@@ -1,10 +1,14 @@
 //! Background directory loading: keeps blocking `read_dir` + metadata off the UI thread.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use crate::panel::{Entry, read_listing};
+
+/// Global cap on concurrent reader threads.
+pub const MAX_READERS: usize = 4;
 
 /// Listing plus the number of items skipped due to errors, or an error message.
 pub type Listing = Result<(Vec<Entry>, usize), String>;
@@ -19,9 +23,35 @@ pub struct LoadResult {
     pub result: Listing,
 }
 
-pub struct Loader {
+struct Req {
+    id: u64,
+    dir: PathBuf,
+    hidden: bool,
+}
+
+#[derive(Default)]
+struct Slot {
+    in_flight: bool,
+    /// Latest request waiting for the in-flight read; older ones are dropped.
+    pending: Option<Req>,
+}
+
+#[derive(Default)]
+struct State {
+    slots: HashMap<usize, Slot>,
+    running: usize,
+}
+
+struct Inner {
     reader: Reader,
     tx: Sender<LoadResult>,
+    state: Mutex<State>,
+}
+
+/// Reads directories off the UI thread: per key (panel) at most one read is in
+/// flight plus one pending (latest wins), and at most [`MAX_READERS`] overall.
+pub struct Loader {
+    inner: Arc<Inner>,
     rx: Mutex<Receiver<LoadResult>>,
 }
 
@@ -35,21 +65,26 @@ impl Loader {
     pub fn with_reader(reader: Reader) -> Self {
         let (tx, rx) = channel();
         Self {
-            reader,
-            tx,
+            inner: Arc::new(Inner {
+                reader,
+                tx,
+                state: Mutex::new(State::default()),
+            }),
             rx: Mutex::new(rx),
         }
     }
 
-    /// Start loading `dir` on its own thread (so one hung mount cannot delay
-    /// other requests). The result is tagged with `id`.
-    pub fn request(&self, id: u64, dir: PathBuf, show_hidden: bool) {
-        let reader = Arc::clone(&self.reader);
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let result = reader(&dir, show_hidden);
-            let _ = tx.send(LoadResult { id, dir, result });
-        });
+    /// Queue loading `dir` for panel `key`; the result is tagged with `id`. A
+    /// pending request of the same key that has not started yet is replaced.
+    pub fn request(&self, key: usize, id: u64, dir: PathBuf, show_hidden: bool) {
+        if let Ok(mut st) = self.inner.state.lock() {
+            st.slots.entry(key).or_default().pending = Some(Req {
+                id,
+                dir,
+                hidden: show_hidden,
+            });
+        }
+        pump(&self.inner);
     }
 
     /// Collect all finished results without blocking.
@@ -58,6 +93,49 @@ impl Loader {
             return Vec::new();
         };
         rx.try_iter().collect()
+    }
+}
+
+/// Start pending requests while reader slots are free.
+fn pump(inner: &Arc<Inner>) {
+    let mut to_run = Vec::new();
+    if let Ok(mut st) = inner.state.lock() {
+        let keys: Vec<usize> = st.slots.keys().copied().collect();
+        for key in keys {
+            if st.running >= MAX_READERS {
+                break;
+            }
+            let slot = st.slots.get_mut(&key).expect("key just listed");
+            if slot.in_flight {
+                continue;
+            }
+            if let Some(req) = slot.pending.take() {
+                slot.in_flight = true;
+                st.running += 1;
+                to_run.push((key, req));
+            }
+        }
+    }
+    for (key, req) in to_run {
+        let inner = Arc::clone(inner);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (inner.reader)(&req.dir, req.hidden)
+            }))
+            .unwrap_or_else(|_| Err("디렉터리 읽기 실패".to_string()));
+            let _ = inner.tx.send(LoadResult {
+                id: req.id,
+                dir: req.dir,
+                result,
+            });
+            if let Ok(mut st) = inner.state.lock() {
+                st.running = st.running.saturating_sub(1);
+                if let Some(slot) = st.slots.get_mut(&key) {
+                    slot.in_flight = false;
+                }
+            }
+            pump(&inner);
+        });
     }
 }
 
@@ -81,7 +159,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         std::fs::write(t.path().join("한글 file.txt"), "x").unwrap();
         let loader = Loader::default();
-        loader.request(7, t.path().to_path_buf(), false);
+        loader.request(0, 7, t.path().to_path_buf(), false);
         let got = wait_for(&loader, 1);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, 7);
@@ -95,7 +173,7 @@ mod tests {
     fn missing_dir_yields_error() {
         let t = tempfile::tempdir().unwrap();
         let loader = Loader::default();
-        loader.request(1, t.path().join("nope"), false);
+        loader.request(0, 1, t.path().join("nope"), false);
         let got = wait_for(&loader, 1);
         assert!(got[0].result.is_err());
     }
@@ -104,10 +182,74 @@ mod tests {
     fn results_keep_their_ids() {
         let t = tempfile::tempdir().unwrap();
         let loader = Loader::default();
-        loader.request(1, t.path().to_path_buf(), false);
-        loader.request(2, t.path().to_path_buf(), true);
+        loader.request(0, 1, t.path().to_path_buf(), false);
+        loader.request(1, 2, t.path().to_path_buf(), true);
         let mut ids: Vec<u64> = wait_for(&loader, 2).iter().map(|r| r.id).collect();
         ids.sort();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Reader that counts invocations and blocks until the gate is released.
+    fn gated(count: Arc<AtomicUsize>, gate: Arc<Mutex<()>>) -> Loader {
+        Loader::with_reader(Arc::new(move |dir, hidden| {
+            count.fetch_add(1, Ordering::SeqCst);
+            drop(gate.lock().unwrap());
+            crate::panel::read_listing(dir, hidden)
+        }))
+    }
+
+    fn pause() {
+        std::thread::sleep(Duration::from_millis(80));
+    }
+
+    #[test]
+    fn rapid_requests_for_one_panel_run_at_most_one_plus_latest() {
+        let t = tempfile::tempdir().unwrap();
+        let (count, gate) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(())));
+        let loader = gated(Arc::clone(&count), Arc::clone(&gate));
+        let guard = gate.lock().unwrap();
+        for id in 1..=10 {
+            loader.request(0, id, t.path().to_path_buf(), false);
+        }
+        pause();
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "one in flight, rest pending"
+        );
+        drop(guard);
+        let mut ids = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            ids.extend(loader.try_results().iter().map(|r| r.id));
+            if ids.contains(&10) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(ids.last(), Some(&10), "latest request wins: {ids:?}");
+        pause();
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "superseded requests never ran"
+        );
+    }
+
+    #[test]
+    fn global_reader_thread_cap() {
+        let t = tempfile::tempdir().unwrap();
+        let (count, gate) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(())));
+        let loader = gated(Arc::clone(&count), Arc::clone(&gate));
+        let guard = gate.lock().unwrap();
+        for key in 0..8 {
+            loader.request(key, key as u64 + 1, t.path().to_path_buf(), false);
+        }
+        pause();
+        assert_eq!(count.load(Ordering::SeqCst), MAX_READERS);
+        drop(guard);
+        assert_eq!(wait_for(&loader, 8).len(), 8, "queued panels still load");
     }
 }

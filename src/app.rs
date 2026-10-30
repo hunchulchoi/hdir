@@ -2,6 +2,8 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13,7 +15,7 @@ use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, Progress
 use crate::loader::Loader;
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
 use crate::ui::{self, View};
-use crate::undo::{UndoOp, UndoStack};
+use crate::undo::{UndoApplied, UndoOp, UndoStack};
 
 /// Rows taken by header (1) + status (1) + fkey bar (1) + panel borders (2).
 const CHROME_ROWS: u16 = 5;
@@ -22,6 +24,9 @@ const CHROME_ROWS: u16 = 5;
 pub fn panel_rows(total_height: u16) -> usize {
     total_height.saturating_sub(CHROME_ROWS) as usize
 }
+
+/// Reverses one op off the UI thread.
+pub type UndoRunner = Arc<dyn Fn(UndoOp) -> UndoApplied + Send + Sync>;
 
 /// What a currently open dialog will do once answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +56,41 @@ pub struct RunningJob {
     pub dest_dir: PathBuf,
     /// Esc was pressed; keep the "취소 중…" status until the worker finishes.
     pub cancelling: bool,
+    /// Panel the job was started from, and its directory at that time.
+    pub src_panel: usize,
+    pub src_cwd: PathBuf,
+}
+
+/// What a background task is doing (and what to do when it ends).
+enum BgKind {
+    Trash {
+        panel: usize,
+        cwd: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    Undo,
+}
+
+enum BgResult {
+    Trash(std::io::Result<()>),
+    Undo(UndoApplied),
+}
+
+/// A short blocking filesystem operation (trash, undo) running on a worker
+/// thread; polled from [`App::tick`].
+pub struct BgTask {
+    rx: Receiver<BgResult>,
+    kind: BgKind,
+}
+
+impl BgTask {
+    fn spawn(kind: BgKind, work: impl FnOnce() -> BgResult + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        Self { rx, kind }
+    }
 }
 
 /// Expand a leading `~` and resolve relative paths against `cwd`.
@@ -94,9 +134,13 @@ pub struct App {
     pub shell: String,
     pub dialog: Option<(Dialog, PendingAction)>,
     pub job: Option<RunningJob>,
+    /// The single background trash/undo task.
+    pub task: Option<BgTask>,
     /// A conflict question that arrived while another dialog was open.
     pending_conflict: Option<PathBuf>,
-    trash: Box<dyn Trash>,
+    trash: Arc<dyn Trash + Send + Sync>,
+    /// Runs one undo op on the worker; tests may swap in a gated one.
+    pub undo_runner: UndoRunner,
     pub undo: UndoStack,
     /// Background directory reader; tests may swap in a gated one.
     pub loader: Loader,
@@ -113,10 +157,10 @@ impl Default for App {
 
 impl App {
     pub fn new(left: PathBuf, right: PathBuf) -> Self {
-        Self::with_trash(left, right, Box::new(SystemTrash))
+        Self::with_trash(left, right, Arc::new(SystemTrash))
     }
 
-    pub fn with_trash(left: PathBuf, right: PathBuf, trash: Box<dyn Trash>) -> Self {
+    pub fn with_trash(left: PathBuf, right: PathBuf, trash: Arc<dyn Trash + Send + Sync>) -> Self {
         let shell = std::env::var("SHELL")
             .ok()
             .and_then(|s| {
@@ -134,8 +178,10 @@ impl App {
             shell,
             dialog: None,
             job: None,
+            task: None,
             pending_conflict: None,
             trash,
+            undo_runner: Arc::new(UndoStack::apply),
             undo: UndoStack::default(),
             loader: Loader::default(),
             next_load_id: 0,
@@ -261,8 +307,12 @@ impl App {
         }
     }
 
+    fn busy(&self) -> bool {
+        self.job.is_some() || self.task.is_some()
+    }
+
     fn open_transfer(&mut self, kind: JobKind) {
-        if self.job.is_some() {
+        if self.busy() {
             self.status = Some("작업 진행 중".into());
             return;
         }
@@ -285,16 +335,17 @@ impl App {
     }
 
     fn start_job(&mut self, kind: JobKind, sources: Vec<PathBuf>, input: &str) {
-        if self.job.is_some() {
+        if self.busy() {
             self.status = Some("작업 진행 중".into());
             return;
         }
         // Only reject empty input; surrounding spaces may be part of a real name.
-        let dest_dir = resolve_dest(input, &self.active_panel().cwd);
-        if input.is_empty() || !dest_dir.is_dir() {
+        // Whether the folder exists is checked by the worker (no IO here).
+        if input.is_empty() {
             self.status = Some("오류: 대상 폴더 없음".into());
             return;
         }
+        let dest_dir = resolve_dest(input, &self.active_panel().cwd);
         let handle = JobHandle::spawn(JobSpec {
             kind,
             sources: sources.clone(),
@@ -307,6 +358,8 @@ impl App {
             sources,
             dest_dir,
             cancelling: false,
+            src_panel: self.active,
+            src_cwd: self.active_panel().cwd.clone(),
         });
     }
 
@@ -318,7 +371,7 @@ impl App {
     /// Hand a panel's pending load request to the background loader.
     fn dispatch(&mut self, idx: usize, req: LoadRequest) {
         let hidden = self.panels[idx].show_hidden;
-        self.loader.request(req.id, req.dir, hidden);
+        self.loader.request(idx, req.id, req.dir, hidden);
     }
 
     /// Start an async reload of panel `idx` (cursor on `focus` if given).
@@ -357,7 +410,70 @@ impl App {
     /// Poll background loads and the job; returns true when the screen needs a redraw.
     pub fn tick(&mut self) -> bool {
         let loaded = self.drain_loads();
-        self.tick_job() || loaded
+        let task = self.tick_task();
+        self.tick_job() || loaded || task
+    }
+
+    fn tick_task(&mut self) -> bool {
+        let Some(task) = self.task.as_ref() else {
+            return false;
+        };
+        let result = match task.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let Some(task) = self.task.take() else {
+            return false;
+        };
+        match (task.kind, result) {
+            (BgKind::Trash { panel, cwd, paths }, Some(BgResult::Trash(res))) => {
+                let status = match res {
+                    Ok(()) => {
+                        let n = paths.len();
+                        self.undo.push(UndoOp::Trash { count: n });
+                        self.clear_selection(panel, &cwd, &paths);
+                        format!("휴지통: {n}개")
+                    }
+                    Err(e) => format!("오류: {e}"),
+                };
+                self.reload_both();
+                self.status = Some(status);
+            }
+            (BgKind::Undo, Some(BgResult::Undo(done))) => {
+                if let Some(retry) = done.retry {
+                    self.undo.push(retry);
+                }
+                self.reload_both();
+                self.status = Some(match done.message {
+                    Ok(m) | Err(m) => m,
+                });
+            }
+            _ => {
+                self.reload_both();
+                self.status = Some("오류: 작업이 중단됨".into());
+            }
+        }
+        true
+    }
+
+    fn reload_both(&mut self) {
+        for i in 0..2 {
+            self.reload_panel(i, None);
+        }
+    }
+
+    /// Drop the selection of `paths` in panel `idx`, unless it moved elsewhere.
+    fn clear_selection(&mut self, idx: usize, cwd: &std::path::Path, paths: &[PathBuf]) {
+        let panel = &mut self.panels[idx];
+        if panel.cwd != cwd {
+            return;
+        }
+        for p in paths {
+            if let Some(name) = p.file_name() {
+                panel.selected.remove(name);
+            }
+        }
     }
 
     fn tick_job(&mut self) -> bool {
@@ -409,17 +525,24 @@ impl App {
                 removed_dirs: report.removed_dirs.clone(),
             });
         }
-        if report.copied > 0 || !report.moved.is_empty() {
-            self.active_panel_mut().selected.clear();
-        }
+        let processed: Vec<PathBuf> = match job.kind {
+            JobKind::Copy if report.copied > 0 => job.sources.clone(),
+            JobKind::Copy => Vec::new(),
+            JobKind::Move => report
+                .moved
+                .iter()
+                .map(|(src, _)| src.clone())
+                .chain(report.removed_dirs.iter().cloned())
+                .filter(|p| p.parent() == Some(job.src_cwd.as_path()))
+                .collect(),
+        };
+        self.clear_selection(job.src_panel, &job.src_cwd, &processed);
         let status = job_summary(job.kind, &report);
         // A conflict dialog may still be open for a job that just ended.
         if matches!(self.dialog, Some((_, PendingAction::Conflict))) {
             self.dialog = None;
         }
-        for i in 0..2 {
-            self.reload_panel(i, None);
-        }
+        self.reload_both();
         self.status = Some(status);
     }
 
@@ -519,15 +642,21 @@ impl App {
                 }
             }
             (PendingAction::Trash { paths }, DialogResult::Confirmed) => {
-                match self.trash.trash(&paths) {
-                    Ok(()) => {
-                        let n = paths.len();
-                        self.undo.push(UndoOp::Trash { count: n });
-                        self.active_panel_mut().selected.clear();
-                        self.after_fs_op(None, format!("휴지통: {n}개"));
-                    }
-                    Err(e) => self.status = Some(format!("오류: {e}")),
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
                 }
+                let trash = Arc::clone(&self.trash);
+                let work = paths.clone();
+                self.task = Some(BgTask::spawn(
+                    BgKind::Trash {
+                        panel: self.active,
+                        cwd: self.active_panel().cwd.clone(),
+                        paths,
+                    },
+                    move || BgResult::Trash(trash.trash(&work)),
+                ));
+                self.status = Some("휴지통으로 이동 중…".into());
             }
             (PendingAction::Transfer { kind, sources }, DialogResult::Submitted(input)) => {
                 self.start_job(kind, sources, &input);
@@ -548,16 +677,22 @@ impl App {
         }
     }
 
-    /// Ctrl+Z: reverse the latest undoable operation and reload both panels.
+    /// Ctrl+Z: pop the latest op here, reverse it on a worker; the result is
+    /// applied (status, retry, reload) from [`App::tick`].
     fn undo(&mut self) {
-        let status = match self.undo.undo() {
-            Ok(msg) => msg,
-            Err(e) => e,
-        };
-        for i in 0..2 {
-            self.reload_panel(i, None);
+        if self.busy() {
+            self.status = Some("작업 진행 중".into());
+            return;
         }
-        self.status = Some(status);
+        let Some(op) = self.undo.pop() else {
+            self.status = Some("되돌릴 작업 없음".into());
+            return;
+        };
+        let runner = Arc::clone(&self.undo_runner);
+        self.task = Some(BgTask::spawn(BgKind::Undo, move || {
+            BgResult::Undo(runner(op))
+        }));
+        self.status = Some("되돌리는 중…".into());
     }
 
     /// Reload the active panel (cursor on `focus` if given) and the other panel
@@ -574,7 +709,9 @@ impl App {
     /// Run a navigation action on the active panel, clearing stale status and
     /// surfacing any panel error afterwards.
     fn navigate(&mut self, f: impl FnOnce(&mut Panel)) {
-        self.status = None;
+        if self.task.is_none() {
+            self.status = None;
+        }
         f(self.active_panel_mut());
         self.show_panel_error();
     }
@@ -625,6 +762,10 @@ fn job_summary(kind: JobKind, report: &OpReport) -> String {
         OpOutcome::Cancelled => format!("취소됨 (처리 {n}개)"),
         OpOutcome::Failed(msg) => format!("오류: {msg} (처리 {n}개)"),
     };
+    if let Some(first) = report.warnings.first() {
+        let shown: String = first.chars().take(60).collect();
+        status.push_str(&format!(" · 경고 {}개: {shown}", report.warnings.len()));
+    }
     if kind == JobKind::Move && report.overwritten > 0 {
         status.push_str(&format!(
             " · 덮어쓴 파일 {}개는 되돌릴 수 없음",
@@ -935,7 +1076,7 @@ mod tests {
         let app = App::with_trash(
             root.to_path_buf(),
             root.to_path_buf(),
-            Box::new(fake.clone()),
+            Arc::new(fake.clone()),
         );
         (tmp, app, fake)
     }
@@ -1046,6 +1187,7 @@ mod tests {
         assert!(app.dialog.is_some());
         press(&mut app, KeyCode::Enter);
         assert!(app.dialog.is_none());
+        wait_idle(&mut app);
         let got = fake.0.lock().unwrap().clone();
         assert_eq!(got, vec![root.join("adir"), root.join("f.txt")]);
         assert!(app.panels[0].selected.is_empty());
@@ -1126,7 +1268,12 @@ mod tests {
         type_str(&mut app, "새폴더");
         press(&mut app, KeyCode::Enter);
         assert!(tmp.path().join("새폴더").is_dir());
+        settle(&mut app);
+        assert!(app.panels[0].entries.iter().any(|e| e.name == "새폴더"));
+        assert!(app.panels[1].entries.iter().any(|e| e.name == "새폴더"));
         ctrl_z(&mut app);
+        wait_idle(&mut app);
+        settle(&mut app);
         assert!(!tmp.path().join("새폴더").exists());
         assert!(app.panels[0].entries.iter().all(|e| e.name != "새폴더"));
         assert!(app.panels[1].entries.iter().all(|e| e.name != "새폴더"));
@@ -1144,10 +1291,19 @@ mod tests {
         }
         type_str(&mut app, "h.txt");
         press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        for i in 0..2 {
+            assert!(app.panels[i].entries.iter().any(|e| e.name == "h.txt"));
+        }
         ctrl_z(&mut app);
+        wait_idle(&mut app);
+        settle(&mut app);
         assert!(tmp.path().join("f.txt").exists());
         assert!(!tmp.path().join("h.txt").exists());
-        assert!(app.panels[0].entries.iter().any(|e| e.name == "f.txt"));
+        for i in 0..2 {
+            assert!(app.panels[i].entries.iter().any(|e| e.name == "f.txt"));
+            assert!(app.panels[i].entries.iter().all(|e| e.name != "h.txt"));
+        }
     }
 
     #[test]
@@ -1156,7 +1312,9 @@ mod tests {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::F(8));
         press(&mut app, KeyCode::Char('y'));
+        wait_idle(&mut app);
         ctrl_z(&mut app);
+        wait_idle(&mut app);
         assert!(app.status.as_deref().unwrap().contains("복원"));
     }
 
@@ -1164,6 +1322,7 @@ mod tests {
     fn ctrl_z_empty_stack_status() {
         let (_t, mut app, _f) = fixture_trash();
         ctrl_z(&mut app);
+        wait_idle(&mut app);
         assert_eq!(app.status.as_deref(), Some("되돌릴 작업 없음"));
     }
 
@@ -1189,6 +1348,19 @@ mod tests {
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(5),
                 "job timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Tick until neither a copy/move job nor a background task is running.
+    fn wait_idle(app: &mut App) {
+        let start = std::time::Instant::now();
+        while app.job.is_some() || app.task.is_some() {
+            app.tick();
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "idle timeout"
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -1255,6 +1427,7 @@ mod tests {
         assert!(app.status.as_deref().unwrap().starts_with("이동 완료"));
         assert_eq!(app.undo.len(), 1);
         ctrl_z(&mut app);
+        wait_idle(&mut app);
         assert!(tmp.path().join("src/a.txt").exists());
         assert!(!tmp.path().join("dst/a.txt").exists());
     }
@@ -1378,9 +1551,13 @@ mod tests {
         }
         type_str(&mut app, "nope");
         press(&mut app, KeyCode::Enter);
-        assert!(app.job.is_none());
-        assert_eq!(app.status.as_deref(), Some("오류: 대상 폴더 없음"));
+        // Validated on the worker, not the UI thread.
+        assert!(app.job.is_some());
+        wait_job(&mut app);
+        assert!(app.status.as_deref().unwrap().contains("대상 폴더 없음"));
+        assert!(app.status.as_deref().unwrap().starts_with("오류:"));
         assert!(!tmp.path().join("src/nope").exists());
+        assert!(!tmp.path().join("dst/a.txt").exists());
     }
 
     #[test]
@@ -1640,6 +1817,7 @@ mod tests {
         assert_eq!(app.undo.len(), 1);
         assert_eq!(app.status.as_deref(), Some("취소됨 (처리 1개)"));
         ctrl_z(&mut app);
+        wait_idle(&mut app);
         assert!(tmp.path().join("src/a.txt").exists());
     }
 
@@ -1652,5 +1830,187 @@ mod tests {
         assert!(s.contains("일부만 이동 1개"), "{s}");
         r.partial = 0;
         assert!(!job_summary(JobKind::Move, &r).contains("일부만"));
+    }
+
+    // ---- round 3 part B: worker trash / undo, source panel, warnings ----
+
+    /// Blocks until `released` is set (2s safety timeout so a regression fails
+    /// instead of hanging).
+    fn block_until(released: &std::sync::atomic::AtomicBool) {
+        let start = Instant::now();
+        while !released.load(std::sync::atomic::Ordering::SeqCst) {
+            if start.elapsed() > Duration::from_secs(2) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    struct GatedTrash {
+        released: Arc<std::sync::atomic::AtomicBool>,
+        seen: Arc<Mutex<Vec<PathBuf>>>,
+    }
+    impl crate::fs_ops::Trash for GatedTrash {
+        fn trash(&self, paths: &[PathBuf]) -> std::io::Result<()> {
+            block_until(&self.released);
+            self.seen.lock().unwrap().extend(paths.iter().cloned());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn f8_trash_runs_on_worker_and_ui_stays_responsive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        for n in ["f.txt", "g.txt"] {
+            fs::write(tmp.path().join(n), "x").unwrap();
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let trash = GatedTrash {
+            released: Arc::clone(&released),
+            seen: Arc::clone(&seen),
+        };
+        let mut app = App::with_trash(
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+            Arc::new(trash),
+        );
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' ')); // f.txt selected, cursor g.txt
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.status.as_deref(), Some("휴지통으로 이동 중…"));
+        // UI keys still work while the worker is blocked.
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.panels[0].cursor, 1);
+        assert_eq!(app.status.as_deref(), Some("휴지통으로 이동 중…"));
+        press(&mut app, KeyCode::F(5));
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        assert!(app.dialog.is_none());
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        assert!(seen.lock().unwrap().is_empty());
+        released.store(true, Ordering::SeqCst);
+        wait_idle(&mut app);
+        assert_eq!(app.status.as_deref(), Some("휴지통: 1개"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(app.panels[0].selected.is_empty());
+        assert_eq!(app.undo.len(), 1);
+    }
+
+    #[test]
+    fn f8_trash_error_is_reported_without_undo_entry() {
+        struct Failing;
+        impl crate::fs_ops::Trash for Failing {
+            fn trash(&self, _: &[PathBuf]) -> std::io::Result<()> {
+                Err(std::io::Error::other("boom"))
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        let mut app = App::with_trash(
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+            Arc::new(Failing),
+        );
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert_eq!(app.status.as_deref(), Some("오류: boom"));
+        assert_eq!(app.undo.len(), 0);
+    }
+
+    fn gated_undo_runner(released: Arc<std::sync::atomic::AtomicBool>) -> UndoRunner {
+        Arc::new(move |op| {
+            block_until(&released);
+            UndoStack::apply(op)
+        })
+    }
+
+    #[test]
+    fn ctrl_z_runs_on_worker_second_ctrl_z_reports_busy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tmp, mut app, _f) = fixture_trash();
+        let dir = tmp.path().join("made");
+        fs::create_dir(&dir).unwrap();
+        app.undo.push(UndoOp::Mkdir { path: dir.clone() });
+        let released = Arc::new(AtomicBool::new(false));
+        app.undo_runner = gated_undo_runner(Arc::clone(&released));
+        ctrl_z(&mut app);
+        assert_eq!(app.status.as_deref(), Some("되돌리는 중…"));
+        assert!(dir.exists(), "not reversed yet");
+        assert_eq!(app.undo.len(), 0);
+        press(&mut app, KeyCode::Down); // UI still responsive
+        assert_eq!(app.panels[0].cursor, 1);
+        ctrl_z(&mut app);
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        released.store(true, Ordering::SeqCst);
+        wait_idle(&mut app);
+        settle(&mut app);
+        assert_eq!(app.status.as_deref(), Some("되돌림: 폴더 생성 취소 made"));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn failed_undo_pushes_retry_back_after_completion() {
+        let (tmp, mut app, _f) = fixture_trash();
+        let (o, n) = (tmp.path().join("o"), tmp.path().join("n"));
+        fs::write(&n, "2").unwrap();
+        fs::write(&o, "blocker").unwrap();
+        app.undo.push(UndoOp::Move {
+            pairs: vec![(o, n)],
+            removed_dirs: vec![],
+        });
+        ctrl_z(&mut app);
+        assert_eq!(app.undo.len(), 0);
+        wait_idle(&mut app);
+        assert_eq!(app.undo.len(), 1, "failed part kept for retry");
+        assert!(app.status.as_deref().unwrap().contains("일부 실패"));
+    }
+
+    #[test]
+    fn finished_job_clears_selection_of_its_source_panel_only() {
+        let (tmp, mut app) = fixture_job();
+        fs::write(tmp.path().join("dst/a.txt"), "OLD").unwrap();
+        app.panels[1].reload();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' ')); // left: a.txt selected
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Down); // a.txt
+        press(&mut app, KeyCode::F(5));
+        press(&mut app, KeyCode::Enter);
+        wait_dialog(&mut app); // blocked on conflict
+        app.dialog = None;
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down); // right: a.txt
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.panels[1].selected.contains(OsStr::new("a.txt")));
+        app.job
+            .as_ref()
+            .unwrap()
+            .handle
+            .answer(ConflictAnswer::OverwriteAll);
+        wait_job(&mut app);
+        assert!(app.panels[0].selected.is_empty(), "source panel cleared");
+        assert!(
+            app.panels[1].selected.contains(OsStr::new("a.txt")),
+            "other panel's selection kept"
+        );
+    }
+
+    #[test]
+    fn job_summary_reports_warnings() {
+        let mut r = OpReport::failed("");
+        r.outcome = OpOutcome::Done;
+        assert!(!job_summary(JobKind::Move, &r).contains("경고"));
+        r.warnings = vec!["x: 빈 원본 폴더 삭제 실패".into(), "y".into()];
+        let s = job_summary(JobKind::Move, &r);
+        assert!(s.contains("경고 2개"), "{s}");
+        assert!(s.contains("x: 빈 원본 폴더 삭제 실패"), "{s}");
     }
 }

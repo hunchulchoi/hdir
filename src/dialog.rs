@@ -248,20 +248,39 @@ fn input_line(value: &str, cursor: usize, width: usize, base: Style) -> Line<'st
     Line::from(spans)
 }
 
-fn buttons_line(options: &[String], selected: usize, base: Style) -> Line<'static> {
-    let mut spans = Vec::new();
+/// Button rows, wrapping onto further lines so every option stays visible.
+fn buttons_lines(
+    options: &[String],
+    selected: usize,
+    base: Style,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
     for (i, o) in options.iter().enumerate() {
-        if i > 0 {
+        let label = format!("[ {o} ]");
+        let w = label.width();
+        if used > 0 && used + 1 + w > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        if used > 0 {
             spans.push(Span::styled(" ", base));
+            used += 1;
         }
         let style = if i == selected {
             base.fg(palette::FG).bg(palette::SELECTED_BG)
         } else {
             base
         };
-        spans.push(Span::styled(format!("[ {o} ]"), style));
+        spans.push(Span::styled(label, style));
+        used += w;
     }
-    Line::from(spans)
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// Draw `dialog` as a centered box over `area` (clearing what is underneath).
@@ -325,10 +344,8 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &Dialog) {
         } => message
             .iter()
             .map(|m| Line::styled(m.clone(), base))
-            .chain([
-                Line::styled("", base),
-                buttons_line(options, *selected, base),
-            ])
+            .chain([Line::styled("", base)])
+            .chain(buttons_lines(options, *selected, base, inner_w))
             .collect(),
     };
 
@@ -692,5 +709,29 @@ mod tests {
         let d = Dialog::choice("t", vec!["m".into()], opts());
         let mut t = Terminal::new(TestBackend::new(20, 5)).unwrap();
         t.draw(|f| render(f, f.area(), &d)).unwrap();
+    }
+
+    #[test]
+    fn narrow_screen_choice_shows_every_option_and_the_selected_one() {
+        let mut d = Dialog::choice("덮어쓰기 확인", vec!["이미 존재: a.txt".into()], opts());
+        for _ in 0..3 {
+            d.handle_key(key(KeyCode::Right)); // Skip all
+        }
+        let mut t = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        t.draw(|f| render(f, f.area(), &d)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let text = all_text(&buf);
+        for o in opts() {
+            assert!(
+                text.contains(&format!("[ {o} ]")),
+                "missing {o} in:\n{text}"
+            );
+        }
+        let hl: String = cells(&buf, buf.area)
+            .into_iter()
+            .filter(|&p| buf[p].bg == CYAN)
+            .map(|p| buf[p].symbol().to_string())
+            .collect();
+        assert_eq!(hl, "[ Skip all ]");
     }
 }

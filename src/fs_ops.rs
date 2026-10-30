@@ -690,7 +690,13 @@ fn relocate(
 /// Move `src` to the exact path `dest`, refusing to overwrite anything.
 /// Falls back to copy + remove across devices.
 pub fn move_path_no_overwrite(src: &Path, dest: &Path) -> io::Result<()> {
-    move_path_with(src, dest, &rename_noreplace, &remove_source)
+    move_path_with(
+        src,
+        dest,
+        &rename_noreplace,
+        &rename_noreplace,
+        &remove_source,
+    )
 }
 
 struct Quiet;
@@ -708,6 +714,7 @@ fn move_path_with(
     src: &Path,
     dest: &Path,
     rename_fn: RenameFn,
+    finalize_fn: RenameFn,
     remove_fn: &dyn Fn(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
     if exists(dest) {
@@ -719,17 +726,26 @@ fn move_path_with(
     match rename_fn(src, dest) {
         Ok(()) => Ok(()),
         Err(e) if is_cross_device(&e) => {
+            // Copy into a private temp sibling and finalize with a no-replace
+            // rename, so a `dest` that appeared meanwhile is never touched.
+            let tmp = temp_sibling(dest);
             let mut acc = Acc::default();
-            let res = copy_entry(src, dest, &mut Quiet, false, false, &mut acc);
+            let res = copy_entry(src, &tmp, &mut Quiet, false, false, &mut acc);
             match res {
-                Ok(Step::Done) if acc.skipped == 0 => remove_fn(src).map_err(|_| {
-                    // The copy at `dest` is complete; deleting it would risk the
-                    // only full copy. Keep both.
-                    io::Error::other(CleanupFailed(src.to_path_buf()))
-                }),
+                Ok(Step::Done) if acc.skipped == 0 => {
+                    if let Err(e) = finalize_fn(&tmp, dest) {
+                        // `tmp` is ours; `dest` (if any) belongs to someone else.
+                        let _ = remove_source(&tmp);
+                        return Err(e);
+                    }
+                    remove_fn(src).map_err(|_| {
+                        // The copy at `dest` is complete; deleting it would risk the
+                        // only full copy. Keep both.
+                        io::Error::other(CleanupFailed(src.to_path_buf()))
+                    })
+                }
                 other => {
-                    // We created `dest` (it did not exist): clean up the partial copy.
-                    let _ = remove_source(dest);
+                    let _ = remove_source(&tmp);
                     match other {
                         Err(e) => Err(e),
                         _ => Err(io::Error::other("could not copy every entry")),
@@ -1726,12 +1742,28 @@ mod tests {
         fs::create_dir(s.join("dir")).unwrap();
         fs::write(s.join("dir/f"), "x").unwrap();
         let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
-        move_path_with(&s.join("dir"), &d.join("dir"), &exdev, &remove_source).unwrap();
+        move_path_with(
+            &s.join("dir"),
+            &d.join("dir"),
+            &exdev,
+            &rename_noreplace,
+            &remove_source,
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(d.join("dir/f")).unwrap(), "x");
         assert!(!s.join("dir").exists());
         fs::write(s.join("f"), "n").unwrap();
         fs::write(d.join("f"), "KEEP").unwrap();
-        assert!(move_path_with(&s.join("f"), &d.join("f"), &exdev, &remove_source).is_err());
+        assert!(
+            move_path_with(
+                &s.join("f"),
+                &d.join("f"),
+                &exdev,
+                &rename_noreplace,
+                &remove_source
+            )
+            .is_err()
+        );
         assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "KEEP");
         assert!(s.join("f").exists());
     }
@@ -1867,8 +1899,14 @@ mod tests {
             fs::remove_file(p.join("a"))?;
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
         };
-        let e = move_path_with(&s.join("dir"), &d.join("dir"), &exdev_err, &partial_remove)
-            .unwrap_err();
+        let e = move_path_with(
+            &s.join("dir"),
+            &d.join("dir"),
+            &exdev_err,
+            &rename_noreplace,
+            &partial_remove,
+        )
+        .unwrap_err();
         let cf = e
             .get_ref()
             .and_then(|x| x.downcast_ref::<CleanupFailed>())
@@ -1877,6 +1915,41 @@ mod tests {
         assert_eq!(fs::read_to_string(d.join("dir/a")).unwrap(), "A");
         assert_eq!(fs::read_to_string(d.join("dir/b")).unwrap(), "B");
         assert!(s.join("dir/b").exists());
+    }
+
+    #[test]
+    fn move_path_exdev_intruder_at_dest_is_never_deleted() {
+        for dir in [false, true] {
+            let (_t, s, d) = two_dirs();
+            if dir {
+                fs::create_dir(s.join("x")).unwrap();
+                fs::write(s.join("x/f"), "src").unwrap();
+            } else {
+                fs::write(s.join("x"), "src").unwrap();
+            }
+            let dest = d.join("x");
+            // The destination appears after the copy, before the final rename.
+            let intrude = |from: &Path, to: &Path| {
+                if dir {
+                    fs::create_dir(to).unwrap();
+                    fs::write(to.join("keep"), "INTRUDER").unwrap();
+                } else {
+                    fs::write(to, "INTRUDER").unwrap();
+                }
+                rename_noreplace(from, to)
+            };
+            let e = move_path_with(&s.join("x"), &dest, &exdev_err, &intrude, &remove_source)
+                .unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "dir={dir}");
+            if dir {
+                assert_eq!(fs::read_to_string(dest.join("keep")).unwrap(), "INTRUDER");
+                assert_eq!(fs::read_to_string(s.join("x/f")).unwrap(), "src");
+            } else {
+                assert_eq!(fs::read_to_string(&dest).unwrap(), "INTRUDER");
+                assert_eq!(fs::read_to_string(s.join("x")).unwrap(), "src");
+            }
+            assert_eq!(names(&d), vec!["x"], "no temp leftovers");
+        }
     }
 
     struct ModeProbe {

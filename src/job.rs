@@ -179,6 +179,10 @@ impl OpControl for Worker {
 }
 
 fn run(spec: &JobSpec, w: &mut Worker) -> OpReport {
+    // Checked here (not on the UI thread): the path may sit on a slow mount.
+    if !spec.dest_dir.is_dir() {
+        return OpReport::failed("대상 폴더 없음");
+    }
     let totals = match spec.kind {
         // Moves are renames: progress by top-level item, no deep walk.
         JobKind::Move => fs_ops::Totals {
@@ -703,5 +707,19 @@ mod tests {
             .collect();
         assert!(progress.len() < 100, "{} progress events", progress.len());
         assert_eq!(progress.last(), Some(&500));
+    }
+
+    #[test]
+    fn missing_dest_dir_fails_in_the_worker() {
+        let (_t, s, d) = dirs();
+        fs::write(s.join("a.txt"), "x").unwrap();
+        for dest in [d.join("nope"), s.join("a.txt")] {
+            let ev = run_answering(
+                spec(JobKind::Copy, vec![s.join("a.txt")], &dest),
+                ConflictAnswer::Skip,
+            );
+            assert_eq!(outcome(&ev), OpOutcome::Failed("대상 폴더 없음".into()));
+        }
+        assert!(!d.join("nope").exists());
     }
 }
