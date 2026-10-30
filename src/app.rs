@@ -108,7 +108,7 @@ enum BgKind {
     },
 }
 
-type TrashListing = std::io::Result<Vec<TrashEntry>>;
+type TrashListing = std::io::Result<crate::trash::TrashListing>;
 
 enum BgResult {
     Trash(std::io::Result<Vec<TrashEntry>>),
@@ -529,14 +529,16 @@ impl App {
                 }
             },
             (BgKind::TrashList { panel }, Some(BgResult::TrashList(res))) => {
-                let failed = self.apply_trash_listing(panel, res);
-                self.status = failed.map(|e| format!("오류: {e}"));
+                self.status = match self.apply_trash_listing(panel, res) {
+                    Ok(warning) => warning,
+                    Err(e) => Some(format!("오류: {e}")),
+                };
             }
             (BgKind::TrashRestore { panel }, Some(BgResult::TrashRestore(report, list))) => {
                 self.finish_trash_restore(panel, report, list);
             }
             (BgKind::TrashPurge { panel, count }, Some(BgResult::TrashPurge(res, list))) => {
-                self.apply_trash_listing(panel, list);
+                let _ = self.apply_trash_listing(panel, list);
                 self.status = Some(match res {
                     Ok(()) => format!("영구 삭제: {count}개"),
                     Err(e) => format!("오류: {e}"),
@@ -846,24 +848,30 @@ impl App {
     }
 
     /// Apply a fresh listing to the trash view of `panel` (if still open);
-    /// returns the error message on failure.
-    fn apply_trash_listing(&mut self, panel: usize, res: TrashListing) -> Option<String> {
-        let view = self.trash_views[panel].as_mut()?;
+    /// returns the listing warning, or the error message on failure.
+    fn apply_trash_listing(
+        &mut self,
+        panel: usize,
+        res: TrashListing,
+    ) -> Result<Option<String>, String> {
+        let Some(view) = self.trash_views[panel].as_mut() else {
+            return Ok(None);
+        };
         match res {
-            Ok(entries) => {
-                view.set_entries(entries);
-                None
+            Ok(listing) => {
+                view.set_entries(listing.entries);
+                Ok(listing.warning)
             }
             Err(e) => {
                 view.loading = false;
                 view.error = Some(e.to_string());
-                Some(e.to_string())
+                Err(e.to_string())
             }
         }
     }
 
     fn finish_trash_restore(&mut self, panel: usize, report: RestoreReport, list: TrashListing) {
-        self.apply_trash_listing(panel, list);
+        let _ = self.apply_trash_listing(panel, list);
         let dirs: Vec<PathBuf> = report
             .restored
             .iter()
@@ -1723,12 +1731,12 @@ mod tests {
         wait_idle(&mut app);
         assert!(!root.join("f.txt").exists() && !root.join("adir").exists());
         assert_eq!(app.undo.len(), 1);
-        assert_eq!(fake.list().unwrap().len(), 2);
+        assert_eq!(fake.list().unwrap().entries.len(), 2);
         ctrl_z(&mut app);
         wait_idle(&mut app);
         assert!(root.join("f.txt").exists() && root.join("adir").is_dir());
         assert_eq!(app.status.as_deref(), Some("되돌림: 휴지통 복원 2개"));
-        assert!(fake.list().unwrap().is_empty());
+        assert!(fake.list().unwrap().entries.is_empty());
         settle(&mut app);
         let _ = tmp;
     }
@@ -1749,7 +1757,7 @@ mod tests {
         assert!(app.status.as_deref().unwrap().contains("일부 실패"));
         assert_eq!(fs::read_to_string(root.join("g.txt")).unwrap(), "new");
         assert_eq!(app.undo.len(), 1, "failed item kept for retry");
-        assert_eq!(fake.list().unwrap().len(), 1);
+        assert_eq!(fake.list().unwrap().entries.len(), 1);
         let _ = tmp;
     }
 
@@ -2814,14 +2822,14 @@ mod tests {
         assert_eq!(message, &["g.txt"]);
         press(&mut app, KeyCode::Char('n'));
         assert!(app.dialog.is_none());
-        assert_eq!(fake.list().unwrap().len(), 2, "cancel keeps items");
+        assert_eq!(fake.list().unwrap().entries.len(), 2, "cancel keeps items");
         press(&mut app, KeyCode::Char(' ')); // select g.txt
         press(&mut app, KeyCode::Char(' ')); // select f.txt
         press(&mut app, KeyCode::F(8));
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.status.as_deref(), Some("영구 삭제 중…"));
         wait_idle(&mut app);
-        assert!(fake.list().unwrap().is_empty());
+        assert!(fake.list().unwrap().entries.is_empty());
         assert!(view_names(&app, 0).is_empty());
         assert_eq!(app.status.as_deref(), Some("영구 삭제: 2개"));
         assert!(!root.join("f.txt").exists());
@@ -2899,13 +2907,47 @@ mod tests {
     }
 
     #[test]
+    fn trash_listing_warning_is_shown_in_status() {
+        struct Partial;
+        impl TrashStore for Partial {
+            fn trash(&self, _: &[PathBuf]) -> std::io::Result<Vec<TrashEntry>> {
+                Ok(vec![])
+            }
+            fn list(&self) -> std::io::Result<crate::trash::TrashListing> {
+                Ok(crate::trash::TrashListing {
+                    entries: vec![],
+                    warning: Some(crate::trash::PARTIAL_LISTING_WARNING.into()),
+                })
+            }
+            fn restore(&self, _: &TrashEntry, _: &std::path::Path) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn purge(&self, _: &[TrashEntry]) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::with_trash(
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+            Arc::new(Partial),
+        );
+        enter_trash(&mut app);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(crate::trash::PARTIAL_LISTING_WARNING)
+        );
+        assert!(app.trash_views[0].as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
     fn trash_list_error_is_shown() {
         struct Broken;
         impl TrashStore for Broken {
             fn trash(&self, _: &[PathBuf]) -> std::io::Result<Vec<TrashEntry>> {
                 Ok(vec![])
             }
-            fn list(&self) -> std::io::Result<Vec<TrashEntry>> {
+            fn list(&self) -> std::io::Result<crate::trash::TrashListing> {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     crate::trash::NO_PERMISSION_MSG,

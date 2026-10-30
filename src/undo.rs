@@ -502,7 +502,7 @@ mod tests {
         assert!(r.retry.is_none());
         assert_eq!(fs::read_to_string(&a).unwrap(), "A");
         assert!(b.is_dir());
-        assert!(store.list().unwrap().is_empty());
+        assert!(store.list().unwrap().entries.is_empty());
     }
 
     #[test]

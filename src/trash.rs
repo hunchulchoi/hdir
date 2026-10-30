@@ -39,12 +39,32 @@ impl TrashEntry {
     }
 }
 
+/// Result of listing the trash: entries (newest first) plus an optional
+/// warning when the listing is known to be incomplete.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrashListing {
+    pub entries: Vec<TrashEntry>,
+    pub warning: Option<String>,
+}
+
+impl TrashListing {
+    pub fn new(entries: Vec<TrashEntry>) -> Self {
+        Self {
+            entries,
+            warning: None,
+        }
+    }
+}
+
+pub const PARTIAL_LISTING_WARNING: &str =
+    "Finder 휴지통 전체 목록은 전체 디스크 접근 권한이 필요함 · hdir가 지운 항목만 표시";
+
 pub trait TrashStore: Send + Sync {
     /// Move `paths` to the trash; returns the created entries (best effort:
     /// may be empty when the backend cannot identify them).
     fn trash(&self, paths: &[PathBuf]) -> io::Result<Vec<TrashEntry>>;
     /// Newest first.
-    fn list(&self) -> io::Result<Vec<TrashEntry>>;
+    fn list(&self) -> io::Result<TrashListing>;
     /// Move the item to `dest` (full target path). Never overwrites:
     /// `AlreadyExists` when `dest` exists.
     fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()>;
@@ -53,8 +73,8 @@ pub trait TrashStore: Send + Sync {
 
 pub const NO_PERMISSION_MSG: &str = "휴지통 접근 권한 없음 (전체 디스크 접근 권한 필요)";
 
-fn permission_error() -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, NO_PERMISSION_MSG)
+fn is_denied(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1)
 }
 
 // ---- index records (pure IO helpers) ----
@@ -226,8 +246,19 @@ fn found_for(path: &Path) -> Option<Found> {
 /// Trashes one path and returns where it ended up.
 pub type Trasher = Box<dyn Fn(&Path) -> io::Result<PathBuf> + Send + Sync>;
 
+/// Lists the paths inside the trash directory (injectable for tests).
+pub type Scanner = Box<dyn Fn(&Path) -> io::Result<Vec<PathBuf>> + Send + Sync>;
+
+fn read_dir_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    Ok(fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .collect())
+}
+
 pub struct IndexTrash {
     trash_dir: PathBuf,
+    scanner: Scanner,
     index_path: PathBuf,
     trasher: Trasher,
     clock: fn() -> i64,
@@ -243,10 +274,16 @@ impl IndexTrash {
     pub fn new(trash_dir: PathBuf, index_path: PathBuf, trasher: Trasher) -> Self {
         Self {
             trash_dir,
+            scanner: Box::new(read_dir_paths),
             index_path,
             trasher,
             clock: now_secs,
         }
+    }
+
+    pub fn with_scanner(mut self, scanner: Scanner) -> Self {
+        self.scanner = scanner;
+        self
     }
 
     pub fn with_clock(mut self, clock: fn() -> i64) -> Self {
@@ -286,27 +323,50 @@ impl TrashStore for IndexTrash {
         Ok(records.iter().map(|r| entry_from_record(r, None)).collect())
     }
 
-    fn list(&self) -> io::Result<Vec<TrashEntry>> {
-        let read = match fs::read_dir(&self.trash_dir) {
-            Ok(r) => r,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(permission_error()),
-            Err(e) => return Err(e),
-        };
-        let mut found: Vec<Found> = read
-            .filter_map(Result::ok)
-            .filter_map(|e| found_for(&e.path()))
-            .collect();
+    fn list(&self) -> io::Result<TrashListing> {
         let records = read_index(&self.index_path);
-        // Items trashed from other volumes live outside the home trash.
-        for r in &records {
-            if r.trashed_path.parent() != Some(self.trash_dir.as_path())
-                && let Some(f) = found_for(&r.trashed_path)
-            {
-                found.push(f);
+        match (self.scanner)(&self.trash_dir) {
+            Ok(paths) => {
+                let mut found: Vec<Found> = paths.iter().filter_map(|p| found_for(p)).collect();
+                // Items trashed from other volumes live outside the home trash.
+                for r in &records {
+                    if r.trashed_path.parent() != Some(self.trash_dir.as_path())
+                        && let Some(f) = found_for(&r.trashed_path)
+                    {
+                        found.push(f);
+                    }
+                }
+                Ok(TrashListing::new(merge_listing(records, found)))
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(TrashListing::default()),
+            // macOS privacy (TCC) blocks the directory scan without Full Disk
+            // Access; fall back to what hdir itself recorded.
+            Err(e) if is_denied(&e) => {
+                let mut kept = Vec::new();
+                for r in &records {
+                    match fs::symlink_metadata(&r.trashed_path) {
+                        Ok(_) => kept.push(r),
+                        Err(e) if is_denied(&e) => kept.push(r),
+                        Err(_) => {}
+                    }
+                }
+                let found = kept
+                    .iter()
+                    .map(|r| {
+                        found_for(&r.trashed_path).unwrap_or_else(|| Found {
+                            path: r.trashed_path.clone(),
+                            size: r.size,
+                            is_dir: r.is_dir,
+                        })
+                    })
+                    .collect();
+                Ok(TrashListing {
+                    entries: merge_listing(records, found),
+                    warning: Some(PARTIAL_LISTING_WARNING.into()),
+                })
+            }
+            Err(e) => Err(e),
         }
-        Ok(merge_listing(records, found))
     }
 
     fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
@@ -365,8 +425,8 @@ impl TrashStore for Unavailable {
     fn trash(&self, _: &[PathBuf]) -> io::Result<Vec<TrashEntry>> {
         Err(io::Error::other("홈 폴더를 찾을 수 없음"))
     }
-    fn list(&self) -> io::Result<Vec<TrashEntry>> {
-        self.trash(&[])
+    fn list(&self) -> io::Result<TrashListing> {
+        self.trash(&[]).map(TrashListing::new)
     }
     fn restore(&self, _: &TrashEntry, _: &Path) -> io::Result<()> {
         self.trash(&[]).map(|_| ())
@@ -469,8 +529,8 @@ impl TrashStore for FreedesktopTrash {
             .unwrap_or_default())
     }
 
-    fn list(&self) -> io::Result<Vec<TrashEntry>> {
-        Self::entries()
+    fn list(&self) -> io::Result<TrashListing> {
+        Self::entries().map(TrashListing::new)
     }
 
     fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
@@ -797,7 +857,7 @@ pub mod fake {
             self.trashed.lock().unwrap().extend(paths.iter().cloned());
             self.inner.trash(paths)
         }
-        fn list(&self) -> io::Result<Vec<TrashEntry>> {
+        fn list(&self) -> io::Result<TrashListing> {
             self.inner.list()
         }
         fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
@@ -989,7 +1049,7 @@ mod tests {
         assert_eq!(entries[0].deleted_at, Some(1_700_000_000));
         assert_eq!(entries[0].size, Some(5));
         assert!(entries[1].is_dir);
-        let listed = f.store.list().unwrap();
+        let listed = f.store.list().unwrap().entries;
         assert_eq!(listed.len(), 2);
         for e in &entries {
             assert!(listed.contains(e), "{e:?} not listed");
@@ -1009,7 +1069,7 @@ mod tests {
             .remove(0);
         f.store.restore(&e, &file).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
-        assert!(f.store.list().unwrap().is_empty());
+        assert!(f.store.list().unwrap().entries.is_empty());
         assert!(read_index(&f.index).is_empty());
     }
 
@@ -1027,7 +1087,7 @@ mod tests {
         let err = f.store.restore(&e, &file).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&file).unwrap(), "new");
-        assert_eq!(f.store.list().unwrap(), vec![e], "still in trash");
+        assert_eq!(f.store.list().unwrap().entries, vec![e], "still in trash");
     }
 
     #[test]
@@ -1047,7 +1107,7 @@ mod tests {
         let f = fixture();
         fs::create_dir_all(&f.trash_dir).unwrap();
         fs::write(f.trash_dir.join("stray.txt"), "s").unwrap();
-        let listed = f.store.list().unwrap();
+        let listed = f.store.list().unwrap().entries;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].original_parent, None);
         assert_eq!(listed[0].name, "stray.txt");
@@ -1066,7 +1126,7 @@ mod tests {
         fs::write(dir.join("i"), "x").unwrap();
         let es = f.store.trash(&[file, dir]).unwrap();
         f.store.purge(&es).unwrap();
-        assert!(f.store.list().unwrap().is_empty());
+        assert!(f.store.list().unwrap().entries.is_empty());
         assert_eq!(fs::read_dir(&f.trash_dir).unwrap().count(), 0);
         assert!(read_index(&f.index).is_empty());
         // purging again (already gone) is not an error
@@ -1076,23 +1136,108 @@ mod tests {
     #[test]
     fn missing_trash_dir_lists_empty() {
         let f = fixture();
-        assert!(f.store.list().unwrap().is_empty());
+        assert!(f.store.list().unwrap().entries.is_empty());
+    }
+
+    fn denied_store(f: &Fixture, kind: io::Error) -> IndexTrash {
+        let kind = std::sync::Mutex::new(Some(kind));
+        IndexTrash::new(
+            f.trash_dir.clone(),
+            f.index.clone(),
+            mover(f.trash_dir.clone()),
+        )
+        .with_clock(|| 1_700_000_000)
+        .with_scanner(Box::new(move |_| {
+            Err(kind
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| io::Error::from(io::ErrorKind::PermissionDenied)))
+        }))
     }
 
     #[test]
-    fn unreadable_trash_dir_reports_permission_message() {
+    fn scan_denied_lists_index_entries_with_warning() {
+        let f = fixture();
+        let a = f.root.join("work/a.txt");
+        let b = f.root.join("work/b.txt");
+        fs::write(&a, "1").unwrap();
+        fs::write(&b, "2").unwrap();
+        let es = f.store.trash(&[a, b]).unwrap();
+        let store = denied_store(&f, io::Error::from(io::ErrorKind::PermissionDenied));
+        let listing = store.list().unwrap();
+        assert_eq!(listing.entries.len(), 2);
+        assert_eq!(listing.warning.as_deref(), Some(PARTIAL_LISTING_WARNING));
+        // restore and purge still work without the directory scan
+        let dest = f.root.join("work/a.txt");
+        let ea = es.iter().find(|e| e.name == "a.txt").unwrap();
+        store.restore(ea, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest).unwrap(), "1");
+        let eb = es.iter().find(|e| e.name == "b.txt").unwrap();
+        store.purge(std::slice::from_ref(eb)).unwrap();
+    }
+
+    #[test]
+    fn scan_eperm_os_error_also_falls_back() {
+        let f = fixture();
+        let a = f.root.join("work/a.txt");
+        fs::write(&a, "1").unwrap();
+        f.store.trash(&[a]).unwrap();
+        let store = denied_store(&f, io::Error::from_raw_os_error(1));
+        let listing = store.list().unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert!(listing.warning.is_some());
+    }
+
+    #[test]
+    fn scan_denied_drops_not_found_records() {
+        let f = fixture();
+        let a = f.root.join("work/a.txt");
+        let b = f.root.join("work/b.txt");
+        fs::write(&a, "1").unwrap();
+        fs::write(&b, "2").unwrap();
+        let es = f.store.trash(&[a, b]).unwrap();
+        fs::remove_file(&es.iter().find(|e| e.name == "a.txt").unwrap().id).unwrap();
+        let store = denied_store(&f, io::Error::from(io::ErrorKind::PermissionDenied));
+        let listing = store.list().unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "b.txt");
+    }
+
+    #[test]
+    fn scan_denied_keeps_records_whose_stat_is_denied() {
         use std::os::unix::fs::PermissionsExt;
         let f = fixture();
-        fs::create_dir_all(&f.trash_dir).unwrap();
+        let a = f.root.join("work/a.txt");
+        fs::write(&a, "1").unwrap();
+        f.store.trash(&[a]).unwrap();
+        // Trash dir without search permission: stat of the child gives EACCES.
         fs::set_permissions(&f.trash_dir, fs::Permissions::from_mode(0o000)).unwrap();
-        let res = f.store.list();
+        let store = denied_store(&f, io::Error::from(io::ErrorKind::PermissionDenied));
+        let listing = store.list();
+        let stat_denied = fs::symlink_metadata(f.trash_dir.join("a.txt")).is_err();
         fs::set_permissions(&f.trash_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        if fs::read_dir(&f.trash_dir).is_ok() && res.is_ok() {
-            return; // running as root: permission bits are not enforced
+        if !stat_denied {
+            return; // running as root
         }
-        let err = res.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(err.to_string(), NO_PERMISSION_MSG);
+        assert_eq!(
+            listing.unwrap().entries.len(),
+            1,
+            "unknown -> assume present"
+        );
+    }
+
+    #[test]
+    fn scan_other_errors_still_fail() {
+        let f = fixture();
+        let store = denied_store(&f, io::Error::other("boom"));
+        assert!(store.list().is_err());
+    }
+
+    #[test]
+    fn missing_trash_dir_has_no_warning() {
+        let f = fixture();
+        assert_eq!(f.store.list().unwrap(), TrashListing::default());
     }
 
     // ---- freedesktop layout ----
@@ -1363,7 +1508,7 @@ mod tests {
         fs::write(&file, "payload").unwrap();
         let made = store.trash(std::slice::from_ref(&file)).unwrap();
         assert!(!file.exists());
-        let listed = store.list().unwrap();
+        let listed = store.list().unwrap().entries;
         let mine = listed
             .iter()
             .find(|e| e.name == name && e.original_parent.as_deref() == Some(dir.as_path()))
@@ -1374,10 +1519,17 @@ mod tests {
         }
         store.restore(&mine, &file).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "payload");
-        assert!(!store.list().unwrap().iter().any(|e| e.id == mine.id));
+        assert!(
+            !store
+                .list()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.id == mine.id)
+        );
         // purge path
         let again = store.trash(std::slice::from_ref(&file)).unwrap();
-        let listed = store.list().unwrap();
+        let listed = store.list().unwrap().entries;
         let mine = listed
             .iter()
             .find(|e| e.name == name && e.original_parent.as_deref() == Some(dir.as_path()))
@@ -1385,6 +1537,13 @@ mod tests {
             .clone();
         let _ = again;
         store.purge(std::slice::from_ref(&mine)).unwrap();
-        assert!(!store.list().unwrap().iter().any(|e| e.id == mine.id));
+        assert!(
+            !store
+                .list()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.id == mine.id)
+        );
     }
 }
