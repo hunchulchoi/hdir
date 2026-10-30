@@ -464,6 +464,7 @@ mod tests {
             selected: Default::default(),
             error: None,
             loading: None,
+            reload_after_load: false,
         }
     }
 
@@ -525,22 +526,45 @@ mod tests {
     }
 
     #[test]
-    fn loading_panel_shows_reading_in_status_and_title() {
-        let (a, b) = setup();
-        let mut pa = Panel::new(a.path());
-        let pb = Panel::new(b.path());
+    fn loading_panel_snapshot_60x12() {
+        let mut pa = fixed_panel("/tmp/a", &[("src", EntryKind::Dir, 0)]);
         pa.loading = Some(crate::panel::LoadRequest {
             id: 1,
-            dir: a.path().to_path_buf(),
+            dir: "/tmp/a".into(),
             focus: None,
             kind: crate::panel::LoadKind::Enter,
         });
-        let buf = render(&pa, &pb, 0, None, 80, 24);
-        // Wide glyphs leave blank continuation cells; compare without spaces.
-        let compact = |y| row(&buf, y).replace(' ', "");
-        assert!(compact(22).contains("읽는중…"), "{}", row(&buf, 22));
-        assert!(compact(1).contains("읽는중…"), "{}", row(&buf, 1));
-        let idle = render(&pb, &pb, 0, None, 80, 24);
-        assert!(!row(&idle, 22).replace(' ', "").contains("읽는중…"));
+        let pb = fixed_panel("/tmp/b", &[("docs", EntryKind::Dir, 0)]);
+        let buf = render(&pa, &pb, 0, None, 60, 12);
+        let got: Vec<String> = (0..12).map(|y| row(&buf, y)).collect();
+        // Wide glyphs leave blank continuation cells in the buffer.
+        let expected = [
+            format!(" ■ hdir {} · zsh · macos · UTF-8", crate::VERSION),
+            "┌/tmp/a 읽 는  중 …─────────────┐┌/tmp/b──────────────────────┐".to_string(),
+            "│ ..                 <UP-DIR>││ ..                 <UP-DIR>│".to_string(),
+            "│ src                   <DIR>││ docs                  <DIR>│".to_string(),
+            "│                            ││                            │".to_string(),
+            "│                            ││                            │".to_string(),
+            "│                            ││                            │".to_string(),
+            "│                            ││                            │".to_string(),
+            "│                            ││                            │".to_string(),
+            "└────────────────────────────┘└────────────────────────────┘".to_string(),
+            " 읽 는  중 …".to_string(),
+            "1Help 2Rena…3View 4Edit 5Copy 6Move 7Mkdir8Del  9Menu 10Quit".to_string(),
+        ]
+        .map(|l| format!("{l:<60}"));
+        assert_eq!(got.join("\n"), expected.join("\n"));
+
+        // Marker styles: title in the active border colors, status bar colors.
+        for x in [8, 10, 13, 15] {
+            assert_eq!(buf[(x, 1)].fg, palette::BORDER_ACTIVE, "title x={x}");
+            assert_eq!(buf[(x, 1)].bg, palette::BG, "title x={x}");
+        }
+        for x in [1, 3, 6, 8] {
+            assert_eq!(buf[(x, 10)].fg, palette::STATUS_FG, "status x={x}");
+            assert_eq!(buf[(x, 10)].bg, palette::STATUS_BG, "status x={x}");
+        }
+        // The idle panel carries no marker.
+        assert!(!row(&buf, 1).chars().skip(30).any(|c| c == '읽'));
     }
 }

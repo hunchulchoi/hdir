@@ -74,6 +74,8 @@ pub struct Panel {
     pub error: Option<String>,
     /// Set while a background load is pending; the old listing stays visible.
     pub loading: Option<LoadRequest>,
+    /// A task finished while a navigation load was in flight; reload once it lands.
+    pub reload_after_load: bool,
 }
 
 impl Panel {
@@ -89,6 +91,7 @@ impl Panel {
             selected: HashSet::new(),
             error: None,
             loading: None,
+            reload_after_load: false,
         };
         panel.reload();
         panel
@@ -224,6 +227,7 @@ impl Panel {
     /// entry under it when the load finishes.
     pub fn begin_reload(&mut self, id: u64, focus: Option<OsString>) -> LoadRequest {
         let dir = self.cwd.clone();
+        self.reload_after_load = false;
         self.begin_change_dir(id, dir, focus, LoadKind::Reload)
     }
 

@@ -414,6 +414,9 @@ impl App {
                 {
                     self.status = Some(err);
                 }
+                if std::mem::take(&mut self.panels[idx].reload_after_load) {
+                    self.reload_panel(idx, None);
+                }
             }
         }
         changed
@@ -511,7 +514,10 @@ impl App {
             .loading
             .as_ref()
             .is_some_and(|r| r.kind != LoadKind::Reload);
-        if !navigating {
+        if navigating {
+            // Reload as soon as the navigation lands so the task's changes show.
+            self.panels[idx].reload_after_load = true;
+        } else {
             self.reload_panel(idx, focus);
         }
     }
@@ -2096,6 +2102,62 @@ mod tests {
         assert_eq!(
             app.panels[0].cwd.canonicalize().unwrap(),
             root.join("adir").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn task_finish_during_navigation_reloads_after_the_load() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("adir")).unwrap();
+        fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let trash = GatedTrash {
+            released: Arc::clone(&released),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let root = tmp.path().to_path_buf();
+        let mut app = App::with_trash(root.clone(), root.clone(), Arc::new(trash));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.task.is_some());
+        // Loader that lists first, then blocks: the listing predates the task's end.
+        let listed = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Mutex::new(()));
+        let (l, g) = (Arc::clone(&listed), Arc::clone(&gate));
+        app.loader = crate::loader::Loader::with_reader(Arc::new(move |dir, hidden| {
+            let res = crate::panel::read_listing(dir, hidden);
+            l.store(true, Ordering::SeqCst);
+            drop(g.lock().unwrap());
+            res
+        }));
+        let guard = gate.lock().unwrap();
+        press(&mut app, KeyCode::Up); // adir
+        press(&mut app, KeyCode::Enter);
+        let start = Instant::now();
+        while !listed.load(Ordering::SeqCst) {
+            assert!(start.elapsed() < Duration::from_secs(5), "reader stuck");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        released.store(true, Ordering::SeqCst);
+        while app.task.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(5), "task stuck");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The task's side effect lands after the navigation listing was read.
+        fs::write(root.join("adir/new.txt"), "n").unwrap();
+        drop(guard);
+        settle(&mut app);
+        assert_eq!(
+            app.panels[0].cwd.canonicalize().unwrap(),
+            root.join("adir").canonicalize().unwrap()
+        );
+        assert!(
+            app.panels[0].entries.iter().any(|e| e.os_name == "new.txt"),
+            "post-task change missing after navigation"
         );
     }
 

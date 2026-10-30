@@ -579,8 +579,11 @@ fn copy_loop(
 ) -> io::Result<OpOutcome> {
     let dests = check_all(sources, dest_dir)?;
     for (src, dest) in sources.iter().zip(&dests) {
+        let skipped_before = acc.skipped;
         match copy_entry(src, dest, ctl, true, false, acc)? {
             Step::Cancelled => return Ok(OpOutcome::Cancelled),
+            // A directory whose children were skipped is incomplete.
+            Step::Done if acc.skipped != skipped_before => acc.partial += 1,
             Step::Done => {
                 acc.copied += 1;
                 acc.done_sources.push(src.clone());
@@ -1021,6 +1024,21 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// `path` -> temp -> `target`, for a case-only rename. The temp step never
+/// replaces anything: a taken temp name is skipped for a fresh one.
+fn case_only_two_step(
+    path: &Path,
+    target: &Path,
+    next: &mut dyn FnMut() -> PathBuf,
+) -> io::Result<()> {
+    let tmp = park_aside_with(path, next)?;
+    if let Err(e) = rename_noreplace(&tmp, target) {
+        let _ = rename_noreplace(&tmp, path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     validate_name(new_name)?;
     let target = path.with_file_name(new_name);
@@ -1029,12 +1047,7 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
         let old = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
         let case_only = old.is_some_and(|o| o == new_name.to_lowercase());
         if case_only && same_file(path, &target) {
-            let tmp = temp_sibling(path);
-            fs::rename(path, &tmp)?;
-            if let Err(e) = rename_noreplace(&tmp, &target) {
-                let _ = fs::rename(&tmp, path);
-                return Err(e);
-            }
+            case_only_two_step(path, &target, &mut || temp_sibling(path))?;
             return Ok(target);
         }
         return Err(io::Error::new(
@@ -1820,6 +1833,38 @@ mod tests {
         let n = rename(&a, "Foo").unwrap();
         assert_eq!(names(t.path()), vec!["Foo"]);
         assert_eq!(fs::read_to_string(n).unwrap(), "x");
+    }
+
+    #[test]
+    fn case_only_rename_never_clobbers_predicted_temp_name() {
+        let t = tempdir().unwrap();
+        let a = t.path().join("foo");
+        fs::write(&a, "x").unwrap();
+        let taken = t.path().join(".taken-tmp");
+        fs::write(&taken, "PRECIOUS").unwrap();
+        let free = t.path().join(".free-tmp");
+        let mut names = vec![taken.clone(), free].into_iter();
+        case_only_two_step(&a, &t.path().join("Foo"), &mut || names.next().unwrap()).unwrap();
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "PRECIOUS");
+        assert_eq!(fs::read_to_string(t.path().join("Foo")).unwrap(), "x");
+        assert!(!t.path().join(".free-tmp").exists());
+    }
+
+    #[test]
+    fn copy_dir_with_skipped_child_is_partial() {
+        let (_t, s, d) = two_dirs();
+        fs::create_dir_all(s.join("x/sub")).unwrap();
+        fs::write(s.join("x/sub/f"), "new").unwrap();
+        fs::create_dir_all(d.join("x/sub")).unwrap();
+        fs::write(d.join("x/sub/f"), "old").unwrap();
+        let mut c = SkipChild {
+            intruder: None,
+            asked: 0,
+        };
+        let r = copy_items(&[s.join("x")], &d, &mut c);
+        assert_eq!(fs::read_to_string(d.join("x/sub/f")).unwrap(), "old");
+        assert_eq!((r.copied, r.partial), (0, 1));
+        assert!(r.done_sources.is_empty());
     }
 
     // ---- review fixes (phase B: OpReport API) ----
