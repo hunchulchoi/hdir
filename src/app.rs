@@ -6431,8 +6431,6 @@ mod tests {
             press(app, KeyCode::Enter);
         }
 
-        #[cfg(unix)]
-
         fn log(f: &ShellFake) -> Vec<String> {
             f.log.lock().unwrap().clone()
         }
