@@ -165,6 +165,42 @@ pub fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// `path` in `\\?\` form when it is absolute and too long for `MAX_PATH`
+/// (std does this for its own calls, raw Win32 calls must do it themselves).
+#[cfg(windows)]
+pub fn long_path(path: &Path) -> std::path::PathBuf {
+    use std::path::{Component, Prefix};
+    const SHORT: usize = 240; // below MAX_PATH (260) with room for a trailing name
+    if path.as_os_str().len() < SHORT {
+        return path.to_path_buf();
+    }
+    let mut comps = path.components();
+    let Some(Component::Prefix(prefix)) = comps.next() else {
+        return path.to_path_buf(); // relative: leave it alone
+    };
+    let mut out = match prefix.kind() {
+        Prefix::Disk(d) => format!(r"\\?\{}:", d as char),
+        Prefix::UNC(server, share) => format!(
+            r"\\?\UNC\{}\{}",
+            server.to_string_lossy(),
+            share.to_string_lossy()
+        ),
+        _ => return path.to_path_buf(), // already verbatim or a device path
+    };
+    for c in comps {
+        match c {
+            Component::RootDir => {}
+            Component::Normal(n) => {
+                out.push('\\');
+                out.push_str(&n.to_string_lossy());
+            }
+            // `.`/`..` are not resolved in verbatim paths: keep the original.
+            _ => return path.to_path_buf(),
+        }
+    }
+    out.into()
+}
+
 /// `MoveFileExW` with `flags`; without `MOVEFILE_REPLACE_EXISTING` it fails with
 /// `ERROR_ALREADY_EXISTS` (-> `AlreadyExists`) if `to` exists, and without
 /// `MOVEFILE_COPY_ALLOWED` a cross-volume move fails with `ERROR_NOT_SAME_DEVICE`.
@@ -177,6 +213,7 @@ fn move_file_ex(
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
     let wide = |p: &Path| -> io::Result<Vec<u16>> {
+        let p = long_path(p);
         let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
         if v.contains(&0) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "nul in path"));
@@ -356,4 +393,40 @@ pub fn is_symlink_privilege_error(_e: &io::Error) -> bool {
 pub fn is_symlink_privilege_error(e: &io::Error) -> bool {
     use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
     e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD as i32)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_paths_get_the_verbatim_prefix_short_ones_do_not() {
+        let short = Path::new(r"C:\a\b");
+        assert_eq!(long_path(short), short);
+        let long = format!(r"C:\{}\f", "x".repeat(250));
+        assert_eq!(
+            long_path(Path::new(&long)),
+            Path::new(&format!(r"\\?\C:\{}\f", "x".repeat(250)))
+        );
+        let unc = format!(r"\\srv\share\{}\f", "x".repeat(250));
+        assert_eq!(
+            long_path(Path::new(&unc)),
+            Path::new(&format!(r"\\?\UNC\srv\share\{}\f", "x".repeat(250)))
+        );
+        let rel = "y".repeat(300);
+        assert_eq!(long_path(Path::new(&rel)), Path::new(&rel));
+    }
+
+    #[test]
+    fn move_file_ex_works_beyond_max_path() {
+        let t = tempfile::tempdir().unwrap();
+        let mut d = t.path().to_path_buf();
+        while d.as_os_str().len() < 280 {
+            d.push("deepdir_deepdir");
+        }
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("a"), "x").unwrap();
+        rename_noreplace_os(&d.join("a"), &d.join("b")).unwrap();
+        assert_eq!(fs::read_to_string(d.join("b")).unwrap(), "x");
+    }
 }
