@@ -165,7 +165,9 @@ pub fn canonical_dir(p: &Path) -> std::io::Result<PathBuf> {
             }
         }
     }
-    let c = std::fs::canonicalize(p)?;
+    // Windows has no physical `..` (and verbatim paths reject `.`/`..`):
+    // use the folded, existence-checked path there.
+    let c = std::fs::canonicalize(if cfg!(windows) { acc.as_path() } else { p })?;
     if !c.is_dir() {
         return Err(std::io::Error::other("디렉터리가 아님"));
     }
