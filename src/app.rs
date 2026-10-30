@@ -113,6 +113,13 @@ enum BgKind {
         name: String,
     },
     OpenOsTrash,
+    /// Re-read config.toml, themes, keymap and assoc.
+    ConfigReload,
+    /// Write `theme.<mode> = name` to config.toml.
+    ThemeSave {
+        mode: Mode,
+        name: String,
+    },
     TrashList {
         panel: usize,
     },
@@ -130,6 +137,8 @@ enum BgResult {
     Trash(TrackedDelete),
     TrashList(TrashListing),
     OpenOsTrash(Result<(), String>),
+    Settings(Box<Settings>),
+    ThemeSaved(Result<(), String>),
     /// Restore result, how many selected items had no known original
     /// location, plus the refreshed listing.
     TrashRestore(RestoreResult, usize, TrashListing),
@@ -277,8 +286,9 @@ impl App {
         }
     }
 
-    /// Load the config from `config_dir` (file IO, so call before the first
-    /// draw) and adopt it. `colorterm` is the `COLORTERM` value, injected so
+    /// Load the config from `config_dir` (synchronous file IO, deliberately:
+    /// it runs once before the first draw, when there is no UI to block; later
+    /// reloads and theme saves use the background runner) and adopt it. `colorterm` is the `COLORTERM` value, injected so
     /// tests do not depend on the environment. Warnings from every source go to
     /// the status line (first one plus a count).
     pub fn configure(&mut self, config_dir: Option<PathBuf>, colorterm: Option<&str>) {
@@ -291,18 +301,24 @@ impl App {
     }
 
     /// Re-read config, themes, keymap and assoc from `config_dir`.
+    /// Synchronous: only for startup, before the first draw.
     fn reload_settings(&mut self) {
         self.settings = config::load_settings(self.config_dir.as_deref());
         self.apply_theme();
     }
 
-    /// Re-read config, themes, keymap and assoc and apply them immediately.
+    /// Re-read config, themes, keymap and assoc on the background runner; the
+    /// result is applied from [`App::tick`].
     pub fn reload_config(&mut self) {
-        self.reload_settings();
-        self.status = Some(
-            config::warning_summary(&self.settings.warnings)
-                .unwrap_or_else(|| "설정을 다시 읽었음".to_string()),
-        );
+        if self.task.is_some() {
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
+        let dir = self.config_dir.clone();
+        self.task = Some(BgTask::spawn(BgKind::ConfigReload, move || {
+            BgResult::Settings(Box::new(config::load_settings(dir.as_deref())))
+        }));
+        self.status = Some("설정 읽는 중…".into());
     }
 
     fn close_hint(&self) -> String {
@@ -402,6 +418,12 @@ impl App {
 
     /// Adopt `name` for the current mode and write it to config.toml.
     fn commit_theme(&mut self, name: &str) {
+        if self.task.is_some() {
+            // Leave the picker's preview and keep the saved choice.
+            self.apply_theme();
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
         let (t, _) = theme::resolve(name, &self.settings.user_themes);
         match self.mode {
             Mode::Classic => {
@@ -414,14 +436,19 @@ impl App {
             }
         }
         self.apply_theme();
-        let saved = match &self.config_dir {
-            Some(dir) => config::save_theme(dir, self.mode, name),
-            None => Err("설정 디렉터리를 알 수 없음".to_string()),
+        let Some(dir) = self.config_dir.clone() else {
+            self.status = Some("테마 저장 실패: 설정 디렉터리를 알 수 없음".into());
+            return;
         };
-        self.status = Some(match saved {
-            Ok(()) => format!("테마 저장: {name} ({})", self.mode.key()),
-            Err(e) => format!("테마 저장 실패: {e}"),
-        });
+        let (mode, owned) = (self.mode, name.to_string());
+        self.task = Some(BgTask::spawn(
+            BgKind::ThemeSave {
+                mode,
+                name: owned.clone(),
+            },
+            move || BgResult::ThemeSaved(config::save_theme(&dir, mode, &owned)),
+        ));
+        self.status = Some("테마 저장 중…".into());
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
@@ -859,6 +886,20 @@ impl App {
                         report.purged
                     ),
                     None => format!("영구 삭제: {}개", report.purged),
+                });
+            }
+            (BgKind::ConfigReload, Some(BgResult::Settings(settings))) => {
+                self.settings = *settings;
+                self.apply_theme();
+                self.status = Some(
+                    config::warning_summary(&self.settings.warnings)
+                        .unwrap_or_else(|| "설정을 다시 읽었음".to_string()),
+                );
+            }
+            (BgKind::ThemeSave { mode, name }, Some(BgResult::ThemeSaved(res))) => {
+                self.status = Some(match res {
+                    Ok(()) => format!("테마 저장: {name} ({})", mode.key()),
+                    Err(e) => format!("테마 저장 실패: {e}"),
                 });
             }
             (BgKind::Undo, Some(BgResult::Undo(done))) => {
@@ -1830,6 +1871,7 @@ mod tests {
         .unwrap();
         press(&mut app, KeyCode::Down);
         app.reload_config();
+        settle_task(&mut app);
         assert_eq!(app.theme.name, "dark");
         assert_eq!(app.status.as_deref(), Some("설정을 다시 읽었음"));
         press(&mut app, KeyCode::F(5));
@@ -1856,6 +1898,7 @@ mod tests {
         )
         .unwrap();
         app.reload_config();
+        settle_task(&mut app);
         assert_eq!(app.mode, Mode::Dev);
         assert_eq!(app.theme.name, "light");
         let st = app.status.clone().unwrap();
@@ -1985,6 +2028,7 @@ mod tests {
         .unwrap();
         press(&mut app, KeyCode::F(9));
         pick(&mut app, "설정 다시 읽기");
+        settle_task(&mut app);
         assert!(app.menu.is_none());
         assert_eq!(app.theme.name, "dark");
         assert_eq!(app.status.as_deref(), Some("설정을 다시 읽었음"));
@@ -2006,6 +2050,7 @@ mod tests {
         )
         .unwrap();
         app.reload_config();
+        settle_task(&mut app);
         open_theme_menu(&mut app);
         let items = menu_items(&app);
         assert_eq!(
@@ -2044,6 +2089,7 @@ mod tests {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down); // dark
         press(&mut app, KeyCode::Enter);
+        settle_task(&mut app);
         assert!(app.menu.is_none());
         assert_eq!(app.theme.name, "dark");
         assert_eq!(app.settings.config.theme.classic, "dark");
@@ -2057,6 +2103,7 @@ mod tests {
         assert!(app.status.as_deref().unwrap().contains("dark"));
         // survives a reload from disk
         app.reload_config();
+        settle_task(&mut app);
         assert_eq!(app.theme.name, "dark");
     }
 
@@ -2067,6 +2114,7 @@ mod tests {
         open_theme_menu(&mut app);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter); // mdir-red
+        settle_task(&mut app);
         assert_eq!(app.theme.name, "mdir-red");
         app.set_mode(Mode::Classic);
         assert_eq!(app.theme.name, "light", "classic untouched");
@@ -2088,11 +2136,78 @@ mod tests {
     }
 
     #[test]
+    fn reload_config_runs_on_the_background_runner() {
+        let (_t, cfg, mut app) = app_with_dir("");
+        fs::write(
+            cfg.path().join("config.toml"),
+            "[theme]\nclassic = \"dark\"\n",
+        )
+        .unwrap();
+        app.reload_config();
+        assert!(app.task.is_some(), "IO runs on a worker");
+        assert_eq!(app.status.as_deref(), Some("설정 읽는 중…"));
+        assert_eq!(app.theme.name, "mdir", "applied only from tick()");
+        settle_task(&mut app);
+        assert_eq!(app.theme.name, "dark");
+        assert_eq!(app.status.as_deref(), Some("설정을 다시 읽었음"));
+    }
+
+    #[test]
+    fn theme_commit_saves_on_the_background_runner() {
+        let (_t, cfg, mut app) = app_with_dir("");
+        open_theme_menu(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.task.is_some(), "save runs on a worker");
+        assert_eq!(app.status.as_deref(), Some("테마 저장 중…"));
+        assert_eq!(app.theme.name, "mdir-red", "applied in memory at once");
+        settle_task(&mut app);
+        assert_eq!(app.status.as_deref(), Some("테마 저장: mdir-red (classic)"));
+        let (c, _) = config::load_config(Some(cfg.path()));
+        assert_eq!(c.theme.classic, "mdir-red");
+    }
+
+    #[test]
+    fn theme_preview_does_no_io_and_starts_no_task() {
+        let (_t, _cfg, mut app) = app_with_dir("");
+        open_theme_menu(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert!(app.task.is_none());
+        assert_eq!(app.theme.name, "mdir-green");
+    }
+
+    #[test]
+    fn config_io_is_refused_while_another_task_runs() {
+        let (_t, cfg, mut app) = app_with_dir("");
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.task = Some(BgTask {
+            rx,
+            kind: BgKind::Undo,
+        });
+        fs::write(
+            cfg.path().join("config.toml"),
+            "[theme]\nclassic = \"dark\"\n",
+        )
+        .unwrap();
+        app.reload_config();
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        assert_eq!(app.theme.name, "mdir");
+        open_theme_menu(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        assert_eq!(app.theme.name, "mdir", "nothing half-applied");
+        assert_eq!(app.settings.config.theme.classic, "mdir");
+    }
+
+    #[test]
     fn theme_save_failure_is_reported_and_theme_stays_for_the_session() {
         let (_t, mut app) = fixture(); // no config dir
         open_theme_menu(&mut app);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
+        settle_task(&mut app);
         assert!(
             app.status.as_deref().unwrap().contains("저장 실패"),
             "{:?}",
@@ -2985,6 +3100,16 @@ mod tests {
         let start = Instant::now();
         while app.panels.iter().any(|p| p.loading.is_some()) {
             assert!(start.elapsed() < Duration::from_secs(5), "load timed out");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Tick until the background task (if any) has been applied (5s timeout).
+    fn settle_task(app: &mut App) {
+        let start = Instant::now();
+        while app.task.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(5), "task timed out");
             app.tick();
             std::thread::sleep(Duration::from_millis(2));
         }

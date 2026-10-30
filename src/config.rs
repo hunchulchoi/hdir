@@ -201,93 +201,130 @@ pub fn warning_summary(warnings: &[String]) -> Option<String> {
     })
 }
 
-fn toml_string(s: &str) -> String {
-    let mut out = String::from('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Set `[theme] <key> = "<name>"` in `text`, leaving everything else as is.
-/// The result is re-parsed; if the edit did not take effect (an exotic layout
-/// such as an inline table) an error is returned and nothing should be written.
+/// Set `theme.<key> = "<name>"` in `text` with `toml_edit`, so comments,
+/// formatting, multiline strings and every other key are left as they are.
+/// Works for a `[theme]` table, dotted keys and an inline table; a missing
+/// table is created. Errors (unparsable file, `theme` not a table) mean nothing
+/// should be written.
 pub fn set_theme_in_text(text: &str, key: &str, name: &str) -> Result<String, String> {
-    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut lines: Vec<String> = text.lines().map(String::from).collect();
-    let new_line = format!("{key} = {}", toml_string(name));
-
-    let mut in_theme = false;
-    let mut header = None;
-    let mut key_line = None;
-    for (i, l) in lines.iter().enumerate() {
-        let t = l.trim_start();
-        if t.starts_with('[') {
-            let rest = t.strip_prefix("[theme]").map(str::trim);
-            in_theme = rest.is_some_and(|r| r.is_empty() || r.starts_with('#'));
-            if in_theme {
-                header = Some(i);
-            }
-        } else if in_theme
-            && let Some(rest) = t.strip_prefix(key)
-            && rest.trim_start().starts_with('=')
+    use toml_edit::{DocumentMut, Item, Table, value};
+    let fail =
+        |why: &str| format!("config.toml을 자동 수정할 수 없음 ({why}); 직접 [theme] 수정 필요");
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|e: toml_edit::TomlError| fail(e.message()))?;
+    if !doc.contains_key("theme") {
+        // New table goes last; comments that trailed the file stay above it.
+        let trailing = doc
+            .trailing()
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_default();
+        doc.set_trailing("");
+        let mut table = Table::new();
+        let first = doc.as_table().is_empty() && trailing.is_empty();
+        let sep = if first || trailing.ends_with("\n\n") {
+            ""
+        } else {
+            "\n"
+        };
+        table.decor_mut().set_prefix(format!("{trailing}{sep}"));
+        doc.insert("theme", Item::Table(table));
+    }
+    let item = doc.entry("theme").or_insert(Item::None);
+    // Keep the existing value's trailing comment/whitespace when replacing.
+    fn set(t: &mut dyn toml_edit::TableLike, key: &str, name: &str) {
+        let mut v = value(name);
+        if let Some(old) = t.get(key).and_then(Item::as_value)
+            && let Some(nv) = v.as_value_mut()
         {
-            key_line = Some(i);
+            *nv.decor_mut() = old.decor().clone();
         }
+        t.insert(key, v);
     }
-    match (key_line, header) {
-        (Some(i), _) => {
-            let indent: String = lines[i].chars().take_while(|c| c.is_whitespace()).collect();
-            lines[i] = format!("{indent}{new_line}");
-        }
-        (None, Some(h)) => lines.insert(h + 1, new_line),
-        (None, None) => {
-            if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                lines.push(String::new());
-            }
-            lines.push("[theme]".into());
-            lines.push(new_line);
-        }
+    match item.as_table_like_mut() {
+        Some(t) => set(t, key, name),
+        None => return Err(fail("theme이 테이블이 아님")),
     }
-    let mut out = lines.join(eol);
-    out.push_str(eol);
-    let ok = out
-        .parse::<toml::Table>()
-        .ok()
-        .and_then(|t| t.get("theme")?.get(key)?.as_str().map(|s| s == name))
-        .unwrap_or(false);
-    if ok {
-        Ok(out)
-    } else {
-        Err("config.toml 구조를 자동 수정할 수 없음 (직접 [theme] 수정 필요)".into())
+    let mut out = doc.to_string();
+    if text.contains("\r\n") {
+        out = out.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    Ok(out)
+}
+
+/// Resolve a symlinked `config.toml` to its real file so a save replaces the
+/// target and leaves the link intact.
+fn real_config_path(path: &Path) -> Result<PathBuf, String> {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return Ok(path.to_path_buf());
+    }
+    match std::fs::canonicalize(path) {
+        Ok(p) => Ok(p),
+        // Dangling link: create the file it points to.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let target = std::fs::read_link(path)
+                .map_err(|e| format!("{} 링크 읽기 실패: {e}", path.display()))?;
+            Ok(path.parent().map_or(target.clone(), |p| p.join(&target)))
+        }
+        Err(e) => Err(format!("{} 경로 확인 실패: {e}", path.display())),
     }
 }
 
-/// Persist `theme.<mode> = name` into `<dir>/config.toml` (created if missing).
+/// Write `text` to `real` via an exclusively created sibling temp file
+/// (0600 on unix, never a fixed name, never follows a symlink), give it the
+/// existing file's permissions, then atomically replace.
+fn write_atomic(real: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let err = |e: std::io::Error| format!("저장 실패: {e}");
+    let (tmp, mut file) = (0..16)
+        .find_map(|_| {
+            let tmp = crate::fs_ops::temp_sibling(real);
+            match crate::platform::create_private_file(&tmp) {
+                Ok(f) => Some(Ok((tmp, f))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(e) => Some(Err(e)),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "임시 파일 이름을 정하지 못함",
+            ))
+        })
+        .map_err(err)?;
+    let result = (|| {
+        file.write_all(text.as_bytes())?;
+        if let Ok(meta) = std::fs::metadata(real) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.sync_all()?;
+        drop(file);
+        crate::platform::rename_replace(&tmp, real)
+    })();
+    result.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        err(e)
+    })
+}
+
+/// Persist `theme.<mode> = name` into `<dir>/config.toml` (created if missing;
+/// a symlinked file is edited in place at its target).
 pub fn save_theme(dir: &Path, mode: Mode, name: &str) -> Result<(), String> {
     let path = config_file(dir);
-    let existing = match std::fs::read_to_string(&path) {
+    let real = real_config_path(&path)?;
+    let existing = match std::fs::read_to_string(&real) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("{} 읽기 실패: {e}", path.display())),
+        Err(e) => return Err(format!("{} 읽기 실패: {e}", real.display())),
     };
     let updated = set_theme_in_text(&existing, mode.key(), name)?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{} 생성 실패: {e}", dir.display()))?;
-    let tmp = dir.join("config.toml.tmp");
-    std::fs::write(&tmp, updated).map_err(|e| format!("저장 실패: {e}"))?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("저장 실패: {e}")
-    })
+    if let Some(parent) = real.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("{} 생성 실패: {e}", parent.display()))?;
+    }
+    write_atomic(&real, &updated)
 }
 
 #[cfg(test)]
@@ -471,7 +508,7 @@ cmd = "x {}"
         let out = set_theme_in_text(src, "classic", "light").unwrap();
         assert_eq!(
             out,
-            "# my config\n[theme]\nclassic = \"light\"\ndev = \"dark\"\n\n[keys]\npreset = \"vim\"\n"
+            "# my config\n[theme]\nclassic = \"light\" \ndev = \"dark\"\n\n[keys]\npreset = \"vim\"\n"
         );
     }
 
@@ -481,7 +518,7 @@ cmd = "x {}"
             set_theme_in_text("[theme]\ndev = \"dark\"\n[keys]\n", "classic", "light").unwrap();
         assert_eq!(
             out,
-            "[theme]\nclassic = \"light\"\ndev = \"dark\"\n[keys]\n"
+            "[theme]\ndev = \"dark\"\nclassic = \"light\"\n[keys]\n"
         );
         let out = set_theme_in_text("[keys]\npreset = \"vim\"", "dev", "dark").unwrap();
         assert_eq!(out, "[keys]\npreset = \"vim\"\n\n[theme]\ndev = \"dark\"\n");
@@ -504,13 +541,43 @@ cmd = "x {}"
     #[test]
     fn set_theme_escapes_and_keeps_crlf() {
         let out = set_theme_in_text("[theme]\r\n", "classic", "a\"b").unwrap();
-        assert_eq!(out, "[theme]\r\nclassic = \"a\\\"b\"\r\n");
+        assert!(!out.replace("\r\n", "").contains('\n'), "{out:?}");
+        let t: toml::Table = out.parse().unwrap();
+        assert_eq!(t["theme"]["classic"].as_str(), Some("a\"b"));
     }
 
     #[test]
-    fn set_theme_rejects_layouts_it_cannot_edit() {
-        let err = set_theme_in_text("theme = { classic = \"mdir\" }\n", "classic", "dark");
-        assert!(err.is_err());
+    fn set_theme_leaves_multiline_strings_and_comments_alone() {
+        let src = "# top\nnote = \"\"\"\n[theme]\nclassic = \"x\"\n\"\"\"\n\n[theme] # mine\nclassic = \"mdir\" # keep me\n";
+        let out = set_theme_in_text(src, "classic", "dark").unwrap();
+        assert_eq!(
+            out,
+            "# top\nnote = \"\"\"\n[theme]\nclassic = \"x\"\n\"\"\"\n\n[theme] # mine\nclassic = \"dark\" # keep me\n"
+        );
+        let t: toml::Table = out.parse().unwrap();
+        assert!(t["note"].as_str().unwrap().contains("classic = \"x\""));
+    }
+
+    #[test]
+    fn set_theme_updates_inline_table_and_dotted_keys() {
+        let out = set_theme_in_text("theme = { classic = \"mdir\" }\n", "classic", "dark").unwrap();
+        assert_eq!(out, "theme = { classic = \"dark\" }\n");
+        let out = set_theme_in_text("theme = { dev = \"x\" }\n", "classic", "dark").unwrap();
+        let t: toml::Table = out.parse().unwrap();
+        assert_eq!(t["theme"]["classic"].as_str(), Some("dark"));
+        assert_eq!(t["theme"]["dev"].as_str(), Some("x"));
+        let out =
+            set_theme_in_text("theme.classic = \"mdir\"\n[keys]\n", "classic", "dark").unwrap();
+        assert_eq!(out, "theme.classic = \"dark\"\n[keys]\n");
+        let out = set_theme_in_text("theme.dev = \"x\"\n", "classic", "dark").unwrap();
+        let t: toml::Table = out.parse().unwrap();
+        assert_eq!(t["theme"]["classic"].as_str(), Some("dark"));
+    }
+
+    #[test]
+    fn set_theme_rejects_a_non_table_theme() {
+        assert!(set_theme_in_text("theme = 3\n", "classic", "dark").is_err());
+        assert!(set_theme_in_text("[theme\n", "classic", "dark").is_err());
     }
 
     #[test]
@@ -525,7 +592,98 @@ cmd = "x {}"
             (c.theme.classic.as_str(), c.theme.dev.as_str()),
             ("light", "dark")
         );
-        assert!(!dir.join("config.toml.tmp").exists());
+        assert!(leftovers(&dir).is_empty());
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "config.toml")
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_theme_never_writes_through_a_planted_symlink_at_a_fixed_temp_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, "precious").unwrap();
+        let dir = tmp.path().join("cfg");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("config.toml.tmp")).unwrap();
+        save_theme(&dir, Mode::Classic, "dark").unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(
+            fs::read_to_string(dir.join("config.toml"))
+                .unwrap()
+                .contains("dark")
+        );
+        assert_eq!(
+            leftovers(&dir),
+            ["config.toml.tmp"],
+            "only the planted link remains"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_theme_creates_new_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        save_theme(tmp.path(), Mode::Classic, "dark").unwrap();
+        let mode = fs::metadata(config_file(tmp.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_theme_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        for m in [0o600, 0o644] {
+            let f = config_file(tmp.path());
+            fs::write(&f, "[keys]\n").unwrap();
+            fs::set_permissions(&f, fs::Permissions::from_mode(m)).unwrap();
+            save_theme(tmp.path(), Mode::Dev, "dark").unwrap();
+            assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, m);
+            assert!(fs::read_to_string(&f).unwrap().contains("dark"));
+        }
+        assert!(leftovers(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_theme_through_a_symlinked_config_keeps_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("dotfiles");
+        fs::create_dir(&real_dir).unwrap();
+        fs::write(real_dir.join("hdir.toml"), "# mine\n").unwrap();
+        let dir = tmp.path().join("cfg");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(real_dir.join("hdir.toml"), config_file(&dir)).unwrap();
+        save_theme(&dir, Mode::Classic, "dark").unwrap();
+        assert!(
+            fs::symlink_metadata(config_file(&dir))
+                .unwrap()
+                .is_symlink()
+        );
+        let real = fs::read_to_string(real_dir.join("hdir.toml")).unwrap();
+        assert!(
+            real.starts_with("# mine\n") && real.contains("dark"),
+            "{real}"
+        );
+        let names: Vec<_> = fs::read_dir(&real_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "no temp left in the target dir: {names:?}");
+        assert!(leftovers(&dir).is_empty());
     }
 
     #[test]
