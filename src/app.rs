@@ -10,6 +10,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 
 use crate::config::{self, Mode, Settings};
 use crate::dialog::{self, Dialog, DialogResult};
+use crate::editor::{self, EditResult, EditorRunner};
 use crate::fs_ops::{self};
 use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
@@ -82,6 +83,14 @@ const MENU_HIDDEN: usize = 1;
 const MENU_KEYS: usize = 2;
 const MENU_RELOAD: usize = 3;
 const MENU_WARNINGS: usize = 4;
+
+/// An F4 edit waiting for the main loop to suspend the TUI and run it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditJob {
+    pub argv: Vec<OsString>,
+    pub panel: usize,
+    pub name: OsString,
+}
 
 /// The single background copy/move job.
 pub struct RunningJob {
@@ -239,6 +248,11 @@ pub struct App {
     truecolor: bool,
     /// A full-screen text page (help, key settings, warnings) over the panels.
     pub screen: Option<TextScreen>,
+    /// `($VISUAL, $EDITOR)` as read at startup; tests inject values.
+    pub editor_vars: (Option<String>, Option<String>),
+    /// Runs the editor argv; tests may swap in a fake.
+    pub editor_runner: EditorRunner,
+    pending_edit: Option<EditJob>,
     /// The F3 file viewer (full screen).
     pub viewer: Option<Viewer>,
     /// The F9 popup menu (or theme picker).
@@ -291,6 +305,9 @@ impl App {
             settings: config::load_settings(None),
             truecolor: true,
             screen: None,
+            editor_vars: (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok()),
+            editor_runner: editor::system_runner(),
+            pending_edit: None,
             viewer: None,
             menu: None,
         }
@@ -677,7 +694,7 @@ impl App {
                 self.status = Some(format!("모드: {:?}", self.mode));
             }
             Action::View => self.open_viewer(),
-            Action::Edit => self.unsupported("편집"),
+            Action::Edit => self.open_editor(),
             Action::CommandLine => self.unsupported("명령줄"),
             Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
             Action::OpenWith => self.unsupported("연결 프로그램 선택"),
@@ -690,6 +707,71 @@ impl App {
             | Action::Search
             | Action::SearchNext => {}
         }
+    }
+
+    /// F4: queue an edit of the current file; the main loop runs it through
+    /// [`App::run_edit`] (it needs the terminal handle).
+    fn open_editor(&mut self) {
+        let panel = self.active_panel();
+        let Some(e) = panel.current() else {
+            return;
+        };
+        let is_dir = match e.kind {
+            EntryKind::Parent | EntryKind::Dir => true,
+            EntryKind::Symlink { target_is_dir } => target_is_dir,
+            EntryKind::File => false,
+        };
+        if is_dir {
+            return;
+        }
+        if cfg!(windows) {
+            self.status = Some("편집: Windows 지원 예정".into());
+            return;
+        }
+        let path = panel.cwd.join(&e.os_name);
+        let name = e.os_name.clone();
+        let (visual, editor) = &self.editor_vars;
+        match editor::editor_argv(visual.as_deref(), editor.as_deref(), &path) {
+            Ok(argv) => {
+                self.status = None;
+                self.pending_edit = Some(EditJob {
+                    argv,
+                    panel: self.active,
+                    name,
+                });
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    pub fn has_pending_edit(&self) -> bool {
+        self.pending_edit.is_some()
+    }
+
+    /// Run the queued edit: `suspend` leaves the TUI, calls the closure (which
+    /// runs the editor) and re-enters; then the panels reload with the cursor
+    /// kept on the edited file.
+    pub fn run_edit(
+        &mut self,
+        suspend: impl FnOnce(&mut dyn FnMut() -> EditResult) -> std::io::Result<EditResult>,
+    ) {
+        let Some(job) = self.pending_edit.take() else {
+            return;
+        };
+        let runner = Arc::clone(&self.editor_runner);
+        let argv = job.argv;
+        let outcome = suspend(&mut || runner(&argv));
+        let cwd = self.panels[job.panel].cwd.clone();
+        if self.panels[1 - job.panel].cwd == cwd {
+            self.reload_after_op(1 - job.panel, None);
+        }
+        let name = job.name.to_string_lossy().into_owned();
+        self.reload_after_op(job.panel, Some(job.name));
+        self.status = Some(match outcome {
+            Ok(Ok(())) => format!("편집 완료: {name}"),
+            Ok(Err(msg)) => msg,
+            Err(e) => format!("터미널 복귀 실패: {e}"),
+        });
     }
 
     /// F3: view the current file (directories and `..` do nothing).
@@ -4425,5 +4507,144 @@ mod tests {
         open_view(&mut app, "f.txt");
         assert!(app.viewer.is_none());
         assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+    }
+    // ---- HDIR-14: F4 editor ----
+
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    /// Fake editor that logs its argv and creates `new.txt` next to the file.
+    fn fake_editor(app: &mut App, log: &Log, result: EditResult) {
+        let log = Arc::clone(log);
+        app.editor_runner = Arc::new(move |argv: &[OsString]| {
+            let path = std::path::PathBuf::from(argv.last().unwrap());
+            log.lock().unwrap().push(format!(
+                "edit {}",
+                argv.iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ));
+            fs::write(path.with_file_name("new.txt"), "n").unwrap();
+            result.clone()
+        });
+    }
+
+    fn run_logged(app: &mut App, log: &Log) {
+        let l = Arc::clone(log);
+        app.run_edit(move |f| {
+            l.lock().unwrap().push("suspend".into());
+            let r = f();
+            l.lock().unwrap().push("resume".into());
+            Ok(r)
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f4_only_queues_the_edit_without_running_the_editor() {
+        let (_t, mut app) = fixture();
+        let log = Log::default();
+        fake_editor(&mut app, &log, Ok(()));
+        app.editor_vars = (None, Some("vim".into()));
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        assert!(app.has_pending_edit());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_edit_suspends_runs_editor_inside_then_reloads_keeping_the_cursor() {
+        let (t, mut app) = fixture();
+        let log = Log::default();
+        fake_editor(&mut app, &log, Ok(()));
+        app.editor_vars = (Some("code -w".into()), Some("ignored".into()));
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        run_logged(&mut app, &log);
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0], "suspend");
+        assert!(
+            got[1].starts_with("edit code|-w|") && got[1].ends_with("/f.txt"),
+            "{got:?}"
+        );
+        assert_eq!(got[2], "resume");
+        assert!(!app.has_pending_edit());
+        settle(&mut app);
+        for i in 0..2 {
+            let names: Vec<_> = app.panels[i]
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            assert!(
+                names.contains(&"new.txt".to_string()),
+                "panel {i} reloaded: {names:?}"
+            );
+        }
+        assert_eq!(name_at(&app, 0), "f.txt", "cursor stays on the edited file");
+        assert_eq!(app.status.as_deref(), Some("편집 완료: f.txt"));
+        drop(t);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_editor_reports_error_and_still_reloads() {
+        let (_t, mut app) = fixture();
+        let log = Log::default();
+        fake_editor(
+            &mut app,
+            &log,
+            Err("편집기가 오류로 종료됨 (종료 코드 1)".into()),
+        );
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        run_logged(&mut app, &log);
+        settle(&mut app);
+        assert!(app.status.as_deref().unwrap().contains("종료 코드 1"));
+        assert!(app.panels[0].entries.iter().any(|e| e.name == "new.txt"));
+        assert_eq!(name_at(&app, 0), "f.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_suspend_failure_is_reported() {
+        let (_t, mut app) = fixture();
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        app.run_edit(|_| Err(std::io::Error::other("tty gone")));
+        assert!(app.status.as_deref().unwrap().contains("tty gone"));
+        assert!(!app.has_pending_edit());
+    }
+
+    #[test]
+    fn f4_on_dir_or_parent_queues_nothing() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(4));
+        cursor_to(&mut app, "adir");
+        press(&mut app, KeyCode::F(4));
+        assert!(!app.has_pending_edit() && app.status.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unparsable_editor_variable_is_a_status_error() {
+        let (_t, mut app) = fixture();
+        app.editor_vars = (Some("vim 'x".into()), None);
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        assert!(!app.has_pending_edit());
+        assert!(app.status.as_deref().unwrap().contains("VISUAL"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f4_on_windows_says_support_is_coming() {
+        let (_t, mut app) = fixture();
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        assert!(!app.has_pending_edit());
+        assert!(app.status.as_deref().unwrap().contains("Windows 지원 예정"));
     }
 }

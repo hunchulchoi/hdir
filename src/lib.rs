@@ -4,6 +4,7 @@ pub mod app;
 pub mod assoc;
 pub mod config;
 pub mod dialog;
+pub mod editor;
 pub mod fs_ops;
 pub mod job;
 pub mod keymap;

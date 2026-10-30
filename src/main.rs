@@ -32,6 +32,10 @@ fn run(
         if event::poll(Duration::from_millis(50))? {
             dirty |= app.handle_event(event::read()?);
         }
+        if app.has_pending_edit() {
+            app.run_edit(|f| term::suspend(terminal, f));
+            dirty = true;
+        }
         dirty |= app.tick();
     }
     Ok(())
