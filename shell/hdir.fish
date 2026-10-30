@@ -8,7 +8,7 @@ function h
     set -l tmp (mktemp -t hdir.XXXXXX); or return
     command hdir --cwd-file $tmp $argv
     set -l rc $status
-    set -l dir (cat -- $tmp | string collect)
+    set -l dir (cat -- $tmp | string collect --no-trim-newlines)
     rm -f -- $tmp
     if test -n "$dir"; and test -d "$dir"; and test "$dir" != "$PWD"
         cd -- $dir

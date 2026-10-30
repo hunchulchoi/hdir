@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use hdir::app::App;
@@ -25,7 +24,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let start = match start_dir(opts.start_dir.as_deref()) {
+    let start = match cli::start_dir(opts.start_dir.as_deref()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("hdir: {e}");
@@ -52,17 +51,6 @@ fn main() -> ExitCode {
         code = ExitCode::FAILURE;
     }
     code
-}
-
-fn start_dir(arg: Option<&std::path::Path>) -> Result<PathBuf, String> {
-    let Some(arg) = arg else {
-        return Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    };
-    let abs = std::path::absolute(arg).map_err(|e| format!("{}: {e}", arg.display()))?;
-    if !abs.is_dir() {
-        return Err(format!("{}: 디렉터리가 아님", arg.display()));
-    }
-    Ok(hdir::cmdline::normalize(&abs))
 }
 
 fn run_app(app: &mut App) -> anyhow::Result<()> {

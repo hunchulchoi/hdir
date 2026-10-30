@@ -119,6 +119,30 @@ pub fn parse_cd(cmd: &str, home: Option<&Path>) -> Option<CdTarget> {
     }
 }
 
+/// Strip a `\\?\` verbatim prefix (what `canonicalize` yields on Windows)
+/// from drive and UNC paths so they display normally.
+pub fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// The physical, existing directory `p` points to (every component is
+/// resolved through the filesystem, symlinks first, like `cd -P`).
+/// Errors if it does not exist or is not a directory.
+pub fn canonical_dir(p: &Path) -> std::io::Result<PathBuf> {
+    let c = strip_verbatim(&std::fs::canonicalize(p)?);
+    if !c.is_dir() {
+        return Err(std::io::Error::other("디렉터리가 아님"));
+    }
+    Ok(c)
+}
+
 /// Lexically clean `p`: drop `.`, fold `..` (like `cd -L`).
 pub fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -155,7 +179,10 @@ pub fn resolve_cd(
         CdTarget::Prev => prev
             .map(Path::to_path_buf)
             .ok_or_else(|| "이전 디렉터리 없음".to_string()),
-        CdTarget::Path(p) => Ok(normalize(&cwd.join(p))),
+        CdTarget::Path(p) => {
+            let full = cwd.join(p);
+            canonical_dir(&full).map_err(|e| format!("{}: {e}", p.display()))
+        }
     }
 }
 
@@ -336,31 +363,62 @@ mod tests {
 
     #[test]
     fn resolve_relative_home_prev() {
-        let cwd = Path::new("/a/b");
-        let r = |t: CdTarget, p: Option<&Path>| resolve_cd(cwd, &t, Some(&home()), p);
+        let d = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::create_dir_all(base.join("b/c")).unwrap();
+        std::fs::create_dir_all(base.join("x/y")).unwrap();
+        let cwd = base.join("b");
+        let r = |t: CdTarget, p: Option<&Path>| resolve_cd(&cwd, &t, Some(&home()), p);
         assert_eq!(r(CdTarget::Home, None), Ok(home()));
         assert_eq!(
             r(CdTarget::Prev, Some(Path::new("/z"))),
             Ok(PathBuf::from("/z"))
         );
         assert!(r(CdTarget::Prev, None).is_err());
-        assert_eq!(
-            r(CdTarget::Path("c".into()), None),
-            Ok(PathBuf::from("/a/b/c"))
-        );
+        assert_eq!(r(CdTarget::Path("c".into()), None), Ok(base.join("b/c")));
         assert_eq!(
             r(CdTarget::Path("../x/./y".into()), None),
-            Ok(PathBuf::from("/a/x/y"))
+            Ok(base.join("x/y"))
         );
         assert_eq!(
-            r(CdTarget::Path("/etc".into()), None),
-            Ok(PathBuf::from("/etc"))
+            r(CdTarget::Path(base.join("x").into()), None),
+            Ok(base.join("x"))
+        );
+        assert!(resolve_cd(&cwd, &CdTarget::Home, None, None).is_err());
+    }
+
+    #[test]
+    fn cd_never_drops_a_missing_component_before_dotdot() {
+        let d = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(d.path()).unwrap();
+        let r = |p: &str| resolve_cd(&base, &CdTarget::Path(p.into()), None, None);
+        assert!(r("missing/..").is_err());
+        assert!(r("missing/../..").is_err());
+        assert_eq!(r("."), Ok(base.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cd_follows_symlinks_physically_like_cd_dash_p() {
+        let d = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::create_dir_all(base.join("real/inner")).unwrap();
+        std::os::unix::fs::symlink(base.join("real/inner"), base.join("link")).unwrap();
+        let r = resolve_cd(&base, &CdTarget::Path("link/..".into()), None, None);
+        assert_eq!(r, Ok(base.join("real")));
+    }
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_display() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\a\b")),
+            PathBuf::from(r"C:\a\b")
         );
         assert_eq!(
-            r(CdTarget::Path("../../..".into()), None),
-            Ok(PathBuf::from("/"))
+            strip_verbatim(Path::new(r"\\?\UNC\srv\sh\a")),
+            PathBuf::from(r"\\srv\sh\a")
         );
-        assert!(resolve_cd(cwd, &CdTarget::Home, None, None).is_err());
+        assert_eq!(strip_verbatim(Path::new("/a/b")), PathBuf::from("/a/b"));
     }
 
     #[test]

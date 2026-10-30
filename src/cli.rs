@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::platform;
+use crate::{fs_ops, platform};
 
 pub const USAGE: &str = "사용법: hdir [--cwd-file PATH] [START_DIR]\n\n\
 옵션:\n  --cwd-file PATH  종료 시 활성 패널의 디렉터리를 PATH에 기록 (셸 통합용)\n  -h, --help       도움말\n  -V, --version    버전\n";
@@ -40,13 +40,27 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Cli, Stri
         } else if text == "--cwd-file" {
             let v = args.next().ok_or("--cwd-file: 경로가 필요함")?;
             set_cwd_file(&mut opts, v)?;
-        } else if let Some(v) = text.strip_prefix("--cwd-file=") {
-            set_cwd_file(&mut opts, OsString::from(v))?;
+        } else if text.starts_with("--cwd-file=") {
+            set_cwd_file(&mut opts, value_after_eq(&arg, "--cwd-file=".len()))?;
         } else {
             return Err(format!("알 수 없는 옵션: {text}"));
         }
     }
     Ok(Cli::Run(opts))
+}
+
+/// `arg` without its first `skip` bytes, keeping non-UTF-8 bytes on unix
+/// (lossy on Windows, where the prefix is ASCII anyway).
+fn value_after_eq(arg: &OsString, skip: usize) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        OsString::from_vec(arg.as_bytes()[skip..].to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(arg.to_string_lossy()[skip..].to_string())
+    }
 }
 
 fn set_start(opts: &mut Options, v: OsString) -> Result<(), String> {
@@ -69,10 +83,20 @@ fn set_cwd_file(opts: &mut Options, v: OsString) -> Result<(), String> {
 /// Write the cwd file atomically (temp file in the same directory, then
 /// rename). `Some(dir)`: the raw bytes of `dir`, no newline. `None` (quit
 /// without cd): an empty file.
+///
+/// The temp is created exclusively under a unique name (retrying on a
+/// collision), and only a temp this call created is ever removed.
 pub fn write_cwd_file(path: &Path, cwd: Option<&Path>) -> io::Result<()> {
-    let tmp = temp_path(path);
+    write_cwd_file_with(path, cwd, &mut || fs_ops::temp_sibling(path))
+}
+
+fn write_cwd_file_with(
+    path: &Path,
+    cwd: Option<&Path>,
+    next_temp: &mut dyn FnMut() -> PathBuf,
+) -> io::Result<()> {
+    let (tmp, mut f) = create_temp(next_temp)?;
     let result = (|| {
-        let mut f = platform::create_private_file(&tmp)?;
         if let Some(dir) = cwd {
             f.write_all(&platform::os_bytes(dir.as_os_str()))?;
         }
@@ -85,16 +109,36 @@ pub fn write_cwd_file(path: &Path, cwd: Option<&Path>) -> io::Result<()> {
     result
 }
 
-/// Hidden sibling of `path` (same directory, so the rename stays atomic).
-fn temp_path(path: &Path) -> PathBuf {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = format!(".{name}.{}.tmp", std::process::id());
-    path.with_file_name(tmp)
+fn create_temp(next: &mut dyn FnMut() -> PathBuf) -> io::Result<(PathBuf, std::fs::File)> {
+    for _ in 0..TEMP_ATTEMPTS {
+        let tmp = next();
+        match platform::create_private_file(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "임시 파일 이름을 정하지 못함",
+    ))
+}
+
+const TEMP_ATTEMPTS: usize = 100;
+
+/// Directory hdir starts in: `arg` resolved to its final physical path first
+/// (symlinks before any `..`), then that exact path is validated.
+pub fn start_dir(arg: Option<&Path>) -> Result<PathBuf, String> {
+    let Some(arg) = arg else {
+        return Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    };
+    crate::cmdline::canonical_dir(arg).map_err(|e| format!("{}: {e}", arg.display()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn args(a: &[&str]) -> Vec<OsString> {
         a.iter().map(OsString::from).collect()
@@ -194,15 +238,65 @@ mod tests {
     }
 
     #[test]
-    fn temp_path_is_a_hidden_sibling() {
-        let a = temp_path(Path::new("/a/b/cwd"));
-        assert_eq!(a.parent(), Some(Path::new("/a/b")));
-        assert!(
-            a.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(".cwd.")
+    fn temp_is_a_hidden_sibling_and_no_temp_is_left_behind() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("cwd");
+        write_cwd_file(&f, None).unwrap();
+        let names: Vec<_> = fs::read_dir(t.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("cwd")]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cwd_file_equals_form_keeps_non_utf8_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let raw = OsString::from_vec(b"--cwd-file=/t/\xff\xfe".to_vec());
+        match parse_args([raw]) {
+            Ok(Cli::Run(o)) => {
+                assert_eq!(o.cwd_file.unwrap().as_os_str().as_bytes(), b"/t/\xff\xfe")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn cwd_file_write_never_deletes_a_file_it_did_not_create() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("cwd");
+        let foreign = fs_ops::temp_sibling(&target);
+        fs::write(&foreign, "foreign").unwrap();
+        let mut names = vec![d.path().join("fresh"), foreign.clone()];
+        let mut next = || names.pop().unwrap();
+        write_cwd_file_with(&target, Some(Path::new("/x/y")), &mut next).unwrap();
+        assert!(!d.path().join("fresh").exists());
+        assert_eq!(fs::read(&target).unwrap(), b"/x/y");
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn start_dir_resolves_symlink_before_dotdot_and_validates_the_result() {
+        let d = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(d.path()).unwrap();
+        fs::create_dir_all(base.join("real/inner")).unwrap();
+        fs::create_dir(base.join("other")).unwrap();
+        fs::write(base.join("real/file"), "").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(base.join("real/inner"), base.join("link")).unwrap();
+            // physical: link -> real/inner, so link/.. is real
+            assert_eq!(
+                start_dir(Some(&base.join("link/.."))),
+                Ok(base.join("real"))
+            );
+        }
+        assert_eq!(
+            start_dir(Some(&base.join("real/../other"))),
+            Ok(base.join("other"))
         );
-        assert_eq!(temp_path(Path::new("rel")).parent(), Some(Path::new("")));
+        assert!(start_dir(Some(&base.join("missing/.."))).is_err());
+        assert!(start_dir(Some(&base.join("real/file"))).is_err());
     }
 }

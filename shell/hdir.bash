@@ -9,7 +9,9 @@ h() {
   tmp=$(mktemp -t hdir.XXXXXX) || return
   command hdir --cwd-file "$tmp" "$@"
   rc=$?
-  dir=$(cat -- "$tmp")
+  # The sentinel keeps trailing newlines, which $(...) would strip.
+  dir=$(cat -- "$tmp"; printf x)
+  dir=${dir%x}
   rm -f -- "$tmp"
   if [[ -n $dir && -d $dir && $dir != "$PWD" ]]; then
     cd -- "$dir" || return

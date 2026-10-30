@@ -12,7 +12,7 @@ const FAKE_HDIR: &str = r#"#!/bin/sh
 [ "$1" = "--cwd-file" ] || exit 64
 file=$2
 shift 2
-printf '%s\n' "$*" > "$FAKE_ARGS"
+for a in "$@"; do printf '%s\0' "$a"; done > "$FAKE_ARGS"
 if [ -n "${FAKE_DIR+x}" ]; then printf '%s' "$FAKE_DIR" > "$file"; fi
 exit "${FAKE_RC:-0}"
 "#;
@@ -59,8 +59,14 @@ fn available(shell: &str) -> bool {
 fn run(e: &Env, shell: &str, fake_dir: Option<&str>, rc: i32, args: &str) -> (String, String) {
     let src = script(shell);
     let code = match shell {
-        "fish" => format!("source '{}'; h {args}; echo rc=$status; pwd", src.display()),
-        _ => format!("source '{}'; h {args}; echo rc=$?; pwd", src.display()),
+        "fish" => format!(
+            "source '{}'; h {args}; echo rc=$status; printf '%s' $PWD",
+            src.display()
+        ),
+        _ => format!(
+            "source '{}'; h {args}; echo rc=$?; printf '%s' \"$PWD\"",
+            src.display()
+        ),
     };
     let path = format!(
         "{}:{}",
@@ -85,10 +91,8 @@ fn run(e: &Env, shell: &str, fake_dir: Option<&str>, rc: i32, args: &str) -> (St
         String::from_utf8_lossy(&out.stderr)
     );
     let text = String::from_utf8(out.stdout).unwrap();
-    let mut lines = text.lines();
-    let rc = lines.next().unwrap_or_default().to_string();
-    let pwd = lines.next().unwrap_or_default().to_string();
-    (rc, pwd)
+    let (rc, pwd) = text.split_once('\n').unwrap_or((&text, ""));
+    (rc.to_string(), pwd.to_string())
 }
 
 fn shells() -> Vec<&'static str> {
@@ -146,11 +150,10 @@ fn h_passes_arguments_and_keeps_the_exit_code() {
         let e = env();
         let (rc, _) = run(&e, sh, None, 3, "'my dir' --flag");
         assert_eq!(rc, "rc=3", "{sh}");
-        assert_eq!(
-            fs::read_to_string(&e.args).unwrap(),
-            "my dir --flag\n",
-            "{sh}"
-        );
+        let raw = fs::read(&e.args).unwrap();
+        let got: Vec<&[u8]> = raw.split(|&b| b == 0).collect();
+        // NUL-terminated records: exactly two args plus the empty tail.
+        assert_eq!(got, [&b"my dir"[..], b"--flag", b""], "{sh}");
     }
 }
 
@@ -163,5 +166,19 @@ fn h_handles_a_leading_dash_directory_name() {
         // Relative on purpose: `cd -- -dash` must not read it as an option.
         let (_, pwd) = run(&e, sh, Some("-dash"), 0, "");
         assert_eq!(pwd, target.to_str().unwrap(), "{sh}");
+    }
+}
+
+#[test]
+fn h_keeps_trailing_newlines_in_the_directory_name() {
+    for sh in shells() {
+        let e = env();
+        let target = e.start.join("nl\n");
+        fs::create_dir(&target).unwrap();
+        let plain = e.start.join("nl");
+        fs::create_dir(&plain).unwrap();
+        let (_, pwd) = run(&e, sh, Some(target.to_str().unwrap()), 0, "");
+        assert_eq!(pwd, target.to_str().unwrap(), "{sh}: trailing newline kept");
+        assert_eq!(leftovers(&e), 0, "{sh}");
     }
 }
