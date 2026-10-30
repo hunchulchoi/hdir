@@ -8,6 +8,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 
 use crate::dialog::{self, Dialog, DialogResult};
 use crate::fs_ops::{self, SystemTrash, Trash};
+use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobOutcome, JobSpec, ProgressView};
 use crate::panel::{EnterResult, EntryKind, Panel};
 use crate::ui::{self, View};
 use crate::undo::{UndoOp, UndoStack};
@@ -24,8 +25,47 @@ pub fn panel_rows(total_height: u16) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingAction {
     Mkdir,
-    Rename { from: PathBuf },
-    Trash { paths: Vec<PathBuf> },
+    Rename {
+        from: PathBuf,
+    },
+    Trash {
+        paths: Vec<PathBuf>,
+    },
+    /// Destination prompt for F5 (copy) / F6 (move).
+    Transfer {
+        kind: JobKind,
+        sources: Vec<PathBuf>,
+    },
+    /// Answer to a worker's overwrite question.
+    Conflict,
+}
+
+/// The single background copy/move job.
+pub struct RunningJob {
+    pub handle: JobHandle,
+    pub view: ProgressView,
+    pub kind: JobKind,
+    pub sources: Vec<PathBuf>,
+    pub dest_dir: PathBuf,
+    /// Esc was pressed; keep the "취소 중…" status until the worker finishes.
+    pub cancelling: bool,
+}
+
+/// Expand a leading `~` and resolve relative paths against `cwd`.
+fn resolve_dest(input: &str, cwd: &std::path::Path) -> PathBuf {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    let expanded = if input == "~" {
+        home().unwrap_or_else(|| PathBuf::from(input))
+    } else if let Some(rest) = input.strip_prefix("~/") {
+        home().map_or_else(|| PathBuf::from(input), |h| h.join(rest))
+    } else {
+        PathBuf::from(input)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
 }
 
 pub struct App {
@@ -35,6 +75,7 @@ pub struct App {
     pub status: Option<String>,
     pub shell: String,
     pub dialog: Option<(Dialog, PendingAction)>,
+    pub job: Option<RunningJob>,
     trash: Box<dyn Trash>,
     pub undo: UndoStack,
     page_height: usize,
@@ -69,6 +110,7 @@ impl App {
             status: None,
             shell,
             dialog: None,
+            job: None,
             trash,
             undo: UndoStack::default(),
             page_height: 1,
@@ -124,6 +166,17 @@ impl App {
         }
         let page = self.page_height.max(1);
         match key.code {
+            KeyCode::Esc => {
+                if let Some(job) = self.job.as_mut() {
+                    job.handle.cancel();
+                    job.cancelling = true;
+                    self.status = Some("취소 중…".into());
+                }
+            }
+            KeyCode::F(5) => self.open_transfer(JobKind::Copy),
+            KeyCode::F(6) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.open_transfer(JobKind::Move)
+            }
             KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => self.undo(),
             KeyCode::F(7) => self.open_mkdir(),
             KeyCode::F(2) => self.open_rename(),
@@ -168,6 +221,138 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn open_transfer(&mut self, kind: JobKind) {
+        if self.job.is_some() {
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
+        let names = self.selected_or_current();
+        if names.is_empty() {
+            return;
+        }
+        let cwd = self.active_panel().cwd.clone();
+        let sources: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
+        let title = match kind {
+            JobKind::Copy => "복사",
+            JobKind::Move => "이동",
+        };
+        let initial = self.other_panel().cwd.to_string_lossy().into_owned();
+        self.status = None;
+        self.dialog = Some((
+            Dialog::input(title, "대상 경로:", &initial),
+            PendingAction::Transfer { kind, sources },
+        ));
+    }
+
+    fn start_job(&mut self, kind: JobKind, sources: Vec<PathBuf>, input: &str) {
+        if self.job.is_some() {
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
+        let dest_dir = resolve_dest(input.trim(), &self.active_panel().cwd);
+        if !dest_dir.is_dir() {
+            self.status = Some("오류: 대상 폴더 없음".into());
+            return;
+        }
+        let handle = JobHandle::spawn(JobSpec {
+            kind,
+            sources: sources.clone(),
+            dest_dir: dest_dir.clone(),
+        });
+        self.job = Some(RunningJob {
+            handle,
+            view: ProgressView::new(kind),
+            kind,
+            sources,
+            dest_dir,
+            cancelling: false,
+        });
+    }
+
+    /// Poll the background job; returns true when the screen needs a redraw.
+    pub fn tick(&mut self) -> bool {
+        let Some(job) = self.job.as_mut() else {
+            return false;
+        };
+        let events = job.handle.try_events();
+        if events.is_empty() {
+            return false;
+        }
+        let mut finished = None;
+        for ev in &events {
+            job.view.apply(ev);
+            match ev {
+                JobEvent::Conflict { dest } => {
+                    let name = dest
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.dialog = Some((
+                        Dialog::choice(
+                            "덮어쓰기 확인",
+                            vec![format!("이미 존재: {name}")],
+                            ["Overwrite", "Skip", "Overwrite all", "Skip all", "Cancel"]
+                                .map(String::from)
+                                .to_vec(),
+                        ),
+                        PendingAction::Conflict,
+                    ));
+                }
+                JobEvent::Finished { outcome } => finished = Some(outcome.clone()),
+                _ => {}
+            }
+        }
+        match finished {
+            Some(outcome) => self.finish_job(outcome),
+            None => {
+                if !job.cancelling {
+                    self.status = Some(job.view.status_line());
+                }
+            }
+        }
+        true
+    }
+
+    fn finish_job(&mut self, outcome: JobOutcome) {
+        let Some(job) = self.job.take() else {
+            return;
+        };
+        let n = job.sources.len();
+        let status = match outcome {
+            JobOutcome::Done => {
+                if job.kind == JobKind::Move {
+                    let pairs: Vec<(PathBuf, PathBuf)> = job
+                        .sources
+                        .iter()
+                        .filter_map(|src| {
+                            let dest = job.dest_dir.join(src.file_name()?);
+                            (src.symlink_metadata().is_err() && dest.symlink_metadata().is_ok())
+                                .then(|| (src.clone(), dest))
+                        })
+                        .collect();
+                    if !pairs.is_empty() {
+                        self.undo.push(UndoOp::Move { pairs });
+                    }
+                }
+                self.active_panel_mut().selected.clear();
+                match job.kind {
+                    JobKind::Copy => format!("복사 완료: {n}개"),
+                    JobKind::Move => format!("이동 완료: {n}개"),
+                }
+            }
+            JobOutcome::Cancelled => "취소됨".to_string(),
+            JobOutcome::Failed(msg) => format!("오류: {msg}"),
+        };
+        // A conflict dialog may still be open for a job that just ended.
+        if matches!(self.dialog, Some((_, PendingAction::Conflict))) {
+            self.dialog = None;
+        }
+        for p in &mut self.panels {
+            p.reload();
+        }
+        self.status = Some(status);
     }
 
     fn open_mkdir(&mut self) {
@@ -257,6 +442,21 @@ impl App {
                         self.after_fs_op(None, format!("휴지통: {n}개"));
                     }
                     Err(e) => self.status = Some(format!("오류: {e}")),
+                }
+            }
+            (PendingAction::Transfer { kind, sources }, DialogResult::Submitted(input)) => {
+                self.start_job(kind, sources, &input);
+            }
+            (PendingAction::Conflict, result) => {
+                let answer = match result {
+                    DialogResult::Chosen(0) => ConflictAnswer::Overwrite,
+                    DialogResult::Chosen(1) => ConflictAnswer::Skip,
+                    DialogResult::Chosen(2) => ConflictAnswer::OverwriteAll,
+                    DialogResult::Chosen(3) => ConflictAnswer::SkipAll,
+                    _ => ConflictAnswer::Cancel,
+                };
+                if let Some(job) = &self.job {
+                    job.handle.answer(answer);
                 }
             }
             _ => {}
@@ -851,5 +1051,276 @@ mod tests {
         let (_t, mut app, _f) = fixture_trash();
         ctrl_z(&mut app);
         assert_eq!(app.status.as_deref(), Some("되돌릴 작업 없음"));
+    }
+
+    // ---- HDIR-9: copy / move jobs ----
+
+    /// left = src dir (a.txt, b.txt), right = empty dst dir.
+    fn fixture_job() -> (TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join("a.txt"), "A").unwrap();
+        fs::write(src.join("b.txt"), "B").unwrap();
+        let app = App::new(src, dst);
+        (tmp, app)
+    }
+
+    fn wait_job(app: &mut App) {
+        let start = std::time::Instant::now();
+        while app.job.is_some() {
+            app.tick();
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "job timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn wait_dialog(app: &mut App) {
+        let start = std::time::Instant::now();
+        while app.dialog.is_none() {
+            app.tick();
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "dialog timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn select_down(app: &mut App) {
+        press(app, KeyCode::Down); // a.txt
+    }
+
+    #[test]
+    fn f5_copies_to_other_panel() {
+        let (tmp, mut app) = fixture_job();
+        select_down(&mut app);
+        press(&mut app, KeyCode::F(5));
+        match &app.dialog.as_ref().unwrap().0 {
+            Dialog::Input { value, .. } => {
+                assert_eq!(value, &app.panels[1].cwd.to_string_lossy())
+            }
+            d => panic!("{d:?}"),
+        }
+        press(&mut app, KeyCode::Enter);
+        assert!(app.job.is_some());
+        wait_job(&mut app);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "A"
+        );
+        assert!(tmp.path().join("src/a.txt").exists());
+        assert!(app.status.as_deref().unwrap().starts_with("복사 완료"));
+        assert!(app.panels[1].entries.iter().any(|e| e.name == "a.txt"));
+    }
+
+    #[test]
+    fn f5_on_parent_is_noop() {
+        let (_t, mut app) = fixture_job();
+        press(&mut app, KeyCode::F(5));
+        assert!(app.dialog.is_none());
+        press(&mut app, KeyCode::F(6));
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn f6_moves_and_undo_moves_back() {
+        let (tmp, mut app) = fixture_job();
+        select_down(&mut app);
+        press(&mut app, KeyCode::F(6));
+        press(&mut app, KeyCode::Enter);
+        wait_job(&mut app);
+        assert!(!tmp.path().join("src/a.txt").exists());
+        assert!(tmp.path().join("dst/a.txt").exists());
+        assert!(app.status.as_deref().unwrap().starts_with("이동 완료"));
+        assert_eq!(app.undo.len(), 1);
+        ctrl_z(&mut app);
+        assert!(tmp.path().join("src/a.txt").exists());
+        assert!(!tmp.path().join("dst/a.txt").exists());
+    }
+
+    #[test]
+    fn copy_selection_clears_selection() {
+        let (_t, mut app) = fixture_job();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.active_panel().selected.len(), 2);
+        press(&mut app, KeyCode::F(5));
+        press(&mut app, KeyCode::Enter);
+        wait_job(&mut app);
+        assert!(app.panels[0].selected.is_empty());
+        assert!(app.status.as_deref().unwrap().contains("2개"));
+    }
+
+    fn start_conflict(app: &mut App, tmp: &TempDir) {
+        fs::write(tmp.path().join("dst/a.txt"), "OLD").unwrap();
+        app.panels[1].reload();
+        select_down(app);
+        press(app, KeyCode::F(5));
+        press(app, KeyCode::Enter);
+        wait_dialog(app);
+    }
+
+    #[test]
+    fn conflict_dialog_skip_keeps_dest() {
+        let (tmp, mut app) = fixture_job();
+        start_conflict(&mut app, &tmp);
+        match &app.dialog.as_ref().unwrap().0 {
+            Dialog::Choice {
+                title,
+                message,
+                options,
+                ..
+            } => {
+                assert_eq!(title, "덮어쓰기 확인");
+                assert_eq!(message, &vec!["이미 존재: a.txt".to_string()]);
+                assert_eq!(options.len(), 5);
+            }
+            d => panic!("{d:?}"),
+        }
+        press(&mut app, KeyCode::Char('s'));
+        wait_job(&mut app);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn conflict_dialog_overwrite_replaces() {
+        let (tmp, mut app) = fixture_job();
+        start_conflict(&mut app, &tmp);
+        press(&mut app, KeyCode::Char('o'));
+        wait_job(&mut app);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "A"
+        );
+    }
+
+    #[test]
+    fn overwrite_all_asks_only_once() {
+        let (tmp, mut app) = fixture_job();
+        fs::write(tmp.path().join("dst/a.txt"), "OLD").unwrap();
+        fs::write(tmp.path().join("dst/b.txt"), "OLD").unwrap();
+        app.panels[1].reload();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::F(5));
+        press(&mut app, KeyCode::Enter);
+        wait_dialog(&mut app);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Enter); // Overwrite all
+        let mut dialogs = 0;
+        let start = std::time::Instant::now();
+        while app.job.is_some() {
+            app.tick();
+            if app.dialog.is_some() {
+                dialogs += 1;
+                press(&mut app, KeyCode::Esc);
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(dialogs, 0);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "A"
+        );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/b.txt")).unwrap(),
+            "B"
+        );
+    }
+
+    #[test]
+    fn esc_in_conflict_dialog_cancels() {
+        let (tmp, mut app) = fixture_job();
+        start_conflict(&mut app, &tmp);
+        press(&mut app, KeyCode::Esc);
+        wait_job(&mut app);
+        assert_eq!(app.status.as_deref(), Some("취소됨"));
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn invalid_dest_sets_error_and_no_job() {
+        let (tmp, mut app) = fixture_job();
+        select_down(&mut app);
+        press(&mut app, KeyCode::F(5));
+        for _ in 0..500 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, "nope");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.job.is_none());
+        assert_eq!(app.status.as_deref(), Some("오류: 대상 폴더 없음"));
+        assert!(!tmp.path().join("src/nope").exists());
+    }
+
+    #[test]
+    fn relative_dest_resolves_against_active_cwd() {
+        let (tmp, mut app) = fixture_job();
+        fs::create_dir(tmp.path().join("src/sub")).unwrap();
+        app.panels[0].reload();
+        press(&mut app, KeyCode::End); // b.txt is last? sub sorts first
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // a.txt (dirs first: sub, a.txt)
+        assert_eq!(name_at(&app, 0), "a.txt");
+        press(&mut app, KeyCode::F(5));
+        for _ in 0..500 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, "sub");
+        press(&mut app, KeyCode::Enter);
+        wait_job(&mut app);
+        assert!(tmp.path().join("src/sub/a.txt").exists());
+    }
+
+    #[test]
+    fn second_f5_while_running_reports_busy() {
+        let (tmp, mut app) = fixture_job();
+        start_conflict(&mut app, &tmp);
+        app.dialog = None; // job stays blocked on the conflict
+        press(&mut app, KeyCode::F(5));
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        assert!(app.dialog.is_none());
+        press(&mut app, KeyCode::F(6));
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        // Esc with no dialog cancels the running job.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.status.as_deref(), Some("취소 중…"));
+        wait_job(&mut app);
+        assert_eq!(app.status.as_deref(), Some("취소됨"));
+    }
+
+    #[test]
+    fn panel_keys_work_while_job_runs() {
+        let (tmp, mut app) = fixture_job();
+        start_conflict(&mut app, &tmp);
+        app.dialog = None;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.panels[0].cursor, 2);
+        press(&mut app, KeyCode::Esc);
+        wait_job(&mut app);
+    }
+
+    #[test]
+    fn tick_is_false_when_idle() {
+        let (_t, mut app) = fixture_job();
+        assert!(!app.tick());
+        assert!(!app.tick());
     }
 }
