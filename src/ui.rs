@@ -977,6 +977,7 @@ mod tests {
             });
         }
         Panel {
+            location: Default::default(),
             cwd: cwd.into(),
             entries,
             cursor: 0,

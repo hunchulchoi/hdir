@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::loader::LoadResult;
+use crate::vfs::Location;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
@@ -65,6 +66,9 @@ pub struct LoadRequest {
 
 #[derive(Debug, Clone)]
 pub struct Panel {
+    /// Where `cwd` lives. Remote paths are byte strings stored as `PathBuf`
+    /// (unix); never hand them to local filesystem calls.
+    pub location: Location,
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
     pub cursor: usize,
@@ -83,6 +87,7 @@ impl Panel {
         let path = path.into();
         let cwd = fs::canonicalize(&path).unwrap_or(path);
         let mut panel = Panel {
+            location: Location::Local,
             cwd,
             entries: Vec::new(),
             cursor: 0,

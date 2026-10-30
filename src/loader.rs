@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
-use crate::panel::{Entry, read_listing};
+use crate::panel::Entry;
+use crate::vfs::{LocalVfs, Vfs};
 
 /// Global cap on concurrent reader threads.
 pub const MAX_READERS: usize = 4;
@@ -27,6 +28,8 @@ struct Req {
     id: u64,
     dir: PathBuf,
     hidden: bool,
+    /// Where to read; `None` = the loader's default reader (local).
+    vfs: Option<Arc<dyn Vfs>>,
 }
 
 #[derive(Default)]
@@ -57,7 +60,7 @@ pub struct Loader {
 
 impl Default for Loader {
     fn default() -> Self {
-        Self::with_reader(Arc::new(read_listing))
+        Self::with_reader(Arc::new(|d, h| LocalVfs.list(d, h)))
     }
 }
 
@@ -77,11 +80,24 @@ impl Loader {
     /// Queue loading `dir` for panel `key`; the result is tagged with `id`. A
     /// pending request of the same key that has not started yet is replaced.
     pub fn request(&self, key: usize, id: u64, dir: PathBuf, show_hidden: bool) {
+        self.request_vfs(key, id, dir, show_hidden, None);
+    }
+
+    /// Like [`Loader::request`], but reads through `vfs` when given.
+    pub fn request_vfs(
+        &self,
+        key: usize,
+        id: u64,
+        dir: PathBuf,
+        show_hidden: bool,
+        vfs: Option<Arc<dyn Vfs>>,
+    ) {
         if let Ok(mut st) = self.inner.state.lock() {
             st.slots.entry(key).or_default().pending = Some(Req {
                 id,
                 dir,
                 hidden: show_hidden,
+                vfs,
             });
         }
         pump(&self.inner);
@@ -119,10 +135,12 @@ fn pump(inner: &Arc<Inner>) {
     for (key, req) in to_run {
         let inner = Arc::clone(inner);
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (inner.reader)(&req.dir, req.hidden)
-            }))
-            .unwrap_or_else(|_| Err("디렉터리 읽기 실패".to_string()));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &req.vfs {
+                    Some(vfs) => vfs.list(&req.dir, req.hidden),
+                    None => (inner.reader)(&req.dir, req.hidden),
+                }))
+                .unwrap_or_else(|_| Err("디렉터리 읽기 실패".to_string()));
             let _ = inner.tx.send(LoadResult {
                 id: req.id,
                 dir: req.dir,
@@ -167,6 +185,25 @@ mod tests {
         let (entries, skipped) = got[0].result.as_ref().unwrap();
         assert_eq!(*skipped, 0);
         assert!(entries.iter().any(|e| e.name == "한글 file.txt"));
+    }
+
+    struct FakeVfs;
+    impl Vfs for FakeVfs {
+        fn list(&self, dir: &Path, hidden: bool) -> Listing {
+            Err(format!("fake:{}:{hidden}", dir.display()))
+        }
+        fn display_path(&self, dir: &Path) -> String {
+            dir.display().to_string()
+        }
+    }
+
+    #[test]
+    fn request_vfs_reads_through_the_given_vfs() {
+        let loader = Loader::default();
+        loader.request_vfs(0, 7, PathBuf::from("/x"), true, Some(Arc::new(FakeVfs)));
+        let got = wait_for(&loader, 1);
+        assert_eq!(got[0].id, 7);
+        assert_eq!(got[0].result.as_ref().unwrap_err(), "fake:/x:true");
     }
 
     #[test]
