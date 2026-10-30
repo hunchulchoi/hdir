@@ -1,0 +1,42 @@
+name = "mdir"
+
+[colors]
+bg = "#0000AA"
+fg = "#AAAAAA"
+border = "#55FFFF"
+border_active = "#FFFFFF"
+title = "#FFFFFF"
+dir = "#FFFFFF"
+file = "#AAAAAA"
+exec = "#55FF55"
+symlink = "#55FFFF"
+hidden = "#555555"
+assoc_file = "#55FFFF"
+selected = "#FFFF55"
+cursor_bg = "#00AAAA"
+cursor_fg = "#000000"
+status_bg = "#00AAAA"
+status_fg = "#000000"
+fkey_num_fg = "#FFFFFF"
+fkey_num_bg = "#000000"
+fkey_label_fg = "#000000"
+fkey_label_bg = "#00AAAA"
+dialog_bg = "#AAAAAA"
+dialog_fg = "#000000"
+danger_bg = "#AA0000"
+danger_fg = "#FFFFFF"
+preview_bg = "#0000AA"
+error = "#FF5555"
+dir_bold = true
+
+[ext_colors.exec]
+exts = ["sh", "command"]
+color = "#55FF55"
+
+[ext_colors.archive]
+exts = ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"]
+color = "#FF55FF"
+
+[ext_colors.doc]
+exts = ["md", "txt", "rs", "toml", "json", "yaml", "yml", "js", "ts", "py", "go", "java", "c", "h"]
+color = "#55FFFF"

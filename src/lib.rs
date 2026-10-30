@@ -8,6 +8,7 @@ pub mod loader;
 pub mod panel;
 pub mod platform;
 pub mod term;
+pub mod theme;
 pub mod trash;
 pub mod ui;
 pub mod undo;
