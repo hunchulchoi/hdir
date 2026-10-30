@@ -6,6 +6,7 @@ pub mod fs_ops;
 pub mod job;
 pub mod loader;
 pub mod panel;
+pub mod platform;
 pub mod term;
 pub mod trash;
 pub mod ui;

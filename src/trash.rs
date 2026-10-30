@@ -197,6 +197,7 @@ pub const SYMLINK_MSG: &str = "심볼릭 링크 항목은 파일 관리자에서
 
 /// Linux: the stored payload of a trash entry, from its `…/info/X.trashinfo`
 /// id to `…/files/X`.
+#[cfg(unix)]
 pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let info = Path::new(id);
@@ -216,6 +217,7 @@ pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
 
 /// Whether the payload of `id` is a symlink. Fails closed: anything but a
 /// definite answer (or a plain NotFound) is an error.
+#[cfg(unix)]
 pub fn payload_is_link(id: &OsStr) -> Result<bool, String> {
     let p = payload_path(id).ok_or("저장 위치를 알 수 없음")?;
     match p.symlink_metadata() {
@@ -518,6 +520,46 @@ pub fn fmt_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM` in local time.
+#[cfg(windows)]
+pub fn format_local(ts: i64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    // Unix seconds -> 100ns ticks since 1601-01-01.
+    let Some(ticks) = ts
+        .checked_add(11_644_473_600)
+        .filter(|s| *s >= 0)
+        .and_then(|s| (s as u64).checked_mul(10_000_000))
+    else {
+        return "-".to_string();
+    };
+    let utc = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    // SAFETY: plain-data structs; all pointers are valid for the call.
+    let mut utc_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // The zone conversion uses the DST rules in force *at that instant*
+    // (FileTimeToLocalFileTime would apply today's offset to every date).
+    // SAFETY: as above; a null zone means the current time zone.
+    let ok = unsafe {
+        FileTimeToSystemTime(&utc, &mut utc_st) != 0
+            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut st) != 0
+    };
+    if !ok {
+        return "-".to_string();
+    }
+    fmt_datetime(
+        st.wYear as i32,
+        st.wMonth as u32,
+        st.wDay as u32,
+        st.wHour as u32,
+        st.wMinute as u32,
+    )
+}
+
+/// `YYYY-MM-DD HH:MM` in local time.
+#[cfg(unix)]
 pub fn format_local(ts: i64) -> String {
     let t = ts as libc::time_t;
     // SAFETY: `tm` is plain data; localtime_r only writes into it.
@@ -963,6 +1005,7 @@ mod tests {
 
     // ---- entry ----
 
+    #[cfg(unix)]
     #[test]
     fn entry_original_path_needs_an_absolute_parent() {
         let e = entry("i", "/srv/data", "한글 문서", 5);
@@ -978,6 +1021,7 @@ mod tests {
         assert_eq!(lost.deleted_at(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_names_display_lossy_but_keep_the_raw_name() {
         use std::os::unix::ffi::OsStringExt;
@@ -1122,6 +1166,7 @@ mod tests {
         assert_eq!((keep.len(), skipped), (1, 0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn payload_path_maps_info_id_to_files_dir() {
         assert_eq!(
@@ -1132,6 +1177,7 @@ mod tests {
         assert_eq!(payload_path(OsStr::new("id7")), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restore_refuses_symlink_items_and_restores_the_rest() {
         use std::os::unix::fs::symlink;
@@ -1200,6 +1246,7 @@ mod tests {
         assert_eq!(r[2], (bad, Err("denied".into())));
     }
 
+    #[cfg(unix)]
     #[test]
     fn delete_with_bulk_failure_only_treats_not_found_as_trashed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1316,6 +1363,7 @@ mod tests {
 
     // ---- payload / guard ----
 
+    #[cfg(unix)]
     #[test]
     fn payload_path_keeps_non_utf8_names() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1331,6 +1379,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn payload_is_link_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1424,5 +1473,46 @@ mod tests {
     #[test]
     fn system_trash_view_support_follows_the_os() {
         assert_eq!(SystemTrash.supports_view(), cfg!(target_os = "linux"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn format_local_matches_the_zone_api_for_known_instants() {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
+        // (unix seconds, UTC y, mo, d, h, mi, s): winter, summer and autumn dates, so
+        // a zone with DST yields different offsets; the UTC fields are written out
+        // by hand, independent of format_local's FILETIME path.
+        let cases = [
+            (1_011_096_000_i64, (2002u16, 1u16, 15u16, 12u16, 0u16, 0u16)),
+            (993_988_800, (2001, 7, 1, 12, 0, 0)),
+            (1_000_000_000, (2001, 9, 9, 1, 46, 40)),
+        ];
+        for (ts, (y, mo, d, h, mi, sec)) in cases {
+            let utc = SYSTEMTIME {
+                wYear: y,
+                wMonth: mo,
+                wDayOfWeek: 0,
+                wDay: d,
+                wHour: h,
+                wMinute: mi,
+                wSecond: sec,
+                wMilliseconds: 0,
+            };
+            // SAFETY: plain data; valid pointers; null zone = current zone.
+            let mut l: SYSTEMTIME = unsafe { std::mem::zeroed() };
+            assert!(
+                unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut l) } != 0
+            );
+            let want = fmt_datetime(
+                l.wYear as i32,
+                l.wMonth as u32,
+                l.wDay as u32,
+                l.wHour as u32,
+                l.wMinute as u32,
+            );
+            assert_eq!(format_local(ts), want, "ts {ts}");
+        }
+        assert_eq!(format_local(i64::MIN), "-");
     }
 }

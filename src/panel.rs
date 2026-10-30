@@ -363,9 +363,36 @@ fn mode_of(meta: &fs::Metadata) -> u32 {
     meta.mode() & 0o7777
 }
 
-#[cfg(not(unix))]
+/// Windows has only the readonly attribute: report 0o444 if readonly, else 0o666.
+#[cfg(windows)]
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn mode_of(_meta: &fs::Metadata) -> u32 {
     0
+}
+
+/// Hidden by the platform: a leading dot everywhere, plus the hidden attribute on Windows.
+fn is_hidden(name: &str, meta: &fs::Metadata) -> bool {
+    name.starts_with('.') || hidden_attr(meta)
+}
+
+#[cfg(windows)]
+fn hidden_attr(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
+#[cfg(not(windows))]
+fn hidden_attr(_meta: &fs::Metadata) -> bool {
+    false
 }
 
 fn parent_only(cwd: &Path) -> Vec<Entry> {
@@ -387,6 +414,16 @@ fn build_listing(
     names: impl Iterator<Item = io::Result<OsString>>,
     show_hidden: bool,
 ) -> (Vec<Entry>, usize) {
+    build_listing_with(cwd, names, show_hidden, &|p| fs::symlink_metadata(p))
+}
+
+/// [`build_listing`] with an injectable `lstat`.
+fn build_listing_with(
+    cwd: &Path,
+    names: impl Iterator<Item = io::Result<OsString>>,
+    show_hidden: bool,
+    stat: &dyn Fn(&Path) -> io::Result<fs::Metadata>,
+) -> (Vec<Entry>, usize) {
     let mut skipped = 0;
     let mut items: Vec<Entry> = Vec::new();
     for r in names {
@@ -395,15 +432,22 @@ fn build_listing(
             continue;
         };
         let name = os_name.to_string_lossy().into_owned();
-        let hidden = name.starts_with('.');
-        if hidden && !show_hidden {
+        // Dot-prefixed names are hidden everywhere: skip them before any stat.
+        if !show_hidden && name.starts_with('.') {
             continue;
         }
         let path = cwd.join(&os_name);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            skipped += 1;
+        let Ok(meta) = stat(&path) else {
+            // Hidden entries stay out of the error count when hidden are not shown.
+            if !name.starts_with('.') || show_hidden {
+                skipped += 1;
+            }
             continue;
         };
+        let hidden = is_hidden(&name, &meta);
+        if hidden && !show_hidden {
+            continue;
+        }
         let kind = if meta.file_type().is_symlink() {
             let target_is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
             EntryKind::Symlink { target_is_dir }
@@ -740,9 +784,10 @@ mod tests {
         assert!(p.go_parent());
         assert_eq!(p.current().unwrap().name, "c");
         assert!(p.selected.is_empty());
-        let mut root = Panel::new("/");
+        let top = if cfg!(windows) { r"C:\" } else { "/" };
+        let mut root = Panel::new(top);
         assert!(!root.go_parent());
-        assert_eq!(root.cwd, PathBuf::from("/"));
+        assert_eq!(root.cwd, PathBuf::from(top).canonicalize().unwrap());
     }
 
     #[test]
@@ -848,6 +893,26 @@ mod tests {
         assert_eq!(skipped, 2);
         let n: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(n, vec!["..", "ok"]);
+    }
+
+    #[test]
+    fn hidden_dot_names_are_not_statted_when_hidden_are_off() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join(".h"), "").unwrap();
+        fs::write(t.path().join("v"), "").unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let stat = |p: &Path| {
+            calls.borrow_mut().push(p.to_path_buf());
+            fs::symlink_metadata(p)
+        };
+        let items = || vec![Ok(OsString::from(".h")), Ok(OsString::from("v"))].into_iter();
+        let (entries, _) = build_listing_with(t.path(), items(), false, &stat);
+        assert_eq!(*calls.borrow(), vec![t.path().join("v")]);
+        assert!(entries.iter().all(|e| e.name != ".h"));
+        calls.borrow_mut().clear();
+        let (entries, _) = build_listing_with(t.path(), items(), true, &stat);
+        assert_eq!(calls.borrow().len(), 2);
+        assert!(entries.iter().any(|e| e.name == ".h"));
     }
 
     #[test]
@@ -1071,5 +1136,45 @@ mod tests {
         assert!(p.show_hidden);
         assert!(p.finish_load(load_of(&req, true)));
         assert!(names(&p).contains(&".hid"));
+    }
+
+    #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)] // Windows-only readonly attribute
+    #[test]
+    fn readonly_attribute_maps_to_mode_444_else_666() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("rw.txt"), "x").unwrap();
+        fs::write(t.path().join("ro.txt"), "x").unwrap();
+        let mut perm = fs::metadata(t.path().join("ro.txt")).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(t.path().join("ro.txt"), perm).unwrap();
+        let p = Panel::new(t.path());
+        let mode = |n: &str| p.entries.iter().find(|e| e.name == n).unwrap().mode;
+        assert_eq!(mode("ro.txt"), 0o444);
+        assert_eq!(mode("rw.txt"), 0o666);
+        let mut perm = fs::metadata(t.path().join("ro.txt")).unwrap().permissions();
+        perm.set_readonly(false);
+        fs::set_permissions(t.path().join("ro.txt"), perm).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_attribute_hides_entries_like_dotfiles() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("plain.txt"), "x").unwrap();
+        fs::write(t.path().join("secret.txt"), "x").unwrap();
+        fs::write(t.path().join(".dot"), "x").unwrap();
+        let st = std::process::Command::new("attrib")
+            .arg("+h")
+            .arg(t.path().join("secret.txt"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let (shown, _) = read_listing(t.path(), false).unwrap();
+        let shown: Vec<_> = shown.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, vec!["..", "plain.txt"]);
+        let (all, _) = read_listing(t.path(), true).unwrap();
+        let hidden = |n: &str| all.iter().find(|e| e.name == n).unwrap().hidden;
+        assert!(hidden("secret.txt") && hidden(".dot") && !hidden("plain.txt"));
     }
 }

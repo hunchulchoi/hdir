@@ -2232,6 +2232,7 @@ mod tests {
         wait_job(&mut app);
     }
 
+    #[cfg(unix)]
     #[test]
     fn dest_with_surrounding_spaces_is_not_trimmed() {
         let (tmp, mut app) = fixture_job();

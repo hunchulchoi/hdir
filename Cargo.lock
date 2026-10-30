@@ -527,6 +527,7 @@ dependencies = [
  "toml",
  "trash",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

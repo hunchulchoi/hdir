@@ -667,6 +667,7 @@ mod tests {
         assert_eq!(items_of(&retry)[0].path, a);
     }
 
+    #[cfg(unix)]
     #[test]
     fn undo_trash_keeps_every_unrestored_item_for_retry() {
         let store = FakeTrash::new();
