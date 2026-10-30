@@ -169,7 +169,7 @@ fn input_key(value: &mut String, cursor: &mut usize, key: KeyEvent) -> DialogRes
         KeyCode::Right => *cursor = (*cursor + 1).min(len),
         KeyCode::Home => *cursor = 0,
         KeyCode::End => *cursor = len,
-        KeyCode::Enter if !value.trim().is_empty() => {
+        KeyCode::Enter if !value.is_empty() => {
             return DialogResult::Submitted(value.clone());
         }
         _ => {}
@@ -518,11 +518,14 @@ mod tests {
     }
 
     #[test]
-    fn input_empty_or_blank_enter_stays_pending() {
+    fn input_empty_enter_stays_pending_but_spaces_submit() {
         let mut d = Dialog::input("t", "p", "");
         assert_eq!(d.handle_key(key(KeyCode::Enter)), DialogResult::Pending);
         type_str(&mut d, "  ");
-        assert_eq!(d.handle_key(key(KeyCode::Enter)), DialogResult::Pending);
+        assert_eq!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Submitted("  ".into())
+        );
     }
 
     #[test]

@@ -103,6 +103,13 @@ struct Worker {
 pub type ChunkHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 impl Worker {
+    /// Send at most one progress event per [`PROGRESS_INTERVAL`]; `run` always sends the final state.
+    fn send_progress_throttled(&mut self) {
+        if self.last_sent.elapsed() >= PROGRESS_INTERVAL {
+            self.send_progress();
+        }
+    }
+
     fn send_progress(&mut self) {
         self.last_sent = Instant::now();
         let _ = self.events.send(JobEvent::Progress {
@@ -123,8 +130,10 @@ impl OpControl for Worker {
         if self.current != current {
             self.current = current.to_path_buf();
         }
-        if first || self.last_sent.elapsed() >= PROGRESS_INTERVAL {
+        if first {
             self.send_progress();
+        } else {
+            self.send_progress_throttled();
         }
     }
 
@@ -133,14 +142,14 @@ impl OpControl for Worker {
             self.files_done += 1;
         }
         self.current = path.to_path_buf();
-        self.send_progress();
+        self.send_progress_throttled();
     }
 
     fn on_item_done(&mut self, src: &Path) {
         if self.by_items {
             self.files_done += 1;
             self.current = src.to_path_buf();
-            self.send_progress();
+            self.send_progress_throttled();
         }
     }
 
@@ -203,8 +212,7 @@ fn run(spec: &JobSpec, w: &mut Worker) -> OpReport {
             w.bytes_done = w.bytes_done.max(totals.bytes);
             w.send_progress();
         }
-        OpOutcome::Cancelled => w.send_progress(),
-        OpOutcome::Failed(_) => {}
+        OpOutcome::Cancelled | OpOutcome::Failed(_) => w.send_progress(),
     }
     report
 }
@@ -674,5 +682,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(report.moved, vec![(s.join("a"), d.join("a"))]);
+    }
+
+    #[test]
+    fn many_tiny_files_coalesce_progress_events() {
+        let (_t, s, d) = dirs();
+        let tree = s.join("tree");
+        fs::create_dir(&tree).unwrap();
+        for i in 0..500 {
+            fs::write(tree.join(format!("f{i}")), "x").unwrap();
+        }
+        let ev = run_answering(spec(JobKind::Copy, vec![tree], &d), ConflictAnswer::Cancel);
+        assert_eq!(outcome(&ev), JobOutcome::Done);
+        let progress: Vec<u64> = ev
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::Progress { files_done, .. } => Some(*files_done),
+                _ => None,
+            })
+            .collect();
+        assert!(progress.len() < 100, "{} progress events", progress.len());
+        assert_eq!(progress.last(), Some(&500));
     }
 }

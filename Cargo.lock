@@ -520,6 +520,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "dirs",
+ "libc",
  "ratatui",
  "serde",
  "tempfile",

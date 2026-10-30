@@ -289,9 +289,9 @@ impl App {
             self.status = Some("작업 진행 중".into());
             return;
         }
-        // Only reject blank input; surrounding spaces may be part of a real name.
+        // Only reject empty input; surrounding spaces may be part of a real name.
         let dest_dir = resolve_dest(input, &self.active_panel().cwd);
-        if input.trim().is_empty() || !dest_dir.is_dir() {
+        if input.is_empty() || !dest_dir.is_dir() {
             self.status = Some("오류: 대상 폴더 없음".into());
             return;
         }
@@ -401,35 +401,18 @@ impl App {
         };
         self.pending_conflict = None;
         // Partial moves are undoable whatever the outcome.
-        if job.kind == JobKind::Move && !report.moved.is_empty() {
+        if job.kind == JobKind::Move
+            && (!report.moved.is_empty() || !report.removed_dirs.is_empty())
+        {
             self.undo.push(UndoOp::Move {
                 pairs: report.moved.clone(),
+                removed_dirs: report.removed_dirs.clone(),
             });
         }
         if report.copied > 0 || !report.moved.is_empty() {
             self.active_panel_mut().selected.clear();
         }
-        let n = report.copied;
-        let mut status = match &report.outcome {
-            OpOutcome::Done => {
-                let mut s = match job.kind {
-                    JobKind::Copy => format!("복사 완료: {n}개"),
-                    JobKind::Move => format!("이동 완료: {n}개"),
-                };
-                if report.skipped > 0 {
-                    s.push_str(&format!(", 건너뜀 {}개", report.skipped));
-                }
-                s
-            }
-            OpOutcome::Cancelled => format!("취소됨 (처리 {n}개)"),
-            OpOutcome::Failed(msg) => format!("오류: {msg} (처리 {n}개)"),
-        };
-        if job.kind == JobKind::Move && report.overwritten > 0 {
-            status.push_str(&format!(
-                " · 덮어쓴 파일 {}개는 되돌릴 수 없음",
-                report.overwritten
-            ));
-        }
+        let status = job_summary(job.kind, &report);
         // A conflict dialog may still be open for a job that just ended.
         if matches!(self.dialog, Some((_, PendingAction::Conflict))) {
             self.dialog = None;
@@ -620,6 +603,35 @@ impl App {
             dialog::render(frame, frame.area(), dlg);
         }
     }
+}
+
+/// Status-bar text for a finished copy/move job.
+fn job_summary(kind: JobKind, report: &OpReport) -> String {
+    let n = report.copied;
+    let mut status = match &report.outcome {
+        OpOutcome::Done => {
+            let mut s = match kind {
+                JobKind::Copy => format!("복사 완료: {n}개"),
+                JobKind::Move => format!("이동 완료: {n}개"),
+            };
+            if report.skipped > 0 {
+                s.push_str(&format!(", 건너뜀 {}개", report.skipped));
+            }
+            if report.partial > 0 {
+                s.push_str(&format!(", 일부만 이동 {}개 (원본 유지)", report.partial));
+            }
+            s
+        }
+        OpOutcome::Cancelled => format!("취소됨 (처리 {n}개)"),
+        OpOutcome::Failed(msg) => format!("오류: {msg} (처리 {n}개)"),
+    };
+    if kind == JobKind::Move && report.overwritten > 0 {
+        status.push_str(&format!(
+            " · 덮어쓴 파일 {}개는 되돌릴 수 없음",
+            report.overwritten
+        ));
+    }
+    status
 }
 
 #[cfg(test)]
@@ -1629,5 +1641,16 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("취소됨 (처리 1개)"));
         ctrl_z(&mut app);
         assert!(tmp.path().join("src/a.txt").exists());
+    }
+
+    #[test]
+    fn job_summary_reports_partial_moves() {
+        let mut r = OpReport::failed("");
+        r.outcome = OpOutcome::Done;
+        r.partial = 1;
+        let s = job_summary(JobKind::Move, &r);
+        assert!(s.contains("일부만 이동 1개"), "{s}");
+        r.partial = 0;
+        assert!(!job_summary(JobKind::Move, &r).contains("일부만"));
     }
 }
