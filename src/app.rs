@@ -14,7 +14,9 @@ use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
 use crate::loader::Loader;
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
-use crate::trash::{self, PurgeReport, RestoreResult, TrashBackend, TrashEntry, TrashView};
+use crate::trash::{
+    self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
+};
 use crate::ui::{self, View};
 use crate::undo::{UndoApplied, UndoOp, UndoStack};
 
@@ -71,9 +73,6 @@ enum BgKind {
     Trash {
         panel: usize,
         cwd: PathBuf,
-        paths: Vec<PathBuf>,
-        /// Unix seconds when the F8 started (to find the items again).
-        since: i64,
     },
     Undo,
     Mkdir {
@@ -86,6 +85,7 @@ enum BgKind {
         from: PathBuf,
         name: String,
     },
+    OpenOsTrash,
     TrashList {
         panel: usize,
     },
@@ -100,8 +100,9 @@ enum BgKind {
 type TrashListing = Result<Vec<TrashEntry>, String>;
 
 enum BgResult {
-    Trash(Vec<(PathBuf, Result<(), String>)>),
+    Trash(TrackedDelete),
     TrashList(TrashListing),
+    OpenOsTrash(Result<(), String>),
     /// Restore result, how many selected items had no known original
     /// location, plus the refreshed listing.
     TrashRestore(RestoreResult, usize, TrashListing),
@@ -475,15 +476,12 @@ impl App {
             return false;
         };
         match (task.kind, result) {
-            (
-                BgKind::Trash {
-                    panel,
-                    cwd,
-                    paths,
-                    since,
-                },
-                Some(BgResult::Trash(results)),
-            ) => {
+            (BgKind::Trash { panel, cwd }, Some(BgResult::Trash(tracked))) => {
+                let TrackedDelete {
+                    results,
+                    undo,
+                    lost,
+                } = tracked;
                 let failed: Vec<&(PathBuf, Result<(), String>)> =
                     results.iter().filter(|(_, r)| r.is_err()).collect();
                 let done: Vec<PathBuf> = results
@@ -497,17 +495,16 @@ impl App {
                     .and_then(|(_, r)| r.as_ref().err())
                     .cloned()
                     .unwrap_or_default();
-                let status = match failed.len() {
+                let mut status = match failed.len() {
                     0 => format!("휴지통: {ok}개"),
                     _ if ok == 0 => format!("오류: {first}"),
                     n => format!("휴지통: {ok}개, 실패 {n}개: {first}"),
                 };
-                let _ = &paths;
-                if !done.is_empty() {
-                    self.undo.push(UndoOp::Trash {
-                        paths: done.clone(),
-                        since,
-                    });
+                if lost > 0 {
+                    status.push_str(" · 되돌리기 정보 없음");
+                }
+                if !undo.is_empty() {
+                    self.undo.push(UndoOp::Trash { items: undo });
                 }
                 self.clear_selection(panel, &cwd, &done);
                 self.reload_both();
@@ -541,6 +538,12 @@ impl App {
                     self.status = Some(format!("오류: {e}"));
                 }
             },
+            (BgKind::OpenOsTrash, Some(BgResult::OpenOsTrash(res))) => {
+                self.status = Some(match res {
+                    Ok(()) => "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".to_string(),
+                    Err(e) => format!("오류: {e}"),
+                });
+            }
             (BgKind::TrashList { panel }, Some(BgResult::TrashList(res))) => {
                 self.status = match self.apply_trash_listing(panel, &res) {
                     Ok(()) => None,
@@ -559,7 +562,7 @@ impl App {
                 self.status = Some(match report.error {
                     Some(e) => format!("오류: {e}"),
                     None if skipped > 0 => format!(
-                        "영구 삭제: {}개, 건너뜀 {skipped}개 (목록이 변경됨)",
+                        "영구 삭제: {}개, 휴지통 항목이 바뀌어 건너뜀 {skipped}개",
                         report.purged
                     ),
                     None => format!("영구 삭제: {}개", report.purged),
@@ -743,16 +746,18 @@ impl App {
     // ---- trash view ----
 
     fn open_trash_view(&mut self) {
-        if !self.trash.supports_view() {
-            // No in-panel view: the OS file manager shows (and restores from) the trash.
-            self.status = Some(match self.trash.open_os_trash() {
-                Ok(()) => "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".to_string(),
-                Err(e) => format!("오류: {e}"),
-            });
-            return;
-        }
         if self.task.is_some() {
             self.status = Some("작업 진행 중".into());
+            return;
+        }
+        if !self.trash.supports_view() {
+            // No in-panel view: the OS file manager shows (and restores from)
+            // the trash. Spawning a process must not block the UI.
+            let store = Arc::clone(&self.trash);
+            self.task = Some(BgTask::spawn(BgKind::OpenOsTrash, move || {
+                BgResult::OpenOsTrash(store.open_os_trash())
+            }));
+            self.status = Some("휴지통 여는 중…".into());
             return;
         }
         let idx = self.active;
@@ -973,15 +978,12 @@ impl App {
                     return;
                 }
                 let trash = Arc::clone(&self.trash);
-                let work = paths.clone();
                 self.task = Some(BgTask::spawn(
                     BgKind::Trash {
                         panel: self.active,
                         cwd: self.active_panel().cwd.clone(),
-                        paths,
-                        since: trash::now_secs(),
                     },
-                    move || BgResult::Trash(trash.delete(&work)),
+                    move || BgResult::Trash(trash::delete_tracked(&*trash, &paths)),
                 ));
                 self.status = Some("휴지통으로 이동 중…".into());
             }
@@ -2978,9 +2980,30 @@ mod tests {
     // ---- macOS mode: no in-panel view, Finder does the work ----
 
     #[test]
+    fn mac_alt_f8_opens_the_os_trash_on_a_worker() {
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = FakeTrash::mac();
+        *fake.open_gate.lock().unwrap() = Some(Arc::clone(&released));
+        let (_t, mut app, fake) = fixture_with(fake);
+        alt_f8(&mut app);
+        assert!(app.task.is_some(), "open runs as a background task");
+        assert_eq!(app.status.as_deref(), Some("휴지통 여는 중…"));
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 0);
+        press(&mut app, KeyCode::Down); // UI stays responsive
+        released.store(true, Ordering::SeqCst);
+        wait_idle(&mut app);
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'")
+        );
+    }
+
+    #[test]
     fn mac_alt_f8_opens_the_os_trash_instead_of_a_view() {
         let (_t, mut app, fake) = fixture_with(FakeTrash::mac());
         alt_f8(&mut app);
+        wait_idle(&mut app);
         assert_eq!(fake.open_calls.load(Ordering::SeqCst), 1);
         assert!(app.trash_views[0].is_none());
         assert!(app.task.is_none());
@@ -3036,6 +3059,25 @@ mod tests {
         assert_eq!(fake.open_calls.load(Ordering::SeqCst), 0);
         settle(&mut app);
         let _ = tmp;
+    }
+
+    #[test]
+    fn f8_without_listing_warns_no_undo_info_and_pushes_no_undo_op() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        *fake.fail_list.lock().unwrap() = Some("busy".into());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // f.txt
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(!root.join("f.txt").exists(), "still trashed");
+        let s = app.status.clone().unwrap();
+        assert!(
+            s.contains("휴지통: 1개") && s.contains("되돌리기 정보 없음"),
+            "{s}"
+        );
+        assert_eq!(app.undo.len(), 0);
     }
 
     #[test]

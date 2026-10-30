@@ -5,7 +5,7 @@
 //! listed / restored / purged through `trash::os_limited`. Everything sits
 //! behind [`TrashBackend`] so the app logic can be tested with a fake.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -174,32 +174,158 @@ where
     res
 }
 
-/// Pick, from `fresh`, the entries of `wanted` that are still listed (same
-/// id); the count of vanished ones is returned too.
+pub const SYMLINK_MSG: &str = "심볼릭 링크 항목은 파일 관리자에서 복원하세요";
+
+/// Linux: the stored payload of a trash entry, from its `…/info/X.trashinfo`
+/// id to `…/files/X`.
+pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
+    let info = Path::new(id);
+    let name = info.file_name()?.to_str()?.strip_suffix(".trashinfo")?;
+    let trash_root = info.parent()?.parent()?;
+    if info.parent()?.file_name()? != "info" {
+        return None;
+    }
+    Some(trash_root.join("files").join(name))
+}
+
+/// Restore through `restore`, but refuse items whose payload is a symlink:
+/// the crate may treat a symlink to a directory as a directory and leave an
+/// empty one behind.
+pub fn restore_guarded(
+    items: &[TrashEntry],
+    is_link: impl Fn(&TrashEntry) -> bool,
+    restore: impl FnOnce(&[TrashEntry]) -> RestoreResult,
+) -> RestoreResult {
+    let (linked, plain): (Vec<&TrashEntry>, Vec<&TrashEntry>) =
+        items.iter().partition(|e| is_link(e));
+    let plain: Vec<TrashEntry> = plain.into_iter().cloned().collect();
+    let mut res = if plain.is_empty() {
+        RestoreResult::default()
+    } else {
+        restore(&plain)
+    };
+    res.errors.extend(
+        linked
+            .iter()
+            .map(|e| format!("{}: {SYMLINK_MSG}", e.name())),
+    );
+    res
+}
+
+/// Same trash entry: the id alone is not enough because backends may reuse it.
+pub fn same_identity(a: &TrashItem, b: &TrashItem) -> bool {
+    a.id == b.id
+        && a.original_parent == b.original_parent
+        && a.name == b.name
+        && a.time_deleted == b.time_deleted
+}
+
+/// Pick, from `fresh`, the entries of `wanted` that are still listed with the
+/// same identity (id, original parent, name, deletion time); the count of
+/// vanished or changed ones is returned too.
 pub fn match_fresh(wanted: &[TrashEntry], fresh: &[TrashEntry]) -> (Vec<TrashEntry>, usize) {
+    let by_id: HashMap<&OsStr, &TrashEntry> = fresh.iter().map(|f| (f.id(), f)).collect();
     let mut keep = Vec::new();
     let mut skipped = 0;
     for w in wanted {
-        match fresh.iter().find(|f| f.id() == w.id()) {
-            Some(f) => keep.push(f.clone()),
-            None => skipped += 1,
+        match by_id.get(w.id()) {
+            Some(f) if same_identity(&f.item, &w.item) => keep.push((*f).clone()),
+            _ => skipped += 1,
         }
     }
     (keep, skipped)
 }
 
-/// Entries of `list` that are `paths` trashed at or after `since` (newest per
-/// path), for undoing an F8.
-pub fn find_trashed(list: &[TrashEntry], paths: &[PathBuf], since: i64) -> Vec<TrashEntry> {
-    paths
+/// One item an F8 sent to the trash, identified exactly so Ctrl+Z restores
+/// that very item and never "the newest one with the same path".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashedItem {
+    /// Backend id; empty when the backend cannot list (macOS).
+    pub id: OsString,
+    pub path: PathBuf,
+    pub time_deleted: i64,
+}
+
+/// Result of [`delete_tracked`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedDelete {
+    pub results: Vec<(PathBuf, Result<(), String>)>,
+    /// Exactly identified items, for the undo op.
+    pub undo: Vec<TrashedItem>,
+    /// Trashed paths that could not be identified (no undo info).
+    pub lost: usize,
+}
+
+type ItemKey = (OsString, PathBuf, OsString, i64);
+
+fn item_key(i: &TrashItem) -> ItemKey {
+    (
+        i.id.clone(),
+        i.original_parent.clone(),
+        i.name.clone(),
+        i.time_deleted,
+    )
+}
+
+/// Trash `paths` and work out which trash entries that created: the entries
+/// listed after but not before, matched to the paths by original path.
+pub fn delete_tracked(store: &dyn TrashBackend, paths: &[PathBuf]) -> TrackedDelete {
+    if !store.supports_view() {
+        let results = store.delete(paths);
+        let undo = results
+            .iter()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(p, _)| TrashedItem {
+                id: OsString::new(),
+                path: p.clone(),
+                time_deleted: 0,
+            })
+            .collect();
+        return TrackedDelete {
+            results,
+            undo,
+            lost: 0,
+        };
+    }
+    let before = store.list();
+    let results = store.delete(paths);
+    let done: Vec<&PathBuf> = results
         .iter()
-        .filter_map(|p| {
-            list.iter()
-                .filter(|e| e.item.time_deleted >= since && e.original_path().as_ref() == Some(p))
-                .max_by_key(|e| e.item.time_deleted)
-                .cloned()
-        })
-        .collect()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(p, _)| p)
+        .collect();
+    let after = store.list();
+    let (Ok(before), Ok(after)) = (before, after) else {
+        return TrackedDelete {
+            lost: done.len(),
+            undo: Vec::new(),
+            results,
+        };
+    };
+    let known: HashSet<ItemKey> = before.iter().map(|e| item_key(&e.item)).collect();
+    let mut fresh: Vec<&TrashEntry> = after
+        .iter()
+        .filter(|e| !known.contains(&item_key(&e.item)))
+        .collect();
+    let mut undo = Vec::new();
+    for p in &done {
+        if let Some(pos) = fresh
+            .iter()
+            .position(|e| e.original_path().as_ref() == Some(*p))
+        {
+            let e = fresh.remove(pos);
+            undo.push(TrashedItem {
+                id: e.id().to_os_string(),
+                path: (*p).clone(),
+                time_deleted: e.item.time_deleted,
+            });
+        }
+    }
+    TrackedDelete {
+        lost: done.len() - undo.len(),
+        undo,
+        results,
+    }
 }
 
 /// Trash `paths`: one bulk call, and when it fails, each path that is still
@@ -215,8 +341,16 @@ pub fn delete_with(
     paths
         .iter()
         .map(|p| {
-            let gone = paths.len() > 1 && p.symlink_metadata().is_err();
-            let r = if gone { Ok(()) } else { single(p) };
+            // After a failed bulk call a path is "trashed" only when it is
+            // really gone; any other stat error is a failure for that path.
+            let r = match paths.len() > 1 {
+                true => match p.symlink_metadata() {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.to_string()),
+                    Ok(_) => single(p),
+                },
+                false => single(p),
+            };
             (p.clone(), r)
         })
         .collect()
@@ -252,12 +386,11 @@ impl TrashBackend for SystemTrash {
         let mut entries: Vec<TrashEntry> = items
             .into_iter()
             .map(|item| {
-                let meta = trash::os_limited::metadata(&item).ok();
-                let is_dir = matches!(
-                    meta.as_ref().map(|m| &m.size),
-                    Some(trash::TrashItemSize::Entries(_))
-                );
-                let size = meta.and_then(|m| m.size.size());
+                // lstat of the payload: no directory child counting, and a
+                // symlink to a directory is not shown as a directory.
+                let meta = payload_path(&item.id).and_then(|p| p.symlink_metadata().ok());
+                let is_dir = meta.as_ref().is_some_and(|m| m.is_dir());
+                let size = meta.filter(|m| m.is_file()).map(|m| m.len());
                 TrashEntry::new(item, size, is_dir)
             })
             .collect();
@@ -272,9 +405,19 @@ impl TrashBackend for SystemTrash {
 
     #[cfg(target_os = "linux")]
     fn restore(&self, items: &[TrashEntry]) -> RestoreResult {
-        restore_with(items.iter().map(|e| e.item.clone()).collect(), |v| {
-            trash::os_limited::restore_all(v)
-        })
+        restore_guarded(
+            items,
+            |e| {
+                payload_path(e.id())
+                    .and_then(|p| p.symlink_metadata().ok())
+                    .is_some_and(|m| m.file_type().is_symlink())
+            },
+            |ok| {
+                restore_with(ok.iter().map(|e| e.item.clone()).collect(), |v| {
+                    trash::os_limited::restore_all(v)
+                })
+            },
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -472,11 +615,17 @@ pub mod fake {
         view: bool,
         next: AtomicI64,
         last_time: AtomicI64,
+        /// When set, every deletion gets exactly this timestamp.
+        pub fixed_time: Mutex<Option<i64>>,
+        /// List in the reverse of the usual order (arbitrary order).
+        pub reverse_list: AtomicBool,
         items: Mutex<Vec<(TrashEntry, PathBuf)>>,
         /// Every path handed to `delete`.
         pub trashed: Mutex<Vec<PathBuf>>,
         /// While set and false, `delete` blocks (up to 2 s).
         pub gate: Mutex<Option<Arc<AtomicBool>>>,
+        /// While set and false, `open_os_trash` blocks (up to 2 s).
+        pub open_gate: Mutex<Option<Arc<AtomicBool>>>,
         pub fail_paths: Mutex<HashMap<PathBuf, String>>,
         pub fail_list: Mutex<Option<String>>,
         /// Original paths of each `restore` call.
@@ -508,9 +657,12 @@ pub mod fake {
                 view,
                 next: AtomicI64::new(1),
                 last_time: AtomicI64::new(0),
+                fixed_time: Mutex::new(None),
+                reverse_list: AtomicBool::new(false),
                 items: Mutex::new(Vec::new()),
                 trashed: Mutex::new(Vec::new()),
                 gate: Mutex::new(None),
+                open_gate: Mutex::new(None),
                 fail_paths: Mutex::new(HashMap::new()),
                 fail_list: Mutex::new(None),
                 restore_calls: Mutex::new(Vec::new()),
@@ -554,6 +706,39 @@ pub mod fake {
         }
     }
 
+    impl FakeTrash {
+        fn restore_inner(&self, items: &[TrashEntry]) -> RestoreResult {
+            self.restore_calls
+                .lock()
+                .unwrap()
+                .push(items.iter().filter_map(TrashEntry::original_path).collect());
+            let mut res = RestoreResult::default();
+            let mut store = self.items.lock().unwrap();
+            for it in items {
+                let Some(dest) = it.original_path() else {
+                    res.errors.push(format!("{}: 원래 위치 모름", it.name()));
+                    continue;
+                };
+                let Some(pos) = store.iter().position(|(e, _)| e.id() == it.id()) else {
+                    res.errors.push(format!("{}: 휴지통에 없음", it.name()));
+                    continue;
+                };
+                if dest.symlink_metadata().is_ok() {
+                    res.collisions.push(dest);
+                    continue;
+                }
+                match fs::rename(&store[pos].1, &dest) {
+                    Ok(()) => {
+                        store.remove(pos);
+                        res.restored.push(dest);
+                    }
+                    Err(e) => res.errors.push(e.to_string()),
+                }
+            }
+            res
+        }
+    }
+
     impl Default for FakeTrash {
         fn default() -> Self {
             Self::new()
@@ -582,7 +767,10 @@ pub mod fake {
                         return (p.clone(), Err(e.to_string()));
                     }
                     // Strictly increasing so "newest first" is deterministic.
-                    let t = now_secs().max(self.last_time.load(Ordering::SeqCst) + 1);
+                    let t = match *self.fixed_time.lock().unwrap() {
+                        Some(t) => t,
+                        None => now_secs().max(self.last_time.load(Ordering::SeqCst) + 1),
+                    };
                     self.last_time.store(t, Ordering::SeqCst);
                     let item = TrashItem {
                         id: format!("id{n}").into(),
@@ -613,38 +801,28 @@ pub mod fake {
                 .map(|(e, _)| e.clone())
                 .collect();
             sort_newest_first(&mut v);
+            if self.reverse_list.load(Ordering::SeqCst) {
+                v.reverse();
+            }
             Ok(v)
         }
 
         fn restore(&self, items: &[TrashEntry]) -> RestoreResult {
-            self.restore_calls
-                .lock()
-                .unwrap()
-                .push(items.iter().filter_map(TrashEntry::original_path).collect());
-            let mut res = RestoreResult::default();
-            let mut store = self.items.lock().unwrap();
-            for it in items {
-                let Some(dest) = it.original_path() else {
-                    res.errors.push(format!("{}: 원래 위치 모름", it.name()));
-                    continue;
-                };
-                let Some(pos) = store.iter().position(|(e, _)| e.id() == it.id()) else {
-                    res.errors.push(format!("{}: 휴지통에 없음", it.name()));
-                    continue;
-                };
-                if dest.symlink_metadata().is_ok() {
-                    res.collisions.push(dest);
-                    continue;
-                }
-                match fs::rename(&store[pos].1, &dest) {
-                    Ok(()) => {
-                        store.remove(pos);
-                        res.restored.push(dest);
-                    }
-                    Err(e) => res.errors.push(e.to_string()),
-                }
-            }
-            res
+            restore_guarded(
+                items,
+                |e| {
+                    self.items
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(x, _)| x.id() == e.id())
+                        .is_some_and(|(_, p)| {
+                            p.symlink_metadata()
+                                .is_ok_and(|m| m.file_type().is_symlink())
+                        })
+                },
+                |ok| self.restore_inner(ok),
+            )
         }
 
         fn purge(&self, items: &[TrashEntry]) -> Result<(), String> {
@@ -667,6 +845,13 @@ pub mod fake {
         }
 
         fn open_os_trash(&self) -> Result<(), String> {
+            let gate = self.open_gate.lock().unwrap().clone();
+            if let Some(g) = gate {
+                let start = std::time::Instant::now();
+                while !g.load(Ordering::SeqCst) && start.elapsed().as_secs() < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
             self.open_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -845,22 +1030,58 @@ mod tests {
     }
 
     #[test]
-    fn find_trashed_matches_path_and_time_and_prefers_the_newest() {
-        let list = vec![
-            entry("old", "/p", "a", 5),
-            entry("new1", "/p", "a", 12),
-            entry("new2", "/p", "a", 15),
-            entry("other", "/q", "a", 20),
-            entry("b", "/p", "b", 11),
-        ];
-        let got = find_trashed(
-            &list,
-            &[PathBuf::from("/p/a"), PathBuf::from("/p/missing")],
-            10,
+    fn match_fresh_requires_the_whole_identity_not_just_the_id() {
+        let wanted = vec![entry("1", "/p", "a", 1)];
+        for changed in [
+            entry("1", "/p", "a", 2),
+            entry("1", "/q", "a", 1),
+            entry("1", "/p", "b", 1),
+        ] {
+            let (keep, skipped) = match_fresh(&wanted, &[changed]);
+            assert!(keep.is_empty(), "reused id must not match");
+            assert_eq!(skipped, 1);
+        }
+        let (keep, skipped) = match_fresh(&wanted, &[entry("1", "/p", "a", 1)]);
+        assert_eq!((keep.len(), skipped), (1, 0));
+    }
+
+    #[test]
+    fn payload_path_maps_info_id_to_files_dir() {
+        assert_eq!(
+            payload_path(OsStr::new("/h/.local/share/Trash/info/a b.txt.trashinfo")),
+            Some(PathBuf::from("/h/.local/share/Trash/files/a b.txt"))
         );
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].id(), "new2");
-        assert!(find_trashed(&list, &[PathBuf::from("/p/a")], 99).is_empty());
+        assert_eq!(payload_path(OsStr::new("/h/Trash/info/noext")), None);
+        assert_eq!(payload_path(OsStr::new("id7")), None);
+    }
+
+    #[test]
+    fn restore_refuses_symlink_items_and_restores_the_rest() {
+        use std::os::unix::fs::symlink;
+        let store = FakeTrash::new();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        symlink(&target, &link).unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, "p").unwrap();
+        for (_, r) in store.delete(&[link.clone(), plain.clone()]) {
+            r.unwrap();
+        }
+        let all = store.list().unwrap();
+        let res = store.restore(&all);
+        assert_eq!(res.restored, std::slice::from_ref(&plain));
+        assert_eq!(res.errors.len(), 1);
+        assert!(res.errors[0].contains(SYMLINK_MSG), "{:?}", res.errors);
+        assert!(res.errors[0].contains("link"));
+        assert!(link.symlink_metadata().is_err(), "no stray dir or link");
+        assert_eq!(store.count(), 1, "the link stays in the trash");
+        assert_eq!(
+            store.restore_calls.lock().unwrap().last().unwrap(),
+            std::slice::from_ref(&plain),
+            "the backend never sees the symlink item"
+        );
     }
 
     // ---- delete_with ----
@@ -900,6 +1121,21 @@ mod tests {
         assert_eq!(r[0], (gone, Ok(())), "already trashed by the bulk call");
         assert_eq!(r[1], (left, Ok(())));
         assert_eq!(r[2], (bad, Err("denied".into())));
+    }
+
+    #[test]
+    fn delete_with_bulk_failure_only_treats_not_found_as_trashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        // "file/child": stat fails with ENOTDIR, which is not "already gone".
+        let weird = file.join("child");
+        let gone = dir.path().join("gone");
+        let paths = vec![gone.clone(), weird.clone()];
+        let r = delete_with(&paths, |_| Err("bulk".into()), |_| Err("single".into()));
+        assert_eq!(r[0], (gone, Ok(())));
+        assert_eq!(r[1].0, weird);
+        assert!(r[1].1.is_err(), "not-found only; other errors are failures");
     }
 
     #[test]
@@ -1039,5 +1275,55 @@ mod tests {
         store.purge(&found).unwrap();
         assert!(find(&store).is_empty());
         assert!(!path.exists());
+    }
+
+    /// A symlink to a directory must come back as the same symlink, or be
+    /// refused by hdir's guard; never as a stray empty directory. Run on Linux
+    /// with `cargo test real_linux_ -- --ignored`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "touches the real user trash"]
+    fn real_linux_symlink_to_dir_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target-dir");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inner"), "x").unwrap();
+        let link = dir.path().join(format!("hdir-link-{}", now_secs()));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let store = SystemTrash;
+        let find = || {
+            store
+                .list()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.original_path().as_deref() == Some(link.as_path()))
+                .collect::<Vec<_>>()
+        };
+        assert!(store.delete(std::slice::from_ref(&link))[0].1.is_ok());
+        assert!(link.symlink_metadata().is_err());
+        let found = find();
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].is_dir, "listed as a symlink, not a directory");
+
+        // hdir's guard: refused, nothing (no empty dir) appears.
+        let r = store.restore(&found);
+        assert!(r.restored.is_empty(), "{r:?}");
+        assert!(r.errors[0].contains(SYMLINK_MSG), "{r:?}");
+        assert!(link.symlink_metadata().is_err(), "no stray empty dir");
+
+        // What the crate itself does (why the guard exists): the result must
+        // still be the same symlink.
+        let raw = trash::os_limited::restore_all(found.iter().map(|e| e.item.clone()));
+        let meta = link.symlink_metadata();
+        let kept = raw.is_ok()
+            && meta.as_ref().is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::read_link(&link).ok().as_deref() == Some(target.as_path());
+        if meta.is_ok() {
+            let _ = std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir(&link));
+        } else {
+            let _ = store.purge(&find());
+        }
+        assert!(kept, "crate restore_all broke the symlink: {raw:?}");
+        assert!(target.join("inner").exists());
     }
 }

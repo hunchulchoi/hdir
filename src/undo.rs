@@ -1,9 +1,11 @@
 //! Undo stack for reversible file operations (no terminal IO).
 
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::trash::TrashBackend;
+use crate::trash::{TrashBackend, TrashEntry, TrashedItem};
 
 const CAP: usize = 50;
 
@@ -24,9 +26,8 @@ pub enum UndoOp {
     },
     /// Items sent to the trash; undo restores them to their original paths.
     Trash {
-        paths: Vec<PathBuf>,
-        /// Unix seconds when the F8 started.
-        since: i64,
+        /// The exact entries F8 created (id + original path + time).
+        items: Vec<TrashedItem>,
     },
 }
 
@@ -164,50 +165,82 @@ fn apply_with(
                 retry,
             }
         }
-        UndoOp::Trash { paths, since } => {
+        UndoOp::Trash { items } => {
             let Some(store) = store else {
                 return done(Err("휴지통을 사용할 수 없음".into()));
             };
-            undo_trash(store, paths, since)
+            undo_trash(store, items)
         }
     }
 }
 
-/// Undo an F8 through the OS trash. With an in-app view the just-trashed items
-/// are found again and restored (never overwriting); otherwise the OS file
-/// manager is opened and the op is consumed.
-fn undo_trash(store: &dyn TrashBackend, paths: Vec<PathBuf>, since: i64) -> UndoApplied {
-    let done = |message| UndoApplied {
-        message,
-        retry: None,
-    };
+/// Undo an F8 through the OS trash. With an in-app view the exact entries
+/// F8 created are found again (id, original path and time must all match) and
+/// restored, never overwriting; otherwise the OS file manager is opened and
+/// the op is consumed. Whatever could not be restored stays for a retry.
+fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied {
     if !store.supports_view() {
-        return done(
-            store
+        return UndoApplied {
+            message: store
                 .open_os_trash()
                 .map(|()| "Finder 휴지통에서 '되돌려 놓기'로 복원하세요".to_string()),
-        );
+            retry: None,
+        };
     }
     let list = match store.list() {
         Ok(l) => l,
-        Err(e) => return done(Err(format!("되돌릴 수 없음: {e}"))),
+        Err(e) => {
+            return UndoApplied {
+                message: Err(format!("되돌릴 수 없음: {e}")),
+                retry: Some(UndoOp::Trash { items }),
+            };
+        }
     };
-    let found = crate::trash::find_trashed(&list, &paths, since);
-    if found.is_empty() {
-        return done(Err("되돌릴 수 없음: 휴지통에서 찾을 수 없음".into()));
+    let by_id: HashMap<&OsStr, &TrashEntry> = list.iter().map(|e| (e.id(), e)).collect();
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for it in items {
+        match by_id.get(it.id.as_os_str()) {
+            Some(e)
+                if e.original_path().as_deref() == Some(it.path.as_path())
+                    && e.item.time_deleted == it.time_deleted =>
+            {
+                found.push(((*e).clone(), it));
+            }
+            _ => missing.push(it),
+        }
     }
-    let res = store.restore(&found);
-    if res.collisions.is_empty() && res.errors.is_empty() {
-        return done(Ok(format!("되돌림: 휴지통 복원 {}개", res.restored.len())));
+    let mut parts = Vec::new();
+    let mut retry_items = Vec::new();
+    let mut problem = !missing.is_empty();
+    if !found.is_empty() {
+        let entries: Vec<TrashEntry> = found.iter().map(|(e, _)| e.clone()).collect();
+        let res = store.restore(&entries);
+        if res.collisions.is_empty() && res.errors.is_empty() {
+            parts.push(format!("되돌림: 휴지통 복원 {}개", res.restored.len()));
+        } else {
+            problem = true;
+            parts.push(format!("되돌림 일부 실패: {}", res.summary()));
+            // Collisions can be retried once the blocker is gone.
+            retry_items.extend(
+                found
+                    .into_iter()
+                    .filter(|(_, it)| res.collisions.contains(&it.path))
+                    .map(|(_, it)| it),
+            );
+        }
     }
-    // Collisions can be retried once the blocker is gone.
-    let retry = (!res.collisions.is_empty()).then(|| UndoOp::Trash {
-        paths: res.collisions.clone(),
-        since,
-    });
+    if !missing.is_empty() {
+        parts.push(format!(
+            "일부 항목을 휴지통에서 찾지 못함: {}개",
+            missing.len()
+        ));
+        retry_items.extend(missing);
+    }
+    let message = parts.join(" · ");
     UndoApplied {
-        message: Err(format!("되돌림 일부 실패: {}", res.summary())),
-        retry,
+        message: if problem { Err(message) } else { Ok(message) },
+        retry: (!retry_items.is_empty()).then_some(UndoOp::Trash { items: retry_items }),
     }
 }
 
@@ -472,19 +505,28 @@ mod tests {
     /// A trash op that matches nothing (never applied in these tests).
     fn trash_op(i: usize) -> UndoOp {
         UndoOp::Trash {
-            paths: vec![PathBuf::from(format!("/nonexistent/hdir-undo-test/{i}"))],
-            since: i as i64,
+            items: vec![TrashedItem {
+                id: format!("none{i}").into(),
+                path: PathBuf::from(format!("/nonexistent/hdir-undo-test/{i}")),
+                time_deleted: i as i64,
+            }],
         }
     }
 
     /// F8 on `paths` through the fake; the op the app would push.
     fn trash_files(store: &FakeTrash, paths: &[&Path]) -> UndoOp {
-        let since = crate::trash::now_secs();
         let paths: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
-        for (_, r) in store.delete(&paths) {
-            r.unwrap();
+        let t = crate::trash::delete_tracked(store, &paths);
+        assert!(t.results.iter().all(|(_, r)| r.is_ok()));
+        assert_eq!(t.lost, 0);
+        UndoOp::Trash { items: t.undo }
+    }
+
+    fn items_of(op: &UndoOp) -> Vec<TrashedItem> {
+        match op {
+            UndoOp::Trash { items } => items.clone(),
+            other => panic!("not a trash op: {other:?}"),
         }
-        UndoOp::Trash { paths, since }
     }
 
     #[test]
@@ -505,26 +547,72 @@ mod tests {
     }
 
     #[test]
-    fn undo_trash_only_restores_items_trashed_since_the_op_started() {
+    fn undo_trash_leaves_an_older_item_with_the_same_path_alone() {
         let store = FakeTrash::new();
         let t = tempfile::tempdir().unwrap();
         let a = t.path().join("a.txt");
         fs::write(&a, "old").unwrap();
         store.delete(std::slice::from_ref(&a));
-        // An older item with the same original path stays in the trash.
-        let since = store.list().unwrap()[0].item.time_deleted + 1;
         fs::write(&a, "new").unwrap();
-        let op = {
-            store.delete(std::slice::from_ref(&a));
-            UndoOp::Trash {
-                paths: vec![a.clone()],
-                since,
-            }
-        };
+        let op = trash_files(&store, &[&a]);
         let r = UndoStack::apply_with_store(op, &store);
         assert!(r.message.is_ok(), "{:?}", r.message);
         assert_eq!(fs::read_to_string(&a).unwrap(), "new");
         assert_eq!(store.count(), 1, "the older item is untouched");
+    }
+
+    #[test]
+    fn same_second_double_delete_of_one_path_restores_the_right_item() {
+        for reverse in [false, true] {
+            let store = FakeTrash::new();
+            *store.fixed_time.lock().unwrap() = Some(1_700_000_000);
+            store
+                .reverse_list
+                .store(reverse, std::sync::atomic::Ordering::SeqCst);
+            let t = tempfile::tempdir().unwrap();
+            let a = t.path().join("a.txt");
+            fs::write(&a, "first").unwrap();
+            let op1 = trash_files(&store, &[&a]);
+            fs::write(&a, "second").unwrap();
+            let op2 = trash_files(&store, &[&a]);
+            let (i1, i2) = (items_of(&op1), items_of(&op2));
+            assert_ne!(i1[0].id, i2[0].id);
+            assert_eq!(i1[0].time_deleted, i2[0].time_deleted);
+            let r = UndoStack::apply_with_store(op2, &store);
+            assert!(r.message.is_ok(), "{:?}", r.message);
+            assert_eq!(
+                fs::read_to_string(&a).unwrap(),
+                "second",
+                "reverse={reverse}"
+            );
+            fs::remove_file(&a).unwrap();
+            let r = UndoStack::apply_with_store(op1, &store);
+            assert!(r.message.is_ok(), "{:?}", r.message);
+            assert_eq!(
+                fs::read_to_string(&a).unwrap(),
+                "first",
+                "reverse={reverse}"
+            );
+        }
+    }
+
+    #[test]
+    fn undo_trash_refuses_a_reused_id_with_a_different_identity() {
+        let store = FakeTrash::new();
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a.txt");
+        fs::write(&a, "A").unwrap();
+        let mut items = items_of(&trash_files(&store, &[&a]));
+        items[0].time_deleted += 1;
+        let r = UndoStack::apply_with_store(
+            UndoOp::Trash {
+                items: items.clone(),
+            },
+            &store,
+        );
+        assert!(r.message.unwrap_err().contains("찾지 못함: 1개"));
+        assert_eq!(r.retry, Some(UndoOp::Trash { items }));
+        assert!(!a.exists(), "nothing restored");
     }
 
     #[test]
@@ -542,28 +630,72 @@ mod tests {
         assert!(msg.contains("b.txt"), "{msg}");
         assert_eq!(fs::read_to_string(&a).unwrap(), "A");
         assert_eq!(fs::read_to_string(&b).unwrap(), "new b");
-        let Some(UndoOp::Trash { paths, since }) = r.retry else {
+        let Some(retry @ UndoOp::Trash { .. }) = r.retry else {
             panic!("expected retry");
         };
-        assert_eq!(paths, vec![b.clone()]);
+        assert_eq!(items_of(&retry).len(), 1);
+        assert_eq!(items_of(&retry)[0].path, b);
         // retry works once the blocker is gone
         fs::remove_file(&b).unwrap();
-        let r = UndoStack::apply_with_store(UndoOp::Trash { paths, since }, &store);
+        let r = UndoStack::apply_with_store(retry, &store);
         assert!(r.message.is_ok() && r.retry.is_none());
         assert_eq!(fs::read_to_string(&b).unwrap(), "B");
     }
 
     #[test]
-    fn undo_trash_item_gone_from_trash_is_reported_without_retry() {
+    fn undo_trash_item_gone_from_trash_is_reported_and_kept_for_retry() {
+        let store = FakeTrash::new();
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a.txt"), t.path().join("b.txt"));
+        fs::write(&a, "A").unwrap();
+        fs::write(&b, "B").unwrap();
+        let op = trash_files(&store, &[&a, &b]);
+        let gone = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.name() == "a.txt")
+            .collect::<Vec<_>>();
+        store.purge(&gone).unwrap();
+        let r = UndoStack::apply_with_store(op, &store);
+        let msg = r.message.unwrap_err();
+        assert!(
+            msg.contains("일부 항목을 휴지통에서 찾지 못함: 1개"),
+            "{msg}"
+        );
+        assert_eq!(fs::read_to_string(&b).unwrap(), "B", "the rest is restored");
+        let retry = r.retry.expect("missing item kept for retry");
+        assert_eq!(items_of(&retry).len(), 1);
+        assert_eq!(items_of(&retry)[0].path, a);
+    }
+
+    #[test]
+    fn undo_trash_listing_failure_keeps_the_whole_op_for_retry() {
         let store = FakeTrash::new();
         let t = tempfile::tempdir().unwrap();
         let a = t.path().join("a.txt");
         fs::write(&a, "A").unwrap();
         let op = trash_files(&store, &[&a]);
-        store.purge(&store.list().unwrap()).unwrap();
+        *store.fail_list.lock().unwrap() = Some("busy".into());
+        let r = UndoStack::apply_with_store(op.clone(), &store);
+        assert!(r.message.unwrap_err().contains("busy"));
+        assert_eq!(r.retry, Some(op.clone()));
+        *store.fail_list.lock().unwrap() = None;
         let r = UndoStack::apply_with_store(op, &store);
-        assert!(r.message.is_err());
-        assert!(r.retry.is_none());
+        assert!(r.message.is_ok());
+        assert_eq!(fs::read_to_string(&a).unwrap(), "A");
+    }
+
+    #[test]
+    fn delete_tracked_without_listing_reports_lost_undo_info() {
+        let store = FakeTrash::new();
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a.txt");
+        fs::write(&a, "A").unwrap();
+        *store.fail_list.lock().unwrap() = Some("nope".into());
+        let d = crate::trash::delete_tracked(&store, std::slice::from_ref(&a));
+        assert!(d.results[0].1.is_ok() && d.undo.is_empty());
+        assert_eq!(d.lost, 1);
     }
 
     #[test]
