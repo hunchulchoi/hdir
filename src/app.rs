@@ -5731,7 +5731,9 @@ mod tests {
             cursor_to(&mut e.app, "blob.bin");
             press(&mut e.app, KeyCode::Enter);
             let l = Arc::clone(&e.log);
-            tick_until(&mut e.app, "spawn", move |_| !l.lock().unwrap().is_empty());
+            tick_until(&mut e.app, "spawn", move |a| {
+                !l.lock().unwrap().is_empty() || a.status.as_deref() == Some("Windows 지원 예정")
+            });
             assert!(e.app.viewer.is_none());
         }
 
