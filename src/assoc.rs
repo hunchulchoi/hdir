@@ -413,6 +413,7 @@ mod tests {
     fn esc(x: &str) -> String {
         s(shell_escape(OsStr::new(x)))
     }
+    #[cfg(unix)]
     fn render(t: &str, p: &str) -> String {
         s(render_command(t, Path::new(p), Path::new("/cwd")))
     }
