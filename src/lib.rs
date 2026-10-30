@@ -4,6 +4,7 @@ pub mod app;
 pub mod dialog;
 pub mod fs_ops;
 pub mod job;
+pub mod keymap;
 pub mod loader;
 pub mod panel;
 pub mod platform;
