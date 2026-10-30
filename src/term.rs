@@ -18,7 +18,9 @@ pub fn init() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
         let _ = restore();
         return Err(e);
     }
-    Terminal::new(CrosstermBackend::new(stdout))
+    Terminal::new(CrosstermBackend::new(stdout)).inspect_err(|_| {
+        let _ = restore();
+    })
 }
 
 /// Leave the alternate screen, show the cursor, disable raw mode.

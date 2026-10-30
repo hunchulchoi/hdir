@@ -36,6 +36,7 @@ pub struct View<'a> {
     pub active: usize,
     pub status: Option<&'a str>,
     pub shell: &'a str,
+    pub os: &'a str,
 }
 
 const FKEYS: [(&str, &str); 10] = [
@@ -208,7 +209,7 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool) {
         .skip(offset)
         .take(rows)
         .map(|(i, e)| {
-            let sel = panel.selected.contains(&e.name);
+            let sel = panel.selected.contains(&e.os_name);
             let mut style = entry_style(e, sel);
             if active && i == panel.cursor {
                 style = style.bg(palette::CURSOR_BG).fg(palette::CURSOR_FG);
@@ -279,7 +280,7 @@ pub fn draw(frame: &mut Frame, view: &View) {
         crate::APP_NAME,
         crate::VERSION,
         view.shell,
-        std::env::consts::OS
+        view.os
     );
     frame.render_widget(
         Paragraph::new(fit_width(&header, area.width as usize))
@@ -360,6 +361,7 @@ mod tests {
             active,
             status,
             shell: "zsh",
+            os: "macos",
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -424,6 +426,79 @@ mod tests {
         let buf = render(&pa, &pb, 0, Some("custom msg"), 80, 24);
         assert!(row(&buf, 22).contains("custom msg"));
         assert!(row(&buf, 20).contains("boom failure"));
+    }
+
+    fn fixed_panel(cwd: &str, names: &[(&str, EntryKind, u64)]) -> Panel {
+        let mut entries = vec![Entry {
+            name: "..".into(),
+            os_name: "..".into(),
+            kind: EntryKind::Parent,
+            size: 0,
+            modified: None,
+            mode: 0,
+            hidden: false,
+        }];
+        for (n, kind, size) in names {
+            entries.push(Entry {
+                name: (*n).into(),
+                os_name: (*n).into(),
+                kind: kind.clone(),
+                size: *size,
+                modified: None,
+                mode: 0o644,
+                hidden: false,
+            });
+        }
+        Panel {
+            cwd: cwd.into(),
+            entries,
+            cursor: 0,
+            scroll: 0,
+            show_hidden: false,
+            selected: Default::default(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn full_buffer_snapshot_60x12() {
+        let mut pa = fixed_panel(
+            "/tmp/a",
+            &[
+                ("src", EntryKind::Dir, 0),
+                ("a.txt", EntryKind::File, 5),
+                ("b.bin", EntryKind::File, 1536),
+            ],
+        );
+        pa.selected.insert("b.bin".into());
+        let pb = fixed_panel("/tmp/b", &[("docs", EntryKind::Dir, 0)]);
+        let buf = render(&pa, &pb, 0, None, 60, 12);
+        let got: Vec<String> = (0..12).map(|y| row(&buf, y)).collect();
+        let expected = [
+            format!(" ■ hdir {} · zsh · macos · UTF-8", crate::VERSION),
+            "┌/tmp/a──────────────────────┐┌/tmp/b──────────────────────┐".to_string(),
+            "│ ..                 <UP-DIR>││ ..                 <UP-DIR>│".to_string(),
+            "│ src                   <DIR>││ docs                  <DIR>│".to_string(),
+            "│ a.txt                    5B││                            │".to_string(),
+            "│*b.bin                  1.5K││                            │".to_string(),
+            "│                            ││                            │".to_string(),
+            "│                            ││                            │".to_string(),
+            "│                            ││                            │".to_string(),
+            "└────────────────────────────┘└────────────────────────────┘".to_string(),
+            " 2 files · 1 dirs".to_string(),
+            "1Help 2Rena…3View 4Edit 5Copy 6Move 7Mkdir8Del  9Menu 10Quit".to_string(),
+        ]
+        .map(|l| fit_width(&l, 60));
+        assert_eq!(got.join("\n"), expected.join("\n"));
+
+        // active cursor row, directory, and selected styles
+        assert_eq!(buf[(2, 2)].bg, palette::CURSOR_BG);
+        assert_eq!(buf[(2, 2)].fg, palette::CURSOR_FG);
+        assert_eq!(buf[(2, 3)].fg, palette::DIR);
+        assert_eq!(buf[(2, 3)].bg, palette::BG);
+        assert_eq!(buf[(2, 5)].fg, palette::SELECTED);
+        // inactive panel has no cursor background
+        assert_ne!(buf[(32, 2)].bg, palette::CURSOR_BG);
     }
 
     #[test]

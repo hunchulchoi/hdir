@@ -1,7 +1,9 @@
 //! Panel state: directory loading, sorting, hidden toggle (pure logic, no UI).
 
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -15,7 +17,10 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone)]
 pub struct Entry {
+    /// Lossy display name.
     pub name: String,
+    /// Exact filesystem name; use for all path joins and identity checks.
+    pub os_name: OsString,
     pub kind: EntryKind,
     pub size: u64,
     pub modified: Option<SystemTime>,
@@ -37,7 +42,7 @@ pub struct Panel {
     pub cursor: usize,
     pub scroll: usize,
     pub show_hidden: bool,
-    pub selected: HashSet<String>,
+    pub selected: HashSet<OsString>,
     pub error: Option<String>,
 }
 
@@ -58,23 +63,29 @@ impl Panel {
         panel
     }
 
-    /// Re-read `cwd`, keeping the cursor on the same entry name when possible.
+    /// Re-read `cwd`, keeping the cursor on the same entry when possible and
+    /// pruning selections that no longer exist in the listing.
     pub fn reload(&mut self) {
-        let keep = self.current().map(|e| e.name.clone());
-        match load_entries(&self.cwd, self.show_hidden) {
-            Ok(entries) => {
-                self.entries = entries;
-                self.error = None;
-            }
-            Err((entries, msg)) => {
-                self.entries = entries;
+        let keep = self.current().map(|e| e.os_name.clone());
+        match read_listing(&self.cwd, self.show_hidden) {
+            Ok(listing) => self.apply_listing(listing),
+            Err(msg) => {
+                self.entries = parent_only(&self.cwd);
                 self.error = Some(msg);
             }
         }
-        let found = keep.and_then(|n| self.entries.iter().position(|e| e.name == n));
+        let found = keep.and_then(|n| self.entries.iter().position(|e| e.os_name == n));
         self.cursor = found.unwrap_or(self.cursor);
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
         self.scroll = self.scroll.min(self.cursor);
+        let entries = &self.entries;
+        self.selected
+            .retain(|n| entries.iter().any(|e| e.os_name == *n));
+    }
+
+    fn apply_listing(&mut self, (entries, skipped): (Vec<Entry>, usize)) {
+        self.entries = entries;
+        self.error = (skipped > 0).then(|| format!("{skipped}개 항목을 읽지 못함"));
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -126,15 +137,23 @@ impl Panel {
         }
     }
 
-    /// Change directory, reset view state and reload; cursor lands on `focus` if present.
-    fn change_dir(&mut self, dir: PathBuf, focus: Option<&str>) {
+    /// Change directory, reset view state; cursor lands on `focus` if present.
+    /// If the target cannot be read, the current location is kept and only
+    /// `error` is set.
+    fn change_dir(&mut self, dir: PathBuf, focus: Option<&OsStr>) {
+        let listing = match read_listing(&dir, self.show_hidden) {
+            Ok(l) => l,
+            Err(msg) => {
+                self.error = Some(msg);
+                return;
+            }
+        };
         self.cwd = dir;
-        self.entries.clear();
         self.cursor = 0;
         self.scroll = 0;
         self.selected.clear();
-        self.reload();
-        if let Some(i) = focus.and_then(|n| self.entries.iter().position(|e| e.name == n)) {
+        self.apply_listing(listing);
+        if let Some(i) = focus.and_then(|n| self.entries.iter().position(|e| e.os_name == n)) {
             self.cursor = i;
         }
     }
@@ -145,10 +164,7 @@ impl Panel {
         let Some(parent) = self.cwd.parent().map(Path::to_path_buf) else {
             return false;
         };
-        let from = self
-            .cwd
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
+        let from = self.cwd.file_name().map(OsStr::to_os_string);
         self.change_dir(parent, from.as_deref());
         true
     }
@@ -169,11 +185,11 @@ impl Panel {
             | EntryKind::Symlink {
                 target_is_dir: true,
             } => {
-                let dir = self.cwd.join(&entry.name);
+                let dir = self.cwd.join(&entry.os_name);
                 self.change_dir(dir, None);
                 EnterResult::Entered
             }
-            _ => EnterResult::Opened(self.cwd.join(&entry.name)),
+            _ => EnterResult::Opened(self.cwd.join(&entry.os_name)),
         }
     }
 }
@@ -181,6 +197,7 @@ impl Panel {
 fn parent_entry() -> Entry {
     Entry {
         name: "..".to_string(),
+        os_name: "..".into(),
         kind: EntryKind::Parent,
         size: 0,
         modified: None,
@@ -200,44 +217,60 @@ fn mode_of(_meta: &fs::Metadata) -> u32 {
     0
 }
 
-/// Returns entries, or (entries-so-far, error message) when the directory is unreadable.
-fn load_entries(cwd: &Path, show_hidden: bool) -> Result<Vec<Entry>, (Vec<Entry>, String)> {
-    let has_parent = cwd.parent().is_some();
-    let parent = || {
-        has_parent
-            .then(parent_entry)
-            .into_iter()
-            .collect::<Vec<_>>()
-    };
-    let rd = fs::read_dir(cwd).map_err(|e| (parent(), format!("{}: {}", cwd.display(), e)))?;
+fn parent_only(cwd: &Path) -> Vec<Entry> {
+    cwd.parent().map(|_| parent_entry()).into_iter().collect()
+}
 
-    let mut items: Vec<Entry> = rd
-        .filter_map(|r| r.ok())
-        .filter_map(|de| {
-            let name = de.file_name().to_string_lossy().into_owned();
-            let hidden = name.starts_with('.');
-            if hidden && !show_hidden {
-                return None;
-            }
-            let meta = fs::symlink_metadata(de.path()).ok()?;
-            let kind = if meta.file_type().is_symlink() {
-                let target_is_dir = fs::metadata(de.path()).map(|m| m.is_dir()).unwrap_or(false);
-                EntryKind::Symlink { target_is_dir }
-            } else if meta.is_dir() {
-                EntryKind::Dir
-            } else {
-                EntryKind::File
-            };
-            Some(Entry {
-                name,
-                kind,
-                size: meta.len(),
-                modified: meta.modified().ok(),
-                mode: mode_of(&meta),
-                hidden,
-            })
-        })
-        .collect();
+/// Entries (with `..` first) plus the number of items skipped due to errors,
+/// or an error message when the directory itself is unreadable.
+fn read_listing(cwd: &Path, show_hidden: bool) -> Result<(Vec<Entry>, usize), String> {
+    let rd = fs::read_dir(cwd).map_err(|e| format!("{}: {}", cwd.display(), e))?;
+    let names = rd.map(|r| r.map(|de| de.file_name()));
+    Ok(build_listing(cwd, names, show_hidden))
+}
+
+/// Build the sorted listing from directory item names; items that errored
+/// (iteration or metadata) are counted, not shown.
+fn build_listing(
+    cwd: &Path,
+    names: impl Iterator<Item = io::Result<OsString>>,
+    show_hidden: bool,
+) -> (Vec<Entry>, usize) {
+    let mut skipped = 0;
+    let mut items: Vec<Entry> = Vec::new();
+    for r in names {
+        let Ok(os_name) = r else {
+            skipped += 1;
+            continue;
+        };
+        let name = os_name.to_string_lossy().into_owned();
+        let hidden = name.starts_with('.');
+        if hidden && !show_hidden {
+            continue;
+        }
+        let path = cwd.join(&os_name);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            skipped += 1;
+            continue;
+        };
+        let kind = if meta.file_type().is_symlink() {
+            let target_is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+            EntryKind::Symlink { target_is_dir }
+        } else if meta.is_dir() {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        };
+        items.push(Entry {
+            name,
+            os_name,
+            kind,
+            size: meta.len(),
+            modified: meta.modified().ok(),
+            mode: mode_of(&meta),
+            hidden,
+        });
+    }
 
     let is_dirlike = |e: &Entry| {
         matches!(
@@ -252,12 +285,12 @@ fn load_entries(cwd: &Path, show_hidden: bool) -> Result<Vec<Entry>, (Vec<Entry>
         is_dirlike(b)
             .cmp(&is_dirlike(a))
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.os_name.cmp(&b.os_name))
     });
 
-    let mut out = parent();
+    let mut out = parent_only(cwd);
     out.extend(items);
-    Ok(out)
+    (out, skipped)
 }
 
 #[cfg(test)]
@@ -547,22 +580,130 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn enter_unreadable_dir_sets_error_no_panic() {
+    fn enter_unreadable_dir_keeps_location_and_sets_error() {
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let d = t.path().join("locked");
         fs::create_dir(&d).unwrap();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
         let mut p = Panel::new(t.path());
+        let cwd = p.cwd.clone();
         p.cursor = 1;
+        p.selected.insert("keep".into());
         let r = p.enter();
         let readable = fs::read_dir(&d).is_ok();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(r, EnterResult::Entered);
-        assert!(p.cwd.ends_with("locked"));
         if !readable {
+            assert_eq!(r, EnterResult::Entered);
+            assert_eq!(p.cwd, cwd);
+            assert_eq!(names(&p), vec!["..", "locked"]);
+            assert_eq!(p.cursor, 1);
+            assert_eq!(p.selected.len(), 1);
             assert!(p.error.is_some());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_load_and_enter() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = tempfile::tempdir().unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"bad\xff");
+        if fs::create_dir(t.path().join(bad)).is_err() {
+            return; // filesystem (e.g. APFS) rejects non-UTF-8 names
+        }
+        fs::write(t.path().join(bad).join("in"), "").unwrap();
+        fs::write(t.path().join(std::ffi::OsStr::from_bytes(b"f\xfe")), "").unwrap();
+        let mut p = Panel::new(t.path());
+        assert!(p.error.is_none());
+        assert_eq!(p.entries.len(), 3);
+        p.cursor = p
+            .entries
+            .iter()
+            .position(|e| e.kind == EntryKind::Dir)
+            .unwrap();
+        assert_eq!(p.enter(), EnterResult::Entered);
+        assert!(p.error.is_none(), "{:?}", p.error);
+        assert!(p.cwd.ends_with(bad));
+        assert_eq!(names(&p), vec!["..", "in"]);
+        assert!(p.go_parent());
+        assert_eq!(p.current().unwrap().kind, EntryKind::Dir);
+        assert!(p.current().unwrap().name.starts_with("bad"));
+        // file opens with exact path
+        p.cursor = p.entries.len() - 1;
+        let EnterResult::Opened(path) = p.enter() else {
+            panic!("expected Opened")
+        };
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn paths_use_os_name_not_display_name() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("real")).unwrap();
+        fs::write(t.path().join("realf"), "").unwrap();
+        let mut p = Panel::new(t.path());
+        for e in &mut p.entries {
+            e.name = format!("shown-{}", e.name);
+        }
+        let i = p.entries.iter().position(|e| e.os_name == "realf").unwrap();
+        p.cursor = i;
+        assert_eq!(p.enter(), EnterResult::Opened(p.cwd.join("realf")));
+        p.cursor = p.entries.iter().position(|e| e.os_name == "real").unwrap();
+        assert_eq!(p.enter(), EnterResult::Entered);
+        assert!(p.cwd.ends_with("real"));
+        assert!(p.error.is_none());
+    }
+
+    #[test]
+    fn partial_read_errors_are_counted() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("ok"), "").unwrap();
+        let items: Vec<io::Result<OsString>> = vec![
+            Ok("ok".into()),
+            Err(io::Error::other("iter fail")),
+            Ok("vanished".into()), // metadata fails: no such file
+        ];
+        let (entries, skipped) = build_listing(t.path(), items.into_iter(), false);
+        assert_eq!(skipped, 2);
+        let n: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(n, vec!["..", "ok"]);
+    }
+
+    #[test]
+    fn apply_listing_sets_partial_error_message() {
+        let t = tempfile::tempdir().unwrap();
+        let mut p = Panel::new(t.path());
+        p.apply_listing((Vec::new(), 3));
+        assert_eq!(p.error.as_deref(), Some("3개 항목을 읽지 못함"));
+        p.apply_listing((Vec::new(), 0));
+        assert!(p.error.is_none());
+    }
+
+    #[test]
+    fn toggle_hidden_prunes_hidden_selection() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join(".hid"), "").unwrap();
+        fs::write(t.path().join("vis"), "").unwrap();
+        let mut p = Panel::new(t.path());
+        p.toggle_hidden();
+        p.selected.insert(".hid".into());
+        p.toggle_hidden();
+        assert!(p.selected.is_empty());
+    }
+
+    #[test]
+    fn reload_prunes_deleted_selection_keeps_existing() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "").unwrap();
+        fs::write(t.path().join("b"), "").unwrap();
+        let mut p = Panel::new(t.path());
+        p.selected.insert("a".into());
+        p.selected.insert("b".into());
+        fs::remove_file(t.path().join("a")).unwrap();
+        p.reload();
+        assert_eq!(p.selected.len(), 1);
+        assert!(p.selected.iter().all(|n| n == "b"));
     }
 
     #[test]

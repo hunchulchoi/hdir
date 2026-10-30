@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use hdir::app::App;
 use hdir::term;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event;
 
 fn main() -> anyhow::Result<()> {
     term::install_panic_hook();
@@ -18,12 +18,14 @@ fn run(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
+    let mut dirty = true;
     while app.running {
-        terminal.draw(|f| app.draw(f))?;
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
-        {
-            app.handle_key(key);
+        if dirty {
+            terminal.draw(|f| app.draw(f))?;
+            dirty = false;
+        }
+        if event::poll(Duration::from_millis(50))? {
+            dirty = app.handle_event(event::read()?);
         }
     }
     Ok(())

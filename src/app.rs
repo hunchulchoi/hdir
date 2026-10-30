@@ -1,9 +1,10 @@
 //! Application state and key handling (no terminal IO).
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 
 use crate::panel::{EnterResult, EntryKind, Panel};
 use crate::ui::{self, View};
@@ -67,16 +68,28 @@ impl App {
 
     /// Selected names (sorted) in the active panel, else the current entry
     /// unless it is the `..` entry.
-    pub fn selected_or_current(&self) -> Vec<String> {
+    pub fn selected_or_current(&self) -> Vec<OsString> {
         let panel = self.active_panel();
         if !panel.selected.is_empty() {
-            let mut names: Vec<String> = panel.selected.iter().cloned().collect();
+            let mut names: Vec<OsString> = panel.selected.iter().cloned().collect();
             names.sort();
             return names;
         }
         match panel.current() {
-            Some(e) if e.kind != EntryKind::Parent => vec![e.name.clone()],
+            Some(e) if e.kind != EntryKind::Parent => vec![e.os_name.clone()],
             _ => Vec::new(),
+        }
+    }
+
+    /// Handle a terminal event; returns true when the screen needs a redraw.
+    pub fn handle_event(&mut self, event: Event) -> bool {
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                self.handle_key(key);
+                true
+            }
+            Event::Resize(..) => true,
+            _ => false,
         }
     }
 
@@ -116,7 +129,7 @@ impl App {
                 if let Some(e) = panel.current()
                     && e.kind != EntryKind::Parent
                 {
-                    let name = e.name.clone();
+                    let name = e.os_name.clone();
                     if !panel.selected.remove(&name) {
                         panel.selected.insert(name);
                     }
@@ -152,6 +165,7 @@ impl App {
             active: self.active,
             status: self.status.as_deref(),
             shell: &self.shell,
+            os: std::env::consts::OS,
         };
         ui::draw(frame, &view);
     }
@@ -163,6 +177,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
+    use std::ffi::OsStr;
     use std::fs;
     use tempfile::TempDir;
 
@@ -322,11 +337,11 @@ mod tests {
         let (_t, mut app) = fixture();
         press(&mut app, KeyCode::Down); // adir
         press(&mut app, KeyCode::Char(' '));
-        assert!(app.panels[0].selected.contains("adir"));
+        assert!(app.panels[0].selected.contains(OsStr::new("adir")));
         assert_eq!(name_at(&app, 0), "bdir");
         press(&mut app, KeyCode::Up);
         press(&mut app, KeyCode::Char(' '));
-        assert!(!app.panels[0].selected.contains("adir"));
+        assert!(!app.panels[0].selected.contains(OsStr::new("adir")));
     }
 
     #[test]
@@ -341,7 +356,7 @@ mod tests {
         let (_t, mut app) = fixture();
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Insert);
-        assert!(app.panels[0].selected.contains("adir"));
+        assert!(app.panels[0].selected.contains(OsStr::new("adir")));
         assert_eq!(name_at(&app, 0), "bdir");
         let (_t2, mut app2) = fixture();
         press(&mut app2, KeyCode::Insert);
@@ -353,7 +368,7 @@ mod tests {
         let (_t, mut app) = fixture();
         assert!(app.selected_or_current().is_empty()); // on ..
         press(&mut app, KeyCode::End);
-        assert_eq!(app.selected_or_current(), vec!["f.txt".to_string()]);
+        assert_eq!(app.selected_or_current(), vec![OsString::from("f.txt")]);
         press(&mut app, KeyCode::Home);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char(' ')); // adir
@@ -362,8 +377,33 @@ mod tests {
         press(&mut app, KeyCode::Home);
         assert_eq!(
             app.selected_or_current(),
-            vec!["adir".to_string(), "f.txt".to_string()]
+            vec![OsString::from("adir"), OsString::from("f.txt")]
         );
+    }
+
+    #[test]
+    fn hidden_toggle_drops_hidden_selection_from_selected_or_current() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::Char('.')); // show hidden: .., adir, bdir, .h, f.txt
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down); // .h
+        }
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.selected_or_current(), vec![OsString::from(".h")]);
+        press(&mut app, KeyCode::Char('.')); // hide again
+        assert!(app.active_panel().selected.is_empty());
+        let cur = app.active_panel().current().unwrap().os_name.clone();
+        assert_eq!(app.selected_or_current(), vec![cur]);
+    }
+
+    #[test]
+    fn handle_event_reports_whether_redraw_needed() {
+        let (_t, mut app) = fixture();
+        assert!(app.handle_event(Event::Key(key(KeyCode::Down, KeyEventKind::Press))));
+        assert!(app.handle_event(Event::Resize(80, 24)));
+        assert!(!app.handle_event(Event::Key(key(KeyCode::Down, KeyEventKind::Release))));
+        assert!(!app.handle_event(Event::FocusGained));
+        assert_eq!(app.panels[0].cursor, 1);
     }
 
     #[test]
