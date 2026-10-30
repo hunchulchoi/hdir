@@ -140,7 +140,15 @@ fn is_real_dir(p: &Path) -> bool {
 }
 
 fn validate_name(name: &str) -> io::Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+    // `\` separates components on Windows only; on unix it is an ordinary name character.
+    let sep = cfg!(windows) && name.contains('\\');
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+        || sep
+    {
         return Err(invalid("invalid file name"));
     }
     Ok(())
@@ -383,8 +391,20 @@ fn copy_symlink(
     acc: &mut Acc,
     approved: bool,
 ) -> io::Result<Step> {
+    copy_symlink_with(src, dest, ctl, acc, approved, &create_symlink)
+}
+
+/// [`copy_symlink`] with an injectable link creator `(target, link, src)`.
+fn copy_symlink_with(
+    src: &Path,
+    dest: &Path,
+    ctl: &mut dyn OpControl,
+    acc: &mut Acc,
+    approved: bool,
+    create: &dyn Fn(&Path, &Path, &Path) -> io::Result<()>,
+) -> io::Result<Step> {
     let tmp = temp_sibling(dest);
-    if let Err(e) = create_symlink(&fs::read_link(src)?, &tmp, src) {
+    if let Err(e) = create(&fs::read_link(src)?, &tmp, src) {
         if is_symlink_privilege_error(&e) {
             acc.skipped += 1;
             acc.warnings.push(format!(
@@ -1014,9 +1034,8 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::time::Duration;
     #[cfg(unix)]
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
     struct Ctl {
@@ -1296,7 +1315,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::create_dir(&dst).unwrap();
         fs::write(src.join("f"), "x").unwrap();
-        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
         let mut c = ctl();
         let r = move_items_with(std::slice::from_ref(&src), &dst, &mut c, &exdev);
         assert_eq!(r.outcome, OpOutcome::Done);
@@ -1341,7 +1360,7 @@ mod tests {
 
     #[test]
     fn cross_device_detection() {
-        assert!(is_cross_device(&io::Error::from_raw_os_error(18)));
+        assert!(is_cross_device(&crate::platform::test_exdev()));
         assert!(is_cross_device(&io::Error::from(
             io::ErrorKind::CrossesDevices
         )));
@@ -1440,7 +1459,7 @@ mod tests {
         assert!(d2.join("empty").is_dir());
         assert!(!e.exists());
         // EXDEV fallback path for an empty dir too.
-        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
         let e2 = s.join("empty2");
         fs::create_dir(&e2).unwrap();
         move_items_with(std::slice::from_ref(&e2), &d2, &mut ctl(), &exdev);
@@ -1530,7 +1549,7 @@ mod tests {
         }
         assert_eq!(fs::read_link(d.join("tree/abs_parent")).unwrap(), s);
         // Moving across devices also must not follow links.
-        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
         let d2 = _t.path().join("d2");
         fs::create_dir(&d2).unwrap();
         move_items_with(std::slice::from_ref(&tree), &d2, &mut ctl(), &exdev);
@@ -1558,6 +1577,8 @@ mod tests {
     #[test]
     fn awkward_file_names() {
         let (_t, s, d) = two_dirs();
+        // Windows rejects control characters and `" * ? < > | : \` in names.
+        #[cfg(unix)]
         let names = [
             "new\nline",
             "qu\"ote",
@@ -1567,15 +1588,22 @@ mod tests {
             "tab\tname",
             "it's $HOME `x`",
         ];
+        #[cfg(windows)]
+        let names = ["-dash", "--rf", "-", "it's $HOME `x`", "sp ace"];
         let mut srcs = vec![];
         for n in names {
             let p = s.join(n);
             fs::write(&p, n).unwrap();
             srcs.push(p);
         }
-        let dir = s.join("-dir\n\"q\"");
+        #[cfg(unix)]
+        let (dir_name, inner_name, odd_dir, odd_file) =
+            ("-dir\n\"q\"", "-in\nner", "-x\ny", "--z\"");
+        #[cfg(windows)]
+        let (dir_name, inner_name, odd_dir, odd_file) = ("-dir 'q'", "-in ner", "-x y", "--z'");
+        let dir = s.join(dir_name);
         fs::create_dir(&dir).unwrap();
-        fs::write(dir.join("-in\nner"), "i").unwrap();
+        fs::write(dir.join(inner_name), "i").unwrap();
         srcs.push(dir);
         let tot = measure(&srcs).unwrap();
         let mut c = ctl();
@@ -1585,21 +1613,18 @@ mod tests {
             assert_eq!(fs::read_to_string(d.join(n)).unwrap(), n);
         }
         assert_eq!(
-            fs::read_to_string(d.join("-dir\n\"q\"/-in\nner")).unwrap(),
+            fs::read_to_string(d.join(format!("{dir_name}/{inner_name}"))).unwrap(),
             "i"
         );
         let d2 = _t.path().join("d2");
         fs::create_dir(&d2).unwrap();
         move_items(&srcs, &d2, &mut ctl());
-        assert_eq!(
-            fs::read_to_string(d2.join("new\nline")).unwrap(),
-            "new\nline"
-        );
+        assert_eq!(fs::read_to_string(d2.join(names[0])).unwrap(), names[0]);
         assert!(!s.join("-dash").exists());
         // make_dir / rename accept these as plain names.
-        let m = make_dir(&d2, "-x\ny").unwrap();
+        let m = make_dir(&d2, odd_dir).unwrap();
         assert!(m.is_dir());
-        let r = rename(&m, "--z\"").unwrap();
+        let r = rename(&m, odd_file).unwrap();
         assert!(r.is_dir());
     }
 
@@ -1650,7 +1675,7 @@ mod tests {
         assert_eq!(fs::read_to_string(copied.join("leaf")).unwrap(), "leaf");
         let d2 = _t.path().join("d2");
         fs::create_dir(&d2).unwrap();
-        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
         move_items_with(std::slice::from_ref(&root), &d2, &mut ctl(), &exdev);
         assert!(!root.exists());
         assert!(d2.join("root/l0").is_dir());
@@ -1739,6 +1764,7 @@ mod tests {
         assert_eq!(fs::read_to_string(s.join("f")).unwrap(), "new");
     }
 
+    #[cfg(unix)]
     #[test]
     fn fifo_in_tree_is_skipped_not_opened() {
         let (_t, s, d) = two_dirs();
@@ -1896,7 +1922,7 @@ mod tests {
         let (_t, s, d) = two_dirs();
         fs::create_dir(s.join("dir")).unwrap();
         fs::write(s.join("dir/f"), "x").unwrap();
-        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
         move_path_with(
             &s.join("dir"),
             &d.join("dir"),
@@ -2164,6 +2190,7 @@ mod tests {
         assert_eq!(r.removed_dirs, vec![s.join("x")]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn exdev_move_with_skipped_special_file_is_partial() {
         let (_t, s, d) = two_dirs();
@@ -2219,6 +2246,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&taken).unwrap(), "OTHER");
     }
 
+    #[cfg(unix)]
     #[test]
     fn copy_dir_over_file_with_fifo_child_restores_backup_as_partial() {
         let (_t, s, d) = dir_over_file_setup();
@@ -2743,5 +2771,204 @@ mod tests {
         let mut c = Ctl::new(ConflictAction::Skip);
         let r = move_items(&[s.join("a"), s.join("b")], &d, &mut c);
         assert_eq!(r.done_sources, vec![s.join("a")]);
+    }
+
+    // ---- Windows (HDIR-65) ----
+
+    #[cfg(windows)]
+    mod windows {
+        use super::*;
+        use crate::platform::test_exdev;
+
+        #[test]
+        fn readonly_attribute_is_copied_to_files() {
+            let (_t, s, d) = two_dirs();
+            let f = s.join("ro.txt");
+            fs::write(&f, "data").unwrap();
+            let mut p = fs::metadata(&f).unwrap().permissions();
+            p.set_readonly(true);
+            fs::set_permissions(&f, p).unwrap();
+            let r = copy_items(std::slice::from_ref(&f), &d, &mut ctl());
+            assert_eq!(r.outcome, OpOutcome::Done);
+            assert!(
+                fs::metadata(d.join("ro.txt"))
+                    .unwrap()
+                    .permissions()
+                    .readonly()
+            );
+            assert_eq!(names(&d), vec!["ro.txt"], "no temp leftovers");
+            // let the tempdir clean up
+            for p in [f, d.join("ro.txt")] {
+                let mut perm = fs::metadata(&p).unwrap().permissions();
+                perm.set_readonly(false);
+                fs::set_permissions(&p, perm).unwrap();
+            }
+        }
+
+        #[test]
+        fn overwrite_replaces_a_readonly_destination() {
+            let (_t, s, d) = two_dirs();
+            fs::write(s.join("f"), "NEW").unwrap();
+            fs::write(d.join("f"), "OLD").unwrap();
+            let mut perm = fs::metadata(d.join("f")).unwrap().permissions();
+            perm.set_readonly(true);
+            fs::set_permissions(d.join("f"), perm).unwrap();
+            let mut c = Ctl::new(ConflictAction::Overwrite);
+            let r = copy_items(&[s.join("f")], &d, &mut c);
+            assert_eq!(r.outcome, OpOutcome::Done, "{r:?}");
+            assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "NEW");
+        }
+
+        #[test]
+        fn rename_noreplace_is_atomic_and_never_replaces_files() {
+            let (_t, s, d) = two_dirs();
+            fs::write(s.join("f"), "NEW").unwrap();
+            fs::write(d.join("f"), "OLD").unwrap();
+            let e = rename_noreplace(&s.join("f"), &d.join("f")).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "OLD");
+            assert_eq!(fs::read_to_string(s.join("f")).unwrap(), "NEW");
+            rename_noreplace(&s.join("f"), &d.join("g")).unwrap();
+            assert_eq!(fs::read_to_string(d.join("g")).unwrap(), "NEW");
+        }
+
+        #[test]
+        fn rename_noreplace_moves_dirs_and_refuses_existing_targets() {
+            let (_t, s, d) = two_dirs();
+            fs::create_dir(s.join("x")).unwrap();
+            fs::write(s.join("x/in"), "i").unwrap();
+            rename_noreplace(&s.join("x"), &d.join("x")).unwrap();
+            assert_eq!(fs::read_to_string(d.join("x/in")).unwrap(), "i");
+            fs::create_dir(s.join("x")).unwrap();
+            let e = rename_noreplace(&s.join("x"), &d.join("x")).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert!(s.join("x").is_dir());
+        }
+
+        #[test]
+        fn rename_replace_overwrites_an_existing_file() {
+            let (_t, s, d) = two_dirs();
+            fs::write(s.join("f"), "NEW").unwrap();
+            fs::write(d.join("f"), "OLD").unwrap();
+            rename_replace(&s.join("f"), &d.join("f")).unwrap();
+            assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "NEW");
+            assert!(!s.join("f").exists());
+        }
+
+        #[test]
+        fn not_same_device_error_takes_the_cross_device_fallback() {
+            // ERROR_NOT_SAME_DEVICE (17) injected as the move's rename error.
+            assert!(is_cross_device(&test_exdev()));
+            assert!(!is_cross_device(&io::Error::from_raw_os_error(18)));
+            let (_t, s, d) = two_dirs();
+            fs::write(s.join("f"), "F").unwrap();
+            let r = move_items_with(&[s.join("f")], &d, &mut ctl(), &|_: &Path, _: &Path| {
+                Err(test_exdev())
+            });
+            assert_eq!(r.outcome, OpOutcome::Done, "{r:?}");
+            assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "F");
+            assert!(!s.join("f").exists());
+        }
+
+        #[test]
+        fn backslash_is_not_a_file_name() {
+            assert!(validate_name("a\\b").is_err());
+            assert!(validate_name("ab").is_ok());
+        }
+
+        #[test]
+        fn privilege_error_skips_a_symlink_with_a_warning() {
+            use std::os::windows::fs::symlink_file;
+            let (_t, s, d) = two_dirs();
+            fs::write(s.join("t"), "x").unwrap();
+            if symlink_file("t", s.join("l")).is_err() {
+                return; // no privilege to even build the fixture
+            }
+            let denied = |_: &Path, _: &Path, _: &Path| Err(io::Error::from_raw_os_error(1314));
+            let mut acc = Acc::default();
+            let step = copy_symlink_with(
+                &s.join("l"),
+                &d.join("l"),
+                &mut ctl(),
+                &mut acc,
+                false,
+                &denied,
+            )
+            .unwrap();
+            assert_eq!(step, Step::Skipped);
+            assert_eq!(acc.skipped, 1);
+            assert!(
+                acc.warnings[0].contains("symlink 생성 권한 없음 (개발자 모드 필요)"),
+                "{:?}",
+                acc.warnings
+            );
+            assert!(names(&d).is_empty());
+        }
+
+        #[test]
+        fn file_and_dir_symlinks_are_copied_as_links() {
+            use std::os::windows::fs::{symlink_dir, symlink_file};
+            let (_t, s, d) = two_dirs();
+            fs::write(s.join("t"), "x").unwrap();
+            fs::create_dir(s.join("td")).unwrap();
+            if symlink_file("t", s.join("lf")).is_err() || symlink_dir("td", s.join("ld")).is_err()
+            {
+                return; // symlinks need developer mode / privilege
+            }
+            let r = copy_items(&[s.join("lf"), s.join("ld")], &d, &mut ctl());
+            assert_eq!(r.outcome, OpOutcome::Done, "{r:?}");
+            for n in ["lf", "ld"] {
+                let m = fs::symlink_metadata(d.join(n)).unwrap();
+                assert!(m.file_type().is_symlink(), "{n}");
+            }
+            assert_eq!(fs::read_link(d.join("lf")).unwrap(), Path::new("t"));
+            // the dir link must be a *directory* symlink
+            assert!(fs::metadata(s.join("ld")).unwrap().is_dir());
+            assert!(
+                fs::metadata(d.join("ld")).is_err(),
+                "dangling here: td is not in d"
+            );
+            use std::os::windows::fs::FileTypeExt;
+            assert!(
+                fs::symlink_metadata(d.join("ld"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink_dir()
+            );
+        }
+
+        #[test]
+        fn source_symlink_is_not_opened_as_a_file() {
+            use std::os::windows::fs::symlink_file;
+            let (_t, s, _d) = two_dirs();
+            fs::write(s.join("t"), "x").unwrap();
+            if symlink_file("t", s.join("l")).is_err() {
+                return;
+            }
+            assert!(open_source(&s.join("l")).unwrap().is_none());
+            assert!(open_source(&s.join("t")).unwrap().is_some());
+            assert!(
+                open_source(&s).unwrap().is_none(),
+                "directories are not files"
+            );
+        }
+
+        #[test]
+        fn same_file_ignores_case_and_rejects_other_files() {
+            let (_t, s, _d) = two_dirs();
+            fs::write(s.join("Abc.txt"), "x").unwrap();
+            fs::write(s.join("other.txt"), "x").unwrap();
+            assert!(same_file(&s.join("Abc.txt"), &s.join("aBC.TXT")));
+            assert!(!same_file(&s.join("Abc.txt"), &s.join("other.txt")));
+            assert!(!same_file(&s.join("Abc.txt"), &s.join("missing")));
+        }
+
+        #[test]
+        fn temp_name_is_capped_by_characters() {
+            let long = "한".repeat(300);
+            let t = temp_sibling(Path::new(&format!("C:\\x\\{long}")));
+            let n = t.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(n.chars().count() < 160, "{}", n.chars().count());
+        }
     }
 }

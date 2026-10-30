@@ -770,9 +770,10 @@ mod tests {
         assert!(p.go_parent());
         assert_eq!(p.current().unwrap().name, "c");
         assert!(p.selected.is_empty());
-        let mut root = Panel::new("/");
+        let top = if cfg!(windows) { r"C:\" } else { "/" };
+        let mut root = Panel::new(top);
         assert!(!root.go_parent());
-        assert_eq!(root.cwd, PathBuf::from("/"));
+        assert_eq!(root.cwd, PathBuf::from(top).canonicalize().unwrap());
     }
 
     #[test]
@@ -1101,5 +1102,44 @@ mod tests {
         assert!(p.show_hidden);
         assert!(p.finish_load(load_of(&req, true)));
         assert!(names(&p).contains(&".hid"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readonly_attribute_maps_to_mode_444_else_666() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("rw.txt"), "x").unwrap();
+        fs::write(t.path().join("ro.txt"), "x").unwrap();
+        let mut perm = fs::metadata(t.path().join("ro.txt")).unwrap().permissions();
+        perm.set_readonly(true);
+        fs::set_permissions(t.path().join("ro.txt"), perm).unwrap();
+        let p = Panel::new(t.path());
+        let mode = |n: &str| p.entries.iter().find(|e| e.name == n).unwrap().mode;
+        assert_eq!(mode("ro.txt"), 0o444);
+        assert_eq!(mode("rw.txt"), 0o666);
+        let mut perm = fs::metadata(t.path().join("ro.txt")).unwrap().permissions();
+        perm.set_readonly(false);
+        fs::set_permissions(t.path().join("ro.txt"), perm).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_attribute_hides_entries_like_dotfiles() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("plain.txt"), "x").unwrap();
+        fs::write(t.path().join("secret.txt"), "x").unwrap();
+        fs::write(t.path().join(".dot"), "x").unwrap();
+        let st = std::process::Command::new("attrib")
+            .arg("+h")
+            .arg(t.path().join("secret.txt"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let (shown, _) = read_listing(t.path(), false).unwrap();
+        let shown: Vec<_> = shown.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, vec!["..", "plain.txt"]);
+        let (all, _) = read_listing(t.path(), true).unwrap();
+        let hidden = |n: &str| all.iter().find(|e| e.name == n).unwrap().hidden;
+        assert!(hidden("secret.txt") && hidden(".dot") && !hidden("plain.txt"));
     }
 }

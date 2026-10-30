@@ -1006,6 +1006,7 @@ mod tests {
 
     // ---- entry ----
 
+    #[cfg(unix)]
     #[test]
     fn entry_original_path_needs_an_absolute_parent() {
         let e = entry("i", "/srv/data", "한글 문서", 5);
@@ -1246,6 +1247,7 @@ mod tests {
         assert_eq!(r[2], (bad, Err("denied".into())));
     }
 
+    #[cfg(unix)]
     #[test]
     fn delete_with_bulk_failure_only_treats_not_found_as_trashed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1472,5 +1474,14 @@ mod tests {
     #[test]
     fn system_trash_view_support_follows_the_os() {
         assert_eq!(SystemTrash.supports_view(), cfg!(target_os = "linux"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn format_local_uses_the_local_time_zone_api() {
+        // 2001-09-09 01:46:40 UTC: the local date is 08..10 whatever the zone.
+        let s = format_local(1_000_000_000);
+        assert!(s.starts_with("2001-09-") && s.len() == 16, "{s}");
+        assert_eq!(format_local(i64::MIN), "-");
     }
 }

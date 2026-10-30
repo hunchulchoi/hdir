@@ -138,7 +138,59 @@ pub fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 pub fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING;
+    match move_file_ex(from, to, MOVEFILE_REPLACE_EXISTING) {
+        // A readonly destination file blocks the replace on Windows, unlike a
+        // POSIX rename. The caller already approved overwriting: lift the attribute
+        // for the replace and put it back if the replace still fails.
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            let Ok(meta) = fs::symlink_metadata(to) else {
+                return Err(e);
+            };
+            if !meta.is_file() || !meta.permissions().readonly() {
+                return Err(e);
+            }
+            let mut writable = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            writable.set_readonly(false);
+            fs::set_permissions(to, writable)?;
+            let res = move_file_ex(from, to, MOVEFILE_REPLACE_EXISTING);
+            if res.is_err() {
+                let _ = fs::set_permissions(to, meta.permissions());
+            }
+            res
+        }
+        other => other,
+    }
+}
+
+/// `MoveFileExW` with `flags`; without `MOVEFILE_REPLACE_EXISTING` it fails with
+/// `ERROR_ALREADY_EXISTS` (-> `AlreadyExists`) if `to` exists, and without
+/// `MOVEFILE_COPY_ALLOWED` a cross-volume move fails with `ERROR_NOT_SAME_DEVICE`.
+#[cfg(windows)]
+fn move_file_ex(
+    from: &Path,
+    to: &Path,
+    flags: windows_sys::Win32::Storage::FileSystem::MOVE_FILE_FLAGS,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+    let wide = |p: &Path| -> io::Result<Vec<u16>> {
+        let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
+        if v.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "nul in path"));
+        }
+        v.push(0);
+        Ok(v)
+    };
+    let (f, t) = (wide(from)?, wide(to)?);
+    // SAFETY: both buffers are valid NUL-terminated UTF-16 strings for the call.
+    if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), flags) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Whether a rename failure means "different filesystem" (EXDEV).
@@ -213,8 +265,9 @@ pub fn rename_noreplace_os(_from: &Path, _to: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub fn rename_noreplace_os(_from: &Path, _to: &Path) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
+pub fn rename_noreplace_os(from: &Path, to: &Path) -> io::Result<()> {
+    // Atomic and never replaces: fails with AlreadyExists if `to` exists.
+    move_file_ex(from, to, 0)
 }
 
 // ------------------------------------------------------------ test helpers
@@ -265,8 +318,12 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 #[cfg(windows)]
-pub fn same_file(_a: &Path, _b: &Path) -> bool {
-    false
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    // `file_index` is not stable: compare the resolved paths case-insensitively.
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
+        _ => false,
+    }
 }
 
 // --------------------------------------------------------------- symlinks
@@ -279,8 +336,13 @@ pub fn create_symlink(target: &Path, link: &Path, _src: &Path) -> io::Result<()>
 }
 
 #[cfg(windows)]
-pub fn create_symlink(target: &Path, link: &Path, _src: &Path) -> io::Result<()> {
-    std::os::windows::fs::symlink_file(target, link)
+pub fn create_symlink(target: &Path, link: &Path, src: &Path) -> io::Result<()> {
+    // Windows distinguishes file and directory links; follow `src` to decide.
+    if fs::metadata(src).is_ok_and(|m| m.is_dir()) {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }
 
 /// Creating a symlink was refused for lack of privilege (Windows without
@@ -291,6 +353,7 @@ pub fn is_symlink_privilege_error(_e: &io::Error) -> bool {
 }
 
 #[cfg(windows)]
-pub fn is_symlink_privilege_error(_e: &io::Error) -> bool {
-    false
+pub fn is_symlink_privilege_error(e: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD;
+    e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD as i32)
 }

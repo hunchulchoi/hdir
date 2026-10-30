@@ -825,6 +825,7 @@ mod tests {
         assert_eq!(inactive[(0, 1)].fg, palette::BORDER);
     }
 
+    #[cfg(unix)]
     #[test]
     fn trash_view_wide_shows_original_parent_column() {
         let buf = render_trash(&trash_view(), 0, 140);
@@ -834,6 +835,7 @@ mod tests {
         assert!(r.find("/srv/data") < r.find(&format_local(TS)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn trash_view_status_shows_original_path_of_current() {
         let mut v = trash_view();
