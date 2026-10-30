@@ -1,6 +1,7 @@
 //! hdir: Mdir-style dual-panel TUI file manager.
 
 pub mod app;
+pub mod assoc;
 pub mod dialog;
 pub mod fs_ops;
 pub mod job;
