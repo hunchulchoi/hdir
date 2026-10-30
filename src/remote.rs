@@ -724,7 +724,10 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
             &Endpoint::Remote(&a, b"/d"),
         )
         .unwrap();
+        #[cfg(unix)]
         assert_eq!(r[r.len() - 2], OsString::from("./a:b"));
+        #[cfg(windows)]
+        assert_eq!(r[r.len() - 2], OsString::from(r".\a:b"));
     }
 
     #[cfg(windows)]
