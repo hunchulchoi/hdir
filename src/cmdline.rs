@@ -127,13 +127,13 @@ pub fn canonical_dir(p: &Path) -> std::io::Result<PathBuf> {
     // would silently drop `missing/..`: require every folded component to exist.
     let mut acc = PathBuf::new();
     for c in p.components() {
-        match c {
-            Component::ParentDir => {
-                std::fs::metadata(&acc)?;
-                acc.pop();
-            }
-            Component::CurDir => {}
-            other => acc.push(other.as_os_str()),
+        // Verbatim (`\\?\`) paths report `..` as an ordinary name.
+        let dots = |s: &str| matches!(c, Component::Normal(n) if n == s);
+        if matches!(c, Component::ParentDir) || dots("..") {
+            std::fs::metadata(&acc)?;
+            acc.pop();
+        } else if !matches!(c, Component::CurDir) && !dots(".") {
+            acc.push(c.as_os_str());
         }
     }
     let c = std::fs::canonicalize(p)?;
