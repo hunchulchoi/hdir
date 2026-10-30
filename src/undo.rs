@@ -56,67 +56,98 @@ impl UndoStack {
         self.ops.is_empty()
     }
 
+    /// Remove and return the latest op without touching the filesystem.
+    pub fn pop(&mut self) -> Option<UndoOp> {
+        self.ops.pop()
+    }
+
     /// Pop and reverse the latest op. The op is consumed, even on error, except
-    /// that failed pairs of a move are pushed back for a retry. Existing files
+    /// that failed parts of a move are pushed back for a retry. Existing files
     /// are never overwritten.
     pub fn undo(&mut self) -> Result<String, String> {
-        let op = self.ops.pop().ok_or("되돌릴 작업 없음")?;
-        match op {
-            UndoOp::Mkdir { path } => {
-                fs::remove_dir(&path).map_err(|e| format!("되돌릴 수 없음: {e}"))?;
-                Ok(format!("되돌림: 폴더 생성 취소 {}", base(&path)))
-            }
-            UndoOp::Rename { from, to } => {
-                restore(&to, &from).map_err(Restore::into_msg)?;
-                Ok(format!("되돌림: 이름 변경 {} → {}", base(&to), base(&from)))
-            }
-            UndoOp::Move {
-                pairs,
-                removed_dirs,
-            } => {
-                let total = if pairs.is_empty() {
-                    removed_dirs.len()
-                } else {
-                    pairs.len()
-                };
-                let mut errors = Vec::new();
-                let mut failed = Vec::new();
-                // Merged-away source directories first, so they exist again.
-                for dir in &removed_dirs {
-                    if let Err(e) = fs::create_dir_all(dir) {
-                        errors.push(format!("되돌릴 수 없음: {e}"));
-                    }
-                }
-                for (orig, new) in pairs {
-                    match restore(&new, &orig) {
-                        Ok(()) => {}
-                        Err(Restore::Failed(e)) => {
-                            errors.push(e);
-                            failed.push((orig, new));
-                        }
-                        // Restored but the old place is not clean: a retry would
-                        // only say "already exists", so do not keep the pair.
-                        Err(Restore::Dirty(e)) => errors.push(e),
-                    }
-                }
-                if errors.is_empty() {
-                    Ok(format!("되돌림: 이동 {total}개"))
-                } else {
-                    let msg = format!(
-                        "되돌림 일부 실패 ({}/{total}): {}",
-                        total - errors.len(),
-                        errors[0]
-                    );
-                    // Keep only the failed pairs so the user can retry.
-                    self.push(UndoOp::Move {
-                        pairs: failed,
-                        removed_dirs: vec![],
-                    });
-                    Err(msg)
-                }
-            }
-            UndoOp::Trash { .. } => Err("휴지통 항목은 Finder/휴지통에서 복원하세요".into()),
+        let op = self.pop().ok_or("되돌릴 작업 없음")?;
+        let UndoApplied { message, retry } = Self::apply(op);
+        if let Some(r) = retry {
+            self.push(r);
         }
+        message
+    }
+
+    /// Reverse `op` on the filesystem without touching any stack (usable from a
+    /// worker thread). `retry` holds what failed and may be pushed back.
+    pub fn apply(op: UndoOp) -> UndoApplied {
+        apply_with(op, &|d| fs::create_dir_all(d))
+    }
+}
+
+/// Outcome of [`UndoStack::apply`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoApplied {
+    pub message: Result<String, String>,
+    /// Remaining work after a partial failure, to push back for a retry.
+    pub retry: Option<UndoOp>,
+}
+
+fn apply_with(op: UndoOp, create_dir: &dyn Fn(&Path) -> std::io::Result<()>) -> UndoApplied {
+    let done = |message| UndoApplied {
+        message,
+        retry: None,
+    };
+    match op {
+        UndoOp::Mkdir { path } => done(
+            fs::remove_dir(&path)
+                .map(|()| format!("되돌림: 폴더 생성 취소 {}", base(&path)))
+                .map_err(|e| format!("되돌릴 수 없음: {e}")),
+        ),
+        UndoOp::Rename { from, to } => done(
+            restore(&to, &from)
+                .map(|()| format!("되돌림: 이름 변경 {} → {}", base(&to), base(&from)))
+                .map_err(Restore::into_msg),
+        ),
+        UndoOp::Move {
+            pairs,
+            removed_dirs,
+        } => {
+            let total = pairs.len() + removed_dirs.len();
+            let mut errors = Vec::new();
+            let mut failed_dirs = Vec::new();
+            let mut failed_pairs = Vec::new();
+            // Merged-away source directories first, so they exist again.
+            for dir in removed_dirs {
+                if let Err(e) = create_dir(&dir) {
+                    errors.push(format!("되돌릴 수 없음: {e}"));
+                    failed_dirs.push(dir);
+                }
+            }
+            for (orig, new) in pairs {
+                match restore(&new, &orig) {
+                    Ok(()) => {}
+                    Err(Restore::Failed(e)) => {
+                        errors.push(e);
+                        failed_pairs.push((orig, new));
+                    }
+                    // Restored but the old place is not clean: a retry would
+                    // only say "already exists", so do not keep the pair.
+                    Err(Restore::Dirty(e)) => errors.push(e),
+                }
+            }
+            if errors.is_empty() {
+                return done(Ok(format!("되돌림: 이동 {total}개")));
+            }
+            let ok = total.saturating_sub(errors.len());
+            let msg = format!("되돌림 일부 실패 ({ok}/{total}): {}", errors[0]);
+            // Keep only what failed so the user can retry.
+            let retry =
+                (!failed_pairs.is_empty() || !failed_dirs.is_empty()).then_some(UndoOp::Move {
+                    pairs: failed_pairs,
+                    removed_dirs: failed_dirs,
+                });
+            UndoApplied {
+                message: Err(msg),
+                retry,
+            }
+        }
+        UndoOp::Trash { .. } => done(Err("휴지통 항목은 Finder/휴지통에서 복원하세요".into())),
     }
 }
 
@@ -171,6 +202,102 @@ fn restore(current: &Path, target: &Path) -> Result<(), Restore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn undo_op_and_applied_are_send() {
+        assert_send::<UndoOp>();
+        assert_send::<UndoApplied>();
+    }
+
+    #[test]
+    fn apply_reverses_without_a_stack_and_pop_is_lifo() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        fs::write(&b, "1").unwrap();
+        let r = UndoStack::apply(UndoOp::Rename {
+            from: a.clone(),
+            to: b.clone(),
+        });
+        assert_eq!(r.message.unwrap(), "되돌림: 이름 변경 b → a");
+        assert!(r.retry.is_none() && a.exists());
+        let mut u = UndoStack::default();
+        assert!(u.pop().is_none());
+        u.push(UndoOp::Trash { count: 1 });
+        u.push(UndoOp::Trash { count: 2 });
+        assert_eq!(u.pop(), Some(UndoOp::Trash { count: 2 }));
+        assert_eq!(u.len(), 1);
+    }
+
+    #[test]
+    fn apply_partial_failure_returns_retry_op() {
+        let t = tempfile::tempdir().unwrap();
+        let (o, n) = (t.path().join("o"), t.path().join("n"));
+        fs::write(&n, "2").unwrap();
+        fs::write(&o, "blocker").unwrap();
+        let r = UndoStack::apply(UndoOp::Move {
+            pairs: vec![(o.clone(), n.clone())],
+            removed_dirs: vec![],
+        });
+        assert!(r.message.is_err());
+        assert_eq!(
+            r.retry,
+            Some(UndoOp::Move {
+                pairs: vec![(o, n)],
+                removed_dirs: vec![]
+            })
+        );
+    }
+
+    #[test]
+    fn dir_and_pair_failures_together_do_not_underflow() {
+        let t = tempfile::tempdir().unwrap();
+        let (o, n) = (t.path().join("o"), t.path().join("n"));
+        fs::write(&n, "2").unwrap();
+        fs::write(&o, "blocker").unwrap();
+        let d1 = t.path().join("d1");
+        let d2 = t.path().join("d2");
+        let deny = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let r = apply_with(
+            UndoOp::Move {
+                pairs: vec![(o, n)],
+                removed_dirs: vec![d1, d2],
+            },
+            &deny,
+        );
+        let e = r.message.unwrap_err();
+        assert!(e.contains("(0/3)"), "{e}");
+    }
+
+    #[test]
+    fn failed_removed_dirs_are_kept_for_retry() {
+        let t = tempfile::tempdir().unwrap();
+        let (good, bad) = (t.path().join("good"), t.path().join("bad"));
+        let selective = |d: &Path| {
+            if d.ends_with("bad") {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                fs::create_dir_all(d)
+            }
+        };
+        let r = apply_with(
+            UndoOp::Move {
+                pairs: vec![],
+                removed_dirs: vec![good.clone(), bad.clone()],
+            },
+            &selective,
+        );
+        assert!(good.is_dir());
+        assert!(r.message.unwrap_err().contains("(1/2)"));
+        assert_eq!(
+            r.retry,
+            Some(UndoOp::Move {
+                pairs: vec![],
+                removed_dirs: vec![bad]
+            })
+        );
+    }
 
     fn s(p: &Path) -> String {
         p.to_string_lossy().into_owned()
