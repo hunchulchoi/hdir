@@ -69,11 +69,23 @@ enum BgKind {
         paths: Vec<PathBuf>,
     },
     Undo,
+    Mkdir {
+        panel: usize,
+        parent: PathBuf,
+        name: String,
+    },
+    Rename {
+        panel: usize,
+        from: PathBuf,
+        name: String,
+    },
 }
 
 enum BgResult {
     Trash(std::io::Result<()>),
     Undo(UndoApplied),
+    Mkdir(std::io::Result<PathBuf>),
+    Rename(std::io::Result<PathBuf>),
 }
 
 /// A short blocking filesystem operation (trash, undo) running on a worker
@@ -440,6 +452,34 @@ impl App {
                 self.reload_both();
                 self.status = Some(status);
             }
+            (
+                BgKind::Mkdir {
+                    panel,
+                    parent,
+                    name,
+                },
+                Some(BgResult::Mkdir(res)),
+            ) => match res {
+                Ok(path) => {
+                    self.undo.push(UndoOp::Mkdir { path });
+                    self.after_fs_op(panel, &parent, Some(&name), format!("폴더 생성: {name}"));
+                }
+                Err(e) => {
+                    self.reload_both();
+                    self.status = Some(format!("오류: {e}"));
+                }
+            },
+            (BgKind::Rename { panel, from, name }, Some(BgResult::Rename(res))) => match res {
+                Ok(to) => {
+                    let parent = from.parent().map(PathBuf::from).unwrap_or_default();
+                    self.undo.push(UndoOp::Rename { from, to });
+                    self.after_fs_op(panel, &parent, Some(&name), format!("이름 변경: {name}"));
+                }
+                Err(e) => {
+                    self.reload_both();
+                    self.status = Some(format!("오류: {e}"));
+                }
+            },
             (BgKind::Undo, Some(BgResult::Undo(done))) => {
                 if let Some(retry) = done.retry {
                     self.undo.push(retry);
@@ -525,17 +565,14 @@ impl App {
                 removed_dirs: report.removed_dirs.clone(),
             });
         }
-        let processed: Vec<PathBuf> = match job.kind {
-            JobKind::Copy if report.copied > 0 => job.sources.clone(),
-            JobKind::Copy => Vec::new(),
-            JobKind::Move => report
-                .moved
-                .iter()
-                .map(|(src, _)| src.clone())
-                .chain(report.removed_dirs.iter().cloned())
-                .filter(|p| p.parent() == Some(job.src_cwd.as_path()))
-                .collect(),
-        };
+        // Only sources fully copied / moved lose their selection; skipped, partial
+        // and unprocessed ones stay selected.
+        let processed: Vec<PathBuf> = report
+            .done_sources
+            .iter()
+            .filter(|p| p.parent() == Some(job.src_cwd.as_path()))
+            .cloned()
+            .collect();
         self.clear_selection(job.src_panel, &job.src_cwd, &processed);
         let status = job_summary(job.kind, &report);
         // A conflict dialog may still be open for a job that just ended.
@@ -620,26 +657,37 @@ impl App {
         };
         match (action, result) {
             (PendingAction::Mkdir, DialogResult::Submitted(name)) => {
-                let cwd = self.active_panel().cwd.clone();
-                match fs_ops::make_dir(&cwd, &name) {
-                    Ok(_) => {
-                        self.undo.push(UndoOp::Mkdir {
-                            path: cwd.join(&name),
-                        });
-                        self.after_fs_op(Some(&name), format!("폴더 생성: {name}"));
-                    }
-                    Err(e) => self.status = Some(format!("오류: {e}")),
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
                 }
+                let parent = self.active_panel().cwd.clone();
+                let (p, n) = (parent.clone(), name.clone());
+                self.task = Some(BgTask::spawn(
+                    BgKind::Mkdir {
+                        panel: self.active,
+                        parent,
+                        name,
+                    },
+                    move || BgResult::Mkdir(fs_ops::make_dir(&p, &n)),
+                ));
+                self.status = Some("폴더 생성 중…".into());
             }
             (PendingAction::Rename { from }, DialogResult::Submitted(name)) => {
-                match fs_ops::rename(&from, &name) {
-                    Ok(_) => {
-                        let to = from.with_file_name(&name);
-                        self.undo.push(UndoOp::Rename { from, to });
-                        self.after_fs_op(Some(&name), format!("이름 변경: {name}"));
-                    }
-                    Err(e) => self.status = Some(format!("오류: {e}")),
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
                 }
+                let (f, n) = (from.clone(), name.clone());
+                self.task = Some(BgTask::spawn(
+                    BgKind::Rename {
+                        panel: self.active,
+                        from,
+                        name,
+                    },
+                    move || BgResult::Rename(fs_ops::rename(&f, &n)),
+                ));
+                self.status = Some("이름 변경 중…".into());
             }
             (PendingAction::Trash { paths }, DialogResult::Confirmed) => {
                 if self.busy() {
@@ -695,14 +743,19 @@ impl App {
         self.status = Some("되돌리는 중…".into());
     }
 
-    /// Reload the active panel (cursor on `focus` if given) and the other panel
-    /// when it shows the same directory, then set the status.
-    fn after_fs_op(&mut self, focus: Option<&str>, status: String) {
-        let same = self.other_panel().cwd == self.active_panel().cwd;
-        if same {
-            self.reload_panel(1 - self.active, None);
+    /// Reload panel `idx` (cursor on `focus` if given) and the other panel when
+    /// it shows the same directory `dir`, then set the status.
+    fn after_fs_op(
+        &mut self,
+        idx: usize,
+        dir: &std::path::Path,
+        focus: Option<&str>,
+        status: String,
+    ) {
+        if self.panels[1 - idx].cwd == dir {
+            self.reload_panel(1 - idx, None);
         }
-        self.reload_panel(self.active, focus.map(OsString::from));
+        self.reload_panel(idx, focus.map(OsString::from));
         self.status = Some(status);
     }
 
@@ -1094,6 +1147,7 @@ mod tests {
         assert!(app.dialog.is_some());
         type_str(&mut app, "새폴더");
         press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
         assert!(app.dialog.is_none());
         assert!(tmp.path().join("새폴더").is_dir());
         settle(&mut app);
@@ -1113,11 +1167,62 @@ mod tests {
     }
 
     #[test]
+    fn f7_mkdir_runs_on_worker_then_focuses_new_dir() {
+        let (tmp, mut app, _f) = fixture_trash();
+        press(&mut app, KeyCode::F(7));
+        type_str(&mut app, "새폴더");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("폴더 생성 중…"));
+        assert!(app.task.is_some());
+        wait_idle(&mut app);
+        settle(&mut app);
+        assert!(tmp.path().join("새폴더").is_dir());
+        assert_eq!(app.status.as_deref(), Some("폴더 생성: 새폴더"));
+        assert_eq!(app.undo.len(), 1);
+        assert_eq!(app.active_panel().current().unwrap().os_name, "새폴더");
+    }
+
+    #[test]
+    fn f2_rename_runs_on_worker() {
+        let (tmp, mut app, _f) = fixture_trash();
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::F(2));
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, "z.txt");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("이름 변경 중…"));
+        assert!(app.task.is_some());
+        wait_idle(&mut app);
+        settle(&mut app);
+        assert!(tmp.path().join("z.txt").exists());
+        assert_eq!(app.undo.len(), 1);
+        assert_eq!(app.status.as_deref(), Some("이름 변경: z.txt"));
+    }
+
+    #[test]
+    fn mkdir_is_refused_while_another_task_runs() {
+        let (tmp, mut app, _f) = fixture_trash();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.task = Some(BgTask {
+            rx,
+            kind: BgKind::Undo,
+        });
+        press(&mut app, KeyCode::F(7));
+        type_str(&mut app, "nope");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        assert!(!tmp.path().join("nope").exists());
+    }
+
+    #[test]
     fn f7_invalid_name_sets_error() {
         let (_t, mut app, _f) = fixture_trash();
         press(&mut app, KeyCode::F(7));
         type_str(&mut app, "a/b");
         press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
         assert!(app.dialog.is_none());
         assert!(app.status.as_deref().unwrap().starts_with("오류:"));
     }
@@ -1137,6 +1242,7 @@ mod tests {
         }
         type_str(&mut app, "h.txt");
         press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
         assert!(!tmp.path().join("f.txt").exists());
         assert!(tmp.path().join("h.txt").exists());
         settle(&mut app);
@@ -1172,6 +1278,7 @@ mod tests {
         }
         type_str(&mut app, "f.txt");
         press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
         assert!(app.status.as_deref().unwrap().starts_with("오류:"));
         assert!(tmp.path().join("g.txt").exists());
     }
@@ -1229,6 +1336,7 @@ mod tests {
         press(&mut app, KeyCode::F(7));
         type_str(&mut app, "nd");
         press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
         settle(&mut app);
         assert!(app.panels[1].entries.iter().any(|e| e.name == "nd"));
     }
@@ -1267,6 +1375,7 @@ mod tests {
         press(&mut app, KeyCode::F(7));
         type_str(&mut app, "새폴더");
         press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
         assert!(tmp.path().join("새폴더").is_dir());
         settle(&mut app);
         assert!(app.panels[0].entries.iter().any(|e| e.name == "새폴더"));
@@ -1291,6 +1400,7 @@ mod tests {
         }
         type_str(&mut app, "h.txt");
         press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
         settle(&mut app);
         for i in 0..2 {
             assert!(app.panels[i].entries.iter().any(|e| e.name == "h.txt"));
@@ -1444,6 +1554,29 @@ mod tests {
         wait_job(&mut app);
         assert!(app.panels[0].selected.is_empty());
         assert!(app.status.as_deref().unwrap().contains("2개"));
+    }
+
+    #[test]
+    fn partial_copy_keeps_skipped_source_selected() {
+        let (tmp, mut app) = fixture_job();
+        fs::write(tmp.path().join("dst/b.txt"), "OLD").unwrap();
+        app.panels[1].reload();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.active_panel().selected.len(), 2);
+        press(&mut app, KeyCode::F(5));
+        press(&mut app, KeyCode::Enter);
+        wait_dialog(&mut app); // b.txt conflicts
+        press(&mut app, KeyCode::Char('s'));
+        wait_job(&mut app);
+        let sel = &app.panels[0].selected;
+        assert!(!sel.contains(OsStr::new("a.txt")));
+        assert!(sel.contains(OsStr::new("b.txt")), "{sel:?}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/b.txt")).unwrap(),
+            "OLD"
+        );
     }
 
     fn start_conflict(app: &mut App, tmp: &TempDir) {

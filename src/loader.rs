@@ -191,31 +191,63 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Reader that counts invocations and blocks until the gate is released.
-    fn gated(count: Arc<AtomicUsize>, gate: Arc<Mutex<()>>) -> Loader {
-        Loader::with_reader(Arc::new(move |dir, hidden| {
-            count.fetch_add(1, Ordering::SeqCst);
-            drop(gate.lock().unwrap());
-            crate::panel::read_listing(dir, hidden)
-        }))
+    /// Reader that counts invocations, reports each entry on `entered`, tracks the
+    /// peak number of simultaneous reads, and blocks until the gate is released.
+    struct Probe {
+        count: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        entered: std::sync::mpsc::Receiver<()>,
     }
 
-    fn pause() {
-        std::thread::sleep(Duration::from_millis(80));
+    fn gated(gate: Arc<Mutex<()>>) -> (Loader, Probe) {
+        let (count, peak, live) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let (tx, entered) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let probe = Probe {
+            count: Arc::clone(&count),
+            peak: Arc::clone(&peak),
+            entered,
+        };
+        let loader = Loader::with_reader(Arc::new(move |dir, hidden| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            let _ = tx.lock().unwrap().send(());
+            drop(gate.lock().unwrap());
+            live.fetch_sub(1, Ordering::SeqCst);
+            crate::panel::read_listing(dir, hidden)
+        }));
+        (loader, probe)
+    }
+
+    impl Probe {
+        /// Block until `n` more readers have entered (5s timeout).
+        fn wait_entered(&self, n: usize) {
+            for _ in 0..n {
+                self.entered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("reader never entered");
+            }
+        }
     }
 
     #[test]
     fn rapid_requests_for_one_panel_run_at_most_one_plus_latest() {
         let t = tempfile::tempdir().unwrap();
-        let (count, gate) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(())));
-        let loader = gated(Arc::clone(&count), Arc::clone(&gate));
+        let gate = Arc::new(Mutex::new(()));
+        let (loader, probe) = gated(Arc::clone(&gate));
         let guard = gate.lock().unwrap();
-        for id in 1..=10 {
+        loader.request(0, 1, t.path().to_path_buf(), false);
+        probe.wait_entered(1); // the first read is in flight and blocked
+        for id in 2..=10 {
             loader.request(0, id, t.path().to_path_buf(), false);
         }
-        pause();
         assert_eq!(
-            count.load(Ordering::SeqCst),
+            probe.count.load(Ordering::SeqCst),
             1,
             "one in flight, rest pending"
         );
@@ -230,9 +262,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(ids.last(), Some(&10), "latest request wins: {ids:?}");
-        pause();
         assert_eq!(
-            count.load(Ordering::SeqCst),
+            probe.count.load(Ordering::SeqCst),
             2,
             "superseded requests never ran"
         );
@@ -241,15 +272,20 @@ mod tests {
     #[test]
     fn global_reader_thread_cap() {
         let t = tempfile::tempdir().unwrap();
-        let (count, gate) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(())));
-        let loader = gated(Arc::clone(&count), Arc::clone(&gate));
+        let gate = Arc::new(Mutex::new(()));
+        let (loader, probe) = gated(Arc::clone(&gate));
         let guard = gate.lock().unwrap();
         for key in 0..8 {
             loader.request(key, key as u64 + 1, t.path().to_path_buf(), false);
         }
-        pause();
-        assert_eq!(count.load(Ordering::SeqCst), MAX_READERS);
+        probe.wait_entered(MAX_READERS); // all four slots are provably busy
+        assert_eq!(probe.peak.load(Ordering::SeqCst), MAX_READERS);
         drop(guard);
         assert_eq!(wait_for(&loader, 8).len(), 8, "queued panels still load");
+        assert_eq!(
+            probe.peak.load(Ordering::SeqCst),
+            MAX_READERS,
+            "never above the cap"
+        );
     }
 }
