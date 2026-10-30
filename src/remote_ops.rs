@@ -10,9 +10,9 @@ use crate::platform::{os_bytes, os_from_bytes};
 use crate::preview::{self, Limits, Preview};
 use crate::remote::{
     DELETE_NO_CWD, DELETE_NO_HOME, DELETE_PROTECTED, PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING,
-    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_GROUP, REPLACE_NOT_OWNER,
-    REPLACE_RESTORED, REPLACE_SIZE, delete_cmd, mkdir_cmd, mktemp_cmd, preview_cmd, rename_cmd,
-    replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd,
+    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_CHANGED, REPLACE_GROUP,
+    REPLACE_NOT_OWNER, REPLACE_RESTORED, REPLACE_SIZE, delete_cmd, mkdir_cmd, mktemp_cmd,
+    preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd, stamp_cmd,
 };
 use crate::remote::{Endpoint, scp_argv};
 use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
@@ -243,6 +243,8 @@ pub struct EditCopy {
     pub dir: tempfile::TempDir,
     pub local: PathBuf,
     pub stamp: FileStamp,
+    /// [`remote_stamp`] of the remote file, taken before downloading it.
+    pub remote: Vec<u8>,
 }
 
 fn scp_run(s: &RemoteSession, argv: Result<Vec<OsString>, String>) -> Result<(), String> {
@@ -256,8 +258,18 @@ fn scp_run(s: &RemoteSession, argv: Result<Vec<OsString>, String>) -> Result<(),
     ))
 }
 
+/// Fingerprint of the remote file `path` (see [`stamp_cmd`]).
+pub fn remote_stamp(s: &RemoteSession, path: &Path) -> Result<Vec<u8>, String> {
+    let out = run_ok(s, &stamp_cmd(&s.os, &os_bytes(path.as_os_str())))?;
+    if out.stdout.is_empty() {
+        return Err("원격 파일 상태를 알 수 없음".into());
+    }
+    Ok(out.stdout)
+}
+
 /// Download `remote` into a fresh private temp dir (same file name, so
-/// extensions keep working) and fingerprint it.
+/// extensions keep working) and fingerprint it. The remote file is stamped
+/// first, so a change during the download also counts as a change.
 pub fn fetch(s: &RemoteSession, remote: &Path) -> Result<EditCopy, String> {
     let name = remote.file_name().ok_or("잘못된 경로")?;
     let mut builder = tempfile::Builder::new();
@@ -271,6 +283,7 @@ pub fn fetch(s: &RemoteSession, remote: &Path) -> Result<EditCopy, String> {
     let dir = builder
         .tempdir()
         .map_err(|e| format!("임시 폴더 생성 실패: {e}"))?;
+    let remote_st = remote_stamp(s, remote)?;
     let argv = scp_argv(
         &Endpoint::Remote(&s.target, &os_bytes(remote.as_os_str())),
         &Endpoint::Local(dir.path()),
@@ -279,7 +292,12 @@ pub fn fetch(s: &RemoteSession, remote: &Path) -> Result<EditCopy, String> {
     scp_run(s, argv)?;
     let local = dir.path().join(name);
     let stamp = FileStamp::of(&local).map_err(|e| format!("내려받은 파일을 읽을 수 없음: {e}"))?;
-    Ok(EditCopy { dir, local, stamp })
+    Ok(EditCopy {
+        dir,
+        local,
+        stamp,
+        remote: remote_st,
+    })
 }
 
 /// A NUL-terminated absolute path printed by a remote command.
@@ -297,14 +315,21 @@ fn nul_path(out: &CmdOutput) -> Result<Vec<u8>, String> {
 ///    survives and the temp lands next to the real file);
 /// 2. `mktemp` creates an exclusive mode-600 `.hdir-edit.XXXXXX` there;
 /// 3. scp onto that exact path;
-/// 4. [`replace_cmd`] verifies the size, applies the original's mode and
+/// 4. [`replace_cmd`] checks the original still matches `expect` (its
+///    [`remote_stamp`] when it was downloaded), verifies the size, applies
+///    the original's group and mode and
 ///    `mv`s it over (hard-linked files are rewritten in place instead).
 ///
 /// On failure the remote temp file is removed and the original is untouched
 /// (a failed in-place write of a hard-linked file is restored from a backup),
 /// except when the original belongs to another user or restoring failed:
 /// then the temp file (and the backup) stay, named in the error.
-pub fn upload_replace(s: &RemoteSession, local: &Path, remote: &Path) -> Result<(), String> {
+pub fn upload_replace(
+    s: &RemoteSession,
+    local: &Path,
+    remote: &Path,
+    expect: &[u8],
+) -> Result<(), String> {
     let size = std::fs::metadata(local)
         .map_err(|e| format!("편집한 파일을 읽을 수 없음: {e}"))?
         .len();
@@ -324,7 +349,7 @@ pub fn upload_replace(s: &RemoteSession, local: &Path, remote: &Path) -> Result<
     let mut keep_tmp = false;
     let res = scp_run(s, argv).and_then(|()| {
         let out = s
-            .exec(&replace_cmd(&s.os, &tmp_b, &phys, size))
+            .exec(&replace_cmd(&s.os, &tmp_b, &phys, size, expect))
             .map_err(|e| e.message())?;
         match out.code {
             Some(0) => Ok(()),
@@ -335,6 +360,7 @@ pub fn upload_replace(s: &RemoteSession, local: &Path, remote: &Path) -> Result<
                 ))
             }
             Some(REPLACE_SIZE) => Err("업로드된 파일 크기가 맞지 않음".into()),
+            Some(REPLACE_CHANGED) => Err("편집하는 동안 원격 파일이 바뀌어 교체하지 않음".into()),
             Some(REPLACE_GROUP) => Err("원격 파일의 그룹을 유지할 수 없어 교체하지 않음".into()),
             Some(REPLACE_RESTORED) => Err("원격 파일 쓰기 실패, 원본을 복원함".into()),
             Some(REPLACE_BACKUP_KEPT) => {
@@ -779,6 +805,9 @@ mod tests {
 
     type Uploads = Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
+    /// What the fake answers to a stamp command.
+    const STAMP: &[u8] = b"7 99 3 1234 3";
+
     /// Inverse of `sh_quote` for a single quoted word.
     fn unquote(q: &str) -> String {
         q.strip_prefix('\'')
@@ -820,6 +849,9 @@ mod tests {
                     "{}\0",
                     phys.map_or_else(|| unquote(q), String::from)
                 ));
+            }
+            if c.starts_with("f=") {
+                return ok(std::str::from_utf8(STAMP).unwrap());
             }
             if let Some(rest) = c.strip_prefix("t=$(mktemp ") {
                 let q = rest.split_once(") || exit 1").unwrap().0;
@@ -885,6 +917,25 @@ mod tests {
     }
 
     #[test]
+    fn fetch_stamps_the_remote_file_before_downloading_it() {
+        let (f, _) = scp_fake("orig", ok(""), ok(""));
+        let copy = fetch(&session(Arc::clone(&f)), &p("/srv/a")).unwrap();
+        assert_eq!(copy.remote, STAMP);
+        let log = f.log.lock().unwrap().clone();
+        let stamp_at = log
+            .iter()
+            .position(|a| crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with("f=")))
+            .unwrap();
+        assert!(stamp_at < log.iter().position(|a| a[0] == "scp").unwrap());
+        // no stamp, no download
+        for answer in [fail(1, "stat: cannot stat\n"), ok("")] {
+            let f = FakeCmd::new(move |_| answer.clone());
+            assert!(fetch(&session(Arc::clone(&f)), &p("/srv/a")).is_err());
+            assert!(f.scp_calls().is_empty());
+        }
+    }
+
+    #[test]
     fn stamp_ignores_rewrites_of_identical_bytes() {
         let t = tempfile::tempdir().unwrap();
         let f = t.path().join("f");
@@ -929,7 +980,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let local = t.path().join("a b.txt");
         std::fs::write(&local, "new content").unwrap();
-        upload_replace(&s, &local, &p("/srv/it's/a b.txt")).unwrap();
+        upload_replace(&s, &local, &p("/srv/it's/a b.txt"), STAMP).unwrap();
         let ups = ups.lock().unwrap().clone();
         assert_eq!(
             ups,
@@ -950,7 +1001,8 @@ mod tests {
                     &crate::remote::RemoteOs::Linux,
                     b"/srv/it's/.hdir-edit.Ab12Cd",
                     b"/srv/it's/a b.txt",
-                    11
+                    11,
+                    STAMP,
                 )),
             ]
         );
@@ -963,7 +1015,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let local = t.path().join("l");
         std::fs::write(&local, "abc").unwrap();
-        upload_replace(&s, &local, &p("/srv/link")).unwrap();
+        upload_replace(&s, &local, &p("/srv/link"), STAMP).unwrap();
         assert_eq!(
             ups.lock().unwrap()[0].0,
             "prod-web:/data/real/.hdir-edit.Ab12Cd"
@@ -991,7 +1043,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let local = t.path().join("l");
         std::fs::write(&local, "abc").unwrap();
-        upload_replace(&session(Arc::clone(&f)), &local, &p("/top.txt")).unwrap();
+        upload_replace(&session(Arc::clone(&f)), &local, &p("/top.txt"), STAMP).unwrap();
         assert!(f.remote_cmds()[1].contains("'/.hdir-edit.XXXXXX'"));
     }
 
@@ -1007,14 +1059,14 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let local = t.path().join("a");
         std::fs::write(&local, "x").unwrap();
-        let e = upload_replace(&s, &local, &p("/srv/a")).unwrap_err();
+        let e = upload_replace(&s, &local, &p("/srv/a"), STAMP).unwrap_err();
         assert!(e.contains("No space left"), "{e}");
         let cmds = f.remote_cmds();
         assert_eq!(cmds.len(), 3, "resolve, mktemp, cleanup: no replace");
         assert_eq!(cmds[2], rm);
 
         let (f, _) = scp_fake("", ok(""), fail(1, "mv: cannot move: Permission denied\n"));
-        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a")).unwrap_err();
+        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a"), STAMP).unwrap_err();
         assert!(e.contains("Permission denied"), "{e}");
         let cmds = f.remote_cmds();
         assert_eq!(cmds.len(), 4);
@@ -1022,7 +1074,7 @@ mod tests {
 
         // size mismatch after the upload
         let (f, _) = scp_fake("", ok(""), code(crate::remote::REPLACE_SIZE));
-        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a")).unwrap_err();
+        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a"), STAMP).unwrap_err();
         assert!(e.contains("크기"), "{e}");
         assert_eq!(f.remote_cmds()[3], rm);
     }
@@ -1045,14 +1097,15 @@ mod tests {
                     ok("")
                 }
             });
-            let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a")).unwrap_err();
+            let e =
+                upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a"), STAMP).unwrap_err();
             assert!(e.contains(err), "{e}");
             assert!(f.scp_calls().is_empty(), "{starts}");
             assert!(f.remote_cmds().iter().all(|c| !c.starts_with("rm ")));
         }
         // garbage answers are refused too
         let f = FakeCmd::new(|_| ok("relative\0"));
-        assert!(upload_replace(&session(f), &local, &p("/srv/a")).is_err());
+        assert!(upload_replace(&session(f), &local, &p("/srv/a"), STAMP).is_err());
     }
 
     #[test]
@@ -1061,7 +1114,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let local = t.path().join("a");
         std::fs::write(&local, "x").unwrap();
-        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a")).unwrap_err();
+        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a"), STAMP).unwrap_err();
         assert!(
             e.contains("소유자") && e.contains("/srv/.hdir-edit.Ab12Cd"),
             "{e}"
@@ -1075,6 +1128,12 @@ mod tests {
     }
 
     // The real scripts, run by a local sh on real files.
+
+    /// Upload over a remote file that did not change since now.
+    fn upload_fresh(s: &RemoteSession, local: &Path, remote: &Path) -> Result<(), String> {
+        let st = remote_stamp(s, remote).unwrap_or_default();
+        upload_replace(s, local, remote, &st)
+    }
 
     fn mode_of(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
@@ -1105,7 +1164,7 @@ mod tests {
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
             let local = edited(&dir, "brand new");
             let s = local_session(&dir);
-            upload_replace(&s, &local, &target).unwrap();
+            upload_fresh(&s, &local, &target).unwrap();
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "brand new");
             assert_eq!(mode_of(&target), mode, "{mode:o}");
             no_temp_left(&dir);
@@ -1126,7 +1185,7 @@ mod tests {
         symlink("l1", root.join("links/l2")).unwrap();
         let local = edited(&root, "through the link");
         let s = local_session(&root);
-        upload_replace(&s, &local, &root.join("links/l2")).unwrap();
+        upload_fresh(&s, &local, &root.join("links/l2")).unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "through the link"
@@ -1148,7 +1207,7 @@ mod tests {
         no_temp_left(&root.join("links"));
         // a dangling link is an error, nothing is created
         symlink("gone", root.join("links/dangling")).unwrap();
-        assert!(upload_replace(&s, &local, &root.join("links/dangling")).is_err());
+        assert!(upload_fresh(&s, &local, &root.join("links/dangling")).is_err());
         assert!(!root.join("links/gone").exists());
         no_temp_left(&root.join("links"));
     }
@@ -1163,7 +1222,7 @@ mod tests {
         std::fs::hard_link(&a, &b).unwrap();
         let ino = std::fs::metadata(&a).unwrap().ino();
         let local = edited(&dir, "edited shared");
-        upload_replace(&local_session(&dir), &local, &a).unwrap();
+        upload_fresh(&local_session(&dir), &local, &a).unwrap();
         assert_eq!(std::fs::metadata(&a).unwrap().nlink(), 2, "link count kept");
         assert_eq!(std::fs::metadata(&a).unwrap().ino(), ino);
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "edited shared");
@@ -1175,7 +1234,7 @@ mod tests {
         let (_t, work) = newline_twins();
         let local = edited(work.parent().unwrap(), "edited");
         let s = local_session(&work);
-        upload_replace(&s, &local, &work.join("a\n/f")).unwrap();
+        upload_fresh(&s, &local, &work.join("a\n/f")).unwrap();
         assert_eq!(
             std::fs::read_to_string(work.join("a\n/f")).unwrap(),
             "edited"
@@ -1183,6 +1242,83 @@ mod tests {
         assert_eq!(std::fs::read_to_string(work.join("a/f")).unwrap(), "keep");
         no_temp_left(&work.join("a"));
         no_temp_left(&work.join("a\n"));
+    }
+
+    #[test]
+    fn real_edit_refuses_to_replace_a_file_changed_on_the_remote_meanwhile() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(t.path()).unwrap();
+        let target = dir.join("it's.txt");
+        std::fs::write(&target, "v1").unwrap();
+        let s = local_session(&dir);
+        let copy = fetch(&s, &target).unwrap();
+        assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "v1");
+        // someone else saves the remote file while we edit
+        std::fs::write(&target, "v2").unwrap();
+        std::fs::write(&copy.local, "mine").unwrap();
+        let e = upload_replace(&s, &copy.local, &target, &copy.remote).unwrap_err();
+        assert!(e.contains("원격 파일이 바뀌어"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "v2",
+            "theirs kept"
+        );
+        assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "mine");
+        no_temp_left(&dir);
+    }
+
+    #[test]
+    fn real_edit_sees_a_same_size_change_with_the_mtime_restored() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(t.path()).unwrap();
+        let target = dir.join("f");
+        std::fs::write(&target, "aaaa").unwrap();
+        let s = local_session(&dir);
+        let before = remote_stamp(&s, &target).unwrap();
+        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        std::fs::write(&target, "bbbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_ne!(remote_stamp(&s, &target).unwrap(), before);
+        // a hard-linked file is checked too, before its backup is made
+        std::fs::hard_link(&target, dir.join("g")).unwrap();
+        let stale = remote_stamp(&s, &target).unwrap();
+        std::fs::write(&target, "cccc").unwrap();
+        let local = edited(&dir, "mine");
+        assert!(upload_replace(&s, &local, &target, &stale).is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("g")).unwrap(), "cccc");
+        assert!(backups(&dir).is_empty());
+        no_temp_left(&dir);
+    }
+
+    #[test]
+    fn real_edit_of_an_unchanged_remote_file_through_a_symlink_replaces_it() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(t.path()).unwrap();
+        std::fs::write(dir.join("real"), "v1").unwrap();
+        symlink("real", dir.join("link")).unwrap();
+        let s = local_session(&dir);
+        let copy = fetch(&s, &dir.join("link")).unwrap();
+        std::fs::write(&copy.local, "mine").unwrap();
+        upload_replace(&s, &copy.local, &dir.join("link"), &copy.remote).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("real")).unwrap(), "mine");
+    }
+
+    #[test]
+    fn upload_reports_a_concurrent_remote_change() {
+        let (f, _) = scp_fake("", ok(""), code(crate::remote::REPLACE_CHANGED));
+        let s = session(Arc::clone(&f));
+        let t = tempfile::tempdir().unwrap();
+        let e = upload_replace(&s, &edited(t.path(), "x"), &p("/srv/a"), STAMP).unwrap_err();
+        assert!(e.contains("원격 파일이 바뀌어"), "{e}");
+        assert!(
+            f.remote_cmds().last().unwrap().starts_with("rm -f -- "),
+            "temp removed"
+        );
     }
 
     #[test]
@@ -1200,6 +1336,7 @@ mod tests {
             tmp.as_os_str().as_encoded_bytes(),
             target.as_os_str().as_encoded_bytes(),
             5,
+            b"",
         );
         let out = inner.exec(&cmd).unwrap();
         assert_eq!(out.code, Some(crate::remote::REPLACE_SIZE));
@@ -1239,6 +1376,7 @@ mod tests {
             dir.join(".hdir-edit.Hl1").as_os_str().as_encoded_bytes(),
             dir.join("a").as_os_str().as_encoded_bytes(),
             7,
+            &remote_stamp(&local_session(&dir), &dir.join("a")).unwrap(),
         ));
         (t, dir, cmd)
     }
@@ -1311,7 +1449,7 @@ mod tests {
         let s = session(Arc::clone(&f));
         let t = tempfile::tempdir().unwrap();
         let local = edited(t.path(), "new");
-        let e = upload_replace(&s, &local, &p("/srv/a")).unwrap_err();
+        let e = upload_replace(&s, &local, &p("/srv/a"), STAMP).unwrap_err();
         assert!(e.contains("원본을 복원"), "{e}");
         assert!(
             f.remote_cmds().last().unwrap().starts_with("rm -f -- "),
@@ -1322,7 +1460,7 @@ mod tests {
         kept.stdout = b"/srv/.hdir-bak.Qq1\0".to_vec();
         let (f, _) = scp_fake("", ok(""), kept);
         let s = session(Arc::clone(&f));
-        let e = upload_replace(&s, &local, &p("/srv/a")).unwrap_err();
+        let e = upload_replace(&s, &local, &p("/srv/a"), STAMP).unwrap_err();
         assert!(e.contains("/srv/.hdir-bak.Qq1"), "{e}");
         assert!(e.contains("/srv/.hdir-edit.Ab12Cd"), "{e}");
         assert!(
@@ -1360,7 +1498,7 @@ mod tests {
             .unwrap();
         assert!(st.success());
         let local = edited(&dir, "new secret");
-        upload_replace(&local_session(&dir), &local, &target).unwrap();
+        upload_fresh(&local_session(&dir), &local, &target).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new secret");
         assert_eq!(std::fs::metadata(&target).unwrap().gid(), g, "group kept");
         assert_eq!(mode_of(&target), 0o640, "mode kept after chgrp");
@@ -1394,7 +1532,7 @@ mod tests {
         let (f, _) = scp_fake("", ok(""), code(crate::remote::REPLACE_GROUP));
         let s = session(Arc::clone(&f));
         let t = tempfile::tempdir().unwrap();
-        let e = upload_replace(&s, &edited(t.path(), "x"), &p("/srv/a")).unwrap_err();
+        let e = upload_replace(&s, &edited(t.path(), "x"), &p("/srv/a"), STAMP).unwrap_err();
         assert!(e.contains("그룹"), "{e}");
         assert!(
             f.remote_cmds().last().unwrap().starts_with("rm -f -- "),
@@ -1411,6 +1549,7 @@ mod tests {
             b"/tmp/x/.hdir-edit.Own1",
             b"/tmp/x/f",
             1,
+            b"",
         );
         let script = String::from_utf8_lossy(&cmd);
         assert!(script.contains("!= \"$(id -u)\""), "{script}");

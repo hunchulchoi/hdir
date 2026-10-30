@@ -114,7 +114,8 @@ pub fn session_mode(cmd: Arc<FakeCmd>, mode: ScpMode) -> Arc<RemoteSession> {
 }
 
 /// Runs `ssh ... -- host CMD` as `sh -c CMD` on this machine (with `HOME`
-/// set) and `scp` as a file copy, so remote scripts can be exercised for real.
+/// set) and `scp` as a file copy (uploads and downloads; source names must
+/// not need SFTP glob escaping), so remote scripts can be exercised for real.
 /// The session's `os` must match this machine (`stat` flags).
 #[cfg(unix)]
 pub struct LocalSh {
@@ -132,7 +133,13 @@ impl Cmd for LocalSh {
         };
         if a[0] == "scp" {
             let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
+            let src = src.strip_prefix("prod-web:").unwrap_or(src);
             let dst = dst.strip_prefix("prod-web:").unwrap_or(dst);
+            // A download into a directory keeps the source's name.
+            let dst = match std::path::Path::new(dst) {
+                d if d.is_dir() => d.join(std::path::Path::new(src).file_name().unwrap()),
+                d => d.to_path_buf(),
+            };
             // Truncate in place like scp does (keeps the target's mode).
             return match std::fs::read(src).and_then(|b| std::fs::write(dst, b)) {
                 Ok(()) => ok(""),

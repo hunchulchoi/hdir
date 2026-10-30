@@ -256,7 +256,8 @@ pub struct UploadReport {
 
 /// Uploads an edited copy over a remote file (`local`, `remote`); tests
 /// inject slow or failing fakes.
-pub type Uploader = Arc<dyn Fn(&RemoteSession, &Path, &Path) -> Result<(), String> + Send + Sync>;
+pub type Uploader =
+    Arc<dyn Fn(&RemoteSession, &Path, &Path, &[u8]) -> Result<(), String> + Send + Sync>;
 
 /// A command line command waiting for the main loop to suspend the TUI.
 struct ShellJob {
@@ -1905,7 +1906,12 @@ impl App {
             remote,
             copy,
         } = ctx;
-        let EditCopy { dir, local, stamp } = copy;
+        let EditCopy {
+            dir,
+            local,
+            stamp,
+            remote: remote_st,
+        } = copy;
         let (tx, rx) = mpsc::channel();
         let abandon = Arc::new(AtomicBool::new(false));
         let (s2, r2, l2) = (Arc::clone(&session), remote.clone(), local.clone());
@@ -1913,7 +1919,7 @@ impl App {
         std::thread::spawn(move || {
             let (result, unchanged) = match stamp.differs(&l2) {
                 Ok(false) => (Ok(()), true),
-                Ok(true) => (up(&s2, &l2, &r2), false),
+                Ok(true) => (up(&s2, &l2, &r2, &remote_st), false),
                 Err(e) => (Err(format!("편집한 파일을 읽을 수 없음: {e}")), false),
             };
             let kept = (result.is_err() || ab.load(Ordering::SeqCst)).then(|| {
@@ -8744,6 +8750,9 @@ mod tests {
         /// Fake scp: downloads create `<dest dir>/<basename>` containing
         /// `body`; uploads answer `up` and are recorded with the local file's
         /// content at that moment.
+        /// The stamp the fake host reports for any file.
+        const REMOTE_STAMP: &str = "7 99 4 1234 4";
+
         fn scp_hook(f: &FakeSsh, body: &'static str, up: CmdOutput) -> Uploads {
             let uploads: Uploads = Arc::new(Mutex::new(Vec::new()));
             let rec = Arc::clone(&uploads);
@@ -8752,6 +8761,9 @@ mod tests {
                     // the upload's resolve and mktemp scripts (see remote_ops)
                     let c = crate::testutil::remote_cmd(a)?;
                     let unq = |q: &str| q[1..q.len() - 1].replace("'\\''", "'");
+                    if c.starts_with("f=") {
+                        return Some(out(0, REMOTE_STAMP));
+                    }
                     if let Some(r) = c.strip_prefix("p=") {
                         let q = r.split_once("; n=0\n").unwrap().0;
                         return Some(out(0, &format!("{}\0", unq(q))));
@@ -8855,6 +8867,7 @@ mod tests {
                 tmp.as_bytes(),
                 b"/srv/data/a.txt",
                 6,
+                REMOTE_STAMP.as_bytes(),
             );
             assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
             assert_eq!(app.status.as_deref(), Some("편집 완료: a.txt (업로드됨)"));
@@ -8921,6 +8934,9 @@ mod tests {
         fn remote_f4_download_failure_is_an_error_and_starts_no_editor() {
             let (_t, mut app, f) = edit_env();
             script(&f, |a| {
+                if crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with("f=")) {
+                    return Some(out(0, REMOTE_STAMP));
+                }
                 (a[0] == "scp").then(|| CmdOutput {
                     code: Some(1),
                     stdout: Vec::new(),
@@ -9015,7 +9031,10 @@ mod tests {
         /// F4 edit of a.txt with `up` as the uploader (scp only serves the
         /// download), left running after `run_edit`.
         fn editing_with_uploader(
-            up: impl Fn(&RemoteSession, &Path, &Path) -> Result<(), String> + Send + Sync + 'static,
+            up: impl Fn(&RemoteSession, &Path, &Path, &[u8]) -> Result<(), String>
+            + Send
+            + Sync
+            + 'static,
         ) -> (TempDir, App, Arc<FakeSsh>) {
             let (t, mut app, f) = edit_env();
             scp_hook(&f, "orig", out(0, ""));
@@ -9029,7 +9048,7 @@ mod tests {
 
         #[test]
         fn quitting_waits_for_a_running_upload() {
-            let (_t, mut app, _f) = editing_with_uploader(|_, _, _| {
+            let (_t, mut app, _f) = editing_with_uploader(|_, _, _, _| {
                 std::thread::sleep(Duration::from_millis(60));
                 Ok(())
             });
@@ -9041,7 +9060,7 @@ mod tests {
 
         #[test]
         fn quit_timeout_keeps_the_edited_copy_and_reports_where_it_goes() {
-            let (_t, mut app, _f) = editing_with_uploader(|_, local, _| {
+            let (_t, mut app, _f) = editing_with_uploader(|_, local, _, _| {
                 std::thread::sleep(Duration::from_millis(400));
                 assert_eq!(fs::read_to_string(local).unwrap(), "slow edit");
                 Ok(())
@@ -9073,7 +9092,7 @@ mod tests {
         #[test]
         fn quit_reports_failed_uploads_with_their_kept_copies() {
             let (_t, mut app, _f) =
-                editing_with_uploader(|_, _, _| Err("scp: No space left on device".into()));
+                editing_with_uploader(|_, _, _, _| Err("scp: No space left on device".into()));
             let start = Instant::now();
             while app.has_uploads() {
                 assert!(start.elapsed() < Duration::from_secs(5));

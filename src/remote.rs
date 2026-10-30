@@ -470,6 +470,29 @@ pub const REPLACE_BACKUP_KEPT: i32 = 34;
 /// The original's group could not be given to the temp file (not a member
 /// of it): nothing is replaced.
 pub const REPLACE_GROUP: i32 = 35;
+/// The original changed on the remote since it was stamped (see
+/// [`stamp_cmd`]): nothing is replaced.
+pub const REPLACE_CHANGED: i32 = 36;
+
+/// Shell that sets `s` (inode, mtime, size, following symlinks) and `k`
+/// (`cksum` of the content) for the file named by `$var`.
+fn stamp_vars(os: &RemoteOs, var: &str) -> String {
+    let st = match os {
+        RemoteOs::Bsd => "stat -L -f '%i %m %z' --",
+        RemoteOs::Linux | RemoteOs::Other(_) => "stat -L -c '%i %Y %s' --",
+    };
+    format!("s=$({st} \"${var}\") && k=$(cksum < \"${var}\")")
+}
+
+/// Prints a fingerprint of the file at `path` (inode, mtime, size and a
+/// content checksum; symlinks followed), to tell later whether it changed.
+pub fn stamp_cmd(os: &RemoteOs, path: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"f=",
+        &sh_quote(path),
+        format!("; {} && printf '%s %s' \"$s\" \"$k\"", stamp_vars(os, "f")).as_bytes(),
+    ])
+}
 
 /// `stat` printing the group id, of `os`.
 fn stat_gid_args(os: &RemoteOs) -> &'static str {
@@ -489,6 +512,9 @@ fn stat_meta_args(os: &RemoteOs) -> &'static str {
 
 /// Put the uploaded temp file `tmp` (`size` bytes) in place of the physical
 /// regular file `orig`, keeping its mode:
+/// - `orig` must still match `expect` (its [`stamp_cmd`] output when it was
+///   downloaded), checked right before replacing; else [`REPLACE_CHANGED`]
+///   and someone else's newer content is kept;
 /// - the temp's size must match, else [`REPLACE_SIZE`];
 /// - when the owner is not the current user (and we are not root) nothing is
 ///   replaced ([`REPLACE_NOT_OWNER`]): ownership cannot be kept;
@@ -505,7 +531,7 @@ fn stat_meta_args(os: &RemoteOs) -> &'static str {
 ///   mode again, as `chgrp` may clear setgid); when that is not allowed
 ///   nothing is replaced ([`REPLACE_GROUP`]) rather than exposing a
 ///   group-restricted file to another group.
-pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8> {
+pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64, expect: &[u8]) -> Vec<u8> {
     let (t, o) = (sh_quote(tmp), sh_quote(orig));
     cat(&[
         b"t=",
@@ -519,6 +545,12 @@ pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8>
         format!("m=$({} \"$o\") || exit 1; set -- $m\n", stat_meta_args(os)).as_bytes(),
         format!(
             "if [ \"$3\" != \"$(id -u)\" ]; then [ \"$(id -u)\" = 0 ] && chown \"$3:$4\" \"$t\" || exit {REPLACE_NOT_OWNER}; fi\n"
+        )
+        .as_bytes(),
+        format!("{} && [ \"$s $k\" = ", stamp_vars(os, "o")).as_bytes(),
+        &sh_quote(expect),
+        format!(
+            " ] || {{ echo 'changed on the remote since it was downloaded' >&2; exit {REPLACE_CHANGED}; }}\n"
         )
         .as_bytes(),
         b"if [ \"$2\" -gt 1 ]; then\n  \
@@ -1169,6 +1201,15 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     }
 
     #[test]
+    fn stamp_cmd_prints_inode_mtime_size_and_checksum_following_links() {
+        assert_eq!(
+            s(stamp_cmd(&RemoteOs::Linux, b"/d/it's")),
+            "f='/d/it'\\''s'; s=$(stat -L -c '%i %Y %s' -- \"$f\") && k=$(cksum < \"$f\") && printf '%s %s' \"$s\" \"$k\""
+        );
+        assert!(s(stamp_cmd(&RemoteOs::Bsd, b"/x")).contains("stat -L -f '%i %m %z' -- \"$f\""));
+    }
+
+    #[test]
     fn resolve_and_mktemp_cmds() {
         let c = s(resolve_cmd(b"/d/it's"));
         assert!(c.starts_with("p='/d/it'\\''s'; n=0\n"), "{c}");
@@ -1196,6 +1237,7 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             b"/d/.hdir-edit.AB",
             b"/d/it's",
             42,
+            b"7 99 42 1234 42",
         ));
         assert!(
             l.starts_with("t='/d/.hdir-edit.AB'; o='/d/it'\\''s'\n"),
@@ -1230,6 +1272,18 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         );
         assert!(l.contains("printf '%s\\0' \"$b\"; exit 34"), "{l}");
         assert!(l.find("exit 31").unwrap() < l.find("cat --").unwrap());
+        assert!(
+            l.contains(
+                "s=$(stat -L -c '%i %Y %s' -- \"$o\") && k=$(cksum < \"$o\") && [ \"$s $k\" = '7 99 42 1234 42' ] || {"
+            ),
+            "{l}"
+        );
+        let changed = l.find("exit 36").unwrap();
+        assert!(l.find("exit 32").unwrap() < changed, "owner check first");
+        assert!(
+            changed < l.find("if [ \"$2\" -gt 1 ]").unwrap(),
+            "checked right before replacing"
+        );
         assert!(l.contains("g=$(stat -c %g -- \"$t\") || exit 1"), "{l}");
         assert!(
             l.contains("if [ \"$g\" != \"$4\" ]; then chgrp \"$4\" \"$t\" || exit 35; fi"),
@@ -1241,10 +1295,11 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             l.find("mv --").unwrap(),
         );
         assert!(grp < mode && mode < mv, "chgrp, then chmod, then mv");
-        assert!(!l.contains("-L"), "no write-through-link branch any more");
-        let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1));
+        assert!(!l.contains("[ -L"), "no write-through-link branch any more");
+        let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1, b"x"));
         assert!(b.contains("stat -f '%Lp %l %u %g' -- \"$o\""), "{b}");
         assert!(b.contains("g=$(stat -f %g -- \"$t\")"), "{b}");
+        assert!(b.contains("s=$(stat -L -f '%i %m %z' -- \"$o\")"), "{b}");
         assert_eq!(
             (
                 REPLACE_SIZE,

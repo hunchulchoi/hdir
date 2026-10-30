@@ -345,7 +345,7 @@ fn remote_file_operations_round_trip() {
     assert!(!copy.stamp.differs(&copy.local).unwrap());
     std::fs::write(&copy.local, "changed on the server").unwrap();
     assert!(copy.stamp.differs(&copy.local).unwrap());
-    ops::upload_replace(&s, &copy.local, &d.join("edit me.txt")).expect("upload");
+    ops::upload_replace(&s, &copy.local, &d.join("edit me.txt"), &copy.remote).expect("upload");
     assert_eq!(run("cat 'edit me.txt'"), "changed on the server");
     assert_eq!(
         run("ls -A | grep -c hdir-edit || true").trim(),
@@ -368,7 +368,7 @@ fn remote_file_operations_round_trip() {
     let before = m("mode600.txt");
     let copy = ops::fetch(&s, &d.join("mode600.txt")).unwrap();
     std::fs::write(&copy.local, "secret edited").unwrap();
-    ops::upload_replace(&s, &copy.local, &d.join("mode600.txt")).unwrap();
+    ops::upload_replace(&s, &copy.local, &d.join("mode600.txt"), &copy.remote).unwrap();
     assert_eq!(run("cat mode600.txt"), "secret edited");
     assert_eq!(m("mode600.txt"), before);
     assert_eq!(before, "600");
@@ -383,7 +383,7 @@ fn remote_file_operations_round_trip() {
     assert_eq!(nlink("hl-a"), "2");
     let copy = ops::fetch(&s, &d.join("hl-a")).unwrap();
     std::fs::write(&copy.local, "shared edited").unwrap();
-    ops::upload_replace(&s, &copy.local, &d.join("hl-a")).unwrap();
+    ops::upload_replace(&s, &copy.local, &d.join("hl-a"), &copy.remote).unwrap();
     assert_eq!(nlink("hl-a"), "2", "hard link count kept");
     assert_eq!(run("cat hl-b"), "shared edited");
 
@@ -395,7 +395,7 @@ fn remote_file_operations_round_trip() {
     );
     let copy = ops::fetch(&s, &d.join("ln-to-target")).expect("download via link");
     std::fs::write(&copy.local, "after").unwrap();
-    ops::upload_replace(&s, &copy.local, &d.join("ln-to-target")).unwrap();
+    ops::upload_replace(&s, &copy.local, &d.join("ln-to-target"), &copy.remote).unwrap();
     assert_eq!(
         run("[ -L ln-to-target ] && cat real-dir/target.txt"),
         "after"
@@ -407,9 +407,34 @@ fn remote_file_operations_round_trip() {
         "no temp left"
     );
 
+    // changed on the server while editing: not replaced, theirs kept
+    run("printf 'v1' > race.txt");
+    let copy = ops::fetch(&s, &d.join("race.txt")).unwrap();
+    run("printf 'v2' > race.txt");
+    std::fs::write(&copy.local, "mine").unwrap();
+    let e = ops::upload_replace(&s, &copy.local, &d.join("race.txt"), &copy.remote).unwrap_err();
+    assert!(e.contains("원격 파일이 바뀌어"), "{e}");
+    assert_eq!(run("cat race.txt"), "v2");
+    assert_eq!(run("ls -A | grep -c hdir-edit || true").trim(), "0");
+
+    // a directory whose name ends in a newline vs. its twin without it
+    // (`$n` = "tw\n"; a bare `$(printf ...)` would drop the newline)
+    const NL: &str = "n=$(printf 'tw\\nx'); n=${n%x}; ";
+    run(&format!(
+        "{NL}mkdir -- \"$n\" tw && printf keep > tw/f && printf keep > \"$n/f\""
+    ));
+    let twin = d.join("tw\n");
+    let copy = ops::fetch(&s, &twin.join("f")).unwrap();
+    std::fs::write(&copy.local, "edited").unwrap();
+    ops::upload_replace(&s, &copy.local, &twin.join("f"), &copy.remote).unwrap();
+    assert_eq!(run(&format!("{NL}cat -- \"$n/f\"")), "edited");
+    assert_eq!(run("cat tw/f"), "keep", "the twin is untouched");
+    ops::delete(&s, &twin, &[OsString::from("f")]).unwrap();
+    assert_eq!(run(&format!("{NL}[ -e \"$n/f\" ] || cat tw/f")), "keep");
+
     // failure path: a vanished directory leaves nothing behind and errors
     let gone = d.join("moved dir").join("nope").join("f.txt");
-    assert!(ops::upload_replace(&s, &copy.local, &gone).is_err());
+    assert!(ops::upload_replace(&s, &copy.local, &gone, &copy.remote).is_err());
 
     // cd resolution
     assert_eq!(ops::resolve_cd(&s, d, "moved dir").unwrap(), moved);
