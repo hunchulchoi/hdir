@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn start_dir_resolves_symlink_before_dotdot_and_validates_the_result() {
         let d = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(d.path()).unwrap();
+        let base = crate::cmdline::canonical_dir(d.path()).unwrap();
         fs::create_dir_all(base.join("real/inner")).unwrap();
         fs::create_dir(base.join("other")).unwrap();
         fs::write(base.join("real/file"), "").unwrap();

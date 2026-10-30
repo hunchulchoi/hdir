@@ -136,6 +136,19 @@ pub fn strip_verbatim(p: &Path) -> PathBuf {
 /// resolved through the filesystem, symlinks first, like `cd -P`).
 /// Errors if it does not exist or is not a directory.
 pub fn canonical_dir(p: &Path) -> std::io::Result<PathBuf> {
+    // Windows resolves `..` lexically before touching the filesystem, which
+    // would silently drop `missing/..`: require every folded component to exist.
+    let mut acc = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                std::fs::metadata(&acc)?;
+                acc.pop();
+            }
+            Component::CurDir => {}
+            other => acc.push(other.as_os_str()),
+        }
+    }
     let c = strip_verbatim(&std::fs::canonicalize(p)?);
     if !c.is_dir() {
         return Err(std::io::Error::other("디렉터리가 아님"));
@@ -364,7 +377,7 @@ mod tests {
     #[test]
     fn resolve_relative_home_prev() {
         let d = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(d.path()).unwrap();
+        let base = canonical_dir(d.path()).unwrap();
         std::fs::create_dir_all(base.join("b/c")).unwrap();
         std::fs::create_dir_all(base.join("x/y")).unwrap();
         let cwd = base.join("b");
@@ -387,7 +400,7 @@ mod tests {
     #[test]
     fn cd_never_drops_a_missing_component_before_dotdot() {
         let d = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(d.path()).unwrap();
+        let base = canonical_dir(d.path()).unwrap();
         let r = |p: &str| resolve_cd(&base, &CdTarget::Path(p.into()), None, None);
         assert!(r("missing/..").is_err());
         assert!(r("missing/../..").is_err());
@@ -398,7 +411,7 @@ mod tests {
     #[test]
     fn cd_follows_symlinks_physically_like_cd_dash_p() {
         let d = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(d.path()).unwrap();
+        let base = canonical_dir(d.path()).unwrap();
         std::fs::create_dir_all(base.join("real/inner")).unwrap();
         std::os::unix::fs::symlink(base.join("real/inner"), base.join("link")).unwrap();
         let r = resolve_cd(&base, &CdTarget::Path("link/..".into()), None, None);
