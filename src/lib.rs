@@ -3,6 +3,7 @@
 pub mod app;
 pub mod dialog;
 pub mod fs_ops;
+pub mod job;
 pub mod panel;
 pub mod term;
 pub mod ui;
