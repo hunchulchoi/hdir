@@ -519,8 +519,8 @@ fn stat_meta_args(os: &RemoteOs) -> &'static str {
 /// regular file `orig`, keeping its mode:
 /// - `orig` must still match `expect` (its [`stamp_cmd`] output when it was
 ///   downloaded), checked right before writing (after the backup / the
-///   temp's group and mode); else [`REPLACE_CHANGED`] and someone else's
-///   newer content is kept;
+///   temp's group; the temp stays mode 600 until the check passes); else
+///   [`REPLACE_CHANGED`] and someone else's newer content is kept;
 /// - the temp's size must match, else [`REPLACE_SIZE`];
 /// - when the owner is not the current user (and we are not root) nothing is
 ///   replaced ([`REPLACE_NOT_OWNER`]): ownership cannot be kept;
@@ -574,8 +574,8 @@ pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64, expect: &[
         format!(
             "else\n  g=$({} \"$t\") || exit 1\n  \
              if [ \"$g\" != \"$4\" ]; then chgrp \"$4\" \"$t\" || exit {REPLACE_GROUP}; fi\n  \
-             chmod \"$1\" \"$t\" || exit 1\n  \
              same || changed\n  \
+             chmod \"$1\" \"$t\" || exit 1\n  \
              mv -- \"$t\" \"$o\"\nfi",
             stat_gid_args(os)
         )
@@ -1292,8 +1292,12 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         let recheck_ln = l.find("same || { rm -f -- \"$b\"; changed; }").unwrap();
         assert!(backup < recheck_ln && recheck_ln < l.find("cat --").unwrap());
         let recheck_mv = l.find("same || changed\n").unwrap();
-        assert!(l.find("chmod \"$1\"").unwrap() < recheck_mv);
-        assert!(recheck_mv < l.find("mv --").unwrap());
+        assert!(l.find("chgrp").unwrap() < recheck_mv);
+        assert!(
+            recheck_mv < l.find("chmod \"$1\"").unwrap(),
+            "private until checked"
+        );
+        assert!(l.find("chmod \"$1\"").unwrap() < l.find("mv --").unwrap());
         assert!(l.contains("g=$(stat -c %g -- \"$t\") || exit 1"), "{l}");
         assert!(
             l.contains("if [ \"$g\" != \"$4\" ]; then chgrp \"$4\" \"$t\" || exit 35; fi"),

@@ -13,6 +13,8 @@ type Responder = Box<dyn Fn(&[String]) -> CmdOutput + Send + Sync>;
 /// Records every argv and answers through a closure.
 pub struct FakeCmd {
     pub log: Mutex<Vec<Vec<String>>>,
+    /// The argvs that came through `run_transfer` (also in `log`).
+    pub transfers: Mutex<Vec<Vec<String>>>,
     respond: Responder,
 }
 
@@ -20,6 +22,7 @@ impl FakeCmd {
     pub fn new(respond: impl Fn(&[String]) -> CmdOutput + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             log: Mutex::new(Vec::new()),
+            transfers: Mutex::new(Vec::new()),
             respond: Box::new(respond),
         })
     }
@@ -27,6 +30,16 @@ impl FakeCmd {
     /// The remote shell commands run through `ssh ... -- host CMD`, in order.
     pub fn remote_cmds(&self) -> Vec<String> {
         self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|a| remote_cmd(a).map(str::to_string))
+            .collect()
+    }
+
+    /// The remote shell commands run without the short timeout.
+    pub fn long_cmds(&self) -> Vec<String> {
+        self.transfers
             .lock()
             .unwrap()
             .iter()
@@ -68,6 +81,10 @@ impl Cmd for FakeCmd {
         (self.respond)(&a)
     }
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
+        self.run(argv)
+    }
+    fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
+        self.transfers.lock().unwrap().push(strs(argv));
         self.run(argv)
     }
 }

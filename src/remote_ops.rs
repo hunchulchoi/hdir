@@ -40,7 +40,10 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 
 /// Run `cmd`; a non-zero exit becomes the first stderr line.
 fn run_ok(s: &RemoteSession, cmd: &[u8]) -> Result<CmdOutput, String> {
-    let out = s.exec(cmd).map_err(|e| e.message())?;
+    ok_or_stderr(s.exec(cmd).map_err(|e| e.message())?)
+}
+
+fn ok_or_stderr(out: CmdOutput) -> Result<CmdOutput, String> {
     if out.code == Some(0) {
         return Ok(out);
     }
@@ -261,7 +264,8 @@ fn scp_run(s: &RemoteSession, argv: Result<Vec<OsString>, String>) -> Result<(),
 
 /// Fingerprint of the remote file `path` (see [`stamp_cmd`]).
 pub fn remote_stamp(s: &RemoteSession, path: &Path) -> Result<Vec<u8>, String> {
-    let out = run_ok(s, &stamp_cmd(&s.os, &os_bytes(path.as_os_str())))?;
+    let cmd = stamp_cmd(&s.os, &os_bytes(path.as_os_str()));
+    let out = ok_or_stderr(s.exec_long(&cmd).map_err(|e| e.message())?)?;
     if out.stdout.is_empty() {
         return Err("원격 파일 상태를 알 수 없음".into());
     }
@@ -355,7 +359,7 @@ pub fn upload_replace(
     let mut keep_tmp = false;
     let res = scp_run(s, argv).and_then(|()| {
         let out = s
-            .exec(&replace_cmd(&s.os, &tmp_b, &phys, size, expect))
+            .exec_long(&replace_cmd(&s.os, &tmp_b, &phys, size, expect))
             .map_err(|e| e.message())?;
         match out.code {
             Some(0) => Ok(()),
@@ -911,8 +915,14 @@ mod tests {
         let f = FakeCmd::new(|_| fail(1, "scp: /srv/x: No such file or directory\n"));
         let e = fetch(&session(f), &p("/srv/x"), true).unwrap_err();
         assert!(e.contains("No such file"), "{e}");
-        let f = FakeCmd::new(|_| ok("")); // "succeeds" but nothing arrived
-        assert!(fetch(&session(f), &p("/srv/x"), true).is_err());
+        // stamped, scp "succeeds" but nothing arrived
+        let f = FakeCmd::new(|a| {
+            let stamp = crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with("f="));
+            ok(if stamp { "1 2 3 4 3" } else { "" })
+        });
+        let e = fetch(&session(Arc::clone(&f)), &p("/srv/x"), true).unwrap_err();
+        assert!(e.contains("내려받은 파일을 읽을 수 없음"), "{e}");
+        assert_eq!(f.scp_calls().len(), 1);
         let f = FakeCmd::new(|_| code(255));
         let s = session(f);
         assert_eq!(
@@ -1329,12 +1339,12 @@ mod tests {
 
     #[test]
     fn real_replace_rechecks_right_before_the_mv() {
-        // someone saves the original while the temp gets its mode
+        // someone saves the original while the temp gets its group
         let (_t, dir, cmd) = replace_with_fakes(
-            &[(
-                "chmod",
-                "/bin/chmod \"$@\" || exit 1; printf other > \"$(dirname \"$0\")/../d/a\"",
-            )],
+            &[
+                ("stat", STAT_OTHER_GID),
+                ("chgrp", "printf other > \"$(dirname \"$0\")/../d/a\""),
+            ],
             false,
         );
         let out = local_session(&dir).exec(&cmd).unwrap();
@@ -1395,11 +1405,14 @@ mod tests {
         let r = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap_or_else(|_| {
-                // let a blocked reader go before failing
-                for _ in 0..2 {
+                // let blocked readers go (non-blocking: never hangs here)
+                use std::os::unix::fs::OpenOptionsExt;
+                for _ in 0..50 {
                     let _ = std::fs::OpenOptions::new()
                         .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
                         .open(dir.join("pipe"));
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 panic!("stamping a FIFO must not block")
             });
@@ -1412,6 +1425,58 @@ mod tests {
         let copy = fetch(&session(Arc::clone(&f)), &p("/srv/a"), false).unwrap();
         assert!(copy.remote.is_empty());
         assert!(!f.remote_cmds().iter().any(|c| c.starts_with("f=")));
+    }
+
+    #[test]
+    fn whole_file_reads_run_without_the_short_command_timeout() {
+        let (f, _) = scp_fake("orig", ok(""), ok(""));
+        let s = session(Arc::clone(&f));
+        let copy = fetch(&s, &p("/srv/a"), true).unwrap();
+        std::fs::write(&copy.local, "mine").unwrap();
+        upload_replace(&s, &copy.local, &p("/srv/a"), &copy.remote).unwrap();
+        let long = f.long_cmds();
+        assert!(long.iter().any(|c| c.starts_with("f=")), "stamp: {long:?}");
+        assert!(
+            long.iter().any(|c| c.starts_with("t='")),
+            "replace: {long:?}"
+        );
+        assert!(
+            !long
+                .iter()
+                .any(|c| c.starts_with("p=") || c.starts_with("t=$(mktemp")),
+            "quick commands keep the short timeout: {long:?}"
+        );
+    }
+
+    #[test]
+    fn real_replace_keeps_the_temp_private_until_the_check_passes() {
+        // the fake cksum records the temp's mode while the check runs
+        let (_t, dir, cmd) = replace_with_fakes(
+            &[(
+                "cksum",
+                "ls -l \"$(dirname \"$0\")/../d/.hdir-edit.Hl1\" > \"$(dirname \"$0\")/seen\"; exec /usr/bin/cksum \"$@\"",
+            )],
+            false,
+        );
+        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(
+            dir.join(".hdir-edit.Hl1"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen = std::fs::read_to_string(dir.parent().unwrap().join("bin/seen")).unwrap();
+        assert!(
+            seen.starts_with("-rw-------"),
+            "temp during the check: {seen}"
+        );
+        assert_eq!(mode_of(&dir.join("a")), 0o644, "mode applied afterwards");
     }
 
     #[test]
