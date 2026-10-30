@@ -1141,26 +1141,21 @@ mod tests {
     }
 
     #[test]
-    fn real_upload_refuses_a_file_owned_by_someone_else() {
-        // Only checkable as root-less impersonation: skip unless a foreign
-        // owned file exists (e.g. /etc/hosts is root-owned on every unix).
-        use std::os::unix::fs::MetadataExt;
-        let hosts = Path::new("/etc/hosts");
-        // SAFETY: getuid cannot fail.
-        let me = unsafe { libc::getuid() };
-        if me == 0 || !hosts.exists() || std::fs::metadata(hosts).unwrap().uid() == me {
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = std::fs::canonicalize(tmp.path()).unwrap();
-        let s = local_session(&dir);
-        let t = dir.join(".hdir-edit.Own1");
-        std::fs::write(&t, "x").unwrap();
-        let cmd =
-            crate::remote::replace_cmd(&s.os, t.as_os_str().as_encoded_bytes(), b"/etc/hosts", 1);
-        let out = s.exec(&cmd).unwrap();
-        assert_eq!(out.code, Some(crate::remote::REPLACE_NOT_OWNER));
-        assert!(t.exists(), "temp kept for the user");
+    fn replace_script_refuses_a_file_owned_by_someone_else() {
+        // Never point a test at a system file: check the script's owner guard
+        // instead. A foreign-owned target can't be created without root.
+        let cmd = crate::remote::replace_cmd(
+            &crate::remote::RemoteOs::Linux,
+            b"/tmp/x/.hdir-edit.Own1",
+            b"/tmp/x/f",
+            1,
+        );
+        let script = String::from_utf8_lossy(&cmd);
+        assert!(script.contains("!= \"$(id -u)\""), "{script}");
+        assert!(
+            script.contains(&format!("exit {}", crate::remote::REPLACE_NOT_OWNER)),
+            "{script}"
+        );
     }
 
     // ---- HDIR-41: cd ----
