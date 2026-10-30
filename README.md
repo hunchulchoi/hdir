@@ -34,3 +34,4 @@ source /path/to/hdir/shell/hdir.fish
 - [구현 계획](docs/plan.md)
 - [초기 구상](docs/mvp계획.md)
 - [개발 룰](CLAUDE.md)
+- [핸드오프](docs/HANDOFF.md)
