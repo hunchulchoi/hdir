@@ -97,7 +97,12 @@ struct Worker {
     bytes_done: u64,
     current: PathBuf,
     last_sent: Instant,
+    /// Test hook: invoked after every copied chunk, on the worker thread.
+    on_chunk: Option<ChunkHook>,
 }
+
+/// Callback run on the worker thread after each copied chunk (used to make tests deterministic).
+pub type ChunkHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 impl Worker {
     fn send_progress(&mut self) {
@@ -112,6 +117,9 @@ impl Worker {
 
 impl OpControl for Worker {
     fn on_progress(&mut self, delta: u64, current: &Path) {
+        if let Some(hook) = &self.on_chunk {
+            hook(current);
+        }
         let first = self.bytes_done == 0;
         self.bytes_done += delta;
         if self.current != current {
@@ -188,6 +196,11 @@ pub struct JobHandle {
 
 impl JobHandle {
     pub fn spawn(spec: JobSpec) -> JobHandle {
+        Self::spawn_with(spec, None)
+    }
+
+    /// Like [`spawn`](Self::spawn) with an optional per-chunk hook (for deterministic tests).
+    pub fn spawn_with(spec: JobSpec, on_chunk: Option<ChunkHook>) -> JobHandle {
         let (etx, erx) = mpsc::channel();
         let (atx, arx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -200,6 +213,7 @@ impl JobHandle {
             bytes_done: 0,
             current: PathBuf::new(),
             last_sent: Instant::now(),
+            on_chunk,
         };
         let thread = std::thread::spawn(move || {
             let outcome = catch_unwind(AssertUnwindSafe(|| run(&spec, &mut worker)))
@@ -477,20 +491,42 @@ mod tests {
     }
 
     #[test]
-    fn cancel_during_large_copy() {
+    fn cancel_mid_copy_is_deterministic() {
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
         let (_t, s, d) = dirs();
-        fs::write(s.join("big.bin"), vec![7u8; 128 << 20]).unwrap();
-        let h = JobHandle::spawn(spec(JobKind::Copy, vec![s.join("big.bin")], &d));
-        let mut ev = wait_events(&h, |e| {
-            e.iter().any(|x| matches!(x, JobEvent::Progress { .. }))
+        fs::write(s.join("big.bin"), vec![7u8; 4 << 20]).unwrap();
+        let (reached_tx, reached_rx) = mpsc::channel::<()>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let gate_rx = Mutex::new(gate_rx);
+        let calls = AtomicUsize::new(0);
+        let hook: ChunkHook = Arc::new(move |_| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                reached_tx.send(()).unwrap();
+                let _ = gate_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+            }
         });
+        let h = JobHandle::spawn_with(spec(JobKind::Copy, vec![s.join("big.bin")], &d), Some(hook));
+        // Worker is provably inside the copy (first 1 MiB chunk written, 3 MiB left).
+        reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         h.cancel();
-        while !finished(&ev) {
-            ev.extend(wait_events(&h, |_| true));
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        gate_tx.send(()).unwrap();
+        let ev = wait_events(&h, finished);
         assert_eq!(outcome(&ev), JobOutcome::Cancelled);
         assert!(!d.join("big.bin").exists());
+        assert!(s.join("big.bin").exists());
+        let max_done = ev
+            .iter()
+            .filter_map(|e| match e {
+                JobEvent::Progress { bytes_done, .. } => Some(*bytes_done),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(max_done < 4 << 20, "copied everything: {max_done}");
     }
 
     #[test]

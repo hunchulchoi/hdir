@@ -731,4 +731,266 @@ mod tests {
         t.trash(&[PathBuf::from("/x/y")]).unwrap();
         assert_eq!(f.0.borrow().as_slice(), [PathBuf::from("/x/y")]);
     }
+
+    // ---- HDIR-12 edge cases ----
+
+    /// Restore permissions so tempdir cleanup can delete everything.
+    struct Unlock(PathBuf);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    fn two_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let t = tempdir().unwrap();
+        let (s, d) = (t.path().join("s"), t.path().join("d"));
+        fs::create_dir(&s).unwrap();
+        fs::create_dir(&d).unwrap();
+        (t, s, d)
+    }
+
+    #[test]
+    fn empty_dir_copy_and_move() {
+        let (_t, s, d) = two_dirs();
+        let e = s.join("empty");
+        fs::create_dir(&e).unwrap();
+        copy_items(std::slice::from_ref(&e), &d, &mut ctl()).unwrap();
+        assert!(d.join("empty").is_dir());
+        assert_eq!(fs::read_dir(d.join("empty")).unwrap().count(), 0);
+        assert!(e.exists());
+        let d2 = _t.path().join("d2");
+        fs::create_dir(&d2).unwrap();
+        move_items(std::slice::from_ref(&e), &d2, &mut ctl()).unwrap();
+        assert!(d2.join("empty").is_dir());
+        assert!(!e.exists());
+        // EXDEV fallback path for an empty dir too.
+        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        let e2 = s.join("empty2");
+        fs::create_dir(&e2).unwrap();
+        move_items_with(std::slice::from_ref(&e2), &d2, &mut ctl(), &exdev).unwrap();
+        assert!(d2.join("empty2").is_dir() && !e2.exists());
+    }
+
+    #[test]
+    fn readonly_source_keeps_perms_and_can_be_overwritten_twice() {
+        let (_t, s, d) = two_dirs();
+        let src = s.join("ro.txt");
+        fs::write(&src, "v1").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
+        copy_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap();
+        let dest = d.join("ro.txt");
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v1");
+        // Second run: dest is read-only and must still be replaced.
+        let mut c = Ctl::new(ConflictAction::Overwrite);
+        assert_eq!(
+            copy_items(std::slice::from_ref(&src), &d, &mut c).unwrap(),
+            OpOutcome::Done
+        );
+        assert_eq!(c.conflicts.len(), 1);
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        // Move overwrite onto a read-only dest as well.
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&src, "v2").unwrap();
+        move_items(
+            std::slice::from_ref(&src),
+            &d,
+            &mut Ctl::new(ConflictAction::Overwrite),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "v2");
+    }
+
+    #[test]
+    fn readonly_dest_dir_errors_without_panic_or_partial() {
+        let (_t, s, d) = two_dirs();
+        let src = s.join("f.txt");
+        fs::write(&src, "x").unwrap();
+        let tree = s.join("tree");
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("sub/g"), "g").unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+        let _g = Unlock(d.clone());
+        if fs::File::create(d.join("probe")).is_ok() {
+            return; // running as root: permissions not enforced
+        }
+        let e = copy_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let e = copy_items(std::slice::from_ref(&tree), &d, &mut ctl()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let e = move_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
+        assert!(src.exists() && tree.exists());
+    }
+
+    #[test]
+    fn symlink_to_parent_is_copied_as_link_not_followed() {
+        let (_t, s, d) = two_dirs();
+        let tree = s.join("tree");
+        fs::create_dir_all(tree.join("a")).unwrap();
+        fs::write(tree.join("a/f"), "f").unwrap();
+        std::os::unix::fs::symlink("..", tree.join("a/up")).unwrap(); // -> tree
+        std::os::unix::fs::symlink(&s, tree.join("abs_parent")).unwrap(); // -> s (contains tree)
+        std::os::unix::fs::symlink("loop2", tree.join("loop1")).unwrap();
+        std::os::unix::fs::symlink("loop1", tree.join("loop2")).unwrap();
+        let tot = measure(std::slice::from_ref(&tree)).unwrap();
+        assert_eq!(tot, Totals { files: 5, bytes: 1 });
+        let mut c = ctl();
+        copy_items(std::slice::from_ref(&tree), &d, &mut c).unwrap();
+        assert_eq!(c.progress, tot.bytes);
+        for (l, t) in [("a/up", ".."), ("loop1", "loop2"), ("loop2", "loop1")] {
+            let p = d.join("tree").join(l);
+            assert!(fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_link(&p).unwrap(), PathBuf::from(t));
+        }
+        assert_eq!(fs::read_link(d.join("tree/abs_parent")).unwrap(), s);
+        // Moving across devices also must not follow links.
+        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        let d2 = _t.path().join("d2");
+        fs::create_dir(&d2).unwrap();
+        move_items_with(std::slice::from_ref(&tree), &d2, &mut ctl(), &exdev).unwrap();
+        assert!(!tree.exists());
+        assert!(
+            fs::symlink_metadata(d2.join("tree/a/up"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn symlink_to_dir_as_source_is_copied_as_link() {
+        let (_t, s, d) = two_dirs();
+        let real = s.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("f"), "f").unwrap();
+        let lnk = s.join("lnk");
+        std::os::unix::fs::symlink(&real, &lnk).unwrap();
+        copy_items(std::slice::from_ref(&lnk), &d, &mut ctl()).unwrap();
+        assert!(fs::symlink_metadata(d.join("lnk")).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn awkward_file_names() {
+        let (_t, s, d) = two_dirs();
+        let names = [
+            "new\nline",
+            "qu\"ote",
+            "-dash",
+            "--rf",
+            "-",
+            "tab\tname",
+            "it's $HOME `x`",
+        ];
+        let mut srcs = vec![];
+        for n in names {
+            let p = s.join(n);
+            fs::write(&p, n).unwrap();
+            srcs.push(p);
+        }
+        let dir = s.join("-dir\n\"q\"");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("-in\nner"), "i").unwrap();
+        srcs.push(dir);
+        let tot = measure(&srcs).unwrap();
+        let mut c = ctl();
+        copy_items(&srcs, &d, &mut c).unwrap();
+        assert_eq!(c.progress, tot.bytes);
+        for n in names {
+            assert_eq!(fs::read_to_string(d.join(n)).unwrap(), n);
+        }
+        assert_eq!(
+            fs::read_to_string(d.join("-dir\n\"q\"/-in\nner")).unwrap(),
+            "i"
+        );
+        let d2 = _t.path().join("d2");
+        fs::create_dir(&d2).unwrap();
+        move_items(&srcs, &d2, &mut ctl()).unwrap();
+        assert_eq!(
+            fs::read_to_string(d2.join("new\nline")).unwrap(),
+            "new\nline"
+        );
+        assert!(!s.join("-dash").exists());
+        // make_dir / rename accept these as plain names.
+        let m = make_dir(&d2, "-x\ny").unwrap();
+        assert!(m.is_dir());
+        let r = rename(&m, "--z\"").unwrap();
+        assert!(r.is_dir());
+    }
+
+    #[test]
+    fn measure_matches_bytes_copied_with_symlinks() {
+        let (_t, s, d) = two_dirs();
+        let tree = s.join("t");
+        fs::create_dir_all(tree.join("x/y")).unwrap();
+        fs::write(tree.join("big"), vec![3u8; 1_500_000]).unwrap();
+        fs::write(tree.join("x/y/small"), "abc").unwrap();
+        fs::write(tree.join("x/empty"), "").unwrap();
+        std::os::unix::fs::symlink("big", tree.join("l1")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/dangling", tree.join("x/dangling")).unwrap();
+        std::os::unix::fs::symlink("x", tree.join("dirlink")).unwrap();
+        let tot = measure(std::slice::from_ref(&tree)).unwrap();
+        assert_eq!(
+            tot,
+            Totals {
+                files: 6,
+                bytes: 1_500_003
+            }
+        );
+        let mut c = ctl();
+        copy_items(&[tree], &d, &mut c).unwrap();
+        assert_eq!(c.progress, tot.bytes);
+        assert_eq!(c.done.len() as u64, tot.files);
+    }
+
+    #[test]
+    fn deep_nesting_50_levels() {
+        let (_t, s, d) = two_dirs();
+        let mut deep = s.join("root");
+        for i in 0..50 {
+            deep = deep.join(format!("l{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("leaf"), "leaf").unwrap();
+        let root = s.join("root");
+        let tot = measure(std::slice::from_ref(&root)).unwrap();
+        assert_eq!(tot, Totals { files: 1, bytes: 4 });
+        let mut c = ctl();
+        copy_items(std::slice::from_ref(&root), &d, &mut c).unwrap();
+        let mut copied = d.join("root");
+        for i in 0..50 {
+            copied = copied.join(format!("l{i}"));
+        }
+        assert_eq!(fs::read_to_string(copied.join("leaf")).unwrap(), "leaf");
+        let d2 = _t.path().join("d2");
+        fs::create_dir(&d2).unwrap();
+        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        move_items_with(std::slice::from_ref(&root), &d2, &mut ctl(), &exdev).unwrap();
+        assert!(!root.exists());
+        assert!(d2.join("root/l0").is_dir());
+    }
+
+    #[test]
+    fn readonly_source_dir_copies_contents() {
+        let (_t, s, d) = two_dirs();
+        let src = s.join("rod");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("f"), "x").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).unwrap();
+        let _g = Unlock(src.clone());
+        copy_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap();
+        assert_eq!(fs::read_to_string(d.join("rod/f")).unwrap(), "x");
+        assert_eq!(
+            fs::metadata(d.join("rod")).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        let _g2 = Unlock(d.join("rod"));
+    }
 }
