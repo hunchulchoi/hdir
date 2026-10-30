@@ -266,30 +266,27 @@ fn trash_row_text(e: &TrashEntry, selected: bool, width: usize) -> String {
     } else {
         e.size.map_or_else(|| "-".to_string(), human_size)
     };
-    let time = e.deleted_at.map_or_else(|| "-".to_string(), format_local);
+    let time = e.deleted_at().map_or_else(|| "-".to_string(), format_local);
     // mark + name + ' ' + time + ' ' + size
     let fixed = 1 + 1 + TIME_W + 1 + SIZE_W;
     if width < fixed + 4 {
-        return fit_width(&format!("{mark}{}", e.name), width);
+        return fit_width(&format!("{mark}{}", e.name()), width);
     }
     let time = fit_width(&time, TIME_W);
     // Room for a parent column only when both columns stay readable.
     if width >= fixed + 1 + 28 {
         let rest = width - fixed - 1;
         let name_w = rest / 2;
-        let parent = e
-            .original_parent
-            .as_deref()
-            .map_or_else(|| "-".to_string(), tilde);
+        let parent = e.original_parent().map_or_else(|| "-".to_string(), tilde);
         return format!(
             "{mark}{} {} {time} {size:>SIZE_W$}",
-            fit_width(&e.name, name_w),
+            fit_width(&e.name(), name_w),
             fit_width(&tail_width(&parent, rest - name_w), rest - name_w),
         );
     }
     format!(
         "{mark}{} {time} {size:>SIZE_W$}",
-        fit_width(&e.name, width - fixed)
+        fit_width(&e.name(), width - fixed)
     )
 }
 
@@ -324,7 +321,7 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool)
         .skip(offset)
         .take(rows)
         .map(|(i, e)| {
-            let sel = tv.selected.contains(&e.id);
+            let sel = tv.selected.contains(e.id());
             let mut style = Style::default().bg(palette::BG).fg(if sel {
                 palette::SELECTED
             } else if e.is_dir {
@@ -729,15 +726,13 @@ mod tests {
     const TS: i64 = 1_700_000_000;
 
     fn tentry(name: &str, parent: Option<&str>, at: Option<i64>, size: Option<u64>) -> TrashEntry {
-        TrashEntry {
+        let item = trash::TrashItem {
             id: format!("id-{name}").into(),
             name: name.into(),
-            os_name: name.into(),
-            original_parent: parent.map(PathBuf::from),
-            deleted_at: at,
-            size,
-            is_dir: size.is_none() && at.is_some(),
-        }
+            original_parent: parent.map(PathBuf::from).unwrap_or_default(),
+            time_deleted: at.unwrap_or(0),
+        };
+        TrashEntry::new(item, size, size.is_none() && at.is_some())
     }
 
     fn trash_view() -> TrashView {
