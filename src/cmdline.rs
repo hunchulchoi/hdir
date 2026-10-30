@@ -380,10 +380,7 @@ mod tests {
             r(CdTarget::Path("../x/./y".into()), None),
             Ok(base.join("x/y"))
         );
-        assert_eq!(
-            r(CdTarget::Path(base.join("x").into()), None),
-            Ok(base.join("x"))
-        );
+        assert_eq!(r(CdTarget::Path(base.join("x")), None), Ok(base.join("x")));
         assert!(resolve_cd(&cwd, &CdTarget::Home, None, None).is_err());
     }
 
