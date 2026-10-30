@@ -1031,7 +1031,7 @@ mod tests {
         let found = find(&store);
         assert_eq!(found.len(), 1);
         let r = store.restore(&found);
-        assert_eq!(r.restored, [path.clone()], "{r:?}");
+        assert_eq!(r.restored, std::slice::from_ref(&path), "{r:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "data");
         assert!(store.delete(std::slice::from_ref(&path))[0].1.is_ok());
         let found = find(&store);
