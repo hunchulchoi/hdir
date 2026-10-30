@@ -136,6 +136,9 @@ fn title_for(panel: &Panel, width: usize) -> String {
             s = format!("~/{rest}");
         }
     }
+    if panel.loading.is_some() {
+        s.push_str(" 읽는 중…");
+    }
     tail_width(&s, width)
 }
 
@@ -230,6 +233,9 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool) {
 }
 
 fn default_status(panel: &Panel) -> String {
+    if panel.loading.is_some() {
+        return "읽는 중…".to_string();
+    }
     let dirs = panel.entries.iter().filter(|e| is_dirlike(e)).count();
     let files = panel
         .entries
@@ -457,6 +463,7 @@ mod tests {
             show_hidden: false,
             selected: Default::default(),
             error: None,
+            loading: None,
         }
     }
 
@@ -515,5 +522,25 @@ mod tests {
         for y in 2..21 {
             assert_eq!(buf[(39, y)].symbol(), "│", "row {y}: {}", row(&buf, y));
         }
+    }
+
+    #[test]
+    fn loading_panel_shows_reading_in_status_and_title() {
+        let (a, b) = setup();
+        let mut pa = Panel::new(a.path());
+        let pb = Panel::new(b.path());
+        pa.loading = Some(crate::panel::LoadRequest {
+            id: 1,
+            dir: a.path().to_path_buf(),
+            focus: None,
+            kind: crate::panel::LoadKind::Enter,
+        });
+        let buf = render(&pa, &pb, 0, None, 80, 24);
+        // Wide glyphs leave blank continuation cells; compare without spaces.
+        let compact = |y| row(&buf, y).replace(' ', "");
+        assert!(compact(22).contains("읽는중…"), "{}", row(&buf, 22));
+        assert!(compact(1).contains("읽는중…"), "{}", row(&buf, 1));
+        let idle = render(&pb, &pb, 0, None, 80, 24);
+        assert!(!row(&idle, 22).replace(' ', "").contains("읽는중…"));
     }
 }

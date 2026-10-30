@@ -9,7 +9,8 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 use crate::dialog::{self, Dialog, DialogResult};
 use crate::fs_ops::{self, SystemTrash, Trash};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobOutcome, JobSpec, ProgressView};
-use crate::panel::{EnterResult, EntryKind, Panel};
+use crate::loader::Loader;
+use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
 use crate::ui::{self, View};
 use crate::undo::{UndoOp, UndoStack};
 
@@ -78,6 +79,9 @@ pub struct App {
     pub job: Option<RunningJob>,
     trash: Box<dyn Trash>,
     pub undo: UndoStack,
+    /// Background directory reader; tests may swap in a gated one.
+    pub loader: Loader,
+    next_load_id: u64,
     page_height: usize,
 }
 
@@ -113,6 +117,8 @@ impl App {
             job: None,
             trash,
             undo: UndoStack::default(),
+            loader: Loader::default(),
+            next_load_id: 0,
             page_height: 1,
         }
     }
@@ -190,20 +196,32 @@ impl App {
             KeyCode::PageDown => self.navigate(|p| p.page_down(page)),
             KeyCode::Home => self.navigate(Panel::home),
             KeyCode::End => self.navigate(Panel::end),
-            KeyCode::Backspace => self.navigate(|p| {
-                p.go_parent();
-            }),
-            KeyCode::Char('.') => self.navigate(Panel::toggle_hidden),
+            KeyCode::Backspace => {
+                self.status = None;
+                let id = self.next_id();
+                if let Some(req) = self.active_panel_mut().begin_parent(id) {
+                    self.dispatch(self.active, req);
+                }
+            }
+            KeyCode::Char('.') => {
+                self.status = None;
+                let id = self.next_id();
+                let req = self.active_panel_mut().begin_toggle_hidden(id);
+                self.dispatch(self.active, req);
+            }
             KeyCode::Enter => {
                 self.status = None;
-                if let EnterResult::Opened(path) = self.active_panel_mut().enter() {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.status = Some(format!("열기: {name}"));
-                } else {
-                    self.show_panel_error();
+                let id = self.next_id();
+                match self.active_panel_mut().begin_enter(id) {
+                    AsyncEnter::Opened(path) => {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        self.status = Some(format!("열기: {name}"));
+                    }
+                    AsyncEnter::Load(req) => self.dispatch(self.active, req),
+                    AsyncEnter::Nothing => self.show_panel_error(),
                 }
             }
             KeyCode::Char(' ') | KeyCode::Insert => {
@@ -271,8 +289,57 @@ impl App {
         });
     }
 
-    /// Poll the background job; returns true when the screen needs a redraw.
+    fn next_id(&mut self) -> u64 {
+        self.next_load_id += 1;
+        self.next_load_id
+    }
+
+    /// Hand a panel's pending load request to the background loader.
+    fn dispatch(&mut self, idx: usize, req: LoadRequest) {
+        let hidden = self.panels[idx].show_hidden;
+        self.loader.request(req.id, req.dir, hidden);
+    }
+
+    /// Start an async reload of panel `idx` (cursor on `focus` if given).
+    fn reload_panel(&mut self, idx: usize, focus: Option<OsString>) {
+        let id = self.next_id();
+        let req = self.panels[idx].begin_reload(id, focus);
+        self.dispatch(idx, req);
+    }
+
+    /// Apply finished directory loads; returns true when anything changed.
+    fn drain_loads(&mut self) -> bool {
+        let mut changed = false;
+        for res in self.loader.try_results() {
+            let id = res.id;
+            let Some(idx) = self
+                .panels
+                .iter()
+                .position(|p| p.loading.as_ref().is_some_and(|r| r.id == id))
+            else {
+                continue; // superseded
+            };
+            let kind = self.panels[idx].loading.as_ref().map(|r| r.kind);
+            if self.panels[idx].finish_load(res) {
+                changed = true;
+                if idx == self.active
+                    && kind != Some(LoadKind::Reload)
+                    && let Some(err) = self.panels[idx].error.clone()
+                {
+                    self.status = Some(err);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Poll background loads and the job; returns true when the screen needs a redraw.
     pub fn tick(&mut self) -> bool {
+        let loaded = self.drain_loads();
+        self.tick_job() || loaded
+    }
+
+    fn tick_job(&mut self) -> bool {
         let Some(job) = self.job.as_mut() else {
             return false;
         };
@@ -349,8 +416,8 @@ impl App {
         if matches!(self.dialog, Some((_, PendingAction::Conflict))) {
             self.dialog = None;
         }
-        for p in &mut self.panels {
-            p.reload();
+        for i in 0..2 {
+            self.reload_panel(i, None);
         }
         self.status = Some(status);
     }
@@ -469,8 +536,8 @@ impl App {
             Ok(msg) => msg,
             Err(e) => e,
         };
-        for p in &mut self.panels {
-            p.reload();
+        for i in 0..2 {
+            self.reload_panel(i, None);
         }
         self.status = Some(status);
     }
@@ -480,16 +547,9 @@ impl App {
     fn after_fs_op(&mut self, focus: Option<&str>, status: String) {
         let same = self.other_panel().cwd == self.active_panel().cwd;
         if same {
-            let other = 1 - self.active;
-            self.panels[other].reload();
+            self.reload_panel(1 - self.active, None);
         }
-        let panel = self.active_panel_mut();
-        panel.reload();
-        if let Some(name) = focus
-            && let Some(i) = panel.entries.iter().position(|e| e.os_name == name)
-        {
-            panel.cursor = i;
-        }
+        self.reload_panel(self.active, focus.map(OsString::from));
         self.status = Some(status);
     }
 
@@ -665,9 +725,11 @@ mod tests {
         let root = fs::canonicalize(tmp.path()).unwrap();
         press(&mut app, KeyCode::Down); // adir
         press(&mut app, KeyCode::Enter);
+        settle(&mut app);
         assert_eq!(app.panels[0].cwd, root.join("adir"));
         assert_eq!(app.panels[1].cwd, root);
         press(&mut app, KeyCode::Backspace);
+        settle(&mut app);
         assert_eq!(app.panels[0].cwd, root);
         assert_eq!(name_at(&app, 0), "adir");
     }
@@ -741,12 +803,14 @@ mod tests {
     fn hidden_toggle_drops_hidden_selection_from_selected_or_current() {
         let (_t, mut app) = fixture();
         press(&mut app, KeyCode::Char('.')); // show hidden: .., adir, bdir, .h, f.txt
+        settle(&mut app);
         for _ in 0..3 {
             press(&mut app, KeyCode::Down); // .h
         }
         press(&mut app, KeyCode::Char(' '));
         assert_eq!(app.selected_or_current(), vec![OsString::from(".h")]);
         press(&mut app, KeyCode::Char('.')); // hide again
+        settle(&mut app);
         assert!(app.active_panel().selected.is_empty());
         let cur = app.active_panel().current().unwrap().os_name.clone();
         assert_eq!(app.selected_or_current(), vec![cur]);
@@ -844,6 +908,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.dialog.is_none());
         assert!(tmp.path().join("새폴더").is_dir());
+        settle(&mut app);
         assert_eq!(name_at(&app, 0), "새폴더");
         assert_eq!(app.status.as_deref(), Some("폴더 생성: 새폴더"));
     }
@@ -886,6 +951,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(!tmp.path().join("f.txt").exists());
         assert!(tmp.path().join("h.txt").exists());
+        settle(&mut app);
         assert_eq!(name_at(&app, 0), "h.txt");
     }
 
@@ -974,6 +1040,7 @@ mod tests {
         press(&mut app, KeyCode::F(7));
         type_str(&mut app, "nd");
         press(&mut app, KeyCode::Enter);
+        settle(&mut app);
         assert!(app.panels[1].entries.iter().any(|e| e.name == "nd"));
     }
 
@@ -1116,6 +1183,7 @@ mod tests {
         );
         assert!(tmp.path().join("src/a.txt").exists());
         assert!(app.status.as_deref().unwrap().starts_with("복사 완료"));
+        settle(&mut app);
         assert!(app.panels[1].entries.iter().any(|e| e.name == "a.txt"));
     }
 
@@ -1322,5 +1390,128 @@ mod tests {
         let (_t, mut app) = fixture_job();
         assert!(!app.tick());
         assert!(!app.tick());
+    }
+
+    // ---- async directory loading ----
+
+    use std::time::{Duration, Instant};
+
+    /// Tick until no panel is loading (5s timeout).
+    fn settle(app: &mut App) {
+        let start = Instant::now();
+        while app.panels.iter().any(|p| p.loading.is_some()) {
+            assert!(start.elapsed() < Duration::from_secs(5), "load timed out");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Replace the loader with one that blocks until the returned mutex guard
+    /// is dropped by the test.
+    fn gate_loader(app: &mut App) -> Arc<Mutex<()>> {
+        let gate = Arc::new(Mutex::new(()));
+        let g = Arc::clone(&gate);
+        app.loader = crate::loader::Loader::with_reader(Arc::new(move |dir, hidden| {
+            drop(g.lock().unwrap());
+            crate::panel::read_listing(dir, hidden)
+        }));
+        gate
+    }
+
+    #[test]
+    fn enter_dir_is_async_cwd_changes_after_tick() {
+        let (tmp, mut app) = fixture();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.panels[0].cwd, root);
+        assert!(app.panels[0].loading.is_some());
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root.join("adir"));
+        assert_eq!(name_at(&app, 0), "..");
+        assert!(app.panels[0].loading.is_none());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn backspace_restores_focus_through_async_path() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // bdir
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        press(&mut app, KeyCode::Backspace);
+        assert!(app.panels[0].loading.is_some());
+        settle(&mut app);
+        assert_eq!(name_at(&app, 0), "bdir");
+    }
+
+    #[test]
+    fn other_panel_and_old_listing_usable_while_loading() {
+        let (_t, mut app) = fixture();
+        let gate = gate_loader(&mut app);
+        let guard = gate.lock().unwrap();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.panels[0].loading.is_some());
+        assert_eq!(app.status, None);
+        // Old listing still navigable.
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.panels[0].cursor, 2);
+        // Other panel fully usable.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.panels[1].cursor, 2);
+        assert!(app.panels[1].loading.is_none());
+        assert!(!app.tick());
+        assert_eq!(app.panels[0].cwd, root);
+        drop(guard);
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root.join("adir"));
+        assert_eq!(app.panels[1].cwd, root);
+    }
+
+    #[test]
+    fn second_enter_supersedes_first() {
+        let (_t, mut app) = fixture();
+        let gate = gate_loader(&mut app);
+        let guard = gate.lock().unwrap();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::Enter);
+        let first = app.panels[0].loading.as_ref().unwrap().id;
+        press(&mut app, KeyCode::Down); // bdir
+        press(&mut app, KeyCode::Enter);
+        let second = app.panels[0].loading.as_ref().unwrap().id;
+        assert_ne!(first, second);
+        drop(guard);
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root.join("bdir"));
+    }
+
+    #[test]
+    fn toggle_hidden_is_async() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::Char('.'));
+        assert!(app.panels[0].loading.is_some());
+        settle(&mut app);
+        assert!(app.panels[0].entries.iter().any(|e| e.name == ".h"));
+    }
+
+    #[test]
+    fn load_failure_shows_error_status_and_keeps_cwd() {
+        let (tmp, mut app) = fixture();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down);
+        let gate = gate_loader(&mut app);
+        let guard = gate.lock().unwrap();
+        press(&mut app, KeyCode::Enter);
+        fs::remove_dir_all(tmp.path().join("adir")).unwrap();
+        drop(guard);
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root);
+        assert!(app.status.as_deref().is_some_and(|s| !s.is_empty()));
     }
 }

@@ -7,6 +7,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::loader::LoadResult;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
     Parent,
@@ -35,6 +37,32 @@ pub enum EnterResult {
     Nothing,
 }
 
+/// Result of starting an async Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsyncEnter {
+    /// A directory load was started; hand the request to the loader.
+    Load(LoadRequest),
+    Opened(PathBuf),
+    Nothing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadKind {
+    Enter,
+    Parent,
+    Reload,
+}
+
+/// An in-flight directory load for a panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadRequest {
+    pub id: u64,
+    pub dir: PathBuf,
+    /// Entry to put the cursor on once loaded.
+    pub focus: Option<OsString>,
+    pub kind: LoadKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct Panel {
     pub cwd: PathBuf,
@@ -44,6 +72,8 @@ pub struct Panel {
     pub show_hidden: bool,
     pub selected: HashSet<OsString>,
     pub error: Option<String>,
+    /// Set while a background load is pending; the old listing stays visible.
+    pub loading: Option<LoadRequest>,
 }
 
 impl Panel {
@@ -58,6 +88,7 @@ impl Panel {
             show_hidden: false,
             selected: HashSet::new(),
             error: None,
+            loading: None,
         };
         panel.reload();
         panel
@@ -66,6 +97,7 @@ impl Panel {
     /// Re-read `cwd`, keeping the cursor on the same entry when possible and
     /// pruning selections that no longer exist in the listing.
     pub fn reload(&mut self) {
+        self.loading = None;
         let keep = self.current().map(|e| e.os_name.clone());
         match read_listing(&self.cwd, self.show_hidden) {
             Ok(listing) => self.apply_listing(listing),
@@ -144,6 +176,7 @@ impl Panel {
     /// If the target cannot be read, the current location is kept and only
     /// `error` is set.
     fn change_dir(&mut self, dir: PathBuf, focus: Option<&OsStr>) -> bool {
+        self.loading = None;
         let listing = match read_listing(&dir, self.show_hidden) {
             Ok(l) => l,
             Err(msg) => {
@@ -158,6 +191,114 @@ impl Panel {
         self.apply_listing(listing);
         if let Some(i) = focus.and_then(|n| self.entries.iter().position(|e| e.os_name == n)) {
             self.cursor = i;
+        }
+        true
+    }
+
+    /// Register a pending load; a newer request supersedes any older one.
+    pub fn begin_change_dir(
+        &mut self,
+        id: u64,
+        dir: PathBuf,
+        focus: Option<OsString>,
+        kind: LoadKind,
+    ) -> LoadRequest {
+        let req = LoadRequest {
+            id,
+            dir,
+            focus,
+            kind,
+        };
+        self.loading = Some(req.clone());
+        req
+    }
+
+    /// Async counterpart of `go_parent`; None at the filesystem root.
+    pub fn begin_parent(&mut self, id: u64) -> Option<LoadRequest> {
+        let parent = self.cwd.parent().map(Path::to_path_buf)?;
+        let from = self.cwd.file_name().map(OsStr::to_os_string);
+        Some(self.begin_change_dir(id, parent, from, LoadKind::Parent))
+    }
+
+    /// Async counterpart of `reload`. `focus` None keeps the cursor on the
+    /// entry under it when the load finishes.
+    pub fn begin_reload(&mut self, id: u64, focus: Option<OsString>) -> LoadRequest {
+        let dir = self.cwd.clone();
+        self.begin_change_dir(id, dir, focus, LoadKind::Reload)
+    }
+
+    pub fn begin_toggle_hidden(&mut self, id: u64) -> LoadRequest {
+        self.show_hidden = !self.show_hidden;
+        self.begin_reload(id, None)
+    }
+
+    /// Async counterpart of `enter`.
+    pub fn begin_enter(&mut self, id: u64) -> AsyncEnter {
+        let Some(entry) = self.current() else {
+            return AsyncEnter::Nothing;
+        };
+        match entry.kind {
+            EntryKind::Parent => match self.begin_parent(id) {
+                Some(req) => AsyncEnter::Load(req),
+                None => AsyncEnter::Nothing,
+            },
+            EntryKind::Dir
+            | EntryKind::Symlink {
+                target_is_dir: true,
+            } => {
+                let dir = self.cwd.join(&entry.os_name);
+                AsyncEnter::Load(self.begin_change_dir(id, dir, None, LoadKind::Enter))
+            }
+            _ => AsyncEnter::Opened(self.cwd.join(&entry.os_name)),
+        }
+    }
+
+    /// Apply a finished load. Returns false (and changes nothing) when the
+    /// result does not belong to the pending request.
+    pub fn finish_load(&mut self, res: LoadResult) -> bool {
+        if self.loading.as_ref().map(|r| r.id) != Some(res.id) {
+            return false;
+        }
+        let Some(req) = self.loading.take() else {
+            return false;
+        };
+        let listing = match res.result {
+            Ok(l) => l,
+            Err(msg) => {
+                if self.entries.is_empty() {
+                    self.entries = parent_only(&self.cwd);
+                }
+                self.error = Some(msg);
+                return true;
+            }
+        };
+        match req.kind {
+            LoadKind::Enter | LoadKind::Parent => {
+                self.cwd = req.dir;
+                self.cursor = 0;
+                self.scroll = 0;
+                self.selected.clear();
+                self.apply_listing(listing);
+                if let Some(i) = req
+                    .focus
+                    .and_then(|n| self.entries.iter().position(|e| e.os_name == n))
+                {
+                    self.cursor = i;
+                }
+            }
+            LoadKind::Reload => {
+                let keep = req
+                    .focus
+                    .or_else(|| self.current().map(|e| e.os_name.clone()));
+                self.apply_listing(listing);
+                let found = keep.and_then(|n| self.entries.iter().position(|e| e.os_name == n));
+                self.cursor = found.unwrap_or(self.cursor);
+                self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
+                self.scroll = self.scroll.min(self.cursor);
+                let present: HashSet<&OsStr> =
+                    self.entries.iter().map(|e| e.os_name.as_os_str()).collect();
+                self.selected.retain(|n| present.contains(n.as_os_str()));
+            }
         }
         true
     }
@@ -229,7 +370,7 @@ fn parent_only(cwd: &Path) -> Vec<Entry> {
 
 /// Entries (with `..` first) plus the number of items skipped due to errors,
 /// or an error message when the directory itself is unreadable.
-fn read_listing(cwd: &Path, show_hidden: bool) -> Result<(Vec<Entry>, usize), String> {
+pub fn read_listing(cwd: &Path, show_hidden: bool) -> Result<(Vec<Entry>, usize), String> {
     let rd = fs::read_dir(cwd).map_err(|e| format!("{}: {}", cwd.display(), e))?;
     let names = rd.map(|r| r.map(|de| de.file_name()));
     Ok(build_listing(cwd, names, show_hidden))
@@ -767,5 +908,164 @@ mod tests {
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
         assert!(p.cwd.is_absolute());
+    }
+
+    // ---- async loading ----
+
+    fn load_of(req: &LoadRequest, show_hidden: bool) -> crate::loader::LoadResult {
+        crate::loader::LoadResult {
+            id: req.id,
+            dir: req.dir.clone(),
+            result: read_listing(&req.dir, show_hidden),
+        }
+    }
+
+    fn started(r: AsyncEnter) -> LoadRequest {
+        match r {
+            AsyncEnter::Load(req) => req,
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
+
+    fn tree() -> (tempfile::TempDir, Panel) {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("adir")).unwrap();
+        fs::create_dir(t.path().join("bdir")).unwrap();
+        fs::write(t.path().join("adir/inner"), "").unwrap();
+        fs::write(t.path().join("f"), "").unwrap();
+        let p = Panel::new(t.path());
+        (t, p)
+    }
+
+    #[test]
+    fn begin_enter_does_not_change_location_until_finish() {
+        let (_t, mut p) = tree();
+        let old = p.cwd.clone();
+        p.selected.insert("f".into());
+        p.cursor = 1;
+        let req = started(p.begin_enter(5));
+        assert_eq!(req.id, 5);
+        assert_eq!(req.kind, LoadKind::Enter);
+        assert_eq!(req.dir, old.join("adir"));
+        assert_eq!(p.cwd, old);
+        assert_eq!(p.loading.as_ref().unwrap().id, 5);
+        assert!(p.finish_load(load_of(&req, false)));
+        assert_eq!(p.cwd, old.join("adir"));
+        assert_eq!(p.cursor, 0);
+        assert!(p.selected.is_empty());
+        assert!(p.loading.is_none());
+        assert_eq!(names(&p), vec!["..", "inner"]);
+    }
+
+    #[test]
+    fn stale_result_is_ignored() {
+        let (_t, mut p) = tree();
+        let old = p.cwd.clone();
+        p.cursor = 1;
+        let first = started(p.begin_enter(1));
+        p.cursor = 2;
+        let second = started(p.begin_enter(2));
+        assert!(!p.finish_load(load_of(&first, false)));
+        assert_eq!(p.cwd, old);
+        assert_eq!(p.loading.as_ref().unwrap().id, 2);
+        assert!(p.finish_load(load_of(&second, false)));
+        assert_eq!(p.cwd, old.join("bdir"));
+    }
+
+    #[test]
+    fn result_without_request_is_ignored() {
+        let (_t, mut p) = tree();
+        let req = LoadRequest {
+            id: 9,
+            dir: p.cwd.join("adir"),
+            focus: None,
+            kind: LoadKind::Enter,
+        };
+        let old = p.cwd.clone();
+        assert!(!p.finish_load(load_of(&req, false)));
+        assert_eq!(p.cwd, old);
+    }
+
+    #[test]
+    fn begin_enter_file_opens_and_parent_at_root_is_nothing() {
+        let (t, mut p) = tree();
+        p.cursor = 3;
+        assert_eq!(p.begin_enter(1), AsyncEnter::Opened(p.cwd.join("f")));
+        assert!(p.loading.is_none());
+        let _ = t;
+        let mut root = Panel::new("/");
+        assert!(root.begin_parent(1).is_none());
+    }
+
+    #[test]
+    fn finish_load_failure_keeps_location_and_sets_error() {
+        let (_t, mut p) = tree();
+        let old = p.cwd.clone();
+        p.cursor = 1;
+        p.selected.insert("f".into());
+        let req = started(p.begin_enter(1));
+        fs::remove_dir_all(old.join("adir")).unwrap();
+        assert!(p.finish_load(load_of(&req, false)));
+        assert_eq!(p.cwd, old);
+        assert!(p.error.is_some());
+        assert!(p.selected.contains(OsStr::new("f")));
+        assert!(p.loading.is_none());
+        assert!(names(&p).contains(&"bdir"));
+    }
+
+    #[test]
+    fn parent_load_restores_focus() {
+        let (_t, mut p) = tree();
+        let root = p.cwd.clone();
+        p.cursor = 2;
+        let req = started(p.begin_enter(1));
+        p.finish_load(load_of(&req, false));
+        let req = p.begin_parent(2).unwrap();
+        assert_eq!(req.kind, LoadKind::Parent);
+        assert_eq!(req.focus.as_deref(), Some(OsStr::new("bdir")));
+        assert!(p.finish_load(load_of(&req, false)));
+        assert_eq!(p.cwd, root);
+        assert_eq!(p.current().unwrap().name, "bdir");
+    }
+
+    #[test]
+    fn reload_load_keeps_cursor_by_name_and_prunes_selection() {
+        let (t, mut p) = tree();
+        p.cursor = 3;
+        p.selected.insert("f".into());
+        p.selected.insert("adir".into());
+        let req = p.begin_reload(1, None);
+        assert_eq!(req.kind, LoadKind::Reload);
+        fs::create_dir(t.path().join("0new")).unwrap();
+        fs::remove_dir_all(t.path().join("adir")).unwrap();
+        assert!(p.finish_load(load_of(&req, false)));
+        assert_eq!(p.current().unwrap().name, "f");
+        assert!(p.selected.contains(OsStr::new("f")));
+        assert!(!p.selected.contains(OsStr::new("adir")));
+    }
+
+    #[test]
+    fn reload_load_focus_override_and_failure_keeps_listing() {
+        let (t, mut p) = tree();
+        let req = p.begin_reload(1, Some("bdir".into()));
+        assert!(p.finish_load(load_of(&req, false)));
+        assert_eq!(p.current().unwrap().name, "bdir");
+        let req = p.begin_reload(2, None);
+        let cwd = p.cwd.clone();
+        fs::remove_dir_all(&cwd).unwrap();
+        assert!(p.finish_load(load_of(&req, false)));
+        assert!(p.error.is_some());
+        assert!(names(&p).contains(&"f"));
+        let _ = t;
+    }
+
+    #[test]
+    fn toggle_hidden_load_shows_hidden() {
+        let (t, mut p) = tree();
+        fs::write(t.path().join(".hid"), "").unwrap();
+        let req = p.begin_toggle_hidden(1);
+        assert!(p.show_hidden);
+        assert!(p.finish_load(load_of(&req, true)));
+        assert!(names(&p).contains(&".hid"));
     }
 }
