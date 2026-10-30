@@ -346,6 +346,33 @@ pub fn rename_cmd(from: &[u8], to: &[u8]) -> Vec<u8> {
     ])
 }
 
+/// Put the uploaded temp file `tmp` in place of `orig`. A regular file is
+/// replaced by `mv` (a failed upload never truncates the original); a symlink
+/// is written through instead, so the link survives.
+pub fn replace_cmd(tmp: &[u8], orig: &[u8]) -> Vec<u8> {
+    let (t, o) = (sh_quote(tmp), sh_quote(orig));
+    cat(&[
+        b"if [ -L ",
+        &o,
+        b" ]; then cat -- ",
+        &t,
+        b" > ",
+        &o,
+        b" && rm -f -- ",
+        &t,
+        b"; else mv -- ",
+        &t,
+        b" ",
+        &o,
+        b"; fi",
+    ])
+}
+
+/// `rm -f` of one file (cleanup of a remote temp file).
+pub fn rm_file_cmd(path: &[u8]) -> Vec<u8> {
+    cat(&[b"rm -f -- ", &sh_quote(path)])
+}
+
 /// `rmdir` (fails unless the directory is empty): undo of a remote mkdir.
 pub fn rmdir_cmd(path: &[u8]) -> Vec<u8> {
     cat(&[b"rmdir -- ", &sh_quote(path)])
@@ -934,6 +961,16 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             ),
             (20, 21, 22, 23)
         );
+    }
+
+    #[test]
+    fn replace_cmd_moves_the_upload_over_the_original_or_writes_through_a_link() {
+        assert_eq!(
+            s(replace_cmd(b"/d/.hdir-edit-1", b"/d/it's")),
+            "if [ -L '/d/it'\\''s' ]; then cat -- '/d/.hdir-edit-1' > '/d/it'\\''s' \
+             && rm -f -- '/d/.hdir-edit-1'; else mv -- '/d/.hdir-edit-1' '/d/it'\\''s'; fi"
+        );
+        assert_eq!(s(rm_file_cmd(b"/d/-x y")), "rm -f -- '/d/-x y'");
     }
 
     #[test]

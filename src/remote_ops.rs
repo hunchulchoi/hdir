@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 
 use crate::platform::os_bytes;
 use crate::preview::{self, Limits, Preview};
+use crate::remote::{Endpoint, scp_argv};
 use crate::remote::{
     PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING, PREVIEW_SPECIAL, RENAME_EXISTS, home_cmd,
-    mkdir_cmd, preview_cmd, rename_cmd, rm_cmd, rmdir_cmd,
+    mkdir_cmd, preview_cmd, rename_cmd, replace_cmd, rm_cmd, rm_file_cmd, rmdir_cmd,
 };
 use crate::session::{CmdOutput, RemoteSession, first_line};
 
@@ -192,6 +193,134 @@ pub fn probe_text(s: &RemoteSession, path: &Path) -> Result<bool, String> {
         Preview::Dir { .. } => Err("디렉터리".into()),
         Preview::Error(e) => Err(e),
     }
+}
+
+/// Content fingerprint of a local file, to tell whether an editor changed it.
+/// Length and mtime give a cheap "unchanged" answer; when either differs the
+/// content hash decides (an editor that re-saves identical bytes is not a
+/// change).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStamp {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    hash: u64,
+}
+
+fn hash_file(path: &Path) -> std::io::Result<u64> {
+    use std::hash::Hasher;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut h = std::hash::DefaultHasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(h.finish());
+        }
+        h.write(&buf[..n]);
+    }
+}
+
+impl FileStamp {
+    pub fn of(path: &Path) -> std::io::Result<FileStamp> {
+        let meta = std::fs::metadata(path)?;
+        Ok(FileStamp {
+            len: meta.len(),
+            mtime: meta.modified().ok(),
+            hash: hash_file(path)?,
+        })
+    }
+
+    /// Did the content of `path` change since this stamp? A vanished file is
+    /// an error.
+    pub fn differs(&self, path: &Path) -> std::io::Result<bool> {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() == self.len && meta.modified().ok() == self.mtime && self.mtime.is_some() {
+            return Ok(false);
+        }
+        Ok(meta.len() != self.len || hash_file(path)? != self.hash)
+    }
+}
+
+/// A private local copy of a remote file.
+#[derive(Debug)]
+pub struct EditCopy {
+    /// Owner-only (0700) temp directory holding the copy; removing it
+    /// removes the copy.
+    pub dir: tempfile::TempDir,
+    pub local: PathBuf,
+    pub stamp: FileStamp,
+}
+
+fn scp_run(s: &RemoteSession, argv: Result<Vec<OsString>, String>) -> Result<(), String> {
+    let out = s.scp(&argv?).map_err(|e| e.message())?;
+    if out.code == Some(0) {
+        return Ok(());
+    }
+    Err(first_line(
+        &out.stderr,
+        &format!("scp 종료 코드 {}", out.code.unwrap_or(-1)),
+    ))
+}
+
+/// Download `remote` into a fresh private temp dir (same file name, so
+/// extensions keep working) and fingerprint it.
+pub fn fetch(s: &RemoteSession, remote: &Path) -> Result<EditCopy, String> {
+    let name = remote.file_name().ok_or("잘못된 경로")?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("hdir-remote-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Owner-only, whatever the umask: the copy may be confidential.
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder
+        .tempdir()
+        .map_err(|e| format!("임시 폴더 생성 실패: {e}"))?;
+    let argv = scp_argv(
+        &Endpoint::Remote(&s.target, &os_bytes(remote.as_os_str())),
+        &Endpoint::Local(dir.path()),
+        s.scp_mode,
+    );
+    scp_run(s, argv)?;
+    let local = dir.path().join(name);
+    let stamp = FileStamp::of(&local).map_err(|e| format!("내려받은 파일을 읽을 수 없음: {e}"))?;
+    Ok(EditCopy { dir, local, stamp })
+}
+
+/// Unique-enough suffix for remote temp file names.
+pub fn edit_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{}-{nanos:x}", std::process::id())
+}
+
+/// Upload `local` over `remote` without ever truncating it: scp to
+/// `.hdir-edit-<token>` next to the original, then replace by `mv` (see
+/// [`replace_cmd`]). On any failure the remote temp file is removed and the
+/// original is untouched.
+pub fn upload_replace(
+    s: &RemoteSession,
+    local: &Path,
+    remote: &Path,
+    token: &str,
+) -> Result<(), String> {
+    let tmp = remote.with_file_name(format!(".hdir-edit-{token}"));
+    let tmp_b = os_bytes(tmp.as_os_str()).into_owned();
+    let argv = scp_argv(
+        &Endpoint::Local(local),
+        &Endpoint::Remote(&s.target, &tmp_b),
+        s.scp_mode,
+    );
+    let res = scp_run(s, argv)
+        .and_then(|()| run_ok(s, &replace_cmd(&tmp_b, &os_bytes(remote.as_os_str()))).map(|_| ()));
+    if res.is_err() {
+        // Best effort: the session may be gone.
+        let _ = s.exec(&rm_file_cmd(&tmp_b));
+    }
+    res
 }
 
 #[cfg(all(test, unix))]
@@ -495,6 +624,155 @@ mod tests {
         let s = session(Arc::clone(&f));
         let _ = probe_text(&s, &p("/t"));
         assert!(f.remote_cmds()[0].contains("head -c 8195 -- '/t'"));
+    }
+
+    // ---- HDIR-40: download / upload / stamp ----
+
+    use crate::remote::ScpMode;
+    use crate::testutil::session_mode;
+    use std::os::unix::fs::PermissionsExt;
+
+    type Uploads = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    /// An scp fake: downloads create `<dest dir>/<basename>` with `body`;
+    /// uploads (destination starts with the host) are recorded with the
+    /// local file's content at that moment.
+    fn scp_fake(
+        body: &'static str,
+        up_result: crate::session::CmdOutput,
+        mv_result: crate::session::CmdOutput,
+    ) -> (Arc<FakeCmd>, Uploads) {
+        let uploads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let up = Arc::clone(&uploads);
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "scp" {
+                let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
+                if dst.starts_with("prod-web:") {
+                    let content = std::fs::read_to_string(src).unwrap_or_default();
+                    up.lock().unwrap().push((dst.clone(), content));
+                    return up_result.clone();
+                }
+                let name = src.rsplit('/').next().unwrap().trim_matches('\'');
+                let name = name.replace("'\\''", "'");
+                std::fs::write(std::path::Path::new(dst).join(name), body).unwrap();
+                return ok("");
+            }
+            let c = crate::testutil::remote_cmd(a).unwrap_or("");
+            if c.starts_with("if [ -L") {
+                mv_result.clone()
+            } else {
+                ok("")
+            }
+        });
+        (f, uploads)
+    }
+
+    #[test]
+    fn fetch_downloads_into_a_private_temp_dir_and_stamps_it() {
+        let (f, _) = scp_fake("orig\n", ok(""), ok(""));
+        let s = session(Arc::clone(&f));
+        let copy = fetch(&s, &p("/srv/it's a.txt")).unwrap();
+        assert_eq!(copy.local, copy.dir.path().join("it's a.txt"));
+        assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "orig\n");
+        let mode = copy.dir.path().metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let calls = f.scp_calls();
+        assert_eq!(calls.len(), 1);
+        let a = &calls[0];
+        assert!(a.contains(&"BatchMode=yes".to_string()));
+        assert_eq!(a[a.len() - 2], "prod-web:/srv/it's a.txt");
+        assert_eq!(a[a.len() - 1], copy.dir.path().to_string_lossy());
+        assert!(!copy.stamp.differs(&copy.local).unwrap());
+    }
+
+    #[test]
+    fn fetch_in_legacy_scp_mode_quotes_the_remote_path() {
+        let (f, _) = scp_fake("x", ok(""), ok(""));
+        let s = session_mode(Arc::clone(&f), ScpMode::Legacy);
+        fetch(&s, &p("/srv/it's a.txt")).unwrap();
+        let a = &f.scp_calls()[0];
+        assert_eq!(a[a.len() - 2], "prod-web:'/srv/it'\\''s a.txt'");
+    }
+
+    #[test]
+    fn fetch_failures_are_errors() {
+        let f = FakeCmd::new(|_| fail(1, "scp: /srv/x: No such file or directory\n"));
+        let e = fetch(&session(f), &p("/srv/x")).unwrap_err();
+        assert!(e.contains("No such file"), "{e}");
+        let f = FakeCmd::new(|_| ok("")); // "succeeds" but nothing arrived
+        assert!(fetch(&session(f), &p("/srv/x")).is_err());
+        let f = FakeCmd::new(|_| code(255));
+        let s = session(f);
+        assert_eq!(
+            fetch(&s, &p("/srv/x")).unwrap_err(),
+            crate::session::DISCONNECTED_MSG
+        );
+        assert!(!s.is_alive());
+    }
+
+    #[test]
+    fn stamp_ignores_rewrites_of_identical_bytes() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("f");
+        std::fs::write(&f, "abc").unwrap();
+        let st = FileStamp::of(&f).unwrap();
+        assert!(!st.differs(&f).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&f, "abc").unwrap(); // newer mtime, same content
+        assert!(!st.differs(&f).unwrap(), "touched but unchanged");
+        std::fs::write(&f, "abd").unwrap(); // same length, other bytes
+        assert!(st.differs(&f).unwrap());
+        std::fs::write(&f, "abcd").unwrap();
+        assert!(st.differs(&f).unwrap());
+        std::fs::remove_file(&f).unwrap();
+        assert!(st.differs(&f).is_err());
+    }
+
+    #[test]
+    fn upload_goes_to_a_temp_name_next_to_the_original_then_replaces_it() {
+        let (f, ups) = scp_fake("", ok(""), ok(""));
+        let s = session(Arc::clone(&f));
+        let t = tempfile::tempdir().unwrap();
+        let local = t.path().join("a b.txt");
+        std::fs::write(&local, "new content").unwrap();
+        upload_replace(&s, &local, &p("/srv/it's/a b.txt"), "T0K3N").unwrap();
+        let ups = ups.lock().unwrap().clone();
+        assert_eq!(
+            ups,
+            vec![(
+                "prod-web:/srv/it's/.hdir-edit-T0K3N".to_string(),
+                "new content".to_string()
+            )]
+        );
+        let want = crate::remote::replace_cmd(b"/srv/it's/.hdir-edit-T0K3N", b"/srv/it's/a b.txt");
+        assert_eq!(f.remote_cmds(), vec![String::from_utf8(want).unwrap()]);
+    }
+
+    #[test]
+    fn upload_failures_clean_up_the_remote_temp_file_and_never_touch_the_original() {
+        let (f, _) = scp_fake(
+            "",
+            fail(1, "scp: write failed: No space left on device\n"),
+            ok(""),
+        );
+        let s = session(Arc::clone(&f));
+        let t = tempfile::tempdir().unwrap();
+        let local = t.path().join("a");
+        std::fs::write(&local, "x").unwrap();
+        let e = upload_replace(&s, &local, &p("/srv/a"), "TK").unwrap_err();
+        assert!(e.contains("No space left"), "{e}");
+        assert_eq!(
+            f.remote_cmds(),
+            vec!["rm -f -- '/srv/.hdir-edit-TK'".to_string()]
+        );
+
+        let (f, _) = scp_fake("", ok(""), fail(1, "mv: cannot move: Permission denied\n"));
+        let s = session(Arc::clone(&f));
+        let e = upload_replace(&s, &local, &p("/srv/a"), "TK").unwrap_err();
+        assert!(e.contains("Permission denied"), "{e}");
+        let cmds = f.remote_cmds();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[1], "rm -f -- '/srv/.hdir-edit-TK'");
     }
 
     #[test]

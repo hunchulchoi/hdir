@@ -96,6 +96,10 @@ pub fn fail(c: i32, stderr: &str) -> CmdOutput {
 }
 
 pub fn session(cmd: Arc<FakeCmd>) -> Arc<RemoteSession> {
+    session_mode(cmd, ScpMode::Sftp)
+}
+
+pub fn session_mode(cmd: Arc<FakeCmd>, mode: ScpMode) -> Arc<RemoteSession> {
     Arc::new(RemoteSession::new(
         "prod".into(),
         SshTarget {
@@ -104,7 +108,7 @@ pub fn session(cmd: Arc<FakeCmd>) -> Arc<RemoteSession> {
             control_path: PathBuf::from("/tmp/hdir-1/cm-%C"),
         },
         RemoteOs::Linux,
-        ScpMode::Sftp,
+        mode,
         cmd,
     ))
 }

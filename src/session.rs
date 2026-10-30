@@ -45,6 +45,12 @@ pub trait Cmd: Send + Sync {
     fn run(&self, argv: &[OsString]) -> CmdOutput;
     /// Run attached to the real terminal (prompts); output is not captured.
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput;
+    /// Like [`run`](Self::run) for file transfers, which may legitimately take
+    /// longer than [`CMD_TIMEOUT`] (a dead link is still caught by ssh's
+    /// ServerAlive options).
+    fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
+        self.run(argv)
+    }
 }
 
 /// Stderr text of a command that was killed for running too long.
@@ -52,6 +58,9 @@ pub const TIMEOUT_MSG: &str = "시간 초과";
 
 /// Hard limit for any non-interactive command run through [`SystemCmd`].
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound for a single scp.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 
 /// The real process runner.
 pub struct SystemCmd;
@@ -111,6 +120,9 @@ pub fn run_limited(argv: &[OsString], limit: Duration) -> CmdOutput {
 impl Cmd for SystemCmd {
     fn run(&self, argv: &[OsString]) -> CmdOutput {
         run_limited(argv, CMD_TIMEOUT)
+    }
+    fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
+        run_limited(argv, TRANSFER_TIMEOUT)
     }
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
         let Some((prog, args)) = argv.split_first() else {
@@ -229,6 +241,26 @@ impl RemoteSession {
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
                 "ssh 실행 실패",
+            ))),
+            Some(_) => Ok(out),
+        }
+    }
+
+    /// Run an `scp` argv (see [`crate::remote::scp_argv`]) through the same
+    /// liveness rules as [`exec`](Self::exec).
+    pub fn scp(&self, argv: &[OsString]) -> Result<CmdOutput, SessionError> {
+        if !self.is_alive() {
+            return Err(SessionError::Disconnected);
+        }
+        let out = self.cmd.run_transfer(argv);
+        match out.code {
+            Some(255) => {
+                self.set_alive(false);
+                Err(SessionError::Disconnected)
+            }
+            None => Err(SessionError::Spawn(first_line(
+                &out.stderr,
+                "scp 실행 실패",
             ))),
             Some(_) => Ok(out),
         }

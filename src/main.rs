@@ -39,6 +39,10 @@ fn main() -> ExitCode {
     let mut app = App::new(start.clone(), start);
     app.ssh_config_path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));
     let result = run_app(&mut app);
+    // An edited remote file may still be uploading.
+    for note in app.finish_uploads(Duration::from_secs(120)) {
+        eprintln!("hdir: {note}");
+    }
     // The terminal is back to normal here, so errors are visible.
     let mut code = ExitCode::SUCCESS;
     if let Err(e) = result {
