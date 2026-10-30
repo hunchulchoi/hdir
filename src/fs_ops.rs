@@ -262,7 +262,7 @@ fn check_all(sources: &[PathBuf], dest_dir: &Path) -> io::Result<Vec<PathBuf>> {
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Unique sibling temp path (`.hdir-tmp-<pid>-<n>-<name>`), name capped to stay under NAME_MAX.
-fn temp_sibling(dest: &Path) -> PathBuf {
+pub(crate) fn temp_sibling(dest: &Path) -> PathBuf {
     sibling_named(dest, "tmp")
 }
 

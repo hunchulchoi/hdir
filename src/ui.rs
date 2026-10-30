@@ -1,36 +1,17 @@
 //! Layout rendering (pure: draws a `View` into a ratatui `Frame`, no IO).
 
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::keymap::{Action, Context, Keymap};
 use crate::panel::{Entry, EntryKind, Panel};
+use crate::theme::Theme;
 use crate::trash::{TrashEntry, TrashView, format_local};
-
-/// Mdir DOS palette. Centralized so a later theme issue can replace it.
-mod palette {
-    use ratatui::style::Color;
-    pub const BG: Color = Color::Rgb(0x00, 0x00, 0xAA);
-    pub const FG: Color = Color::Rgb(0xAA, 0xAA, 0xAA);
-    pub const BORDER: Color = Color::Rgb(0x55, 0xFF, 0xFF);
-    pub const BORDER_ACTIVE: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
-    pub const DIR: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
-    pub const EXEC: Color = Color::Rgb(0x55, 0xFF, 0x55);
-    pub const HIDDEN: Color = Color::Rgb(0x55, 0x55, 0x55);
-    pub const SELECTED: Color = Color::Rgb(0xFF, 0xFF, 0x55);
-    pub const CURSOR_BG: Color = Color::Rgb(0x00, 0xAA, 0xAA);
-    pub const CURSOR_FG: Color = Color::Rgb(0x00, 0x00, 0x00);
-    pub const STATUS_BG: Color = Color::Rgb(0x00, 0xAA, 0xAA);
-    pub const STATUS_FG: Color = Color::Rgb(0x00, 0x00, 0x00);
-    pub const FKEY_NUM_FG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
-    pub const FKEY_NUM_BG: Color = Color::Rgb(0x00, 0x00, 0x00);
-    pub const FKEY_LABEL_FG: Color = Color::Rgb(0x00, 0x00, 0x00);
-    pub const FKEY_LABEL_BG: Color = Color::Rgb(0x00, 0xAA, 0xAA);
-    pub const ERROR: Color = Color::Rgb(0xFF, 0x55, 0x55);
-}
 
 pub struct View<'a> {
     pub panels: [&'a Panel; 2],
@@ -40,34 +21,79 @@ pub struct View<'a> {
     pub os: &'a str,
     /// A panel showing the trash instead of its directory.
     pub trash: [Option<&'a TrashView>; 2],
+    pub theme: &'a Theme,
+    /// F-key bar `(key, label)` slots, see [`fkey_bar`].
+    pub fkeys: &'a [(String, String)],
 }
 
-const FKEYS: [(&str, &str); 10] = [
-    ("1", "Help"),
-    ("2", "Rename"),
-    ("3", "View"),
-    ("4", "Edit"),
-    ("5", "Copy"),
-    ("6", "Move"),
-    ("7", "Mkdir"),
-    ("8", "Del"),
-    ("9", "Menu"),
-    ("10", "Quit"),
+/// F-key bar slots: the action each slot stands for and its label.
+const PANEL_BAR: [Option<(Action, &str)>; 10] = [
+    Some((Action::Help, "Help")),
+    Some((Action::Rename, "Rename")),
+    Some((Action::View, "View")),
+    Some((Action::Edit, "Edit")),
+    Some((Action::Copy, "Copy")),
+    Some((Action::Move, "Move")),
+    Some((Action::Mkdir, "Mkdir")),
+    Some((Action::Delete, "Del")),
+    Some((Action::Menu, "Menu")),
+    Some((Action::Quit, "Quit")),
 ];
 
-/// F-key bar while a panel shows the trash; unavailable keys stay blank.
-const TRASH_FKEYS: [(&str, &str); 10] = [
-    ("1", ""),
-    ("2", ""),
-    ("3", ""),
-    ("4", ""),
-    ("5", "Restore"),
-    ("6", ""),
-    ("7", ""),
-    ("8", "Purge"),
-    ("Esc", "Back"),
-    ("10", "Quit"),
+/// F-key bar while a panel shows the trash; unavailable slots stay blank.
+const TRASH_BAR: [Option<(Action, &str)>; 10] = [
+    None,
+    None,
+    None,
+    None,
+    Some((Action::Copy, "Restore")),
+    None,
+    None,
+    Some((Action::Delete, "Purge")),
+    Some((Action::Cancel, "Back")),
+    Some((Action::Quit, "Quit")),
 ];
+
+/// The key to show for `action`: a plain F-key if bound (shown as its number),
+/// else the shortest binding. `None` when the action has no key.
+fn key_label(km: &Keymap, ctx: Context, action: Action) -> Option<String> {
+    let keys = km.keys_for(ctx, action);
+    if let Some(n) = keys.iter().find_map(|k| match (k.code, k.mods.is_empty()) {
+        (KeyCode::F(n), true) => Some(n),
+        _ => None,
+    }) {
+        return Some(n.to_string());
+    }
+    keys.iter()
+        .map(ToString::to_string)
+        .min_by_key(|s| s.width())
+}
+
+/// `(key, label)` for the 10 bar slots of `ctx` (`Trash` or anything else = panel),
+/// generated from the keymap so remaps show immediately.
+pub fn fkey_bar(km: &Keymap, ctx: Context) -> Vec<(String, String)> {
+    let slots = if ctx == Context::Trash {
+        &TRASH_BAR
+    } else {
+        &PANEL_BAR
+    };
+    let ctx = if ctx == Context::Trash {
+        Context::Trash
+    } else {
+        Context::Panel
+    };
+    slots
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| match slot {
+            None => ((i + 1).to_string(), String::new()),
+            Some((action, label)) => match key_label(km, ctx, *action) {
+                Some(k) => (k, (*label).to_string()),
+                None => (String::new(), String::new()),
+            },
+        })
+        .collect()
+}
 
 /// Offset that keeps `cursor` within a window of `height` rows, starting from `scroll`.
 pub fn visible_offset(cursor: usize, scroll: usize, height: usize) -> usize {
@@ -176,21 +202,29 @@ fn is_dirlike(e: &Entry) -> bool {
     )
 }
 
-fn entry_style(e: &Entry, selected: bool) -> Style {
-    let base = Style::default().bg(palette::BG);
+fn entry_style(e: &Entry, selected: bool, theme: &Theme) -> Style {
+    let base = Style::default().bg(theme.bg);
     if selected {
-        return base.fg(palette::SELECTED);
+        return base.fg(theme.selected);
     }
     if is_dirlike(e) || e.kind == EntryKind::Parent {
-        return base.fg(palette::DIR).add_modifier(Modifier::BOLD);
+        let style = base.fg(theme.dir);
+        return if theme.dir_bold {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        };
+    }
+    if matches!(e.kind, EntryKind::Symlink { .. }) {
+        return base.fg(theme.symlink);
     }
     if e.hidden {
-        return base.fg(palette::HIDDEN);
+        return base.fg(theme.hidden);
     }
     if e.kind == EntryKind::File && e.mode & 0o111 != 0 {
-        return base.fg(palette::EXEC);
+        return base.fg(theme.exec);
     }
-    base.fg(palette::FG)
+    base.fg(theme.color_for_ext(&e.name).unwrap_or(theme.file))
 }
 
 fn row_text(e: &Entry, selected: bool, width: usize) -> String {
@@ -208,18 +242,18 @@ fn row_text(e: &Entry, selected: bool, width: usize) -> String {
     format!("{} {:>8}", fit_width(&name, width - 9), right)
 }
 
-fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool) {
+fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool, theme: &Theme) {
     let border = if active {
-        palette::BORDER_ACTIVE
+        theme.border_active
     } else {
-        palette::BORDER
+        theme.border
     };
     let title = title_for(panel, (area.width as usize).saturating_sub(4));
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border).bg(palette::BG))
+        .border_style(Style::default().fg(border).bg(theme.bg))
         .title(title)
-        .style(Style::default().fg(palette::FG).bg(palette::BG));
+        .style(Style::default().fg(theme.fg).bg(theme.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let w = inner.width as usize;
@@ -237,9 +271,9 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool) {
         .take(rows)
         .map(|(i, e)| {
             let sel = panel.selected.contains(&e.os_name);
-            let mut style = entry_style(e, sel);
+            let mut style = entry_style(e, sel, theme);
             if active && i == panel.cursor {
-                style = style.bg(palette::CURSOR_BG).fg(palette::CURSOR_FG);
+                style = style.bg(theme.cursor_bg).fg(theme.cursor_fg);
             }
             Line::from(Span::styled(row_text(e, sel, w), style))
         })
@@ -250,7 +284,7 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool) {
         }
         lines.push(Line::from(Span::styled(
             fit_width(err, w),
-            Style::default().fg(palette::ERROR).bg(palette::BG),
+            Style::default().fg(theme.error).bg(theme.bg),
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -290,11 +324,11 @@ fn trash_row_text(e: &TrashEntry, selected: bool, width: usize) -> String {
     )
 }
 
-fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool) {
+fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool, theme: &Theme) {
     let border = if active {
-        palette::BORDER_ACTIVE
+        theme.border_active
     } else {
-        palette::BORDER
+        theme.border
     };
     let mut title = "휴지통".to_string();
     if tv.loading {
@@ -302,9 +336,9 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool)
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border).bg(palette::BG))
+        .border_style(Style::default().fg(border).bg(theme.bg))
         .title(tail_width(&title, (area.width as usize).saturating_sub(4)))
-        .style(Style::default().fg(palette::FG).bg(palette::BG));
+        .style(Style::default().fg(theme.fg).bg(theme.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let w = inner.width as usize;
@@ -322,18 +356,18 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool)
         .take(rows)
         .map(|(i, e)| {
             let sel = tv.selected.contains(e.id());
-            let mut style = Style::default().bg(palette::BG).fg(if sel {
-                palette::SELECTED
+            let mut style = Style::default().bg(theme.bg).fg(if sel {
+                theme.selected
             } else if e.is_dir {
-                palette::DIR
+                theme.dir
             } else {
-                palette::FG
+                theme.fg
             });
             if e.is_dir {
                 style = style.add_modifier(Modifier::BOLD);
             }
             if active && i == tv.cursor {
-                style = style.bg(palette::CURSOR_BG).fg(palette::CURSOR_FG);
+                style = style.bg(theme.cursor_bg).fg(theme.cursor_fg);
             }
             Line::from(Span::styled(trash_row_text(e, sel, w), style))
         })
@@ -344,7 +378,7 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool)
         }
         lines.push(Line::from(Span::styled(
             fit_width(err, w),
-            Style::default().fg(palette::ERROR).bg(palette::BG),
+            Style::default().fg(theme.error).bg(theme.bg),
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -381,14 +415,12 @@ fn default_status(panel: &Panel) -> String {
     format!("{files} files · {dirs} dirs")
 }
 
-fn fkey_line(width: usize, keys: &[(&str, &str); 10]) -> Line<'static> {
+fn fkey_line(width: usize, keys: &[(String, String)], theme: &Theme) -> Line<'static> {
     let label_style = Style::default()
-        .fg(palette::FKEY_LABEL_FG)
-        .bg(palette::FKEY_LABEL_BG);
-    let num_style = Style::default()
-        .fg(palette::FKEY_NUM_FG)
-        .bg(palette::FKEY_NUM_BG);
-    let slot = width / keys.len();
+        .fg(theme.fkey_label_fg)
+        .bg(theme.fkey_label_bg);
+    let num_style = Style::default().fg(theme.fkey_num_fg).bg(theme.fkey_num_bg);
+    let slot = width / keys.len().max(1);
     let mut spans = Vec::new();
     for (i, (n, l)) in keys.iter().enumerate() {
         let w = if i == keys.len() - 1 {
@@ -396,17 +428,23 @@ fn fkey_line(width: usize, keys: &[(&str, &str); 10]) -> Line<'static> {
         } else {
             slot
         };
-        spans.push(Span::styled((*n).to_string(), num_style));
+        let key_w = n.width().min(w);
         spans.push(Span::styled(
-            fit_width(l, w.saturating_sub(n.len())),
-            label_style,
+            if key_w == n.width() {
+                n.clone()
+            } else {
+                fit_width(n, key_w)
+            },
+            num_style,
         ));
+        spans.push(Span::styled(fit_width(l, w - key_w), label_style));
     }
     Line::from(spans)
 }
 
 pub fn draw(frame: &mut Frame, view: &View) {
     let area = frame.area();
+    let theme = view.theme;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -426,7 +464,7 @@ pub fn draw(frame: &mut Frame, view: &View) {
     );
     frame.render_widget(
         Paragraph::new(fit_width(&header, area.width as usize))
-            .style(Style::default().fg(palette::FG).bg(palette::BG)),
+            .style(Style::default().fg(theme.fg).bg(theme.bg)),
         rows[0],
     );
 
@@ -436,8 +474,8 @@ pub fn draw(frame: &mut Frame, view: &View) {
         .split(rows[1]);
     for i in 0..2 {
         match view.trash[i] {
-            Some(tv) => draw_trash_panel(frame, cols[i], tv, view.active == i),
-            None => draw_panel(frame, cols[i], view.panels[i], view.active == i),
+            Some(tv) => draw_trash_panel(frame, cols[i], tv, view.active == i, view.theme),
+            None => draw_panel(frame, cols[i], view.panels[i], view.active == i, view.theme),
         }
     }
 
@@ -448,20 +486,12 @@ pub fn draw(frame: &mut Frame, view: &View) {
         (None, None) => default_status(view.panels[active]),
     };
     frame.render_widget(
-        Paragraph::new(fit_width(&format!(" {status}"), area.width as usize)).style(
-            Style::default()
-                .fg(palette::STATUS_FG)
-                .bg(palette::STATUS_BG),
-        ),
+        Paragraph::new(fit_width(&format!(" {status}"), area.width as usize))
+            .style(Style::default().fg(theme.status_fg).bg(theme.status_bg)),
         rows[2],
     );
-    let keys = if view.trash[active].is_some() {
-        &TRASH_FKEYS
-    } else {
-        &FKEYS
-    };
     frame.render_widget(
-        Paragraph::new(fkey_line(area.width as usize, keys)),
+        Paragraph::new(fkey_line(area.width as usize, view.fkeys, view.theme)),
         rows[3],
     );
 }
@@ -469,11 +499,17 @@ pub fn draw(frame: &mut Frame, view: &View) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::{Context, Keymap};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
     use std::fs;
     use std::path::PathBuf;
+
+    fn th() -> Theme {
+        crate::theme::builtin("mdir").unwrap()
+    }
 
     #[test]
     fn fit_width_truncates_ascii() {
@@ -519,6 +555,8 @@ mod tests {
             shell: "zsh",
             os: "macos",
             trash: [None, None],
+            theme: &th(),
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -567,11 +605,11 @@ mod tests {
         let (a, b) = setup();
         let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
         let buf = render(&pa, &pb, 0, None, 80, 24);
-        assert_eq!(buf[(5, 2)].bg, palette::CURSOR_BG);
-        assert_ne!(buf[(45, 2)].bg, palette::CURSOR_BG);
+        assert_eq!(buf[(5, 2)].bg, th().cursor_bg);
+        assert_ne!(buf[(45, 2)].bg, th().cursor_bg);
         let buf = render(&pa, &pb, 1, None, 80, 24);
-        assert_ne!(buf[(5, 2)].bg, palette::CURSOR_BG);
-        assert_eq!(buf[(45, 2)].bg, palette::CURSOR_BG);
+        assert_ne!(buf[(5, 2)].bg, th().cursor_bg);
+        assert_eq!(buf[(45, 2)].bg, th().cursor_bg);
     }
 
     #[test]
@@ -651,13 +689,230 @@ mod tests {
         assert_eq!(got.join("\n"), expected.join("\n"));
 
         // active cursor row, directory, and selected styles
-        assert_eq!(buf[(2, 2)].bg, palette::CURSOR_BG);
-        assert_eq!(buf[(2, 2)].fg, palette::CURSOR_FG);
-        assert_eq!(buf[(2, 3)].fg, palette::DIR);
-        assert_eq!(buf[(2, 3)].bg, palette::BG);
-        assert_eq!(buf[(2, 5)].fg, palette::SELECTED);
+        assert_eq!(buf[(2, 2)].bg, th().cursor_bg);
+        assert_eq!(buf[(2, 2)].fg, th().cursor_fg);
+        assert_eq!(buf[(2, 3)].fg, th().dir);
+        assert_eq!(buf[(2, 3)].bg, th().bg);
+        assert_eq!(buf[(2, 5)].fg, th().selected);
         // inactive panel has no cursor background
-        assert_ne!(buf[(32, 2)].bg, palette::CURSOR_BG);
+        assert_ne!(buf[(32, 2)].bg, th().cursor_bg);
+    }
+
+    // ---- HDIR-21/22/23: theme-driven colors ----
+
+    fn render_themed(a: &Panel, b: &Panel, theme: &Theme) -> Buffer {
+        let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let view = View {
+            panels: [a, b],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            trash: [None, None],
+            theme,
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    #[test]
+    fn theme_slots_drive_every_region() {
+        let mut theme = th();
+        theme.bg = Color::Rgb(1, 2, 3);
+        theme.status_bg = Color::Rgb(4, 5, 6);
+        theme.fkey_label_bg = Color::Rgb(7, 8, 9);
+        theme.border_active = Color::Rgb(10, 11, 12);
+        let pa = fixed_panel("/tmp/a", &[]);
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_themed(&pa, &pb, &theme);
+        assert_eq!(buf[(0, 0)].bg, theme.bg); // header
+        assert_eq!(buf[(5, 5)].bg, theme.bg); // panel body
+        assert_eq!(buf[(0, 1)].fg, theme.border_active);
+        assert_eq!(buf[(1, 10)].bg, theme.status_bg);
+        assert_eq!(buf[(5, 11)].bg, theme.fkey_label_bg);
+    }
+
+    /// Color of the first name cell of entry `idx` (0 is `..`) in the left panel.
+    fn name_fg(buf: &Buffer, idx: u16) -> Color {
+        buf[(2, 2 + idx)].fg
+    }
+
+    #[test]
+    fn extension_groups_color_file_names() {
+        let theme = th();
+        let pa = fixed_panel(
+            "/tmp/a",
+            &[
+                ("a.zip", EntryKind::File, 1),
+                ("b.TXT", EntryKind::File, 1),
+                ("c.bin", EntryKind::File, 1),
+                ("noext", EntryKind::File, 1),
+            ],
+        );
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_themed(&pa, &pb, &theme);
+        assert_eq!(name_fg(&buf, 1), Color::Rgb(0xFF, 0x55, 0xFF), "archive");
+        assert_eq!(
+            name_fg(&buf, 2),
+            Color::Rgb(0x55, 0xFF, 0xFF),
+            "doc, case-insensitive"
+        );
+        assert_eq!(name_fg(&buf, 3), theme.file, "unknown ext");
+        assert_eq!(name_fg(&buf, 4), theme.file, "no ext");
+    }
+
+    #[test]
+    fn style_precedence_selected_dir_symlink_hidden_exec_ext() {
+        let theme = th();
+        let mut pa = fixed_panel(
+            "/tmp/a",
+            &[
+                ("d.zip", EntryKind::Dir, 0),
+                (
+                    "l",
+                    EntryKind::Symlink {
+                        target_is_dir: false,
+                    },
+                    0,
+                ),
+                (".h.zip", EntryKind::File, 1),
+                ("run.zip", EntryKind::File, 1),
+                ("sel.zip", EntryKind::File, 1),
+            ],
+        );
+        pa.entries[3].hidden = true;
+        pa.entries[3].mode = 0o755; // exec bit but hidden: hidden wins
+        pa.entries[4].mode = 0o755;
+        pa.selected.insert("sel.zip".into());
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_themed(&pa, &pb, &theme);
+        assert_eq!(name_fg(&buf, 1), theme.dir, "dir beats ext");
+        assert_eq!(name_fg(&buf, 2), theme.symlink);
+        assert_eq!(name_fg(&buf, 3), theme.hidden, "hidden beats exec");
+        assert_eq!(name_fg(&buf, 4), theme.exec, "exec beats ext");
+        assert_eq!(name_fg(&buf, 5), theme.selected, "selected beats ext");
+    }
+
+    #[test]
+    fn exec_bit_beats_extension_color() {
+        let theme = th();
+        let mut pa = fixed_panel("/tmp/a", &[("x.zip", EntryKind::File, 1)]);
+        pa.entries[1].mode = 0o755;
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_themed(&pa, &pb, &theme);
+        assert_eq!(name_fg(&buf, 1), theme.exec);
+    }
+
+    #[test]
+    fn dir_bold_follows_theme() {
+        let mut theme = th();
+        let pa = fixed_panel("/tmp/a", &[("sub", EntryKind::Dir, 0)]);
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_themed(&pa, &pb, &theme);
+        assert!(buf[(2, 3)].modifier.contains(Modifier::BOLD));
+        theme.dir_bold = false;
+        let buf = render_themed(&pa, &pb, &theme);
+        assert!(!buf[(2, 3)].modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn user_ext_groups_apply() {
+        let mut theme = th();
+        theme.ext_colors = vec![crate::theme::ExtGroup {
+            name: "mine".into(),
+            exts: vec!["rs".into()],
+            color: Color::Rgb(9, 9, 9),
+        }];
+        let pa = fixed_panel("/tmp/a", &[("main.rs", EntryKind::File, 1)]);
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_themed(&pa, &pb, &theme);
+        assert_eq!(name_fg(&buf, 1), Color::Rgb(9, 9, 9));
+    }
+
+    // ---- HDIR-20: F-key bar from the keymap ----
+
+    fn km_with(src: &str) -> Keymap {
+        let cfg: crate::keymap::KeysConfig = toml::from_str(src).unwrap();
+        crate::keymap::build(&cfg).0
+    }
+
+    fn bar(km: &Keymap, ctx: Context) -> Vec<(String, String)> {
+        fkey_bar(km, ctx)
+    }
+
+    fn pair(n: &str, l: &str) -> (String, String) {
+        (n.to_string(), l.to_string())
+    }
+
+    #[test]
+    fn default_panel_bar_matches_the_classic_f_keys() {
+        let got = bar(&Keymap::preset("mdir").unwrap(), Context::Panel);
+        let want = [
+            ("1", "Help"),
+            ("2", "Rename"),
+            ("3", "View"),
+            ("4", "Edit"),
+            ("5", "Copy"),
+            ("6", "Move"),
+            ("7", "Mkdir"),
+            ("8", "Del"),
+            ("9", "Menu"),
+            ("10", "Quit"),
+        ]
+        .map(|(n, l)| pair(n, l));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn trash_bar_labels_only_available_actions() {
+        let got = bar(&Keymap::preset("mdir").unwrap(), Context::Trash);
+        assert_eq!(got.len(), 10);
+        assert_eq!(got[0], pair("1", ""));
+        assert_eq!(got[4], pair("5", "Restore"));
+        assert_eq!(got[7], pair("8", "Purge"));
+        assert_eq!(got[8], pair("Esc", "Back"));
+        assert_eq!(got[9], pair("10", "Quit"));
+        assert!(got.iter().all(|(_, l)| l != "Copy" && l != "Mkdir"));
+    }
+
+    #[test]
+    fn remapped_keys_show_in_the_bar_f_key_preferred_else_shortest() {
+        let km = km_with(
+            "[bind]\ncopy = [\"c\"]\nmove = [\"Alt+6\", \"F6\"]\nmkdir = [\"Ctrl+Shift+x\", \"Alt+m\"]\nview = []\n",
+        );
+        let got = bar(&km, Context::Panel);
+        assert_eq!(got[4], pair("c", "Copy"));
+        assert_eq!(got[5], pair("6", "Move"), "F-key preferred over Alt+6");
+        assert_eq!(got[6], pair("Alt+M", "Mkdir"), "shortest of the rest");
+        assert_eq!(
+            got[2],
+            pair("", ""),
+            "disabled action leaves the slot blank"
+        );
+    }
+
+    #[test]
+    fn draw_shows_remapped_key_in_fkey_row() {
+        let km = km_with("[bind]\ncopy = [\"c\"]\n");
+        let pa = fixed_panel("/tmp/a", &[]);
+        let pb = fixed_panel("/tmp/b", &[]);
+        let fkeys = fkey_bar(&km, Context::Panel);
+        let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let view = View {
+            panels: [&pa, &pb],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            trash: [None, None],
+            theme: &th(),
+            fkeys: &fkeys,
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        let row11 = row(t.backend().buffer(), 11);
+        assert!(row11.contains("cCopy"), "{row11}");
+        assert!(!row11.contains("5Copy"));
     }
 
     #[test]
@@ -708,12 +963,12 @@ mod tests {
 
         // Marker styles: title in the active border colors, status bar colors.
         for x in [8, 10, 13, 15] {
-            assert_eq!(buf[(x, 1)].fg, palette::BORDER_ACTIVE, "title x={x}");
-            assert_eq!(buf[(x, 1)].bg, palette::BG, "title x={x}");
+            assert_eq!(buf[(x, 1)].fg, th().border_active, "title x={x}");
+            assert_eq!(buf[(x, 1)].bg, th().bg, "title x={x}");
         }
         for x in [1, 3, 6, 8] {
-            assert_eq!(buf[(x, 10)].fg, palette::STATUS_FG, "status x={x}");
-            assert_eq!(buf[(x, 10)].bg, palette::STATUS_BG, "status x={x}");
+            assert_eq!(buf[(x, 10)].fg, th().status_fg, "status x={x}");
+            assert_eq!(buf[(x, 10)].bg, th().status_bg, "status x={x}");
         }
         // The idle panel carries no marker.
         assert!(!row(&buf, 1).chars().skip(30).any(|c| c == '읽'));
@@ -756,6 +1011,8 @@ mod tests {
             shell: "zsh",
             os: "macos",
             trash: [Some(tv), None],
+            theme: &th(),
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -817,12 +1074,12 @@ mod tests {
         v.toggle_current(); // select report.pdf, cursor -> 한글 문서
         let buf = render_trash(&v, 0, 80);
         assert!(left_half(&buf, 2).starts_with("│*report.pdf"));
-        assert_eq!(buf[(20, 3)].bg, palette::CURSOR_BG);
-        assert_ne!(buf[(20, 2)].bg, palette::CURSOR_BG);
+        assert_eq!(buf[(20, 3)].bg, th().cursor_bg);
+        assert_ne!(buf[(20, 2)].bg, th().cursor_bg);
         let inactive = render_trash(&v, 1, 80);
-        assert_ne!(inactive[(20, 3)].bg, palette::CURSOR_BG);
-        assert_eq!(buf[(0, 1)].fg, palette::BORDER_ACTIVE);
-        assert_eq!(inactive[(0, 1)].fg, palette::BORDER);
+        assert_ne!(inactive[(20, 3)].bg, th().cursor_bg);
+        assert_eq!(buf[(0, 1)].fg, th().border_active);
+        assert_eq!(inactive[(0, 1)].fg, th().border);
     }
 
     #[cfg(unix)]

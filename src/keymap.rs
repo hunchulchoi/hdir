@@ -302,7 +302,10 @@ const MDIR_TRASH: &[(Action, &[&str])] = &[
     (A::Delete, &["F8"]),
     (A::Parent, &["Backspace"]),
     (A::Cancel, &["Esc"]),
-    (A::Quit, &["F10"]),
+    (A::SwitchPanel, &["Tab"]),
+    (A::ToggleSelect, &["Space", "Insert"]),
+    (A::TrashView, &["Alt+F8"]),
+    (A::Quit, &["F10", "q"]),
 ];
 
 /// Extra single-key bindings layered on top of mdir for the vim preset.
@@ -852,6 +855,18 @@ mod tests {
             look(&km, Context::Trash, KeyCode::Backspace, NONE),
             Some(Action::Parent)
         );
+    }
+
+    #[test]
+    fn mdir_trash_context_covers_the_whole_trash_view() {
+        let km = mdir();
+        let t = |c, m| look(&km, Context::Trash, c, m);
+        assert_eq!(t(KeyCode::Tab, NONE), Some(Action::SwitchPanel));
+        assert_eq!(t(KeyCode::Char(' '), NONE), Some(Action::ToggleSelect));
+        assert_eq!(t(KeyCode::Insert, NONE), Some(Action::ToggleSelect));
+        assert_eq!(t(KeyCode::Char('q'), NONE), Some(Action::Quit));
+        assert_eq!(t(KeyCode::F(8), ALT), Some(Action::TrashView));
+        assert_eq!(t(KeyCode::F(5), NONE), Some(Action::Copy));
     }
 
     #[test]

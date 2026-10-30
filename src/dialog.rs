@@ -8,14 +8,31 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-mod palette {
-    use ratatui::style::Color;
-    pub const BG: Color = Color::Rgb(0xAA, 0xAA, 0xAA);
-    pub const FG: Color = Color::Rgb(0x00, 0x00, 0x00);
-    pub const TITLE: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
-    pub const DANGER_BG: Color = Color::Rgb(0xAA, 0x00, 0x00);
-    pub const DANGER_FG: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
-    pub const SELECTED_BG: Color = Color::Rgb(0x00, 0xAA, 0xAA);
+use crate::theme::{self, Theme};
+
+/// Colors a dialog needs, taken from the active theme.
+struct Colors {
+    bg: Color,
+    fg: Color,
+    title: Color,
+    danger_bg: Color,
+    danger_fg: Color,
+    sel_bg: Color,
+    sel_fg: Color,
+}
+
+impl Colors {
+    fn from_theme(t: &Theme) -> Self {
+        Self {
+            bg: t.dialog_bg,
+            fg: t.dialog_fg,
+            title: t.title,
+            danger_bg: t.danger_bg,
+            danger_fg: t.danger_fg,
+            sel_bg: t.cursor_bg,
+            sel_fg: t.cursor_fg,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +271,7 @@ fn buttons_lines(
     selected: usize,
     base: Style,
     width: usize,
+    colors: &Colors,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -270,7 +288,7 @@ fn buttons_lines(
             used += 1;
         }
         let style = if i == selected {
-            base.fg(palette::FG).bg(palette::SELECTED_BG)
+            base.fg(colors.sel_fg).bg(colors.sel_bg)
         } else {
             base
         };
@@ -285,14 +303,21 @@ fn buttons_lines(
 
 /// Draw `dialog` as a centered box over `area` (clearing what is underneath).
 pub fn render(frame: &mut Frame, area: Rect, dialog: &Dialog) {
+    let mdir = theme::builtin("mdir").expect("mdir is built in");
+    render_themed(frame, area, dialog, &mdir);
+}
+
+/// Like [`render`] with colors from `theme`.
+pub fn render_themed(frame: &mut Frame, area: Rect, dialog: &Dialog, theme: &Theme) {
+    let colors = Colors::from_theme(theme);
     let (title, danger) = match dialog {
         Dialog::Input { title, .. } | Dialog::Choice { title, .. } => (title, false),
         Dialog::Confirm { title, danger, .. } => (title, *danger),
     };
     let (bg, fg): (Color, Color) = if danger {
-        (palette::DANGER_BG, palette::DANGER_FG)
+        (colors.danger_bg, colors.danger_fg)
     } else {
-        (palette::BG, palette::FG)
+        (colors.bg, colors.fg)
     };
     let base = Style::default().fg(fg).bg(bg);
 
@@ -345,17 +370,17 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &Dialog) {
             .iter()
             .map(|m| Line::styled(m.clone(), base))
             .chain([Line::styled("", base)])
-            .chain(buttons_lines(options, *selected, base, inner_w))
+            .chain(buttons_lines(options, *selected, base, inner_w, &colors))
             .collect(),
     };
 
     let rect = centered(area, box_w, lines.len() as u16 + 2);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(palette::TITLE).bg(bg))
+        .border_style(Style::default().fg(colors.title).bg(bg))
         .title(Span::styled(
             format!(" {title} "),
-            Style::default().fg(palette::TITLE).bg(bg),
+            Style::default().fg(colors.title).bg(bg),
         ))
         .style(base);
     let inner = block.inner(rect);
@@ -702,6 +727,34 @@ mod tests {
             .map(|p| buf[p].symbol().to_string())
             .collect();
         assert_eq!(hl, "[ Skip ]");
+    }
+
+    #[test]
+    fn themed_dialog_uses_theme_slots() {
+        let mut theme = crate::theme::builtin("mdir").unwrap();
+        theme.dialog_bg = Color::Rgb(1, 2, 3);
+        theme.dialog_fg = Color::Rgb(4, 5, 6);
+        theme.danger_bg = Color::Rgb(7, 8, 9);
+        theme.cursor_bg = Color::Rgb(10, 11, 12);
+        let d = Dialog::choice("t", vec!["m".into()], opts());
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| render_themed(f, f.area(), &d, &theme)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let all = cells(&buf, buf.area);
+        assert!(all.iter().any(|&p| buf[p].bg == theme.dialog_bg));
+        assert!(all.iter().any(|&p| buf[p].fg == theme.dialog_fg));
+        assert!(
+            all.iter().any(|&p| buf[p].bg == theme.cursor_bg),
+            "selected button"
+        );
+        let d = Dialog::danger("t", vec!["m".into()]);
+        t.draw(|f| render_themed(f, f.area(), &d, &theme)).unwrap();
+        let buf = t.backend().buffer().clone();
+        assert!(
+            cells(&buf, buf.area)
+                .iter()
+                .any(|&p| buf[p].bg == theme.danger_bg)
+        );
     }
 
     #[test]

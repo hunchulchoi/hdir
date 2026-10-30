@@ -113,6 +113,42 @@ impl Theme {
         })
     }
 
+    /// Copy with every RGB color approximated by the nearest xterm-256 index
+    /// (for terminals without truecolor).
+    pub fn to_256(&self) -> Theme {
+        let mut t = self.clone();
+        t.bg = to_256(t.bg);
+        t.fg = to_256(t.fg);
+        t.border = to_256(t.border);
+        t.border_active = to_256(t.border_active);
+        t.title = to_256(t.title);
+        t.dir = to_256(t.dir);
+        t.file = to_256(t.file);
+        t.exec = to_256(t.exec);
+        t.symlink = to_256(t.symlink);
+        t.hidden = to_256(t.hidden);
+        t.assoc_file = to_256(t.assoc_file);
+        t.selected = to_256(t.selected);
+        t.cursor_bg = to_256(t.cursor_bg);
+        t.cursor_fg = to_256(t.cursor_fg);
+        t.status_bg = to_256(t.status_bg);
+        t.status_fg = to_256(t.status_fg);
+        t.fkey_num_fg = to_256(t.fkey_num_fg);
+        t.fkey_num_bg = to_256(t.fkey_num_bg);
+        t.fkey_label_fg = to_256(t.fkey_label_fg);
+        t.fkey_label_bg = to_256(t.fkey_label_bg);
+        t.dialog_bg = to_256(t.dialog_bg);
+        t.dialog_fg = to_256(t.dialog_fg);
+        t.danger_bg = to_256(t.danger_bg);
+        t.danger_fg = to_256(t.danger_fg);
+        t.preview_bg = to_256(t.preview_bg);
+        t.error = to_256(t.error);
+        for g in &mut t.ext_colors {
+            g.color = to_256(g.color);
+        }
+        t
+    }
+
     /// Color for a file name's last extension (case-insensitive); `.tar.gz` -> "gz".
     /// Dotfiles without a further extension (`.zip`) and trailing dots have none.
     pub fn color_for_ext(&self, name: &str) -> Option<Color> {
@@ -398,7 +434,10 @@ pub fn load_user_themes(dir: &Path) -> (Vec<Theme>, Vec<String>) {
         if parent == Some(name) {
             return builtin(name);
         }
-        let (_, src) = sources.iter().find(|(n, _)| n == name)?;
+        // Not a user theme: fall through to the built-in of that name.
+        let Some((_, src)) = sources.iter().find(|(n, _)| n == name) else {
+            return builtin(name);
+        };
         if cyclic.iter().any(|c| c == name) {
             let mut t = builtin("mdir")?;
             t.name = name.to_string();
@@ -434,6 +473,14 @@ pub fn resolve(name: &str, user: &[Theme]) -> (Theme, Vec<String>) {
         builtin("mdir").expect("mdir is built in"),
         vec![format!("unknown theme {name:?}, using mdir")],
     )
+}
+
+/// Whether a `COLORTERM` value announces 24-bit color.
+pub fn supports_truecolor(colorterm: Option<&str>) -> bool {
+    colorterm.is_some_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit")
+    })
 }
 
 /// Convert an RGB color to the nearest xterm-256 index (other colors pass through).
@@ -742,6 +789,21 @@ mod tests {
     }
 
     #[test]
+    fn user_theme_can_extend_a_builtin_it_does_not_override() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("mine.toml"),
+            "base = \"dark\"\n[colors]\nbg = \"#010203\"\n",
+        )
+        .unwrap();
+        let (themes, warnings) = load_user_themes(d.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mine = &themes[0];
+        assert_eq!(mine.bg, rgb(1, 2, 3));
+        assert_eq!(mine.fg, builtin("dark").unwrap().fg);
+    }
+
+    #[test]
     fn user_theme_can_extend_user_theme() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -803,5 +865,47 @@ mod tests {
         assert_eq!(to_256(Color::Red), Color::Red);
         assert_eq!(to_256(Color::Indexed(7)), Color::Indexed(7));
         assert_eq!(to_256(Color::Reset), Color::Reset);
+    }
+
+    // ---- HDIR-25: 256-color fallback ----
+
+    #[test]
+    fn truecolor_detection() {
+        for v in ["truecolor", "24bit", "TrueColor", " 24BIT "] {
+            assert!(supports_truecolor(Some(v)), "{v}");
+        }
+        for v in [None, Some(""), Some("256color"), Some("yes")] {
+            assert!(!supports_truecolor(v), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn theme_to_256_maps_every_rgb_slot_and_ext_group() {
+        let t = builtin("mdir").unwrap();
+        let m = t.to_256();
+        assert_eq!(m.name, t.name);
+        assert_eq!(m.dir_bold, t.dir_bold);
+        assert_eq!(m.bg, to_256(t.bg));
+        assert!(matches!(m.bg, Color::Indexed(_)));
+        assert!(matches!(m.cursor_fg, Color::Indexed(_)));
+        assert!(matches!(m.error, Color::Indexed(_)));
+        assert_eq!(m.ext_colors.len(), t.ext_colors.len());
+        for (a, b) in t.ext_colors.iter().zip(&m.ext_colors) {
+            assert_eq!(b.color, to_256(a.color));
+            assert_eq!(a.exts, b.exts);
+        }
+    }
+
+    #[test]
+    fn theme_to_256_keeps_named_and_indexed_colors() {
+        let mut t = builtin("mdir").unwrap();
+        t.fg = Color::Red;
+        t.bg = Color::Indexed(17);
+        t.border = Color::Reset;
+        let m = t.to_256();
+        assert_eq!(
+            (m.fg, m.bg, m.border),
+            (Color::Red, Color::Indexed(17), Color::Reset)
+        );
     }
 }
