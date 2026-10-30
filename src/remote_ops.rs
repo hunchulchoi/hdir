@@ -10,8 +10,9 @@ use crate::platform::{os_bytes, os_from_bytes};
 use crate::preview::{self, Limits, Preview};
 use crate::remote::{
     DELETE_NO_CWD, DELETE_NO_HOME, DELETE_PROTECTED, PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING,
-    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_NOT_OWNER, REPLACE_SIZE, delete_cmd, mkdir_cmd,
-    mktemp_cmd, preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd,
+    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_NOT_OWNER, REPLACE_RESTORED,
+    REPLACE_SIZE, delete_cmd, mkdir_cmd, mktemp_cmd, preview_cmd, rename_cmd, replace_cmd,
+    resolve_cmd, rm_file_cmd, rmdir_cmd,
 };
 use crate::remote::{Endpoint, scp_argv};
 use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
@@ -299,9 +300,10 @@ fn nul_path(out: &CmdOutput) -> Result<Vec<u8>, String> {
 /// 4. [`replace_cmd`] verifies the size, applies the original's mode and
 ///    `mv`s it over (hard-linked files are rewritten in place instead).
 ///
-/// On failure the remote temp file is removed and the original is untouched,
-/// except when the original belongs to another user: then nothing is
-/// replaced and the temp file stays, named in the error.
+/// On failure the remote temp file is removed and the original is untouched
+/// (a failed in-place write of a hard-linked file is restored from a backup),
+/// except when the original belongs to another user or restoring failed:
+/// then the temp file (and the backup) stay, named in the error.
 pub fn upload_replace(s: &RemoteSession, local: &Path, remote: &Path) -> Result<(), String> {
     let size = std::fs::metadata(local)
         .map_err(|e| format!("편집한 파일을 읽을 수 없음: {e}"))?
@@ -317,26 +319,38 @@ pub fn upload_replace(s: &RemoteSession, local: &Path, remote: &Path) -> Result<
         &Endpoint::Remote(&s.target, &tmp_b),
         s.scp_mode,
     );
+    let tmp_s = String::from_utf8_lossy(&tmp_b).into_owned();
+    // Errors that leave the remote temp file in place on purpose.
+    let mut keep_tmp = false;
     let res = scp_run(s, argv).and_then(|()| {
         let out = s
             .exec(&replace_cmd(&s.os, &tmp_b, &phys, size))
             .map_err(|e| e.message())?;
         match out.code {
             Some(0) => Ok(()),
-            Some(REPLACE_NOT_OWNER) => Err(format!(
-                "원격 파일의 소유자가 달라 교체하지 않음 (원격 임시 파일: {})",
-                String::from_utf8_lossy(&tmp_b)
-            )),
+            Some(REPLACE_NOT_OWNER) => {
+                keep_tmp = true;
+                Err(format!(
+                    "원격 파일의 소유자가 달라 교체하지 않음 (원격 임시 파일: {tmp_s})"
+                ))
+            }
             Some(REPLACE_SIZE) => Err("업로드된 파일 크기가 맞지 않음".into()),
+            Some(REPLACE_RESTORED) => Err("원격 파일 쓰기 실패, 원본을 복원함".into()),
+            Some(REPLACE_BACKUP_KEPT) => {
+                keep_tmp = true;
+                let bak = out.stdout.split(|&b| b == 0).next().unwrap_or_default();
+                Err(format!(
+                    "원격 파일 쓰기와 복원 모두 실패 (원본 백업: {}, 원격 임시 파일: {tmp_s})",
+                    String::from_utf8_lossy(bak)
+                ))
+            }
             c => Err(first_line(
                 &out.stderr,
                 &format!("종료 코드 {}", c.unwrap_or(-1)),
             )),
         }
     });
-    if let Err(e) = &res
-        && !e.starts_with("원격 파일의 소유자가")
-    {
+    if res.is_err() && !keep_tmp {
         // Best effort: the session may be gone.
         let _ = s.exec(&rm_file_cmd(&tmp_b));
     }
@@ -1189,6 +1203,121 @@ mod tests {
         let out = inner.exec(&cmd).unwrap();
         assert_eq!(out.code, Some(crate::remote::REPLACE_SIZE));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+    }
+
+    /// `dir/a` hard-linked as `dir/b` ("shared"), a verified temp holding
+    /// "edited!", and a `bin` dir of fake tools put first on PATH.
+    fn hard_linked_with_fakes(fakes: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let dir = root.join("d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "shared").unwrap();
+        std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        std::fs::write(dir.join(".hdir-edit.Hl1"), "edited!").unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for (name, body) in fakes {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cmd = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
+        cmd.extend(crate::remote::replace_cmd(
+            &crate::testutil::local_os(),
+            dir.join(".hdir-edit.Hl1").as_os_str().as_encoded_bytes(),
+            dir.join("a").as_os_str().as_encoded_bytes(),
+            7,
+        ));
+        (t, dir, cmd)
+    }
+
+    fn backups(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".hdir-bak")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn real_replace_restores_a_hard_linked_file_when_the_in_place_write_fails() {
+        use std::os::unix::fs::MetadataExt;
+        // cat truncates the target, writes a little, then fails
+        let (_t, dir, cmd) = hard_linked_with_fakes(&[("cat", "printf par; exit 1")]);
+        let ino = std::fs::metadata(dir.join("a")).unwrap().ino();
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_RESTORED));
+        for f in ["a", "b"] {
+            assert_eq!(
+                std::fs::read_to_string(dir.join(f)).unwrap(),
+                "shared",
+                "{f}"
+            );
+        }
+        assert_eq!(std::fs::metadata(dir.join("a")).unwrap().ino(), ino);
+        assert_eq!(std::fs::metadata(dir.join("a")).unwrap().nlink(), 2);
+        assert!(backups(&dir).is_empty(), "backup removed after restoring");
+    }
+
+    #[test]
+    fn real_replace_keeps_the_backup_when_restoring_fails_too() {
+        // the first cp (backup) works, the second (restore) fails
+        let mark = "\"$(dirname \"$0\")/used\"";
+        let cp = format!("[ -e {mark} ] && exit 1; : > {mark}; exec /bin/cp \"$@\"");
+        let (_t, dir, cmd) = hard_linked_with_fakes(&[("cat", "exit 1"), ("cp", &cp)]);
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_BACKUP_KEPT));
+        let kept = backups(&dir);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), "shared");
+        let printed = &out.stdout[..out.stdout.iter().position(|&b| b == 0).unwrap()];
+        assert_eq!(printed, kept[0].as_os_str().as_encoded_bytes());
+        assert_eq!(mode_of(&kept[0]) & 0o077, 0, "backup is private");
+        assert!(
+            dir.join(".hdir-edit.Hl1").exists(),
+            "the edited temp is kept too"
+        );
+    }
+
+    #[test]
+    fn real_replace_touches_nothing_when_the_backup_cannot_be_made() {
+        let (_t, dir, cmd) = hard_linked_with_fakes(&[("cp", "exit 1")]);
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_ne!(out.code, Some(0));
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "shared");
+        assert!(backups(&dir).is_empty());
+    }
+
+    #[test]
+    fn upload_reports_a_restored_or_a_kept_backup_hard_link_write() {
+        let (f, _) = scp_fake("", ok(""), code(crate::remote::REPLACE_RESTORED));
+        let s = session(Arc::clone(&f));
+        let t = tempfile::tempdir().unwrap();
+        let local = edited(t.path(), "new");
+        let e = upload_replace(&s, &local, &p("/srv/a")).unwrap_err();
+        assert!(e.contains("원본을 복원"), "{e}");
+        assert!(
+            f.remote_cmds().last().unwrap().starts_with("rm -f -- "),
+            "temp removed"
+        );
+
+        let mut kept = code(crate::remote::REPLACE_BACKUP_KEPT);
+        kept.stdout = b"/srv/.hdir-bak.Qq1\0".to_vec();
+        let (f, _) = scp_fake("", ok(""), kept);
+        let s = session(Arc::clone(&f));
+        let e = upload_replace(&s, &local, &p("/srv/a")).unwrap_err();
+        assert!(e.contains("/srv/.hdir-bak.Qq1"), "{e}");
+        assert!(e.contains("/srv/.hdir-edit.Ab12Cd"), "{e}");
+        assert!(
+            !f.remote_cmds().iter().any(|c| c.starts_with("rm -f -- ")),
+            "nothing is cleaned up"
+        );
     }
 
     #[test]

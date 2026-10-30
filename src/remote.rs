@@ -461,6 +461,12 @@ pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
 /// left in place.
 pub const REPLACE_SIZE: i32 = 31;
 pub const REPLACE_NOT_OWNER: i32 = 32;
+/// The in-place write of a hard-linked file failed and the original content
+/// was copied back from the backup.
+pub const REPLACE_RESTORED: i32 = 33;
+/// The in-place write failed and so did restoring: the backup (path printed,
+/// NUL-terminated) and the temp file are kept.
+pub const REPLACE_BACKUP_KEPT: i32 = 34;
 
 /// `stat` fields `mode nlink uid gid` of `os`.
 fn stat_meta_args(os: &RemoteOs) -> &'static str {
@@ -477,10 +483,12 @@ fn stat_meta_args(os: &RemoteOs) -> &'static str {
 ///   replaced ([`REPLACE_NOT_OWNER`]): ownership cannot be kept;
 /// - the original's mode is applied to the temp, then `mv` replaces it
 ///   atomically (a failed upload never truncates the original);
-/// - a file with several hard links keeps its inode: the verified temp
-///   content is copied in place with `cat`, then the temp is removed. That
-///   copy is not atomic (a crash or full disk mid-write can leave the
-///   original truncated) - the price of not breaking the other links.
+/// - a file with several hard links keeps its inode: it is first copied to a
+///   private backup `.hdir-bak.XXXXXX` next to it (no backup, no write), then
+///   the verified temp content is written in place with `cat`. If that write
+///   fails the backup is copied back ([`REPLACE_RESTORED`]); if restoring
+///   fails too, the backup and the temp stay ([`REPLACE_BACKUP_KEPT`], the
+///   backup path printed NUL-terminated).
 ///
 /// The group of a replaced file becomes the user's/directory's group.
 pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8> {
@@ -499,8 +507,17 @@ pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8>
             "if [ \"$3\" != \"$(id -u)\" ]; then [ \"$(id -u)\" = 0 ] && chown \"$3:$4\" \"$t\" || exit {REPLACE_NOT_OWNER}; fi\n"
         )
         .as_bytes(),
-        b"if [ \"$2\" -gt 1 ]; then cat -- \"$t\" > \"$o\" && rm -f -- \"$t\"\n\
-          else chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\"; fi",
+        b"if [ \"$2\" -gt 1 ]; then\n  \
+          b=$(mktemp \"${o%/*}/.hdir-bak.XXXXXX\") || exit 1\n  \
+          cp -- \"$o\" \"$b\" || { rm -f -- \"$b\"; exit 1; }\n  \
+          if cat -- \"$t\" > \"$o\"; then rm -f -- \"$t\" \"$b\"; exit 0; fi\n  \
+          echo 'in-place write failed' >&2\n",
+        format!(
+            "  if cp -- \"$b\" \"$o\"; then rm -f -- \"$b\"; exit {REPLACE_RESTORED}; fi\n  \
+             printf '%s\\0' \"$b\"; exit {REPLACE_BACKUP_KEPT}\n"
+        )
+        .as_bytes(),
+        b"else chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\"; fi",
     ])
 }
 
@@ -1177,15 +1194,34 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             l.contains("chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\""),
             "{l}"
         );
+        assert!(l.contains("if [ \"$2\" -gt 1 ]; then\n"), "{l}");
         assert!(
-            l.contains("if [ \"$2\" -gt 1 ]; then cat -- \"$t\" > \"$o\" && rm -f -- \"$t\""),
+            l.contains("b=$(mktemp \"${o%/*}/.hdir-bak.XXXXXX\") || exit 1"),
             "{l}"
         );
+        let (bak, write) = (
+            l.find("cp -- \"$o\" \"$b\"").unwrap(),
+            l.find("cat --").unwrap(),
+        );
+        assert!(bak < write, "backup before the in-place write");
+        assert!(
+            l.contains("cp -- \"$b\" \"$o\"; then rm -f -- \"$b\"; exit 33"),
+            "{l}"
+        );
+        assert!(l.contains("printf '%s\\0' \"$b\"; exit 34"), "{l}");
         assert!(l.find("exit 31").unwrap() < l.find("cat --").unwrap());
         assert!(!l.contains("-L"), "no write-through-link branch any more");
         let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1));
         assert!(b.contains("stat -f '%Lp %l %u %g' -- \"$o\""), "{b}");
-        assert_eq!((REPLACE_SIZE, REPLACE_NOT_OWNER), (31, 32));
+        assert_eq!(
+            (
+                REPLACE_SIZE,
+                REPLACE_NOT_OWNER,
+                REPLACE_RESTORED,
+                REPLACE_BACKUP_KEPT
+            ),
+            (31, 32, 33, 34)
+        );
         assert_eq!(s(rm_file_cmd(b"/d/-x y")), "rm -f -- '/d/-x y'");
     }
 
