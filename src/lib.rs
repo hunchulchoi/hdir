@@ -17,10 +17,13 @@ pub mod panel;
 pub mod platform;
 pub mod preview;
 pub mod remote;
+pub mod remote_ops;
 pub mod screen;
 pub mod servers;
 pub mod session;
 pub mod term;
+#[cfg(test)]
+pub mod testutil;
 pub mod theme;
 pub mod trash;
 pub mod ui;

@@ -135,7 +135,7 @@ fn spawn_failed(msg: &str) -> CmdOutput {
 }
 
 /// First non-empty stderr line, or `fallback`.
-fn first_line(stderr: &[u8], fallback: &str) -> String {
+pub(crate) fn first_line(stderr: &[u8], fallback: &str) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .map(str::trim)
@@ -178,6 +178,16 @@ impl std::fmt::Debug for RemoteSession {
             .finish()
     }
 }
+
+/// Sessions are identities, not values: two are equal only when they are the
+/// same connection.
+impl PartialEq for RemoteSession {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for RemoteSession {}
 
 impl RemoteSession {
     pub fn new(

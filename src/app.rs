@@ -25,6 +25,7 @@ use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
 use crate::preview::{self, Preview};
 use crate::remote::SshTarget;
+use crate::remote_ops;
 use crate::screen::{self, TextScreen};
 use crate::servers::{self, Server, SshHost};
 use crate::session::{self, Cmd, DISCONNECTED_MSG, Established, RemoteSession, SystemCmd};
@@ -51,6 +52,13 @@ pub enum PendingAction {
     },
     Trash {
         paths: Vec<PathBuf>,
+    },
+    /// Permanent delete on a remote host (no trash there).
+    RemoteDelete {
+        panel: usize,
+        session: Arc<RemoteSession>,
+        cwd: PathBuf,
+        names: Vec<OsString>,
     },
     /// Destination prompt for F5 (copy) / F6 (move).
     Transfer {
@@ -295,6 +303,23 @@ enum BgKind {
         from: PathBuf,
         name: String,
     },
+    RemoteMkdir {
+        panel: usize,
+        parent: PathBuf,
+        name: String,
+        session: Arc<RemoteSession>,
+    },
+    RemoteRename {
+        panel: usize,
+        from: PathBuf,
+        name: String,
+        session: Arc<RemoteSession>,
+    },
+    RemoteDelete {
+        panel: usize,
+        cwd: PathBuf,
+        paths: Vec<PathBuf>,
+    },
     OpenOsTrash,
     /// Re-read config.toml, themes, keymap and assoc.
     ConfigReload,
@@ -330,6 +355,9 @@ enum BgResult {
     Undo(UndoApplied),
     Mkdir(std::io::Result<PathBuf>),
     Rename(std::io::Result<PathBuf>),
+    RemoteMkdir(Result<PathBuf, String>),
+    RemoteRename(Result<PathBuf, String>),
+    RemoteDelete(Result<(), String>),
 }
 
 /// The F3 viewer's own load slot (independent of the shared [`BgTask`]).
@@ -1347,15 +1375,13 @@ impl App {
         let page = self.page_height.max(1);
         let remote_here = self.active_panel().location.is_remote();
         let remote_any = remote_here || self.other_panel().location.is_remote();
+        if action == Action::TrashView && remote_here {
+            self.status = Some("원격: 휴지통 없음".into());
+            return;
+        }
         let blocked = match action {
             Action::Copy | Action::Move => remote_any,
-            Action::Mkdir
-            | Action::Rename
-            | Action::Delete
-            | Action::TrashView
-            | Action::View
-            | Action::Edit
-            | Action::OpenWith => remote_here,
+            Action::View | Action::Edit | Action::OpenWith => remote_here,
             _ => false,
         };
         if blocked {
@@ -2159,6 +2185,52 @@ impl App {
                     self.status = Some(format!("오류: {e}"));
                 }
             },
+            (
+                BgKind::RemoteMkdir {
+                    panel,
+                    parent,
+                    name,
+                    session,
+                },
+                Some(BgResult::RemoteMkdir(res)),
+            ) => match res {
+                Ok(path) => {
+                    self.undo.push(UndoOp::RemoteMkdir { session, path });
+                    self.after_fs_op(panel, &parent, Some(&name), format!("폴더 생성: {name}"));
+                }
+                Err(e) => {
+                    self.reload_both();
+                    self.status = Some(format!("오류: {e}"));
+                }
+            },
+            (
+                BgKind::RemoteRename {
+                    panel,
+                    from,
+                    name,
+                    session,
+                },
+                Some(BgResult::RemoteRename(res)),
+            ) => match res {
+                Ok(to) => {
+                    let parent = from.parent().map(PathBuf::from).unwrap_or_default();
+                    self.undo.push(UndoOp::RemoteRename { session, from, to });
+                    self.after_fs_op(panel, &parent, Some(&name), format!("이름 변경: {name}"));
+                }
+                Err(e) => {
+                    self.reload_both();
+                    self.status = Some(format!("오류: {e}"));
+                }
+            },
+            (BgKind::RemoteDelete { panel, cwd, paths }, Some(BgResult::RemoteDelete(res))) => {
+                // Even a failed rm -rf may have removed some of the items.
+                self.clear_selection(panel, &cwd, &paths);
+                self.reload_both();
+                self.status = Some(match res {
+                    Ok(()) => format!("영구 삭제: {}개 (원격 삭제는 되돌릴 수 없음)", paths.len()),
+                    Err(e) => format!("오류: {e}"),
+                });
+            }
             (BgKind::OpenOsTrash, Some(BgResult::OpenOsTrash(res))) => {
                 self.status = Some(match res {
                     Ok(()) => "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".to_string(),
@@ -2362,6 +2434,29 @@ impl App {
             return;
         }
         let cwd = self.active_panel().cwd.clone();
+        if let Some(session) = self.active_panel().location.session().cloned() {
+            // No trash on a remote host: a red permanent-delete confirmation.
+            let mut msg: Vec<String> = names
+                .iter()
+                .take(5)
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+            if names.len() > 5 {
+                msg.push(format!("외 {}개", names.len() - 5));
+            }
+            let title = format!("영구 삭제 (원격: {})", session.name);
+            self.status = None;
+            self.dialog = Some((
+                Dialog::danger(&title, msg),
+                PendingAction::RemoteDelete {
+                    panel: self.active,
+                    session,
+                    cwd,
+                    names,
+                },
+            ));
+            return;
+        }
         let paths: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
         let mut msg: Vec<String> = names
             .iter()
@@ -2611,6 +2706,20 @@ impl App {
                 }
                 let parent = self.active_panel().cwd.clone();
                 let (p, n) = (parent.clone(), name.clone());
+                if let Some(session) = self.active_panel().location.session().cloned() {
+                    let sess = Arc::clone(&session);
+                    self.task = Some(BgTask::spawn(
+                        BgKind::RemoteMkdir {
+                            panel: self.active,
+                            parent,
+                            name,
+                            session,
+                        },
+                        move || BgResult::RemoteMkdir(remote_ops::mkdir(&sess, &p, &n)),
+                    ));
+                    self.status = Some("폴더 생성 중…".into());
+                    return;
+                }
                 self.task = Some(BgTask::spawn(
                     BgKind::Mkdir {
                         panel: self.active,
@@ -2627,6 +2736,20 @@ impl App {
                     return;
                 }
                 let (f, n) = (from.clone(), name.clone());
+                if let Some(session) = self.active_panel().location.session().cloned() {
+                    let sess = Arc::clone(&session);
+                    self.task = Some(BgTask::spawn(
+                        BgKind::RemoteRename {
+                            panel: self.active,
+                            from,
+                            name,
+                            session,
+                        },
+                        move || BgResult::RemoteRename(remote_ops::rename(&sess, &f, &n)),
+                    ));
+                    self.status = Some("이름 변경 중…".into());
+                    return;
+                }
                 self.task = Some(BgTask::spawn(
                     BgKind::Rename {
                         panel: self.active,
@@ -2651,6 +2774,27 @@ impl App {
                     move || BgResult::Trash(trash::delete_tracked(&*trash, &paths)),
                 ));
                 self.status = Some("휴지통으로 이동 중…".into());
+            }
+            (
+                PendingAction::RemoteDelete {
+                    panel,
+                    session,
+                    cwd,
+                    names,
+                },
+                DialogResult::Confirmed,
+            ) => {
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
+                }
+                let paths: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
+                let dir = cwd.clone();
+                self.task = Some(BgTask::spawn(
+                    BgKind::RemoteDelete { panel, cwd, paths },
+                    move || BgResult::RemoteDelete(remote_ops::delete(&session, &dir, &names)),
+                ));
+                self.status = Some("영구 삭제 중…".into());
             }
             (PendingAction::TrashPurge { panel, entries }, DialogResult::Confirmed) => {
                 if self.busy() {
@@ -2709,7 +2853,9 @@ impl App {
         focus: Option<&str>,
         status: String,
     ) {
-        if self.panels[1 - idx].cwd == dir {
+        let same_source = self.panels[idx].location.vfs().source_key()
+            == self.panels[1 - idx].location.vfs().source_key();
+        if same_source && self.panels[1 - idx].cwd == dir {
             self.reload_after_op(1 - idx, None);
         }
         self.reload_after_op(idx, focus.map(OsString::from));
@@ -7159,7 +7305,15 @@ mod tests {
             /// Held by a test to make every remote listing hang.
             list_gate: Mutex<()>,
             tree: HashMap<&'static str, Vec<(&'static str, &'static str)>>,
+            /// Every ssh/scp argv that is not a master check or `ssh -V`.
+            calls: Mutex<Vec<Vec<String>>>,
+            /// Tests script answers here; `None` falls through to the defaults.
+            hook: Mutex<Option<Hook>>,
+            /// What `printf "$HOME"` answers.
+            home: Mutex<String>,
         }
+
+        type Hook = Box<dyn Fn(&[String]) -> Option<CmdOutput> + Send + Sync>;
 
         impl FakeSsh {
             fn new(master_up: bool) -> Arc<Self> {
@@ -7178,6 +7332,9 @@ mod tests {
                     checks: Mutex::new(0),
                     list_gate: Mutex::new(()),
                     tree,
+                    calls: Mutex::new(Vec::new()),
+                    hook: Mutex::new(None),
+                    home: Mutex::new("/home/choi".into()),
                 })
             }
         }
@@ -7221,9 +7378,26 @@ mod tests {
                     return out(255, "");
                 }
                 let i = a.iter().position(|s| s == "--").unwrap();
-                let cmd = a[i + 2].as_str();
+                let cmd = a.get(i + 2).map_or("", String::as_str);
+                if cmd != "uname -s" {
+                    self.calls.lock().unwrap().push(a.clone());
+                }
+                if let Some(h) = self.hook.lock().unwrap().as_ref()
+                    && let Some(o) = h(&a)
+                {
+                    return o;
+                }
+                if a[0] == "scp" {
+                    return out(0, "");
+                }
                 if cmd == "uname -s" {
                     return out(0, "Linux\n");
+                }
+                if cmd.contains("\"$HOME\"") && !cmd.starts_with("cd -- ") {
+                    return out(0, &format!("{}\0", self.home.lock().unwrap()));
+                }
+                if !cmd.starts_with("cd -- ") {
+                    return out(0, ""); // mkdir, mv, rm, ... succeed by default
                 }
                 let dir = cmd
                     .strip_prefix("cd -- ")
@@ -7262,6 +7436,21 @@ mod tests {
                     out(255, "")
                 }
             }
+        }
+
+        /// Remote shell commands other than listings and path lookups.
+        fn cmds(f: &FakeSsh) -> Vec<String> {
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|a| crate::testutil::remote_cmd(a).map(str::to_string))
+                .filter(|c| !c.starts_with("cd -- "))
+                .collect()
+        }
+
+        fn script(f: &FakeSsh, h: impl Fn(&[String]) -> Option<CmdOutput> + Send + Sync + 'static) {
+            *f.hook.lock().unwrap() = Some(Box::new(h));
         }
 
         fn env_with(master_up: bool) -> (TempDir, App, Arc<FakeSsh>) {
@@ -7596,11 +7785,231 @@ mod tests {
             assert!(f.interactive.lock().unwrap().is_empty());
         }
 
+        // ---- HDIR-38: remote mkdir / rename / delete ----
+
+        fn rename_to(app: &mut App, new: &str) {
+            press(app, KeyCode::F(2));
+            for _ in 0..40 {
+                press(app, KeyCode::Backspace);
+            }
+            type_str(app, new);
+            press(app, KeyCode::Enter);
+        }
+
+        #[test]
+        fn remote_f7_makes_the_dir_over_ssh_and_is_undoable() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "new dir");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.status.as_deref(), Some("폴더 생성 중…"));
+            assert!(app.task.is_some(), "runs on a worker");
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(cmds(&f), vec!["mkdir -- '/srv/data/new dir'".to_string()]);
+            assert_eq!(app.status.as_deref(), Some("폴더 생성: new dir"));
+            assert_eq!(app.undo.len(), 1);
+            ctrl_z(&mut app);
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(cmds(&f)[1], "rmdir -- '/srv/data/new dir'");
+            assert_eq!(
+                app.status.as_deref(),
+                Some("되돌림: 폴더 생성 취소 new dir")
+            );
+        }
+
+        #[test]
+        fn remote_f7_with_weird_names_stays_quoted_and_rejects_slashes() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "한글 'q' -x");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert_eq!(
+                cmds(&f),
+                vec!["mkdir -- '/srv/data/한글 '\\''q'\\'' -x'".to_string()]
+            );
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "a/b");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert_eq!(cmds(&f).len(), 1, "invalid name never reaches ssh");
+            assert!(app.status.as_deref().unwrap().starts_with("오류"));
+        }
+
+        #[test]
+        fn remote_f7_failure_is_reported_without_undo_entry() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("mkdir"))
+                    .map(|_| CmdOutput {
+                        code: Some(1),
+                        stdout: Vec::new(),
+                        stderr: b"mkdir: cannot create directory 'x': File exists\n".to_vec(),
+                    })
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "x");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert!(app.status.as_deref().unwrap().contains("File exists"));
+            assert_eq!(app.undo.len(), 0);
+        }
+
+        #[test]
+        fn remote_f2_renames_without_clobbering_and_undo_moves_back() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // a.txt
+            rename_to(&mut app, "b c.txt");
+            assert_eq!(app.status.as_deref(), Some("이름 변경 중…"));
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            let fwd = crate::remote::rename_cmd(b"/srv/data/a.txt", b"/srv/data/b c.txt");
+            assert_eq!(cmds(&f), vec![String::from_utf8(fwd).unwrap()]);
+            assert_eq!(app.status.as_deref(), Some("이름 변경: b c.txt"));
+            assert_eq!(app.undo.len(), 1);
+            ctrl_z(&mut app);
+            wait_idle(&mut app);
+            let back = crate::remote::rename_cmd(b"/srv/data/b c.txt", b"/srv/data/a.txt");
+            assert_eq!(cmds(&f)[1], String::from_utf8(back).unwrap());
+            assert_eq!(
+                app.status.as_deref(),
+                Some("되돌림: 이름 변경 b c.txt → a.txt")
+            );
+        }
+
+        #[test]
+        fn remote_f2_onto_an_existing_name_is_an_error() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -e"))
+                    .map(|_| out(crate::remote::RENAME_EXISTS, ""))
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            rename_to(&mut app, "sub");
+            wait_idle(&mut app);
+            assert_eq!(app.status.as_deref(), Some("오류: 이미 존재함: sub"));
+            assert_eq!(app.undo.len(), 0);
+        }
+
+        #[test]
+        fn remote_f8_asks_with_a_danger_dialog_naming_the_server() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char(' ')); // sub
+            press(&mut app, KeyCode::Char(' ')); // a.txt
+            press(&mut app, KeyCode::F(8));
+            let Some((
+                Dialog::Confirm {
+                    title,
+                    message,
+                    danger,
+                },
+                _,
+            )) = app.dialog.clone()
+            else {
+                panic!("expected a confirm dialog: {:?}", app.dialog);
+            };
+            assert!(danger, "red permanent-delete style");
+            assert_eq!(title, "영구 삭제 (원격: prod)");
+            assert_eq!(message, vec!["a.txt".to_string(), "sub".to_string()]);
+            press(&mut app, KeyCode::Esc);
+            assert!(app.dialog.is_none());
+            assert!(cmds(&f).is_empty(), "cancel deletes nothing");
+        }
+
+        #[test]
+        fn remote_f8_confirm_runs_rm_rf_and_is_not_undoable() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char(' ')); // a.txt
+            press(&mut app, KeyCode::Char(' ')); // 한글 b.txt
+            press(&mut app, KeyCode::F(8));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.status.as_deref(), Some("영구 삭제 중…"));
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            let rm: Vec<String> = cmds(&f)
+                .into_iter()
+                .filter(|c| c.starts_with("rm "))
+                .collect();
+            assert_eq!(
+                rm,
+                vec!["rm -rf -- '/srv/data/a.txt' '/srv/data/한글 b.txt'".to_string()]
+            );
+            assert_eq!(
+                app.status.as_deref(),
+                Some("영구 삭제: 2개 (원격 삭제는 되돌릴 수 없음)")
+            );
+            assert_eq!(app.undo.len(), 0);
+            assert!(app.panels[1].selected.is_empty());
+            ctrl_z(&mut app);
+            assert_eq!(app.status.as_deref(), Some("되돌릴 작업 없음"));
+        }
+
+        #[test]
+        fn remote_f8_refuses_the_remote_home_directory() {
+            let (_t, mut app, f) = env();
+            *f.home.lock().unwrap() = "/srv/data/sub".into();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down); // sub == $HOME
+            press(&mut app, KeyCode::F(8));
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert!(app.status.as_deref().unwrap().contains("삭제 거부"));
+            assert!(cmds(&f).iter().all(|c| !c.starts_with("rm ")));
+        }
+
+        #[test]
+        fn remote_ops_are_refused_while_another_task_runs() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.task = Some(BgTask {
+                rx,
+                kind: BgKind::Undo,
+            });
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "nope");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+            assert!(cmds(&f).is_empty());
+        }
+
+        #[test]
+        fn remote_ops_on_a_dropped_connection_say_so() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            f.down.store(true, Ordering::SeqCst);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "x");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert_eq!(
+                app.status.as_deref(),
+                Some(&format!("오류: {DISCONNECTED_MSG}")[..])
+            );
+            assert!(!app.panels[1].location.session().unwrap().is_alive());
+        }
+
         #[test]
         fn file_operations_on_remote_panels_are_not_supported_yet() {
             let (_t, mut app, _f) = env();
             connect_prod(&mut app);
-            for f in [2u8, 3, 4, 5, 6, 7, 8] {
+            for f in [3u8, 4, 5, 6] {
                 app.status = None;
                 press(&mut app, KeyCode::F(f));
                 assert_eq!(app.status.as_deref(), Some(UNSUPPORTED), "F{f}");

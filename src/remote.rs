@@ -293,6 +293,40 @@ pub fn rm_cmd(paths: &[&[u8]]) -> Vec<u8> {
     o
 }
 
+/// Exit code of [`rename_cmd`] when the target already exists.
+pub const RENAME_EXISTS: i32 = 17;
+
+/// Rename without replacing. The target is checked in the same remote command
+/// as the move, and `mv -n` refuses to clobber a target that appears between
+/// the check and the move. This is as close to an atomic no-replace rename as
+/// plain POSIX tools get: there is still a tiny race window (and `mv -n` may
+/// exit 0 without moving when it loses that race), unlike the local
+/// `renameat2`/`link` based rename.
+pub fn rename_cmd(from: &[u8], to: &[u8]) -> Vec<u8> {
+    let q = sh_quote(to);
+    cat(&[
+        b"if [ -e ",
+        &q,
+        b" ] || [ -L ",
+        &q,
+        format!(" ]; then exit {RENAME_EXISTS}; fi; ").as_bytes(),
+        b"mv -n -- ",
+        &sh_quote(from),
+        b" ",
+        &q,
+    ])
+}
+
+/// `rmdir` (fails unless the directory is empty): undo of a remote mkdir.
+pub fn rmdir_cmd(path: &[u8]) -> Vec<u8> {
+    cat(&[b"rmdir -- ", &sh_quote(path)])
+}
+
+/// Prints the remote home directory, NUL-terminated.
+pub fn home_cmd() -> Vec<u8> {
+    b"printf '%s\\0' \"$HOME\"".to_vec()
+}
+
 /// How the local `scp` interprets remote paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScpMode {
@@ -426,6 +460,10 @@ pub fn scp_argv(
         v.push(os("-o"));
         v.push(control_opt(t));
     }
+    // Never prompt (the TUI owns the terminal) and never hang on a dead link.
+    v.push(os("-o"));
+    v.push(os("BatchMode=yes"));
+    net_opts(&mut v);
     port_args(port, "-P", &mut v);
     v.push(os("--"));
     v.push(a);
@@ -835,6 +873,25 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     }
 
     #[test]
+    fn rename_cmd_checks_the_target_in_the_same_command() {
+        assert_eq!(
+            s(rename_cmd(b"/d/a b", b"/d/it's")),
+            "if [ -e '/d/it'\\''s' ] || [ -L '/d/it'\\''s' ]; then exit 17; fi; \
+             mv -n -- '/d/a b' '/d/it'\\''s'"
+        );
+        // leading dash and newline stay inside the quotes
+        let c = s(rename_cmd(b"/d/-a", b"/d/b\nc"));
+        assert!(c.ends_with("mv -n -- '/d/-a' '/d/b\nc'"), "{c}");
+        assert_eq!(RENAME_EXISTS, 17);
+    }
+
+    #[test]
+    fn rmdir_and_home_cmds() {
+        assert_eq!(s(rmdir_cmd(b"/d/-x y")), "rmdir -- '/d/-x y'");
+        assert_eq!(s(home_cmd()), "printf '%s\\0' \"$HOME\"");
+    }
+
+    #[test]
     fn scp_routes_legacy_quoted() {
         let a = t(None);
         let up = scp_argv(
@@ -850,6 +907,14 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
                 "-rp",
                 "-o",
                 "ControlPath=/c/cm-1",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "--",
                 "/l/f x",
                 "prod:'/r/d'"
@@ -869,6 +934,14 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
                 "-rp",
                 "-o",
                 "ControlPath=/c/cm-1",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "-P",
                 "2222",
                 "--",
@@ -888,7 +961,22 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         // distinct masters: no ControlPath (it would be applied to the wrong host)
         assert_eq!(
             rr,
-            v(&["scp", "-3", "-rp", "--", "prod:'/s'", "other:'/d'"])
+            v(&[
+                "scp",
+                "-3",
+                "-rp",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "--",
+                "prod:'/s'",
+                "other:'/d'"
+            ])
         );
         let same = scp_argv(
             &Endpoint::Remote(&a, b"/s"),
@@ -904,6 +992,14 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
                 "-rp",
                 "-o",
                 "ControlPath=/c/cm-1",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "--",
                 "prod:'/s'",
                 "prod:'/d'"
