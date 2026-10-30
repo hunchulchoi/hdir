@@ -1,6 +1,7 @@
 //! hdir: Mdir-style dual-panel TUI file manager.
 
 pub mod app;
+pub mod panel;
 pub mod term;
 
 pub const APP_NAME: &str = "hdir";
