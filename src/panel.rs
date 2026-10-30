@@ -70,17 +70,20 @@ impl Panel {
         match read_listing(&self.cwd, self.show_hidden) {
             Ok(listing) => self.apply_listing(listing),
             Err(msg) => {
-                self.entries = parent_only(&self.cwd);
+                // Keep the last good listing and selection; only report the error.
+                if self.entries.is_empty() {
+                    self.entries = parent_only(&self.cwd);
+                }
                 self.error = Some(msg);
+                return;
             }
         }
         let found = keep.and_then(|n| self.entries.iter().position(|e| e.os_name == n));
         self.cursor = found.unwrap_or(self.cursor);
         self.cursor = self.cursor.min(self.entries.len().saturating_sub(1));
         self.scroll = self.scroll.min(self.cursor);
-        let entries = &self.entries;
-        self.selected
-            .retain(|n| entries.iter().any(|e| e.os_name == *n));
+        let present: HashSet<&OsStr> = self.entries.iter().map(|e| e.os_name.as_os_str()).collect();
+        self.selected.retain(|n| present.contains(n.as_os_str()));
     }
 
     fn apply_listing(&mut self, (entries, skipped): (Vec<Entry>, usize)) {
@@ -140,12 +143,12 @@ impl Panel {
     /// Change directory, reset view state; cursor lands on `focus` if present.
     /// If the target cannot be read, the current location is kept and only
     /// `error` is set.
-    fn change_dir(&mut self, dir: PathBuf, focus: Option<&OsStr>) {
+    fn change_dir(&mut self, dir: PathBuf, focus: Option<&OsStr>) -> bool {
         let listing = match read_listing(&dir, self.show_hidden) {
             Ok(l) => l,
             Err(msg) => {
                 self.error = Some(msg);
-                return;
+                return false;
             }
         };
         self.cwd = dir;
@@ -156,17 +159,17 @@ impl Panel {
         if let Some(i) = focus.and_then(|n| self.entries.iter().position(|e| e.os_name == n)) {
             self.cursor = i;
         }
+        true
     }
 
     /// Go to the parent directory, focusing the directory we came from.
-    /// Returns false at the filesystem root.
+    /// Returns false at the filesystem root or when the parent can't be read.
     pub fn go_parent(&mut self) -> bool {
         let Some(parent) = self.cwd.parent().map(Path::to_path_buf) else {
             return false;
         };
         let from = self.cwd.file_name().map(OsStr::to_os_string);
-        self.change_dir(parent, from.as_deref());
-        true
+        self.change_dir(parent, from.as_deref())
     }
 
     pub fn enter(&mut self) -> EnterResult {
@@ -186,8 +189,11 @@ impl Panel {
                 target_is_dir: true,
             } => {
                 let dir = self.cwd.join(&entry.os_name);
-                self.change_dir(dir, None);
-                EnterResult::Entered
+                if self.change_dir(dir, None) {
+                    EnterResult::Entered
+                } else {
+                    EnterResult::Nothing
+                }
             }
             _ => EnterResult::Opened(self.cwd.join(&entry.os_name)),
         }
@@ -320,8 +326,37 @@ mod tests {
 
     #[test]
     fn no_parent_at_root() {
-        let p = Panel::new("/");
-        assert!(p.entries.iter().all(|e| e.kind != EntryKind::Parent));
+        assert!(parent_only(Path::new("/")).is_empty());
+        assert_eq!(parent_only(Path::new("/tmp")).len(), 1);
+    }
+
+    #[test]
+    fn enter_vanished_dir_fails_and_keeps_location() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("gone")).unwrap();
+        let mut p = Panel::new(t.path());
+        let cwd = p.cwd.clone();
+        p.cursor = 1;
+        fs::remove_dir(t.path().join("gone")).unwrap();
+        assert_eq!(p.enter(), EnterResult::Nothing);
+        assert_eq!(p.cwd, cwd);
+        assert!(p.error.is_some());
+    }
+
+    #[test]
+    fn reload_failure_keeps_entries_and_selection() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a"), "").unwrap();
+        let mut p = Panel::new(&dir);
+        p.selected.insert("a".into());
+        fs::remove_file(dir.join("a")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        p.reload();
+        assert!(p.error.is_some());
+        assert_eq!(names(&p), vec!["..", "a"]);
+        assert!(p.selected.contains(OsStr::new("a")));
     }
 
     #[test]
@@ -594,7 +629,7 @@ mod tests {
         let readable = fs::read_dir(&d).is_ok();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
         if !readable {
-            assert_eq!(r, EnterResult::Entered);
+            assert_eq!(r, EnterResult::Nothing);
             assert_eq!(p.cwd, cwd);
             assert_eq!(names(&p), vec!["..", "locked"]);
             assert_eq!(p.cursor, 1);
