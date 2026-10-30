@@ -3204,7 +3204,7 @@ mod tests {
     #[test]
     fn enter_dir_and_backspace_returns_to_it() {
         let (tmp, mut app) = fixture();
-        let root = crate::cmdline::canonical_dir(tmp.path()).unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
         press(&mut app, KeyCode::Down); // adir
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
