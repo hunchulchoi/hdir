@@ -12,6 +12,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 toml_edit = "0.25.17"
 trash = "5.2.9"
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
 
 [target.'cfg(unix)'.dependencies]

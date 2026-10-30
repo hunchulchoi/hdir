@@ -6,14 +6,35 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
+use crate::config::Mode;
 use crate::keymap::{Action, Context, Keymap};
 use crate::panel::{Entry, EntryKind, Panel};
+use crate::preview::Preview;
 use crate::theme::Theme;
 use crate::trash::{TrashEntry, TrashView, format_local};
 
+/// What the Dev-mode preview area shows.
+#[derive(Debug, Clone, Copy)]
+pub enum PreviewBody<'a> {
+    /// Nothing to preview (no entry, `..`, trash view).
+    Idle,
+    Loading,
+    Ready(&'a Preview),
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewView<'a> {
+    /// Name of the previewed entry.
+    pub title: String,
+    pub body: PreviewBody<'a>,
+}
+
 pub struct View<'a> {
+    pub preview: Option<PreviewView<'a>>,
+    pub mode: Mode,
     pub panels: [&'a Panel; 2],
     pub active: usize,
     pub status: Option<&'a str>,
@@ -109,7 +130,14 @@ pub fn visible_offset(cursor: usize, scroll: usize, height: usize) -> usize {
     }
 }
 
+/// Display width of one grapheme cluster (ZWJ sequences, VS16 and combining
+/// marks measured as a unit).
+fn cluster_width(g: &str) -> usize {
+    g.width()
+}
+
 /// Truncate (with `…`) or right-pad `s` to exactly `width` display columns.
+/// Never splits a grapheme cluster.
 pub fn fit_width(s: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -117,12 +145,12 @@ pub fn fit_width(s: &str, width: usize) -> String {
         out.push_str(s);
         used = s.width();
     } else if width > 0 {
-        for c in s.chars() {
-            let w = c.width().unwrap_or(0);
+        for g in s.graphemes(true) {
+            let w = cluster_width(g);
             if used + w > width - 1 {
                 break;
             }
-            out.push(c);
+            out.push_str(g);
             used += w;
         }
         out.push('…');
@@ -133,29 +161,30 @@ pub fn fit_width(s: &str, width: usize) -> String {
 }
 
 /// Keep the tail of `s` within `width` columns, prefixed with `…` when cut.
-fn tail_width(s: &str, width: usize) -> String {
+/// Never splits a grapheme cluster.
+pub(crate) fn tail_width(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
     }
     if width == 0 {
         return String::new();
     }
-    let mut tail: Vec<char> = Vec::new();
+    let mut tail: Vec<&str> = Vec::new();
     let mut used = 1;
-    for c in s.chars().rev() {
-        let w = c.width().unwrap_or(0);
+    for g in s.graphemes(true).rev() {
+        let w = cluster_width(g);
         if used + w > width {
             break;
         }
-        tail.push(c);
+        tail.push(g);
         used += w;
     }
-    tail.push('…');
+    tail.push("…");
     tail.reverse();
-    tail.into_iter().collect()
+    tail.concat()
 }
 
-fn human_size(size: u64) -> String {
+pub(crate) fn human_size(size: u64) -> String {
     const UNITS: [&str; 3] = ["K", "M", "G"];
     if size < 1024 {
         return format!("{size}B");
@@ -442,18 +471,85 @@ fn fkey_line(width: usize, keys: &[(String, String)], theme: &Theme) -> Line<'st
     Line::from(spans)
 }
 
+/// Screen regions for a layout mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Areas {
+    pub header: Rect,
+    pub panels: Rect,
+    /// Dev only, and only when the terminal is tall enough.
+    pub preview: Option<Rect>,
+    /// Dev only: the `>` prompt row.
+    pub command: Option<Rect>,
+    pub status: Rect,
+    pub fkeys: Rect,
+}
+
+/// Rows outside the panel/preview body: header, status, F-key bar (+ command
+/// row in Dev).
+fn fixed_rows(mode: Mode) -> u16 {
+    match mode {
+        Mode::Classic => 3,
+        Mode::Dev => 4,
+    }
+}
+
+/// Smallest body (panels + preview) that still gets a preview area.
+const MIN_BODY_FOR_PREVIEW: u16 = 12;
+
+/// `(panel rows, preview rows)` of a body `body` rows tall (Dev: the bottom
+/// third is the preview).
+fn body_split(mode: Mode, body: u16) -> (u16, u16) {
+    if mode == Mode::Dev && body >= MIN_BODY_FOR_PREVIEW {
+        let preview = body / 3;
+        (body - preview, preview)
+    } else {
+        (body, 0)
+    }
+}
+
+pub fn layout(mode: Mode, area: Rect) -> Areas {
+    let body = area.height.saturating_sub(fixed_rows(mode));
+    let (panels_h, preview_h) = body_split(mode, body);
+    let mut constraints = vec![Constraint::Length(1), Constraint::Length(panels_h)];
+    if preview_h > 0 {
+        constraints.push(Constraint::Length(preview_h));
+    }
+    if mode == Mode::Dev {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(1));
+    let r = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let mut it = r.iter().copied();
+    let header = it.next().unwrap_or_default();
+    let panels = it.next().unwrap_or_default();
+    let preview = (preview_h > 0).then(|| it.next().unwrap_or_default());
+    let command = (mode == Mode::Dev).then(|| it.next().unwrap_or_default());
+    let status = it.next().unwrap_or_default();
+    let fkeys = it.next().unwrap_or_default();
+    Areas {
+        header,
+        panels,
+        preview,
+        command,
+        status,
+        fkeys,
+    }
+}
+
+/// Visible entry rows inside a panel for a terminal of `total_height` rows.
+pub fn panel_rows(mode: Mode, total_height: u16) -> usize {
+    let body = total_height.saturating_sub(fixed_rows(mode));
+    body_split(mode, body).0.saturating_sub(2) as usize
+}
+
 pub fn draw(frame: &mut Frame, view: &View) {
     let area = frame.area();
     let theme = view.theme;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let areas = layout(view.mode, area);
 
     let header = format!(
         " ■ {} {} · {} · {} · UTF-8",
@@ -465,18 +561,29 @@ pub fn draw(frame: &mut Frame, view: &View) {
     frame.render_widget(
         Paragraph::new(fit_width(&header, area.width as usize))
             .style(Style::default().fg(theme.fg).bg(theme.bg)),
-        rows[0],
+        areas.header,
     );
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
+        .split(areas.panels);
     for i in 0..2 {
         match view.trash[i] {
             Some(tv) => draw_trash_panel(frame, cols[i], tv, view.active == i, view.theme),
             None => draw_panel(frame, cols[i], view.panels[i], view.active == i, view.theme),
         }
+    }
+
+    if let Some(r) = areas.preview {
+        draw_preview(frame, r, view.preview.as_ref(), theme);
+    }
+    if let Some(r) = areas.command {
+        frame.render_widget(
+            Paragraph::new(fit_width("> ", r.width as usize))
+                .style(Style::default().fg(theme.fg).bg(theme.bg)),
+            r,
+        );
     }
 
     let active = view.active.min(1);
@@ -488,12 +595,90 @@ pub fn draw(frame: &mut Frame, view: &View) {
     frame.render_widget(
         Paragraph::new(fit_width(&format!(" {status}"), area.width as usize))
             .style(Style::default().fg(theme.status_fg).bg(theme.status_bg)),
-        rows[2],
+        areas.status,
     );
     frame.render_widget(
         Paragraph::new(fkey_line(area.width as usize, view.fkeys, view.theme)),
-        rows[3],
+        areas.fkeys,
     );
+}
+
+/// The Dev-mode preview area.
+/// Text rows describing a preview (one per screen row, uncut).
+fn preview_lines(p: &Preview) -> Vec<String> {
+    match p {
+        Preview::Text { lines, .. } => lines.clone(),
+        Preview::Binary {
+            kind: "특수 파일",
+        ..
+        } => vec!["특수 파일".to_string()],
+        Preview::Binary { size, kind } => {
+            vec![format!("바이너리 파일 ({kind}, {})", human_size(*size))]
+        }
+        Preview::Empty => vec!["빈 파일".to_string()],
+        Preview::Error(e) => vec![format!("오류: {e}")],
+        Preview::Dir {
+            files,
+            dirs,
+            total_size,
+            truncated,
+            errors,
+        } => {
+            let mut v = vec![
+                format!("폴더 {dirs}개, 파일 {files}개"),
+                format!("총 크기 {}", human_size(*total_size)),
+            ];
+            if *errors > 0 {
+                v.push(format!("읽지 못함 {errors}개"));
+            }
+            if *truncated {
+                v.push("일부만 집계됨 (항목이 너무 많음)".to_string());
+            }
+            v
+        }
+    }
+}
+
+/// The Dev-mode preview area.
+fn draw_preview(frame: &mut Frame, area: Rect, pv: Option<&PreviewView>, theme: &Theme) {
+    let base = Style::default().fg(theme.fg).bg(theme.preview_bg);
+    let mut title = " 미리보기".to_string();
+    if let Some(pv) = pv {
+        if !pv.title.is_empty() {
+            title.push_str(": ");
+            title.push_str(&pv.title);
+        }
+        if let PreviewBody::Ready(Preview::Text {
+            truncated: true, ..
+        }) = pv.body
+        {
+            title.push_str(" · 잘림");
+        }
+    }
+    title.push(' ');
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border).bg(theme.preview_bg))
+        .title(tail_width(&title, (area.width as usize).saturating_sub(2)))
+        .style(base);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(pv) = pv else {
+        return;
+    };
+    let w = inner.width as usize;
+    let (text, style) = match pv.body {
+        PreviewBody::Idle => return,
+        PreviewBody::Loading => (vec!["읽는 중…".to_string()], base),
+        PreviewBody::Ready(p @ Preview::Error(_)) => (preview_lines(p), base.fg(theme.error)),
+        PreviewBody::Ready(p) => (preview_lines(p), base),
+    };
+    let lines: Vec<Line> = text
+        .iter()
+        .take(inner.height as usize)
+        .map(|l| Line::styled(fit_width(l, w), style))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]
@@ -509,6 +694,35 @@ mod tests {
 
     fn th() -> Theme {
         crate::theme::builtin("mdir").unwrap()
+    }
+
+    #[test]
+    fn fit_width_never_splits_grapheme_clusters() {
+        // ZWJ emoji (2 cols), VS16 heart (2 cols), e + combining acute (1 col)
+        let zwj = "👩\u{200d}💻";
+        assert_eq!(fit_width(&format!("{zwj}ab"), 3), format!("{zwj}…"));
+        assert_eq!(fit_width(zwj, 3), format!("{zwj} "));
+        // width 2 for "a" + 2-wide cluster does not fit in 2 columns: cut before it
+        assert_eq!(fit_width(&format!("a{zwj}"), 2), "a…");
+        let heart = "❤\u{fe0f}";
+        assert_eq!(
+            fit_width(&format!("{heart}{heart}{heart}"), 5),
+            format!("{heart}{heart}…")
+        );
+        let e = "e\u{301}";
+        assert_eq!(fit_width(&format!("{e}{e}{e}{e}"), 3), format!("{e}{e}…"));
+        assert_eq!(fit_width(&format!("{e}{e}"), 4), format!("{e}{e}  "));
+        assert_eq!(fit_width("한글한글", 5), "한글…");
+    }
+
+    #[test]
+    fn tail_width_never_splits_grapheme_clusters() {
+        let zwj = "👩\u{200d}💻";
+        assert_eq!(tail_width(&format!("ab{zwj}"), 3), format!("…{zwj}"));
+        assert_eq!(tail_width(zwj, 1), "…");
+        let e = "e\u{301}";
+        assert_eq!(tail_width(&format!("{e}{e}{e}{e}"), 3), format!("…{e}{e}"));
+        assert_eq!(tail_width("가나다라", 5), "…다라");
     }
 
     #[test]
@@ -554,6 +768,8 @@ mod tests {
             status,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
+            preview: None,
             trash: [None, None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
@@ -708,6 +924,8 @@ mod tests {
             status: None,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
+            preview: None,
             trash: [None, None],
             theme,
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
@@ -905,6 +1123,8 @@ mod tests {
             status: None,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
+            preview: None,
             trash: [None, None],
             theme: &th(),
             fkeys: &fkeys,
@@ -1010,6 +1230,8 @@ mod tests {
             status: None,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
+            preview: None,
             trash: [Some(tv), None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
@@ -1129,5 +1351,286 @@ mod tests {
         let buf = render_trash(&v, 0, 80);
         let text: String = (2..21).map(|y| left_half(&buf, y)).collect();
         assert!(text.contains("file30") && !text.contains("file00"));
+    }
+    fn rows_of(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height).map(|y| row(buf, y)).collect()
+    }
+
+    fn render_mode(mode: Mode, w: u16, h: u16) -> Vec<String> {
+        let (a, b) = setup();
+        let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let view = View {
+            panels: [&pa, &pb],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            mode,
+            preview: None,
+            trash: [None, None],
+            theme: &th(),
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        rows_of(t.backend().buffer())
+    }
+
+    #[test]
+    fn classic_layout_has_no_preview_or_command_row() {
+        let rows = render_mode(Mode::Classic, 100, 30);
+        assert!(rows[0].contains("hdir"));
+        assert!(rows[1].starts_with('┌'));
+        assert!(rows[28].contains("files"), "status: {:?}", rows[28]);
+        assert!(rows[29].contains("Copy"));
+        assert!(
+            rows[27].starts_with('└'),
+            "panels run down to the status row"
+        );
+        assert!(!rows.iter().any(|r| r.starts_with("> ")));
+        assert!(!rows.iter().any(|r| r.contains("미리보기")));
+        let a = layout(Mode::Classic, Rect::new(0, 0, 100, 30));
+        assert_eq!((a.preview, a.command), (None, None));
+        assert_eq!(a.panels.height, 27);
+    }
+
+    #[test]
+    fn dev_layout_adds_preview_area_and_command_prompt() {
+        let rows = render_mode(Mode::Dev, 100, 30);
+        assert!(rows[0].contains("hdir"));
+        assert!(rows[27].starts_with("> "), "command row: {:?}", rows[27]);
+        assert!(rows[28].contains("files"), "status: {:?}", rows[28]);
+        assert!(rows[29].contains("Copy"));
+        let a = layout(Mode::Dev, Rect::new(0, 0, 100, 30));
+        let pv = a.preview.unwrap();
+        assert_eq!((a.panels.height, pv.height), (18, 8));
+        assert_eq!(pv.y, a.panels.y + a.panels.height);
+        assert_eq!(a.command.unwrap().y, 27);
+        assert!(
+            rows[pv.y as usize].replace(' ', "").contains("미리보기"),
+            "{:?}",
+            rows[pv.y as usize]
+        );
+        assert!(rows[pv.y as usize].starts_with('┌'));
+        // panels still render above the preview
+        assert!(rows[1].starts_with('┌') && rows[18].starts_with('└'));
+    }
+
+    #[test]
+    fn panel_rows_follow_the_active_layout() {
+        assert_eq!(panel_rows(Mode::Classic, 24), 19);
+        assert_eq!(panel_rows(Mode::Classic, 3), 0);
+        assert_eq!(panel_rows(Mode::Classic, 0), 0);
+        assert_eq!(panel_rows(Mode::Dev, 30), 16);
+        assert_eq!(panel_rows(Mode::Dev, 0), 0);
+        // small terminals drop the preview area but keep the command row
+        assert_eq!(panel_rows(Mode::Dev, 14), 14 - 4 - 2);
+        for mode in [Mode::Classic, Mode::Dev] {
+            for h in 6..80u16 {
+                let a = layout(mode, Rect::new(0, 0, 80, h));
+                assert_eq!(
+                    a.panels.height.saturating_sub(2) as usize,
+                    panel_rows(mode, h),
+                    "{mode:?} h={h}"
+                );
+                let used = 1
+                    + a.panels.height
+                    + a.preview.map_or(0, |r| r.height)
+                    + a.command.map_or(0, |r| r.height)
+                    + 2;
+                assert_eq!(used, h, "{mode:?} h={h}: regions tile the screen");
+            }
+        }
+    }
+
+    #[test]
+    fn dev_layout_survives_tiny_terminals() {
+        for (w, h) in [(0, 0), (1, 1), (10, 3), (30, 5), (100, 9)] {
+            render_mode(Mode::Dev, w, h);
+            render_mode(Mode::Classic, w, h);
+        }
+    }
+    #[test]
+    fn preview_lines_cover_every_kind() {
+        let l = |p: &Preview| preview_lines(p);
+        assert_eq!(l(&Preview::Empty), ["빈 파일"]);
+        assert_eq!(
+            l(&Preview::Binary {
+                size: 2048,
+                kind: "PNG 이미지"
+            }),
+            ["바이너리 파일 (PNG 이미지, 2.0K)"]
+        );
+        assert_eq!(
+            l(&Preview::Binary {
+                size: 0,
+                kind: "특수 파일"
+            }),
+            ["특수 파일"]
+        );
+        assert_eq!(l(&Preview::Error("권한 없음".into())), ["오류: 권한 없음"]);
+        assert_eq!(
+            l(&Preview::Text {
+                lines: vec!["a".into(), "b".into()],
+                truncated: true
+            }),
+            ["a", "b"]
+        );
+        let dir = l(&Preview::Dir {
+            files: 3,
+            dirs: 2,
+            total_size: 1536,
+            truncated: false,
+            errors: 0,
+        });
+        assert_eq!(dir, ["폴더 2개, 파일 3개", "총 크기 1.5K"]);
+        let dir = l(&Preview::Dir {
+            files: 1,
+            dirs: 0,
+            total_size: 10,
+            truncated: true,
+            errors: 4,
+        });
+        assert_eq!(dir.len(), 4, "{dir:?}");
+        assert_eq!(dir[2], "읽지 못함 4개");
+        assert!(dir[3].contains("일부만"));
+    }
+
+    fn render_preview(pv: PreviewView, theme: &Theme, w: u16, h: u16) -> Buffer {
+        let (a, b) = setup();
+        let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let view = View {
+            preview: Some(pv),
+            panels: [&pa, &pb],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            mode: Mode::Dev,
+            trash: [None, None],
+            theme,
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    #[test]
+    fn preview_area_shows_text_title_and_truncation() {
+        let p = Preview::Text {
+            lines: (0..20).map(|i| format!("줄{i}")).collect(),
+            truncated: true,
+        };
+        let buf = render_preview(
+            PreviewView {
+                title: "a.txt".into(),
+                body: PreviewBody::Ready(&p),
+            },
+            &th(),
+            100,
+            30,
+        );
+        let rows = rows_of(&buf);
+        // preview block: y 19..27, 6 inner rows
+        let top = rows[19].replace(' ', "");
+        assert!(
+            top.contains("미리보기:a.txt") && top.contains("잘림"),
+            "{top}"
+        );
+        assert!(
+            rows[20].replace(' ', "").starts_with("│줄0"),
+            "{:?}",
+            rows[20]
+        );
+        assert!(
+            rows[25].replace(' ', "").starts_with("│줄5"),
+            "{:?}",
+            rows[25]
+        );
+        assert!(
+            !rows.join("").replace(' ', "").contains("줄6"),
+            "clipped to the area"
+        );
+    }
+
+    #[test]
+    fn preview_area_shows_loading_idle_and_binary() {
+        let buf = render_preview(
+            PreviewView {
+                title: "x".into(),
+                body: PreviewBody::Loading,
+            },
+            &th(),
+            100,
+            30,
+        );
+        assert!(rows_of(&buf)[20].replace(' ', "").contains("읽는중"));
+        let buf = render_preview(
+            PreviewView {
+                title: String::new(),
+                body: PreviewBody::Idle,
+            },
+            &th(),
+            100,
+            30,
+        );
+        assert!(rows_of(&buf)[20].replace(' ', "").starts_with("│"));
+        let bin = Preview::Binary {
+            size: 5,
+            kind: "ELF 실행파일",
+        };
+        let buf = render_preview(
+            PreviewView {
+                title: "bin".into(),
+                body: PreviewBody::Ready(&bin),
+            },
+            &th(),
+            100,
+            30,
+        );
+        assert!(
+            rows_of(&buf)[20]
+                .replace(' ', "")
+                .contains("바이너리파일(ELF실행파일,5B)")
+        );
+    }
+
+    #[test]
+    fn preview_area_uses_the_preview_bg_slot() {
+        let mut theme = th();
+        theme.preview_bg = Color::Rgb(1, 2, 3);
+        let p = Preview::Empty;
+        let buf = render_preview(
+            PreviewView {
+                title: "e".into(),
+                body: PreviewBody::Ready(&p),
+            },
+            &theme,
+            100,
+            30,
+        );
+        assert_eq!(buf[(5, 22)].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(buf[(40, 20)].bg, Color::Rgb(1, 2, 3));
+        assert_ne!(buf[(5, 5)].bg, Color::Rgb(1, 2, 3), "panels keep bg");
+    }
+
+    #[test]
+    fn preview_long_lines_are_cut_to_the_width() {
+        let p = Preview::Text {
+            lines: vec!["한".repeat(100)],
+            truncated: false,
+        };
+        let buf = render_preview(
+            PreviewView {
+                title: "w".into(),
+                body: PreviewBody::Ready(&p),
+            },
+            &th(),
+            40,
+            30,
+        );
+        let r = rows_of(&buf);
+        assert!(r[20].contains('…'), "cut with an ellipsis: {:?}", r[20]);
     }
 }

@@ -114,6 +114,10 @@ pub fn action_label(a: Action) -> &'static str {
         Action::ConnectRight => "오른쪽 패널 연결",
         Action::OpenWith => "연결 프로그램 선택",
         Action::CancelJob => "작업 취소",
+        Action::ScrollLeft => "왼쪽으로 스크롤",
+        Action::ScrollRight => "오른쪽으로 스크롤",
+        Action::Search => "검색",
+        Action::SearchNext => "다음 검색 결과",
         Action::Confirm => "확인",
         Action::Cancel => "취소",
     }
@@ -133,14 +137,22 @@ const KEY_COL: usize = 26;
 
 /// Help text: every context's bindings, generated from the live keymap.
 pub fn help_lines(km: &Keymap) -> Vec<String> {
+    help_lines_for(
+        km,
+        &[
+            Context::Panel,
+            Context::Trash,
+            Context::Viewer,
+            Context::Dialog,
+            Context::Menu,
+        ],
+    )
+}
+
+/// Help text for just the given contexts.
+pub fn help_lines_for(km: &Keymap, contexts: &[Context]) -> Vec<String> {
     let mut out = Vec::new();
-    for ctx in [
-        Context::Panel,
-        Context::Trash,
-        Context::Viewer,
-        Context::Dialog,
-        Context::Menu,
-    ] {
+    for &ctx in contexts {
         let rows = km.describe(ctx);
         if rows.is_empty() {
             continue;

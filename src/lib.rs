@@ -4,6 +4,7 @@ pub mod app;
 pub mod assoc;
 pub mod config;
 pub mod dialog;
+pub mod editor;
 pub mod fs_ops;
 pub mod job;
 pub mod keymap;
@@ -20,6 +21,7 @@ pub mod theme;
 pub mod trash;
 pub mod ui;
 pub mod undo;
+pub mod viewer;
 
 pub const APP_NAME: &str = "hdir";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

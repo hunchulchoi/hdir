@@ -3,13 +3,15 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::config::{self, Mode, Settings};
 use crate::dialog::{self, Dialog, DialogResult};
+use crate::editor::{self, EditResult, EditorRunner};
 use crate::fs_ops::{self};
 use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
@@ -17,21 +19,17 @@ use crate::keymap::{Action, Context};
 use crate::loader::Loader;
 use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
+use crate::preview::{self, Preview};
 use crate::screen::{self, TextScreen};
 use crate::theme::{self, Theme};
 use crate::trash::{
     self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
 };
-use crate::ui::{self, View};
+use crate::ui::{self, PreviewBody, PreviewView, View};
 use crate::undo::{UndoApplied, UndoOp, UndoStack};
+use crate::viewer::{self, Viewer};
 
-/// Rows taken by header (1) + status (1) + fkey bar (1) + panel borders (2).
-const CHROME_ROWS: u16 = 5;
-
-/// Visible entry rows inside a panel for a terminal of `total_height` rows.
-pub fn panel_rows(total_height: u16) -> usize {
-    total_height.saturating_sub(CHROME_ROWS) as usize
-}
+pub use crate::ui::panel_rows;
 
 /// Reverses one op off the UI thread.
 pub type UndoRunner = Arc<dyn Fn(UndoOp) -> UndoApplied + Send + Sync>;
@@ -80,6 +78,60 @@ const MENU_HIDDEN: usize = 1;
 const MENU_KEYS: usize = 2;
 const MENU_RELOAD: usize = 3;
 const MENU_WARNINGS: usize = 4;
+
+/// Computes one preview off the UI thread; tests may swap in a gated fake.
+pub type PreviewRunner = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
+
+/// Reads the F3 viewer's file off the UI thread; tests may swap in a gated fake.
+pub type ViewerLoader = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
+
+/// Dev-mode preview bookkeeping: debounce, latest-wins ids, last result.
+pub struct PreviewState {
+    /// Path under the cursor that the preview should show.
+    wanted: Option<PathBuf>,
+    wanted_at: Instant,
+    /// A request for `wanted` has been started (or is done).
+    requested: bool,
+    /// A worker is running; at most one at a time. The newest wanted path
+    /// waits (as the single pending request) until its result arrives.
+    in_flight: bool,
+    /// Results with another id are stale and dropped.
+    latest_id: u64,
+    shown: Option<(PathBuf, Preview)>,
+    tx: Sender<(u64, PathBuf, Preview)>,
+    rx: Receiver<(u64, PathBuf, Preview)>,
+}
+
+impl PreviewState {
+    fn shown_for_wanted(&self) -> Option<&Preview> {
+        match (&self.wanted, &self.shown) {
+            (Some(w), Some((p, pv))) if w == p => Some(pv),
+            _ => None,
+        }
+    }
+
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            wanted: None,
+            wanted_at: Instant::now(),
+            requested: false,
+            in_flight: false,
+            latest_id: 0,
+            shown: None,
+            tx,
+            rx,
+        }
+    }
+}
+
+/// An F4 edit waiting for the main loop to suspend the TUI and run it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditJob {
+    pub argv: Vec<OsString>,
+    pub panel: usize,
+    pub name: OsString,
+}
 
 /// The single background copy/move job.
 pub struct RunningJob {
@@ -147,6 +199,13 @@ enum BgResult {
     Undo(UndoApplied),
     Mkdir(std::io::Result<PathBuf>),
     Rename(std::io::Result<PathBuf>),
+}
+
+/// The F3 viewer's own load slot (independent of the shared [`BgTask`]).
+/// Closing the viewer or starting another load drops the receiver, so a late
+/// result of an abandoned load has nowhere to go.
+struct ViewerLoad {
+    rx: Receiver<Preview>,
 }
 
 /// A short blocking filesystem operation (trash, undo) running on a worker
@@ -232,6 +291,19 @@ pub struct App {
     truecolor: bool,
     /// A full-screen text page (help, key settings, warnings) over the panels.
     pub screen: Option<TextScreen>,
+    /// `($VISUAL, $EDITOR)` as read at startup; tests inject values.
+    pub editor_vars: (Option<String>, Option<String>),
+    /// Runs the editor argv; tests may swap in a fake.
+    pub editor_runner: EditorRunner,
+    pending_edit: Option<EditJob>,
+    pub preview: PreviewState,
+    pub preview_runner: PreviewRunner,
+    /// Wait this long after the cursor stops before computing a preview.
+    pub preview_debounce: Duration,
+    /// The F3 file viewer (full screen).
+    pub viewer: Option<Viewer>,
+    pub viewer_loader: ViewerLoader,
+    viewer_load: Option<ViewerLoad>,
     /// The F9 popup menu (or theme picker).
     pub menu: Option<OpenMenu>,
 }
@@ -282,6 +354,15 @@ impl App {
             settings: config::load_settings(None),
             truecolor: true,
             screen: None,
+            editor_vars: (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok()),
+            editor_runner: editor::system_runner(),
+            pending_edit: None,
+            preview: PreviewState::new(),
+            preview_runner: Arc::new(preview::preview_path),
+            preview_debounce: Duration::from_millis(80),
+            viewer: None,
+            viewer_loader: Arc::new(|p| preview::preview_path_with(p, preview::Limits::VIEWER)),
+            viewer_load: None,
             menu: None,
         }
     }
@@ -572,6 +653,10 @@ impl App {
             self.handle_screen_key(key);
             return;
         }
+        if self.viewer.is_some() {
+            self.handle_viewer_key(key);
+            return;
+        }
         if self.menu.is_some() {
             self.handle_menu_key(key);
             return;
@@ -662,14 +747,258 @@ impl App {
                 self.set_mode(self.mode.toggled());
                 self.status = Some(format!("모드: {:?}", self.mode));
             }
-            Action::View => self.unsupported("보기"),
-            Action::Edit => self.unsupported("편집"),
+            Action::View => self.open_viewer(),
+            Action::Edit => self.open_editor(),
             Action::CommandLine => self.unsupported("명령줄"),
             Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
             Action::OpenWith => self.unsupported("연결 프로그램 선택"),
             Action::Menu => self.open_main_menu(),
             Action::Help => self.open_help(),
-            Action::Confirm | Action::Cancel => {}
+            Action::Confirm
+            | Action::Cancel
+            | Action::ScrollLeft
+            | Action::ScrollRight
+            | Action::Search
+            | Action::SearchNext => {}
+        }
+    }
+
+    /// F4: queue an edit of the current file; the main loop runs it through
+    /// [`App::run_edit`] (it needs the terminal handle).
+    fn open_editor(&mut self) {
+        let panel = self.active_panel();
+        let Some(e) = panel.current() else {
+            return;
+        };
+        let is_dir = match e.kind {
+            EntryKind::Parent | EntryKind::Dir => true,
+            EntryKind::Symlink { target_is_dir } => target_is_dir,
+            EntryKind::File => false,
+        };
+        if is_dir {
+            return;
+        }
+        let path = panel.cwd.join(&e.os_name);
+        self.queue_edit(&path);
+    }
+
+    /// Queue an edit of `path` (a file in the active panel's directory).
+    fn queue_edit(&mut self, path: &std::path::Path) {
+        if cfg!(windows) {
+            self.status = Some("편집: Windows 지원 예정".into());
+            return;
+        }
+        let Some(name) = path.file_name().map(OsString::from) else {
+            return;
+        };
+        let (visual, editor) = &self.editor_vars;
+        match editor::editor_argv(visual.as_deref(), editor.as_deref(), path) {
+            Ok(argv) => {
+                self.status = None;
+                self.pending_edit = Some(EditJob {
+                    argv,
+                    panel: self.active,
+                    name,
+                });
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// The finished preview for the entry under the cursor, if any.
+    pub fn preview_shown(&self) -> Option<&Preview> {
+        self.preview.shown_for_wanted()
+    }
+
+    /// Dev mode wants a preview that has not arrived yet.
+    pub fn preview_pending(&self) -> bool {
+        self.mode == Mode::Dev && self.preview.wanted.is_some() && self.preview_shown().is_none()
+    }
+
+    /// Path the Dev preview should show: the active panel's cursor entry.
+    fn preview_target(&self) -> Option<PathBuf> {
+        if self.mode != Mode::Dev
+            || self.viewer.is_some()
+            || self.trash_views[self.active].is_some()
+        {
+            return None;
+        }
+        let panel = self.active_panel();
+        if panel.loading.is_some() {
+            // Navigating: keep what we had instead of flickering.
+            return self.preview.wanted.clone();
+        }
+        match panel.current() {
+            Some(e) if e.kind != EntryKind::Parent => Some(panel.cwd.join(&e.os_name)),
+            _ => None,
+        }
+    }
+
+    /// Drop in-flight results and recompute for the current target (the old
+    /// result stays on screen until the new one lands).
+    fn preview_refresh(&mut self) {
+        self.preview.latest_id += 1;
+        self.preview.requested = false;
+        self.preview.wanted_at = Instant::now();
+    }
+
+    /// Track the cursor, dispatch a debounced worker for the latest position
+    /// and apply fresh results; returns true when a result changed the screen.
+    fn tick_preview(&mut self) -> bool {
+        let target = self.preview_target();
+        let st = &mut self.preview;
+        if target != st.wanted {
+            st.wanted = target;
+            st.wanted_at = Instant::now();
+            st.requested = false;
+            st.latest_id += 1; // anything in flight is now stale
+            if st.wanted.is_none() {
+                st.shown = None;
+            }
+        }
+        let mut changed = false;
+        while let Ok((id, path, result)) = st.rx.try_recv() {
+            st.in_flight = false;
+            if id == st.latest_id {
+                st.shown = Some((path, result));
+                changed = true;
+            }
+        }
+        if let Some(path) = st.wanted.clone()
+            && !st.requested
+            && !st.in_flight
+            && st.wanted_at.elapsed() >= self.preview_debounce
+        {
+            st.requested = true;
+            st.in_flight = true;
+            let (id, tx) = (st.latest_id, st.tx.clone());
+            let runner = Arc::clone(&self.preview_runner);
+            std::thread::spawn(move || {
+                // A panicking runner must still report back or the single
+                // slot would stay occupied forever.
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner(&path)))
+                        .unwrap_or_else(|_| Preview::Error("미리보기 실패".into()));
+                let _ = tx.send((id, path, result));
+            });
+        }
+        changed
+    }
+
+    pub fn has_pending_edit(&self) -> bool {
+        self.pending_edit.is_some()
+    }
+
+    /// Run the queued edit: `suspend` leaves the TUI, calls the closure (which
+    /// runs the editor) and re-enters; then the panels reload with the cursor
+    /// kept on the edited file.
+    pub fn run_edit(
+        &mut self,
+        suspend: impl FnOnce(&mut dyn FnMut() -> EditResult) -> std::io::Result<EditResult>,
+    ) {
+        let Some(job) = self.pending_edit.take() else {
+            return;
+        };
+        let runner = Arc::clone(&self.editor_runner);
+        let argv = job.argv;
+        let outcome = suspend(&mut || runner(&argv));
+        let cwd = self.panels[job.panel].cwd.clone();
+        if self.panels[1 - job.panel].cwd == cwd {
+            self.reload_after_op(1 - job.panel, None);
+        }
+        let name = job.name.to_string_lossy().into_owned();
+        if let Some(path) = self.viewer.as_ref().map(|v| v.path.clone()) {
+            self.start_viewer_load(path); // show what the editor saved
+        }
+        self.reload_after_op(job.panel, Some(job.name));
+        self.status = Some(match outcome {
+            Ok(Ok(())) => format!("편집 완료: {name}"),
+            Ok(Err(msg)) => msg,
+            Err(e) => format!("터미널 복귀 실패: {e}"),
+        });
+    }
+
+    /// F3: view the current file (directories and `..` do nothing).
+    fn open_viewer(&mut self) {
+        let panel = self.active_panel();
+        let Some(e) = panel.current() else {
+            return;
+        };
+        let is_dir = match e.kind {
+            EntryKind::Parent | EntryKind::Dir => true,
+            EntryKind::Symlink { target_is_dir } => target_is_dir,
+            EntryKind::File => false,
+        };
+        if is_dir {
+            return;
+        }
+        let path = panel.cwd.join(&e.os_name);
+        self.status = None;
+        self.viewer = Some(Viewer::loading(path.clone()));
+        self.start_viewer_load(path);
+    }
+
+    /// Read `path` for the open viewer on a worker; replaces (abandons) any
+    /// load still running.
+    fn start_viewer_load(&mut self, path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        let loader = Arc::clone(&self.viewer_loader);
+        std::thread::spawn(move || {
+            let _ = tx.send(loader(&path));
+        });
+        self.viewer_load = Some(ViewerLoad { rx });
+    }
+
+    fn close_viewer(&mut self) {
+        self.viewer = None;
+        self.viewer_load = None; // abandon: the worker's send just fails
+    }
+
+    /// Apply a finished viewer load; returns true when the screen changed.
+    fn tick_viewer_load(&mut self) -> bool {
+        let Some(load) = self.viewer_load.as_ref() else {
+            return false;
+        };
+        let preview = match load.rx.try_recv() {
+            Ok(p) => p,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Preview::Error("읽기 중단됨".into()),
+        };
+        self.viewer_load = None;
+        match self.viewer.as_mut() {
+            Some(v) => {
+                v.set_preview(preview);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// F1 inside the viewer: help for the viewer keys only.
+    fn open_viewer_help(&mut self) {
+        let lines = screen::help_lines_for(&self.settings.keymap, &[Context::Viewer]);
+        self.open_screen("도움말 (뷰어)", lines);
+    }
+
+    fn handle_viewer_key(&mut self, key: KeyEvent) {
+        let Some(v) = self.viewer.as_mut() else {
+            return;
+        };
+        if v.input.is_some() {
+            v.input_key(key);
+            return;
+        }
+        let Some(action) = self.settings.keymap.lookup(Context::Viewer, &key) else {
+            return;
+        };
+        match action {
+            Action::Edit => {
+                let path = v.path.clone();
+                self.queue_edit(&path);
+            }
+            Action::Help => self.open_viewer_help(),
+            _ if v.apply(action) => self.close_viewer(),
+            _ => {}
         }
     }
 
@@ -762,6 +1091,7 @@ impl App {
             let kind = self.panels[idx].loading.as_ref().map(|r| r.kind);
             if self.panels[idx].finish_load(res) {
                 changed = true;
+                self.preview_refresh();
                 if idx == self.active
                     && kind != Some(LoadKind::Reload)
                     && let Some(err) = self.panels[idx].error.clone()
@@ -779,8 +1109,9 @@ impl App {
     /// Poll background loads and the job; returns true when the screen needs a redraw.
     pub fn tick(&mut self) -> bool {
         let loaded = self.drain_loads();
-        let task = self.tick_task();
-        self.tick_job() || loaded || task
+        let task = self.tick_task() | self.tick_viewer_load();
+        let preview = self.tick_preview();
+        self.tick_job() || loaded || task || preview
     }
 
     fn tick_task(&mut self) -> bool {
@@ -1432,8 +1763,8 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        self.page_height = panel_rows(frame.area().height).max(1);
-        let rows = panel_rows(frame.area().height);
+        let rows = panel_rows(self.mode, frame.area().height);
+        self.page_height = rows.max(1);
         for p in &mut self.panels {
             p.ensure_visible(rows);
         }
@@ -1446,18 +1777,39 @@ impl App {
             Context::Panel
         };
         let fkeys = ui::fkey_bar(&self.settings.keymap, bar_ctx);
+        let preview_view = (self.mode == Mode::Dev).then(|| {
+            let title = self
+                .preview
+                .wanted
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let body = match (&self.preview.wanted, self.preview.shown_for_wanted()) {
+                (None, _) => PreviewBody::Idle,
+                (Some(_), Some(p)) => PreviewBody::Ready(p),
+                (Some(_), None) => PreviewBody::Loading,
+            };
+            PreviewView { title, body }
+        });
         let view = View {
             panels: [&self.panels[0], &self.panels[1]],
             active: self.active,
             status: self.status.as_deref(),
             shell: &self.shell,
             os: std::env::consts::OS,
+            mode: self.mode,
+            preview: preview_view,
             trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
             theme: &self.theme,
             fkeys: &fkeys,
         };
+        let viewer_hint = format!("{} · /: 검색 · n: 다음", self.close_hint());
         if let Some(scr) = self.screen.as_mut() {
             screen::render(frame, scr, &self.theme);
+        } else if let Some(v) = self.viewer.as_mut() {
+            let hint = &viewer_hint;
+            viewer::render(frame, v, &self.theme, hint);
         } else {
             ui::draw(frame, &view);
         }
@@ -1673,14 +2025,21 @@ mod tests {
     #[test]
     fn empty_binding_disables_the_action() {
         let (_t, mut app) = fixture();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::F(3));
+        assert!(app.viewer.is_some(), "default: view is bound");
+        let (_t, mut app) = configured("[keys.bind]\nview = []\n", Some("truecolor"));
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
         press(&mut app, KeyCode::F(3));
         assert!(
-            app.status.is_some(),
-            "default: view is bound (not yet implemented)"
+            app.viewer.is_none() && app.status.is_none(),
+            "{:?}",
+            app.status
         );
-        let (_t, mut app) = configured("[keys.bind]\nview = []\n", Some("truecolor"));
-        press(&mut app, KeyCode::F(3));
-        assert!(app.status.is_none(), "{:?}", app.status);
     }
 
     #[test]
@@ -2434,13 +2793,6 @@ mod tests {
         press(&mut app, KeyCode::Char('.'));
         assert_ne!(app.panels[0].show_hidden, before);
         assert_eq!(app.panels[1].show_hidden, before);
-    }
-
-    #[test]
-    fn panel_rows_matches_layout() {
-        assert_eq!(panel_rows(24), 19);
-        assert_eq!(panel_rows(3), 0);
-        assert_eq!(panel_rows(0), 0);
     }
 
     #[test]
@@ -4160,5 +4512,798 @@ mod tests {
         assert_eq!(app.undo.len(), 1, "failed item kept for retry");
         assert_eq!(fake.count(), 1);
         let _ = tmp;
+    }
+    // ---- HDIR-13: F3 viewer ----
+
+    fn cursor_to(app: &mut App, name: &str) {
+        let i = app
+            .active_panel()
+            .entries
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap();
+        app.active_panel_mut().cursor = i;
+    }
+
+    fn open_view(app: &mut App, name: &str) {
+        cursor_to(app, name);
+        press(app, KeyCode::F(3));
+    }
+
+    fn draw_app(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        use unicode_width::UnicodeWidthStr;
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < w {
+                    let sym = buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += sym.width().max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn f3_opens_viewer_and_loads_text_on_the_worker() {
+        let (t, mut app) = fixture();
+        fs::write(t.path().join("f.txt"), "하나\ntwo\n\tthree\n").unwrap();
+        open_view(&mut app, "f.txt");
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(v.path.file_name().unwrap(), "f.txt");
+        assert_eq!(v.content, crate::viewer::Content::Loading);
+        assert!(app.task.is_none(), "own slot, not the shared BgTask");
+        assert!(app.viewer_load.is_some(), "load runs on a worker");
+        settle_view(&mut app);
+        match &app.viewer.as_ref().unwrap().content {
+            crate::viewer::Content::Text { lines, truncated } => {
+                assert_eq!(lines[..2], ["하나", "two"]);
+                assert!(!truncated);
+            }
+            c => panic!("{c:?}"),
+        }
+        let rows = draw_app(&mut app, 60, 10);
+        assert!(
+            rows[0].contains("f.txt") && rows[0].contains("1/3"),
+            "{rows:?}"
+        );
+        assert!(rows[1].starts_with("하나"));
+    }
+
+    #[test]
+    fn f3_on_dir_or_parent_does_nothing() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(3)); // ".."
+        assert!(app.viewer.is_none() && app.task.is_none() && app.status.is_none());
+        open_view(&mut app, "adir");
+        assert!(app.viewer.is_none() && app.task.is_none() && app.status.is_none());
+    }
+
+    #[test]
+    fn viewer_swallows_panel_keys_and_closes_with_q_esc_f3_f10() {
+        for close in [
+            KeyCode::Char('q'),
+            KeyCode::Esc,
+            KeyCode::F(3),
+            KeyCode::F(10),
+        ] {
+            let (_t, mut app) = fixture();
+            open_view(&mut app, "f.txt");
+            settle_view(&mut app);
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.active, 0, "Tab goes to the viewer, not the panels");
+            press(&mut app, close);
+            assert!(app.viewer.is_none() && app.running, "{close:?}");
+        }
+    }
+
+    #[test]
+    fn viewer_scrolls_searches_and_hscrolls_through_the_keymap() {
+        let (t, mut app) = fixture();
+        let body: String = (0..50).map(|i| format!("line{i}\n")).collect();
+        fs::write(t.path().join("f.txt"), body).unwrap();
+        open_view(&mut app, "f.txt");
+        settle_view(&mut app);
+        draw_app(&mut app, 40, 12); // 10 body rows
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 10);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 40);
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Char('/'));
+        for c in "line1".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let rows = draw_app(&mut app, 40, 12);
+        assert!(rows[11].contains("/line1"), "{:?}", rows[11]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.viewer.as_ref().unwrap().match_line, Some(1));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.viewer.as_ref().unwrap().match_line, Some(10));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Left);
+        assert!(app.viewer.is_some());
+    }
+
+    #[test]
+    fn typing_q_in_search_input_does_not_close_the_viewer() {
+        let (_t, mut app) = fixture();
+        open_view(&mut app, "f.txt");
+        settle_view(&mut app);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.viewer.is_some());
+        assert_eq!(app.viewer.as_ref().unwrap().input.as_deref(), Some("q"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.viewer.is_some(), "Esc only closes the input line");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn closing_the_viewer_while_loading_drops_the_result() {
+        let (_t, mut app) = fixture();
+        open_view(&mut app, "f.txt");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.viewer.is_none());
+        settle_view(&mut app);
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn binary_file_shows_kind_and_size_summary() {
+        let (t, mut app) = fixture();
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[0u8; 2000]);
+        fs::write(t.path().join("f.txt"), &bytes).unwrap();
+        open_view(&mut app, "f.txt");
+        settle_view(&mut app);
+        let rows = draw_app(&mut app, 60, 8);
+        assert!(
+            rows.join("").contains("바이너리 파일 (PNG 이미지, 2.0K)"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn viewer_uses_the_larger_cap_and_marks_truncation() {
+        let (t, mut app) = fixture();
+        let many: String = (0..120_000).map(|_| "x\n").collect();
+        fs::write(t.path().join("f.txt"), many).unwrap();
+        open_view(&mut app, "f.txt");
+        settle_view(&mut app);
+        match &app.viewer.as_ref().unwrap().content {
+            crate::viewer::Content::Text { lines, truncated } => {
+                assert_eq!(lines.len(), 100_000);
+                assert!(truncated);
+            }
+            c => panic!("{c:?}"),
+        }
+        let rows = draw_app(&mut app, 70, 6);
+        assert!(
+            rows[0].contains("잘림") && rows[0].contains("/100000"),
+            "{:?}",
+            rows[0]
+        );
+    }
+
+    fn settle_view(app: &mut App) {
+        let start = Instant::now();
+        loop {
+            app.tick();
+            match &app.viewer {
+                Some(v) if v.content == crate::viewer::Content::Loading => {}
+                _ => return,
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "viewer timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn text_of(v: &crate::viewer::Viewer) -> String {
+        match &v.content {
+            crate::viewer::Content::Text { lines, .. } => lines.join("\n"),
+            c => format!("{c:?}"),
+        }
+    }
+
+    /// Loader that blocks on `f.txt` until the returned guard is dropped.
+    fn gate_viewer_loader(app: &mut App) -> (Arc<Mutex<()>>, Arc<Mutex<Vec<String>>>) {
+        let gate = Arc::new(Mutex::new(()));
+        let g = Arc::clone(&gate);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let c = Arc::clone(&calls);
+        app.viewer_loader = Arc::new(move |p: &std::path::Path| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            c.lock().unwrap().push(name.clone());
+            if name == "f.txt" {
+                drop(g.lock().unwrap());
+            }
+            Preview::Text {
+                lines: vec![format!("loaded {name}")],
+                truncated: false,
+            }
+        });
+        (gate, calls)
+    }
+
+    #[test]
+    fn closing_a_slow_viewer_load_frees_other_tasks_at_once() {
+        let (t, mut app) = fixture();
+        let (gate, _calls) = gate_viewer_loader(&mut app);
+        let guard = gate.lock().unwrap();
+        open_view(&mut app, "f.txt");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.viewer.is_none());
+        press(&mut app, KeyCode::F(7));
+        assert!(app.dialog.is_some(), "mkdir dialog opens: {:?}", app.status);
+        assert_ne!(app.status.as_deref(), Some("작업 진행 중"));
+        type_str(&mut app, "newdir");
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(t.path().join("newdir").is_dir());
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(30));
+        app.tick();
+        assert!(app.viewer.is_none(), "late result is ignored");
+    }
+
+    #[test]
+    fn a_late_result_of_an_abandoned_load_never_reaches_a_newer_viewer() {
+        let (t, mut app) = fixture();
+        fs::write(t.path().join("other.txt"), "x").unwrap();
+        app.reload_panel(0, None);
+        settle(&mut app);
+        let (gate, _calls) = gate_viewer_loader(&mut app);
+        let guard = gate.lock().unwrap();
+        open_view(&mut app, "f.txt");
+        press(&mut app, KeyCode::Esc);
+        open_view(&mut app, "other.txt");
+        settle_view(&mut app);
+        assert_eq!(text_of(app.viewer.as_ref().unwrap()), "loaded other.txt");
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(30));
+        app.tick();
+        assert_eq!(text_of(app.viewer.as_ref().unwrap()), "loaded other.txt");
+    }
+
+    #[test]
+    fn viewer_opens_even_while_another_task_runs() {
+        let (_t, mut app) = fixture();
+        app.reload_config();
+        open_view(&mut app, "f.txt");
+        assert!(app.viewer.is_some());
+        settle_view(&mut app);
+        assert!(matches!(
+            app.viewer.as_ref().unwrap().content,
+            crate::viewer::Content::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn f1_in_viewer_shows_viewer_help_over_it_and_esc_returns() {
+        let (_t, mut app) = fixture();
+        open_view(&mut app, "f.txt");
+        settle_view(&mut app);
+        press(&mut app, KeyCode::F(1));
+        let scr = app.screen.as_ref().expect("help opened");
+        let all = scr.lines.join("\n");
+        assert!(all.contains("[뷰어 / 도움말]"), "{all}");
+        assert!(
+            !all.contains("[패널]") && !all.contains("[휴지통]"),
+            "{all}"
+        );
+        let rows = draw_app(&mut app, 80, 20);
+        assert!(rows.join("").contains("뷰어 / 도움말"), "{rows:?}");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.screen.is_none());
+        assert!(app.viewer.is_some(), "back in the viewer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f4_in_viewer_edits_the_viewed_file_then_reloads_the_view() {
+        let (t, mut app) = fixture();
+        let log = Log::default();
+        let l = Arc::clone(&log);
+        app.editor_runner = Arc::new(move |argv: &[OsString]| {
+            let path = std::path::PathBuf::from(argv.last().unwrap());
+            l.lock().unwrap().push(path.to_string_lossy().into_owned());
+            fs::write(path, "edited body").unwrap();
+            Ok(())
+        });
+        app.editor_vars = (None, Some("vim".into()));
+        fs::write(t.path().join("f.txt"), "old body").unwrap();
+        open_view(&mut app, "f.txt");
+        settle_view(&mut app);
+        assert_eq!(text_of(app.viewer.as_ref().unwrap()), "old body");
+        press(&mut app, KeyCode::F(4));
+        assert!(app.has_pending_edit());
+        assert!(app.viewer.is_some());
+        run_logged(&mut app, &log);
+        assert!(log.lock().unwrap().iter().any(|e| e.ends_with("/f.txt")));
+        let start = Instant::now();
+        while text_of(app.viewer.as_ref().unwrap()) != "edited body" {
+            app.tick();
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "view not reloaded"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    // ---- HDIR-14: F4 editor ----
+
+    #[cfg(unix)]
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    #[cfg(unix)]
+    /// Fake editor that logs its argv and creates `new.txt` next to the file.
+    fn fake_editor(app: &mut App, log: &Log, result: EditResult) {
+        let log = Arc::clone(log);
+        app.editor_runner = Arc::new(move |argv: &[OsString]| {
+            let path = std::path::PathBuf::from(argv.last().unwrap());
+            log.lock().unwrap().push(format!(
+                "edit {}",
+                argv.iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ));
+            fs::write(path.with_file_name("new.txt"), "n").unwrap();
+            result.clone()
+        });
+    }
+
+    #[cfg(unix)]
+    fn run_logged(app: &mut App, log: &Log) {
+        let l = Arc::clone(log);
+        app.run_edit(move |f| {
+            l.lock().unwrap().push("suspend".into());
+            let r = f();
+            l.lock().unwrap().push("resume".into());
+            Ok(r)
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f4_only_queues_the_edit_without_running_the_editor() {
+        let (_t, mut app) = fixture();
+        let log = Log::default();
+        fake_editor(&mut app, &log, Ok(()));
+        app.editor_vars = (None, Some("vim".into()));
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        assert!(app.has_pending_edit());
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_edit_suspends_runs_editor_inside_then_reloads_keeping_the_cursor() {
+        let (t, mut app) = fixture();
+        let log = Log::default();
+        fake_editor(&mut app, &log, Ok(()));
+        app.editor_vars = (Some("code -w".into()), Some("ignored".into()));
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        run_logged(&mut app, &log);
+        let got = log.lock().unwrap().clone();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0], "suspend");
+        assert!(
+            got[1].starts_with("edit code|-w|") && got[1].ends_with("/f.txt"),
+            "{got:?}"
+        );
+        assert_eq!(got[2], "resume");
+        assert!(!app.has_pending_edit());
+        settle(&mut app);
+        for i in 0..2 {
+            let names: Vec<_> = app.panels[i]
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            assert!(
+                names.contains(&"new.txt".to_string()),
+                "panel {i} reloaded: {names:?}"
+            );
+        }
+        assert_eq!(name_at(&app, 0), "f.txt", "cursor stays on the edited file");
+        assert_eq!(app.status.as_deref(), Some("편집 완료: f.txt"));
+        drop(t);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_editor_reports_error_and_still_reloads() {
+        let (_t, mut app) = fixture();
+        let log = Log::default();
+        fake_editor(
+            &mut app,
+            &log,
+            Err("편집기가 오류로 종료됨 (종료 코드 1)".into()),
+        );
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        run_logged(&mut app, &log);
+        settle(&mut app);
+        assert!(app.status.as_deref().unwrap().contains("종료 코드 1"));
+        assert!(app.panels[0].entries.iter().any(|e| e.name == "new.txt"));
+        assert_eq!(name_at(&app, 0), "f.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_suspend_failure_is_reported() {
+        let (_t, mut app) = fixture();
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        app.run_edit(|_| Err(std::io::Error::other("tty gone")));
+        assert!(app.status.as_deref().unwrap().contains("tty gone"));
+        assert!(!app.has_pending_edit());
+    }
+
+    #[test]
+    fn f4_on_dir_or_parent_queues_nothing() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(4));
+        cursor_to(&mut app, "adir");
+        press(&mut app, KeyCode::F(4));
+        assert!(!app.has_pending_edit() && app.status.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unparsable_editor_variable_is_a_status_error() {
+        let (_t, mut app) = fixture();
+        app.editor_vars = (Some("vim 'x".into()), None);
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        assert!(!app.has_pending_edit());
+        assert!(app.status.as_deref().unwrap().contains("VISUAL"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn f4_on_windows_says_support_is_coming() {
+        let (_t, mut app) = fixture();
+        cursor_to(&mut app, "f.txt");
+        press(&mut app, KeyCode::F(4));
+        assert!(!app.has_pending_edit());
+        assert!(app.status.as_deref().unwrap().contains("Windows 지원 예정"));
+    }
+    // ---- HDIR-16: modes ----
+
+    #[test]
+    fn ctrl_t_switches_layout_and_page_height() {
+        let (_t, mut app) = fixture();
+        let rows = draw_app(&mut app, 100, 30);
+        assert_eq!(app.page_height, 25);
+        assert!(!rows.iter().any(|r| r.starts_with("> ")));
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, crate::config::Mode::Dev);
+        let rows = draw_app(&mut app, 100, 30);
+        assert_eq!(app.page_height, 16, "panels are shorter in Dev");
+        assert!(rows[27].starts_with("> "), "{:?}", rows[27]);
+        assert!(rows.iter().any(|r| r.contains("미리보기")));
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let rows = draw_app(&mut app, 100, 30);
+        assert_eq!(app.page_height, 25);
+        assert!(!rows.iter().any(|r| r.starts_with("> ")));
+    }
+
+    #[test]
+    fn page_down_follows_the_dev_page_height() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..80 {
+            fs::write(tmp.path().join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf());
+        settle(&mut app);
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        draw_app(&mut app, 100, 30);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.panels[0].cursor, 16);
+    }
+    // ---- HDIR-15: preview panel ----
+
+    fn dev_app() -> (TempDir, App) {
+        let (t, mut app) = fixture();
+        app.set_mode(Mode::Dev);
+        app.preview_debounce = Duration::ZERO;
+        (t, app)
+    }
+
+    fn settle_preview(app: &mut App) {
+        let start = Instant::now();
+        loop {
+            app.tick();
+            if !app.preview_pending() {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "preview timed out"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn counting_runner(app: &mut App) -> Log2 {
+        let log = Log2::default();
+        let l = Arc::clone(&log);
+        app.preview_runner = Arc::new(move |p: &std::path::Path| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            l.lock().unwrap().push(name.clone());
+            Preview::Text {
+                lines: vec![format!("content of {name}")],
+                truncated: false,
+            }
+        });
+        log
+    }
+
+    type Log2 = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn dev_preview_shows_the_cursor_entry_text() {
+        let (t, mut app) = dev_app();
+        fs::write(t.path().join("f.txt"), "hello preview\n둘째 줄\n").unwrap();
+        cursor_to(&mut app, "f.txt");
+        app.tick();
+        assert!(app.preview_pending(), "computed on a worker, not inline");
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("읽는 중")), "{rows:?}");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        let pv: Vec<_> = rows[19..27].iter().map(|r| r.replace(' ', "")).collect();
+        assert!(pv[0].contains("미리보기:f.txt"), "{pv:?}");
+        assert!(pv[1].contains("hellopreview"), "{pv:?}");
+        assert!(pv[2].contains("둘째줄"), "{pv:?}");
+    }
+
+    #[test]
+    fn classic_mode_computes_no_preview() {
+        let (_t, mut app) = fixture();
+        let log = counting_runner(&mut app);
+        app.preview_debounce = Duration::ZERO;
+        cursor_to(&mut app, "f.txt");
+        for _ in 0..5 {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(log.lock().unwrap().is_empty());
+        assert!(!app.preview_pending());
+    }
+
+    #[test]
+    fn debounce_computes_only_the_latest_cursor_position() {
+        let (_t, mut app) = dev_app();
+        let log = counting_runner(&mut app);
+        app.preview_debounce = Duration::from_millis(60);
+        cursor_to(&mut app, "adir");
+        app.tick();
+        cursor_to(&mut app, "bdir");
+        app.tick();
+        cursor_to(&mut app, "f.txt");
+        app.tick();
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing before the debounce"
+        );
+        std::thread::sleep(Duration::from_millis(90));
+        settle_preview(&mut app);
+        assert_eq!(*log.lock().unwrap(), ["f.txt"]);
+    }
+
+    #[test]
+    fn stale_results_are_dropped_by_id() {
+        let (_t, mut app) = dev_app();
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock().unwrap();
+        let g = Arc::clone(&gate);
+        let log = Log2::default();
+        let l = Arc::clone(&log);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let done_tx = Mutex::new(done_tx);
+        app.preview_runner = Arc::new(move |p: &std::path::Path| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            l.lock().unwrap().push(name.clone());
+            if name == "f.txt" {
+                drop(g.lock().unwrap());
+            }
+            let result = Preview::Text {
+                lines: vec![format!("content of {name}")],
+                truncated: false,
+            };
+            if name == "f.txt" {
+                // The worker is about to send its (now stale) result.
+                done_tx.lock().unwrap().send(()).unwrap();
+            }
+            result
+        });
+        cursor_to(&mut app, "f.txt");
+        app.tick(); // slow request for f.txt is now blocked
+        cursor_to(&mut app, "bdir");
+        app.tick();
+        drop(guard); // the stale f.txt result lands now
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("f.txt worker finished and sent its result");
+        // bdir's worker can only start once the stale f.txt result has been
+        // received (and dropped): wait for that.
+        let start = Instant::now();
+        while !log.lock().unwrap().contains(&"bdir".to_string()) {
+            app.tick();
+            assert!(start.elapsed() < Duration::from_secs(5), "bdir never ran");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            app.preview.shown.is_none(),
+            "stale f.txt result must not be shown: {:?}",
+            app.preview.shown
+        );
+        settle_preview(&mut app);
+        assert!(
+            matches!(app.preview_shown(), Some(Preview::Text { lines, .. }) if lines[0] == "content of bdir"),
+            "{:?}",
+            app.preview_shown()
+        );
+    }
+
+    #[test]
+    fn rapid_cursor_moves_keep_one_read_in_flight_and_the_latest_pending() {
+        let (_t, mut app) = dev_app();
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock().unwrap();
+        let g = Arc::clone(&gate);
+        let log = Log2::default();
+        let l = Arc::clone(&log);
+        app.preview_runner = Arc::new(move |p: &std::path::Path| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            l.lock().unwrap().push(name.clone());
+            drop(g.lock().unwrap());
+            Preview::Text {
+                lines: vec![format!("content of {name}")],
+                truncated: false,
+            }
+        });
+        let names = ["adir", "bdir", "f.txt"];
+        for i in 0..10 {
+            cursor_to(&mut app, names[i % 3]); // last move: names[0] = adir
+            app.tick();
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        app.tick();
+        assert!(
+            log.lock().unwrap().len() <= 1,
+            "one read in flight: {:?}",
+            log.lock().unwrap()
+        );
+        drop(guard);
+        settle_preview(&mut app);
+        assert!(
+            log.lock().unwrap().len() <= 2,
+            "in flight + latest pending only: {:?}",
+            log.lock().unwrap()
+        );
+        assert_eq!(log.lock().unwrap().last().unwrap(), "adir");
+        assert!(
+            matches!(app.preview_shown(), Some(Preview::Text { lines, .. }) if lines[0] == "content of adir"),
+            "{:?}",
+            app.preview_shown()
+        );
+    }
+
+    #[test]
+    fn old_result_is_not_shown_for_a_different_entry() {
+        let (_t, mut app) = dev_app();
+        counting_runner(&mut app);
+        cursor_to(&mut app, "f.txt");
+        settle_preview(&mut app);
+        assert!(app.preview_shown().is_some());
+        cursor_to(&mut app, "adir");
+        app.tick();
+        assert!(app.preview_shown().is_none(), "no stale content for adir");
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(!rows.join("").contains("content of f.txt"));
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.join("").contains("content of adir"));
+        assert!(!rows.join("").contains("content of f.txt"));
+    }
+
+    #[test]
+    fn dir_entry_shows_a_summary_including_unreadable_count() {
+        let (_t, mut app) = dev_app();
+        cursor_to(&mut app, "adir");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("폴더 0개, 파일 1개")),
+            "{rows:?}"
+        );
+        app.preview_runner = Arc::new(|_| Preview::Dir {
+            files: 1,
+            dirs: 1,
+            total_size: 0,
+            truncated: false,
+            errors: 3,
+        });
+        cursor_to(&mut app, "bdir");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("읽지 못함 3개")), "{rows:?}");
+    }
+
+    #[test]
+    fn parent_entry_has_nothing_to_preview() {
+        let (_t, mut app) = dev_app();
+        let log = counting_runner(&mut app);
+        for _ in 0..3 {
+            app.tick();
+        }
+        assert!(log.lock().unwrap().is_empty(), "cursor starts on '..'");
+        assert!(!app.preview_pending());
+        assert!(app.preview_shown().is_none());
+    }
+
+    #[test]
+    fn opening_the_trash_view_clears_the_preview_and_computes_no_more() {
+        let (_t, mut app, _fake) = fixture_trash();
+        app.set_mode(Mode::Dev);
+        app.preview_debounce = Duration::ZERO;
+        let log = counting_runner(&mut app);
+        cursor_to(&mut app, "f.txt");
+        settle_preview(&mut app);
+        assert_eq!(*log.lock().unwrap(), ["f.txt"]);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.join("").contains("content of f.txt"), "{rows:?}");
+
+        alt_f8(&mut app);
+        assert!(app.trash_views[0].is_some(), "trash view really opened");
+        wait_idle(&mut app);
+        for _ in 0..5 {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.trash_views[0].is_some());
+        assert!(!app.preview_pending());
+        assert!(app.preview_shown().is_none());
+        assert!(app.preview.shown.is_none(), "cleared, not just hidden");
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(!rows.join("").contains("content of f.txt"), "{rows:?}");
+        assert_eq!(*log.lock().unwrap(), ["f.txt"], "no new runner call");
+    }
+
+    #[test]
+    fn preview_refreshes_after_the_panel_reloads() {
+        let (t, mut app) = dev_app();
+        fs::write(t.path().join("f.txt"), "version1").unwrap();
+        cursor_to(&mut app, "f.txt");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.join("").contains("version1"));
+        fs::write(t.path().join("f.txt"), "version2").unwrap();
+        app.reload_panel(0, Some(OsString::from("f.txt")));
+        settle(&mut app);
+        settle_preview(&mut app);
+        let start = Instant::now();
+        loop {
+            let rows = draw_app(&mut app, 100, 30);
+            if rows.join("").contains("version2") {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "{rows:?}");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
