@@ -13,6 +13,7 @@ use crate::dialog::{self, Dialog, DialogResult};
 use crate::fs_ops::{self};
 use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
+use crate::keymap::{Action, Context};
 use crate::loader::Loader;
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
 use crate::theme::{self, Theme};
@@ -331,47 +332,57 @@ impl App {
             self.handle_trash_key(key);
             return;
         }
+        let Some(action) = self.settings.keymap.lookup(Context::Panel, &key) else {
+            return;
+        };
+        self.panel_action(action);
+    }
+
+    fn unsupported(&mut self, what: &str) {
+        self.status = Some(format!("{what}: 아직 지원하지 않음"));
+    }
+
+    /// Run a panel-context action.
+    fn panel_action(&mut self, action: Action) {
         let page = self.page_height.max(1);
-        match key.code {
-            KeyCode::Esc => {
+        match action {
+            Action::CancelJob => {
                 if let Some(job) = self.job.as_mut() {
                     job.handle.cancel();
                     job.cancelling = true;
                     self.status = Some("취소 중…".into());
                 }
             }
-            KeyCode::F(5) => self.open_transfer(JobKind::Copy),
-            KeyCode::F(6) if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.open_transfer(JobKind::Move)
-            }
-            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => self.undo(),
-            KeyCode::F(7) => self.open_mkdir(),
-            KeyCode::F(2) => self.open_rename(),
-            KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => self.open_rename(),
-            KeyCode::F(8) if key.modifiers.contains(KeyModifiers::ALT) => self.open_trash_view(),
-            KeyCode::F(8) => self.open_trash(),
-            KeyCode::F(10) | KeyCode::Char('q') => self.running = false,
-            KeyCode::Tab => self.active = 1 - self.active,
-            KeyCode::Up => self.navigate(Panel::move_up),
-            KeyCode::Down => self.navigate(Panel::move_down),
-            KeyCode::PageUp => self.navigate(|p| p.page_up(page)),
-            KeyCode::PageDown => self.navigate(|p| p.page_down(page)),
-            KeyCode::Home => self.navigate(Panel::home),
-            KeyCode::End => self.navigate(Panel::end),
-            KeyCode::Backspace => {
+            Action::Copy => self.open_transfer(JobKind::Copy),
+            Action::Move => self.open_transfer(JobKind::Move),
+            Action::Undo => self.undo(),
+            Action::Mkdir => self.open_mkdir(),
+            Action::Rename => self.open_rename(),
+            Action::TrashView => self.open_trash_view(),
+            Action::Delete => self.open_trash(),
+            // No cwd file is written yet, so both quit the same way.
+            Action::Quit | Action::QuitNoCd => self.running = false,
+            Action::SwitchPanel => self.active = 1 - self.active,
+            Action::CursorUp => self.navigate(Panel::move_up),
+            Action::CursorDown => self.navigate(Panel::move_down),
+            Action::PageUp => self.navigate(|p| p.page_up(page)),
+            Action::PageDown => self.navigate(|p| p.page_down(page)),
+            Action::Home => self.navigate(Panel::home),
+            Action::End => self.navigate(Panel::end),
+            Action::Parent => {
                 self.status = None;
                 let id = self.next_id();
                 if let Some(req) = self.active_panel_mut().begin_parent(id) {
                     self.dispatch(self.active, req);
                 }
             }
-            KeyCode::Char('.') => {
+            Action::ToggleHidden => {
                 self.status = None;
                 let id = self.next_id();
                 let req = self.active_panel_mut().begin_toggle_hidden(id);
                 self.dispatch(self.active, req);
             }
-            KeyCode::Enter => {
+            Action::Enter => {
                 self.status = None;
                 let id = self.next_id();
                 match self.active_panel_mut().begin_enter(id) {
@@ -386,7 +397,7 @@ impl App {
                     AsyncEnter::Nothing => self.show_panel_error(),
                 }
             }
-            KeyCode::Char(' ') | KeyCode::Insert => {
+            Action::ToggleSelect => {
                 self.status = None;
                 let panel = self.active_panel_mut();
                 if let Some(e) = panel.current()
@@ -399,7 +410,18 @@ impl App {
                 }
                 self.active_panel_mut().move_down();
             }
-            _ => {}
+            Action::ToggleMode => {
+                self.set_mode(self.mode.toggled());
+                self.status = Some(format!("모드: {:?}", self.mode));
+            }
+            Action::View => self.unsupported("보기"),
+            Action::Edit => self.unsupported("편집"),
+            Action::CommandLine => self.unsupported("명령줄"),
+            Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
+            Action::OpenWith => self.unsupported("연결 프로그램 선택"),
+            Action::Menu => self.unsupported("메뉴"),
+            Action::Help => self.unsupported("도움말"),
+            Action::Confirm | Action::Cancel => {}
         }
     }
 
@@ -830,7 +852,6 @@ impl App {
     fn handle_trash_key(&mut self, key: KeyEvent) {
         let idx = self.active;
         let page = self.page_height.max(1);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let moved = |app: &mut App, f: &dyn Fn(&mut TrashView)| {
             if app.task.is_none() {
                 app.status = None;
@@ -839,23 +860,32 @@ impl App {
                 f(v);
             }
         };
-        match key.code {
-            KeyCode::Esc | KeyCode::Backspace => self.close_trash_view(idx),
-            KeyCode::Tab => self.active = 1 - self.active,
-            KeyCode::F(10) | KeyCode::Char('q') => self.running = false,
+        let Some(action) = self.settings.keymap.lookup(Context::Trash, &key) else {
+            if matches!(key.code, KeyCode::F(_)) {
+                self.status = Some("휴지통에서는 사용할 수 없음".into());
+            }
+            return;
+        };
+        match action {
+            Action::Cancel | Action::Parent => self.close_trash_view(idx),
+            Action::SwitchPanel => self.active = 1 - self.active,
+            Action::Quit | Action::QuitNoCd => self.running = false,
             // Already in the trash view.
-            KeyCode::F(8) if alt => {}
-            KeyCode::F(8) => self.open_trash_purge(),
-            KeyCode::F(5) | KeyCode::Enter => self.open_trash_restore(),
-            KeyCode::F(_) => self.status = Some("휴지통에서는 사용할 수 없음".into()),
-            KeyCode::Up => moved(self, &TrashView::move_up),
-            KeyCode::Down => moved(self, &TrashView::move_down),
-            KeyCode::PageUp => moved(self, &|v| v.page_up(page)),
-            KeyCode::PageDown => moved(self, &|v| v.page_down(page)),
-            KeyCode::Home => moved(self, &TrashView::home),
-            KeyCode::End => moved(self, &TrashView::end),
-            KeyCode::Char(' ') | KeyCode::Insert => moved(self, &TrashView::toggle_current),
-            _ => {}
+            Action::TrashView => {}
+            Action::Delete => self.open_trash_purge(),
+            Action::Copy | Action::Enter => self.open_trash_restore(),
+            Action::CursorUp => moved(self, &TrashView::move_up),
+            Action::CursorDown => moved(self, &TrashView::move_down),
+            Action::PageUp => moved(self, &|v| v.page_up(page)),
+            Action::PageDown => moved(self, &|v| v.page_down(page)),
+            Action::Home => moved(self, &TrashView::home),
+            Action::End => moved(self, &TrashView::end),
+            Action::ToggleSelect => moved(self, &TrashView::toggle_current),
+            _ => {
+                if matches!(key.code, KeyCode::F(_)) {
+                    self.status = Some("휴지통에서는 사용할 수 없음".into());
+                }
+            }
         }
     }
 
@@ -977,7 +1007,29 @@ impl App {
         self.open_pending_conflict();
     }
 
+    /// Map a key through the dialog context: bound confirm/cancel keys become
+    /// Enter/Esc. In text inputs, plain characters are always text.
+    fn dialog_key(&self, key: KeyEvent) -> KeyEvent {
+        let Some((dlg, _)) = self.dialog.as_ref() else {
+            return key;
+        };
+        let plain_char = matches!(key.code, KeyCode::Char(_))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if matches!(dlg, Dialog::Input { .. }) && plain_char {
+            return key;
+        }
+        let code = match self.settings.keymap.lookup(Context::Dialog, &key) {
+            Some(Action::Confirm) => KeyCode::Enter,
+            Some(Action::Cancel) => KeyCode::Esc,
+            _ => return key,
+        };
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, key.kind)
+    }
+
     fn dispatch_dialog_key(&mut self, key: KeyEvent) {
+        let key = self.dialog_key(key);
         let Some((dlg, _)) = self.dialog.as_mut() else {
             return;
         };
@@ -1315,6 +1367,133 @@ mod tests {
         let (_t, app) = configured("[theme\n", Some("truecolor"));
         assert_eq!(app.theme.name, "mdir");
         assert!(app.status.as_deref().unwrap().contains("config.toml"));
+    }
+
+    // ---- HDIR-19: keymap-driven dispatch ----
+
+    fn press_mods(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        app.handle_key(KeyEvent::new_with_kind(code, mods, KeyEventKind::Press));
+    }
+
+    #[test]
+    fn user_remap_copy_to_c_moves_copy_off_f5() {
+        let (_t, mut app) = configured("[keys.bind]\ncopy = [\"c\"]\n", Some("truecolor"));
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::F(5));
+        assert!(app.dialog.is_none(), "F5 must no longer copy");
+        press(&mut app, KeyCode::Char('c'));
+        assert!(matches!(
+            app.dialog,
+            Some((
+                _,
+                PendingAction::Transfer {
+                    kind: JobKind::Copy,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn empty_binding_disables_the_action() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(3));
+        assert!(
+            app.status.is_some(),
+            "default: view is bound (not yet implemented)"
+        );
+        let (_t, mut app) = configured("[keys.bind]\nview = []\n", Some("truecolor"));
+        press(&mut app, KeyCode::F(3));
+        assert!(app.status.is_none(), "{:?}", app.status);
+    }
+
+    #[test]
+    fn alt_digit_fallbacks_and_shift_f6_come_from_the_keymap() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::Down);
+        press_mods(&mut app, KeyCode::Char('5'), KeyModifiers::ALT);
+        assert!(matches!(
+            app.dialog,
+            Some((
+                _,
+                PendingAction::Transfer {
+                    kind: JobKind::Copy,
+                    ..
+                }
+            ))
+        ));
+        press(&mut app, KeyCode::Esc);
+        press_mods(&mut app, KeyCode::F(6), KeyModifiers::SHIFT);
+        assert!(matches!(
+            app.dialog,
+            Some((_, PendingAction::Rename { .. }))
+        ));
+    }
+
+    #[test]
+    fn vim_preset_navigates_with_jk_and_quits_with_q() {
+        let (_t, mut app) = configured("[keys]\npreset = \"vim\"\n", Some("truecolor"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.panels[0].cursor, 1);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.panels[0].cursor, 0);
+    }
+
+    #[test]
+    fn quit_no_cd_and_toggle_mode_actions() {
+        let (_t, mut app) = fixture();
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, Mode::Dev);
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, Mode::Classic);
+        press_mods(&mut app, KeyCode::F(10), KeyModifiers::SHIFT);
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn dialog_confirm_and_cancel_keys_are_remappable() {
+        let (_t, mut app) = configured(
+            "[keys.dialog]\nconfirm = [\"Enter\", \"Ctrl+Y\"]\ncancel = [\"Esc\", \"Ctrl+G\"]\n",
+            Some("truecolor"),
+        );
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::F(8));
+        assert!(matches!(app.dialog, Some((Dialog::Confirm { .. }, _))));
+        press_mods(&mut app, KeyCode::Char('g'), KeyModifiers::CONTROL);
+        assert!(app.dialog.is_none(), "Ctrl+G cancels");
+        assert!(app.task.is_none());
+        press(&mut app, KeyCode::F(8));
+        press_mods(&mut app, KeyCode::Char('y'), KeyModifiers::CONTROL);
+        assert!(app.dialog.is_none());
+        assert!(app.task.is_some(), "Ctrl+Y confirmed the trash move");
+    }
+
+    #[test]
+    fn text_input_keys_stay_raw_even_if_bound_in_dialog_context() {
+        let (_t, mut app) = configured(
+            "[keys.dialog]\ncancel = [\"Esc\", \"q\"]\n",
+            Some("truecolor"),
+        );
+        press(&mut app, KeyCode::F(7));
+        press(&mut app, KeyCode::Char('q'));
+        match &app.dialog {
+            Some((Dialog::Input { value, .. }, _)) => assert_eq!(value, "q"),
+            other => panic!("input dialog must stay open: {other:?}"),
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn trash_view_keys_come_from_the_trash_context() {
+        let (_t, mut app, _f) = fixture_trash();
+        let cfg = config_with("[keys.trash]\ncancel = [\"x\"]\n");
+        app.configure(Some(cfg.path().to_path_buf()), Some("truecolor"));
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.trash_views[0].is_some(), "Esc no longer closes");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.trash_views[0].is_none());
     }
 
     #[test]
