@@ -9,12 +9,14 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::config::Mode;
 use crate::keymap::{Action, Context, Keymap};
 use crate::panel::{Entry, EntryKind, Panel};
 use crate::theme::Theme;
 use crate::trash::{TrashEntry, TrashView, format_local};
 
 pub struct View<'a> {
+    pub mode: Mode,
     pub panels: [&'a Panel; 2],
     pub active: usize,
     pub status: Option<&'a str>,
@@ -451,18 +453,85 @@ fn fkey_line(width: usize, keys: &[(String, String)], theme: &Theme) -> Line<'st
     Line::from(spans)
 }
 
+/// Screen regions for a layout mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Areas {
+    pub header: Rect,
+    pub panels: Rect,
+    /// Dev only, and only when the terminal is tall enough.
+    pub preview: Option<Rect>,
+    /// Dev only: the `>` prompt row.
+    pub command: Option<Rect>,
+    pub status: Rect,
+    pub fkeys: Rect,
+}
+
+/// Rows outside the panel/preview body: header, status, F-key bar (+ command
+/// row in Dev).
+fn fixed_rows(mode: Mode) -> u16 {
+    match mode {
+        Mode::Classic => 3,
+        Mode::Dev => 4,
+    }
+}
+
+/// Smallest body (panels + preview) that still gets a preview area.
+const MIN_BODY_FOR_PREVIEW: u16 = 12;
+
+/// `(panel rows, preview rows)` of a body `body` rows tall (Dev: the bottom
+/// third is the preview).
+fn body_split(mode: Mode, body: u16) -> (u16, u16) {
+    if mode == Mode::Dev && body >= MIN_BODY_FOR_PREVIEW {
+        let preview = body / 3;
+        (body - preview, preview)
+    } else {
+        (body, 0)
+    }
+}
+
+pub fn layout(mode: Mode, area: Rect) -> Areas {
+    let body = area.height.saturating_sub(fixed_rows(mode));
+    let (panels_h, preview_h) = body_split(mode, body);
+    let mut constraints = vec![Constraint::Length(1), Constraint::Length(panels_h)];
+    if preview_h > 0 {
+        constraints.push(Constraint::Length(preview_h));
+    }
+    if mode == Mode::Dev {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(1));
+    let r = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let mut it = r.iter().copied();
+    let header = it.next().unwrap_or_default();
+    let panels = it.next().unwrap_or_default();
+    let preview = (preview_h > 0).then(|| it.next().unwrap_or_default());
+    let command = (mode == Mode::Dev).then(|| it.next().unwrap_or_default());
+    let status = it.next().unwrap_or_default();
+    let fkeys = it.next().unwrap_or_default();
+    Areas {
+        header,
+        panels,
+        preview,
+        command,
+        status,
+        fkeys,
+    }
+}
+
+/// Visible entry rows inside a panel for a terminal of `total_height` rows.
+pub fn panel_rows(mode: Mode, total_height: u16) -> usize {
+    let body = total_height.saturating_sub(fixed_rows(mode));
+    body_split(mode, body).0.saturating_sub(2) as usize
+}
+
 pub fn draw(frame: &mut Frame, view: &View) {
     let area = frame.area();
     let theme = view.theme;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    let areas = layout(view.mode, area);
 
     let header = format!(
         " ■ {} {} · {} · {} · UTF-8",
@@ -474,18 +543,29 @@ pub fn draw(frame: &mut Frame, view: &View) {
     frame.render_widget(
         Paragraph::new(fit_width(&header, area.width as usize))
             .style(Style::default().fg(theme.fg).bg(theme.bg)),
-        rows[0],
+        areas.header,
     );
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
+        .split(areas.panels);
     for i in 0..2 {
         match view.trash[i] {
             Some(tv) => draw_trash_panel(frame, cols[i], tv, view.active == i, view.theme),
             None => draw_panel(frame, cols[i], view.panels[i], view.active == i, view.theme),
         }
+    }
+
+    if let Some(r) = areas.preview {
+        draw_preview(frame, r, theme);
+    }
+    if let Some(r) = areas.command {
+        frame.render_widget(
+            Paragraph::new(fit_width("> ", r.width as usize))
+                .style(Style::default().fg(theme.fg).bg(theme.bg)),
+            r,
+        );
     }
 
     let active = view.active.min(1);
@@ -497,12 +577,22 @@ pub fn draw(frame: &mut Frame, view: &View) {
     frame.render_widget(
         Paragraph::new(fit_width(&format!(" {status}"), area.width as usize))
             .style(Style::default().fg(theme.status_fg).bg(theme.status_bg)),
-        rows[2],
+        areas.status,
     );
     frame.render_widget(
         Paragraph::new(fkey_line(area.width as usize, view.fkeys, view.theme)),
-        rows[3],
+        areas.fkeys,
     );
+}
+
+/// The Dev-mode preview area (content arrives with HDIR-15).
+fn draw_preview(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border).bg(theme.preview_bg))
+        .title(" 미리보기 ")
+        .style(Style::default().fg(theme.fg).bg(theme.preview_bg));
+    frame.render_widget(block, area);
 }
 
 #[cfg(test)]
@@ -592,6 +682,7 @@ mod tests {
             status,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
             trash: [None, None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
@@ -746,6 +837,7 @@ mod tests {
             status: None,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
             trash: [None, None],
             theme,
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
@@ -943,6 +1035,7 @@ mod tests {
             status: None,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
             trash: [None, None],
             theme: &th(),
             fkeys: &fkeys,
@@ -1048,6 +1141,7 @@ mod tests {
             status: None,
             shell: "zsh",
             os: "macos",
+            mode: Mode::Classic,
             trash: [Some(tv), None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
@@ -1167,5 +1261,102 @@ mod tests {
         let buf = render_trash(&v, 0, 80);
         let text: String = (2..21).map(|y| left_half(&buf, y)).collect();
         assert!(text.contains("file30") && !text.contains("file00"));
+    }
+    fn rows_of(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height).map(|y| row(buf, y)).collect()
+    }
+
+    fn render_mode(mode: Mode, w: u16, h: u16) -> Vec<String> {
+        let (a, b) = setup();
+        let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let view = View {
+            panels: [&pa, &pb],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            mode,
+            trash: [None, None],
+            theme: &th(),
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        rows_of(t.backend().buffer())
+    }
+
+    #[test]
+    fn classic_layout_has_no_preview_or_command_row() {
+        let rows = render_mode(Mode::Classic, 100, 30);
+        assert!(rows[0].contains("hdir"));
+        assert!(rows[1].starts_with('┌'));
+        assert!(rows[28].contains("files"), "status: {:?}", rows[28]);
+        assert!(rows[29].contains("Copy"));
+        assert!(
+            rows[27].starts_with('└'),
+            "panels run down to the status row"
+        );
+        assert!(!rows.iter().any(|r| r.starts_with("> ")));
+        assert!(!rows.iter().any(|r| r.contains("미리보기")));
+        let a = layout(Mode::Classic, Rect::new(0, 0, 100, 30));
+        assert_eq!((a.preview, a.command), (None, None));
+        assert_eq!(a.panels.height, 27);
+    }
+
+    #[test]
+    fn dev_layout_adds_preview_area_and_command_prompt() {
+        let rows = render_mode(Mode::Dev, 100, 30);
+        assert!(rows[0].contains("hdir"));
+        assert!(rows[27].starts_with("> "), "command row: {:?}", rows[27]);
+        assert!(rows[28].contains("files"), "status: {:?}", rows[28]);
+        assert!(rows[29].contains("Copy"));
+        let a = layout(Mode::Dev, Rect::new(0, 0, 100, 30));
+        let pv = a.preview.unwrap();
+        assert_eq!((a.panels.height, pv.height), (18, 8));
+        assert_eq!(pv.y, a.panels.y + a.panels.height);
+        assert_eq!(a.command.unwrap().y, 27);
+        assert!(
+            rows[pv.y as usize].replace(' ', "").contains("미리보기"),
+            "{:?}",
+            rows[pv.y as usize]
+        );
+        assert!(rows[pv.y as usize].starts_with('┌'));
+        // panels still render above the preview
+        assert!(rows[1].starts_with('┌') && rows[18].starts_with('└'));
+    }
+
+    #[test]
+    fn panel_rows_follow_the_active_layout() {
+        assert_eq!(panel_rows(Mode::Classic, 24), 19);
+        assert_eq!(panel_rows(Mode::Classic, 3), 0);
+        assert_eq!(panel_rows(Mode::Classic, 0), 0);
+        assert_eq!(panel_rows(Mode::Dev, 30), 16);
+        assert_eq!(panel_rows(Mode::Dev, 0), 0);
+        // small terminals drop the preview area but keep the command row
+        assert_eq!(panel_rows(Mode::Dev, 14), 14 - 4 - 2);
+        for mode in [Mode::Classic, Mode::Dev] {
+            for h in 6..80u16 {
+                let a = layout(mode, Rect::new(0, 0, 80, h));
+                assert_eq!(
+                    a.panels.height.saturating_sub(2) as usize,
+                    panel_rows(mode, h),
+                    "{mode:?} h={h}"
+                );
+                let used = 1
+                    + a.panels.height
+                    + a.preview.map_or(0, |r| r.height)
+                    + a.command.map_or(0, |r| r.height)
+                    + 2;
+                assert_eq!(used, h, "{mode:?} h={h}: regions tile the screen");
+            }
+        }
+    }
+
+    #[test]
+    fn dev_layout_survives_tiny_terminals() {
+        for (w, h) in [(0, 0), (1, 1), (10, 3), (30, 5), (100, 9)] {
+            render_mode(Mode::Dev, w, h);
+            render_mode(Mode::Classic, w, h);
+        }
     }
 }

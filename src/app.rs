@@ -28,13 +28,7 @@ use crate::ui::{self, View};
 use crate::undo::{UndoApplied, UndoOp, UndoStack};
 use crate::viewer::{self, Viewer};
 
-/// Rows taken by header (1) + status (1) + fkey bar (1) + panel borders (2).
-const CHROME_ROWS: u16 = 5;
-
-/// Visible entry rows inside a panel for a terminal of `total_height` rows.
-pub fn panel_rows(total_height: u16) -> usize {
-    total_height.saturating_sub(CHROME_ROWS) as usize
-}
+pub use crate::ui::panel_rows;
 
 /// Reverses one op off the UI thread.
 pub type UndoRunner = Arc<dyn Fn(UndoOp) -> UndoApplied + Send + Sync>;
@@ -1582,8 +1576,8 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        self.page_height = panel_rows(frame.area().height).max(1);
-        let rows = panel_rows(frame.area().height);
+        let rows = panel_rows(self.mode, frame.area().height);
+        self.page_height = rows.max(1);
         for p in &mut self.panels {
             p.ensure_visible(rows);
         }
@@ -1602,6 +1596,7 @@ impl App {
             status: self.status.as_deref(),
             shell: &self.shell,
             os: std::env::consts::OS,
+            mode: self.mode,
             trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
             theme: &self.theme,
             fkeys: &fkeys,
@@ -2595,13 +2590,6 @@ mod tests {
         press(&mut app, KeyCode::Char('.'));
         assert_ne!(app.panels[0].show_hidden, before);
         assert_eq!(app.panels[1].show_hidden, before);
-    }
-
-    #[test]
-    fn panel_rows_matches_layout() {
-        assert_eq!(panel_rows(24), 19);
-        assert_eq!(panel_rows(3), 0);
-        assert_eq!(panel_rows(0), 0);
     }
 
     #[test]
@@ -4649,5 +4637,38 @@ mod tests {
         press(&mut app, KeyCode::F(4));
         assert!(!app.has_pending_edit());
         assert!(app.status.as_deref().unwrap().contains("Windows 지원 예정"));
+    }
+    // ---- HDIR-16: modes ----
+
+    #[test]
+    fn ctrl_t_switches_layout_and_page_height() {
+        let (_t, mut app) = fixture();
+        let rows = draw_app(&mut app, 100, 30);
+        assert_eq!(app.page_height, 25);
+        assert!(!rows.iter().any(|r| r.starts_with("> ")));
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        assert_eq!(app.mode, crate::config::Mode::Dev);
+        let rows = draw_app(&mut app, 100, 30);
+        assert_eq!(app.page_height, 16, "panels are shorter in Dev");
+        assert!(rows[27].starts_with("> "), "{:?}", rows[27]);
+        assert!(rows.iter().any(|r| r.contains("미리보기")));
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let rows = draw_app(&mut app, 100, 30);
+        assert_eq!(app.page_height, 25);
+        assert!(!rows.iter().any(|r| r.starts_with("> ")));
+    }
+
+    #[test]
+    fn page_down_follows_the_dev_page_height() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..80 {
+            fs::write(tmp.path().join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+        let mut app = App::new(tmp.path().to_path_buf(), tmp.path().to_path_buf());
+        settle(&mut app);
+        press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+        draw_app(&mut app, 100, 30);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.panels[0].cursor, 16);
     }
 }
