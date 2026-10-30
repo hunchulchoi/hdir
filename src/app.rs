@@ -1698,6 +1698,7 @@ impl App {
             return;
         }
         let (r, sess) = (remote.clone(), Arc::clone(&session));
+        let for_edit = matches!(purpose, FetchPurpose::Edit);
         self.task = Some(BgTask::spawn(
             BgKind::RemoteFetch {
                 panel: self.active,
@@ -1705,7 +1706,7 @@ impl App {
                 remote,
                 purpose,
             },
-            move || BgResult::RemoteFetch(remote_ops::fetch(&sess, &r)),
+            move || BgResult::RemoteFetch(remote_ops::fetch(&sess, &r, for_edit)),
         ));
         self.status = Some("내려받는 중…".into());
     }

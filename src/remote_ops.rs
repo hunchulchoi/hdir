@@ -243,7 +243,8 @@ pub struct EditCopy {
     pub dir: tempfile::TempDir,
     pub local: PathBuf,
     pub stamp: FileStamp,
-    /// [`remote_stamp`] of the remote file, taken before downloading it.
+    /// [`remote_stamp`] of the remote file, taken before downloading it
+    /// (empty unless fetched for editing).
     pub remote: Vec<u8>,
 }
 
@@ -268,9 +269,10 @@ pub fn remote_stamp(s: &RemoteSession, path: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// Download `remote` into a fresh private temp dir (same file name, so
-/// extensions keep working) and fingerprint it. The remote file is stamped
-/// first, so a change during the download also counts as a change.
-pub fn fetch(s: &RemoteSession, remote: &Path) -> Result<EditCopy, String> {
+/// extensions keep working) and fingerprint it. `for_edit`: the remote file
+/// is stamped first (so a change during the download also counts as a
+/// change); a copy that is only opened skips that full read.
+pub fn fetch(s: &RemoteSession, remote: &Path, for_edit: bool) -> Result<EditCopy, String> {
     let name = remote.file_name().ok_or("잘못된 경로")?;
     let mut builder = tempfile::Builder::new();
     builder.prefix("hdir-remote-");
@@ -283,7 +285,11 @@ pub fn fetch(s: &RemoteSession, remote: &Path) -> Result<EditCopy, String> {
     let dir = builder
         .tempdir()
         .map_err(|e| format!("임시 폴더 생성 실패: {e}"))?;
-    let remote_st = remote_stamp(s, remote)?;
+    let remote_st = if for_edit {
+        remote_stamp(s, remote)?
+    } else {
+        Vec::new()
+    };
     let argv = scp_argv(
         &Endpoint::Remote(&s.target, &os_bytes(remote.as_os_str())),
         &Endpoint::Local(dir.path()),
@@ -877,7 +883,7 @@ mod tests {
     fn fetch_downloads_into_a_private_temp_dir_and_stamps_it() {
         let (f, _) = scp_fake("orig\n", ok(""), ok(""));
         let s = session(Arc::clone(&f));
-        let copy = fetch(&s, &p("/srv/it's a.txt")).unwrap();
+        let copy = fetch(&s, &p("/srv/it's a.txt"), true).unwrap();
         assert_eq!(copy.local, copy.dir.path().join("it's a.txt"));
         assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "orig\n");
         let mode = copy.dir.path().metadata().unwrap().permissions().mode() & 0o777;
@@ -895,7 +901,7 @@ mod tests {
     fn fetch_in_legacy_scp_mode_quotes_the_remote_path() {
         let (f, _) = scp_fake("x", ok(""), ok(""));
         let s = session_mode(Arc::clone(&f), ScpMode::Legacy);
-        fetch(&s, &p("/srv/it's a.txt")).unwrap();
+        fetch(&s, &p("/srv/it's a.txt"), true).unwrap();
         let a = &f.scp_calls()[0];
         assert_eq!(a[a.len() - 2], "prod-web:'/srv/it'\\''s a.txt'");
     }
@@ -903,14 +909,14 @@ mod tests {
     #[test]
     fn fetch_failures_are_errors() {
         let f = FakeCmd::new(|_| fail(1, "scp: /srv/x: No such file or directory\n"));
-        let e = fetch(&session(f), &p("/srv/x")).unwrap_err();
+        let e = fetch(&session(f), &p("/srv/x"), true).unwrap_err();
         assert!(e.contains("No such file"), "{e}");
         let f = FakeCmd::new(|_| ok("")); // "succeeds" but nothing arrived
-        assert!(fetch(&session(f), &p("/srv/x")).is_err());
+        assert!(fetch(&session(f), &p("/srv/x"), true).is_err());
         let f = FakeCmd::new(|_| code(255));
         let s = session(f);
         assert_eq!(
-            fetch(&s, &p("/srv/x")).unwrap_err(),
+            fetch(&s, &p("/srv/x"), true).unwrap_err(),
             crate::session::DISCONNECTED_MSG
         );
         assert!(!s.is_alive());
@@ -919,7 +925,7 @@ mod tests {
     #[test]
     fn fetch_stamps_the_remote_file_before_downloading_it() {
         let (f, _) = scp_fake("orig", ok(""), ok(""));
-        let copy = fetch(&session(Arc::clone(&f)), &p("/srv/a")).unwrap();
+        let copy = fetch(&session(Arc::clone(&f)), &p("/srv/a"), true).unwrap();
         assert_eq!(copy.remote, STAMP);
         let log = f.log.lock().unwrap().clone();
         let stamp_at = log
@@ -930,7 +936,7 @@ mod tests {
         // no stamp, no download
         for answer in [fail(1, "stat: cannot stat\n"), ok("")] {
             let f = FakeCmd::new(move |_| answer.clone());
-            assert!(fetch(&session(Arc::clone(&f)), &p("/srv/a")).is_err());
+            assert!(fetch(&session(Arc::clone(&f)), &p("/srv/a"), true).is_err());
             assert!(f.scp_calls().is_empty());
         }
     }
@@ -1251,7 +1257,7 @@ mod tests {
         let target = dir.join("it's.txt");
         std::fs::write(&target, "v1").unwrap();
         let s = local_session(&dir);
-        let copy = fetch(&s, &target).unwrap();
+        let copy = fetch(&s, &target, true).unwrap();
         assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "v1");
         // someone else saves the remote file while we edit
         std::fs::write(&target, "v2").unwrap();
@@ -1302,10 +1308,110 @@ mod tests {
         std::fs::write(dir.join("real"), "v1").unwrap();
         symlink("real", dir.join("link")).unwrap();
         let s = local_session(&dir);
-        let copy = fetch(&s, &dir.join("link")).unwrap();
+        let copy = fetch(&s, &dir.join("link"), true).unwrap();
         std::fs::write(&copy.local, "mine").unwrap();
         upload_replace(&s, &copy.local, &dir.join("link"), &copy.remote).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("real")).unwrap(), "mine");
+    }
+
+    #[test]
+    fn real_replace_rechecks_a_hard_linked_file_after_backing_it_up() {
+        // someone saves the original while its backup is being copied
+        let (_t, dir, cmd) = hard_linked_with_fakes(&[(
+            "cp",
+            "/bin/cp \"$@\" || exit 1; printf other > \"$(dirname \"$0\")/../d/a\"",
+        )]);
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
+        assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "other");
+        assert!(backups(&dir).is_empty(), "backup removed");
+    }
+
+    #[test]
+    fn real_replace_rechecks_right_before_the_mv() {
+        // someone saves the original while the temp gets its mode
+        let (_t, dir, cmd) = replace_with_fakes(
+            &[(
+                "chmod",
+                "/bin/chmod \"$@\" || exit 1; printf other > \"$(dirname \"$0\")/../d/a\"",
+            )],
+            false,
+        );
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "other");
+    }
+
+    /// Fake `stat` reporting group 999999 for `stat -c|-f %g`, so the group
+    /// branch runs whatever groups the account has.
+    const STAT_OTHER_GID: &str =
+        "if [ \"$2\" = %g ]; then echo 999999; else exec /usr/bin/stat \"$@\"; fi";
+
+    #[test]
+    fn replace_script_group_branch_without_a_second_group() {
+        let (_t, dir, cmd) =
+            replace_with_fakes(&[("stat", STAT_OTHER_GID), ("chgrp", "exit 1")], false);
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_GROUP));
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "shared");
+
+        let rec = "echo \"$@\" > \"$(dirname \"$0\")/chgrp-args\"";
+        let (_t, dir, cmd) = replace_with_fakes(&[("stat", STAT_OTHER_GID), ("chgrp", rec)], false);
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let args = std::fs::read_to_string(dir.parent().unwrap().join("bin/chgrp-args")).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let gid = std::fs::metadata(&dir).unwrap().gid();
+        assert_eq!(
+            args.trim(),
+            format!("{gid} {}", dir.join(".hdir-edit.Hl1").display()),
+            "chgrp to the original's group"
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "edited!");
+    }
+
+    #[test]
+    fn real_stamp_refuses_a_fifo_without_reading_it() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(t.path()).unwrap();
+        let st = std::process::Command::new("mkfifo")
+            .arg(dir.join("pipe"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        symlink("pipe", dir.join("to-pipe")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = dir.clone();
+        std::thread::spawn(move || {
+            let s = local_session(&d2);
+            let r = ["pipe", "to-pipe"].map(|n| remote_stamp(&s, &d2.join(n)).is_err());
+            let _ = tx.send(r);
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap_or_else(|_| {
+                // let a blocked reader go before failing
+                for _ in 0..2 {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(dir.join("pipe"));
+                }
+                panic!("stamping a FIFO must not block")
+            });
+        assert_eq!(r, [true, true]);
+    }
+
+    #[test]
+    fn fetch_for_opening_only_skips_the_stamp() {
+        let (f, _) = scp_fake("orig", ok(""), ok(""));
+        let copy = fetch(&session(Arc::clone(&f)), &p("/srv/a"), false).unwrap();
+        assert!(copy.remote.is_empty());
+        assert!(!f.remote_cmds().iter().any(|c| c.starts_with("f=")));
     }
 
     #[test]

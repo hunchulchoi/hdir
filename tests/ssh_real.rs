@@ -340,7 +340,7 @@ fn remote_file_operations_round_trip() {
     const MODE_OF: &str = "stat -c %a 'edit me.txt' 2>/dev/null || stat -f %Lp 'edit me.txt'";
     let mode_before = run(MODE_OF).trim().to_string();
     assert_eq!(mode_before, "640");
-    let copy = ops::fetch(&s, &d.join("edit me.txt")).expect("download");
+    let copy = ops::fetch(&s, &d.join("edit me.txt"), true).expect("download");
     assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "original");
     assert!(!copy.stamp.differs(&copy.local).unwrap());
     std::fs::write(&copy.local, "changed on the server").unwrap();
@@ -366,7 +366,7 @@ fn remote_file_operations_round_trip() {
             .to_string()
     };
     let before = m("mode600.txt");
-    let copy = ops::fetch(&s, &d.join("mode600.txt")).unwrap();
+    let copy = ops::fetch(&s, &d.join("mode600.txt"), true).unwrap();
     std::fs::write(&copy.local, "secret edited").unwrap();
     ops::upload_replace(&s, &copy.local, &d.join("mode600.txt"), &copy.remote).unwrap();
     assert_eq!(run("cat mode600.txt"), "secret edited");
@@ -381,7 +381,7 @@ fn remote_file_operations_round_trip() {
             .to_string()
     };
     assert_eq!(nlink("hl-a"), "2");
-    let copy = ops::fetch(&s, &d.join("hl-a")).unwrap();
+    let copy = ops::fetch(&s, &d.join("hl-a"), true).unwrap();
     std::fs::write(&copy.local, "shared edited").unwrap();
     ops::upload_replace(&s, &copy.local, &d.join("hl-a"), &copy.remote).unwrap();
     assert_eq!(nlink("hl-a"), "2", "hard link count kept");
@@ -393,7 +393,7 @@ fn remote_file_operations_round_trip() {
         "mkdir real-dir && printf 'before' > real-dir/target.txt && chmod 640 real-dir/target.txt \
          && ln -s real-dir/target.txt ln-to-target",
     );
-    let copy = ops::fetch(&s, &d.join("ln-to-target")).expect("download via link");
+    let copy = ops::fetch(&s, &d.join("ln-to-target"), true).expect("download via link");
     std::fs::write(&copy.local, "after").unwrap();
     ops::upload_replace(&s, &copy.local, &d.join("ln-to-target"), &copy.remote).unwrap();
     assert_eq!(
@@ -409,7 +409,7 @@ fn remote_file_operations_round_trip() {
 
     // changed on the server while editing: not replaced, theirs kept
     run("printf 'v1' > race.txt");
-    let copy = ops::fetch(&s, &d.join("race.txt")).unwrap();
+    let copy = ops::fetch(&s, &d.join("race.txt"), true).unwrap();
     run("printf 'v2' > race.txt");
     std::fs::write(&copy.local, "mine").unwrap();
     let e = ops::upload_replace(&s, &copy.local, &d.join("race.txt"), &copy.remote).unwrap_err();
@@ -424,7 +424,7 @@ fn remote_file_operations_round_trip() {
         "{NL}mkdir -- \"$n\" tw && printf keep > tw/f && printf keep > \"$n/f\""
     ));
     let twin = d.join("tw\n");
-    let copy = ops::fetch(&s, &twin.join("f")).unwrap();
+    let copy = ops::fetch(&s, &twin.join("f"), true).unwrap();
     std::fs::write(&copy.local, "edited").unwrap();
     ops::upload_replace(&s, &copy.local, &twin.join("f"), &copy.remote).unwrap();
     assert_eq!(run(&format!("{NL}cat -- \"$n/f\"")), "edited");
