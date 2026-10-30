@@ -96,23 +96,38 @@ const MENU_WARNINGS: usize = 4;
 const MENU_OPEN_WITH: usize = 5;
 
 /// Decides off the UI thread whether a file is text (first chunk only).
-pub type TextProbe = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+pub type TextProbe = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
+
+/// Status shown when Enter lands on a FIFO, socket or device.
+const SPECIAL_FILE: &str = "특수 파일은 열 수 없음";
 
 /// Reads the first 8 KiB of `path` and classifies it like the preview does.
-pub fn probe_text(path: &Path) -> bool {
+/// Errors (vanished, unreadable, dangling symlink, special file) carry the
+/// user-facing reason; special files are refused before any blocking open.
+pub fn probe_text(path: &Path) -> Result<bool, String> {
     use std::io::Read;
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let size = file.metadata().map_or(0, |m| m.len());
-    let mut buf = Vec::new();
-    if file.take(8 * 1024).read_to_end(&mut buf).is_err() {
-        return false;
+    // `metadata` follows symlinks, so a link to a FIFO is refused as well.
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.file_type().is_file() {
+        return Err(SPECIAL_FILE.into());
     }
-    matches!(
-        preview::classify(&buf, size),
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Second guard: never block in open() if the file turns into a FIFO.
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    file.take(8 * 1024)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    Ok(matches!(
+        preview::classify(&buf, meta.len()),
         Preview::Text { .. } | Preview::Empty
-    )
+    ))
 }
 
 /// An association run waiting for the main loop to suspend the TUI.
@@ -128,8 +143,17 @@ struct RunJob {
 
 /// An in-flight text-or-not decision for a file without a rule.
 struct ProbeLoad {
-    rx: Receiver<bool>,
+    rx: Receiver<Result<bool, String>>,
+    req: ProbeReq,
+}
+
+/// One text-probe request with the UI state it was made in; a result is only
+/// applied while `id` is still the newest generation and that state holds.
+struct ProbeReq {
+    id: u64,
     path: PathBuf,
+    active: usize,
+    cwd: PathBuf,
 }
 
 /// Computes one preview off the UI thread; tests may swap in a gated fake.
@@ -364,7 +388,14 @@ pub struct App {
     /// Text detection for Enter on a file without a rule; tests inject fakes.
     pub text_probe: TextProbe,
     pending_run: Option<RunJob>,
+    /// The single probe worker in flight, if any.
     probe: Option<ProbeLoad>,
+    /// A newer request waiting for the running probe to finish.
+    probe_next: Option<ProbeReq>,
+    probe_gen: u64,
+    /// Results of background spawns, shown by `tick`.
+    spawn_tx: Sender<String>,
+    spawn_rx: Receiver<String>,
 }
 
 impl Default for App {
@@ -380,6 +411,7 @@ impl App {
     }
 
     pub fn with_trash(left: PathBuf, right: PathBuf, trash: Arc<dyn TrashBackend>) -> Self {
+        let (spawn_tx, spawn_rx) = mpsc::channel();
         let shell = std::env::var("SHELL")
             .ok()
             .and_then(|s| {
@@ -427,6 +459,10 @@ impl App {
             text_probe: Arc::new(probe_text),
             pending_run: None,
             probe: None,
+            probe_next: None,
+            probe_gen: 0,
+            spawn_tx,
+            spawn_rx,
         }
     }
 
@@ -478,6 +514,7 @@ impl App {
 
     fn open_screen(&mut self, title: &str, lines: Vec<String>) {
         self.status = None;
+        self.invalidate_probe();
         self.screen = Some(TextScreen::new(title, lines, self.close_hint()));
     }
 
@@ -721,6 +758,18 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_inner(key);
+        // Any overlay opened by this key supersedes a pending text probe.
+        if self.dialog.is_some()
+            || self.screen.is_some()
+            || self.viewer.is_some()
+            || self.menu.is_some()
+        {
+            self.invalidate_probe();
+        }
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
         }
@@ -774,7 +823,10 @@ impl App {
             Action::Delete => self.open_trash(),
             // No cwd file is written yet, so both quit the same way.
             Action::Quit | Action::QuitNoCd => self.running = false,
-            Action::SwitchPanel => self.active = 1 - self.active,
+            Action::SwitchPanel => {
+                self.invalidate_probe();
+                self.active = 1 - self.active;
+            }
             Action::CursorUp => self.navigate(Panel::move_up),
             Action::CursorDown => self.navigate(Panel::move_down),
             Action::PageUp => self.navigate(|p| p.page_up(page)),
@@ -783,6 +835,7 @@ impl App {
             Action::End => self.navigate(Panel::end),
             Action::Parent => {
                 self.status = None;
+                self.invalidate_probe();
                 let id = self.next_id();
                 if let Some(req) = self.active_panel_mut().begin_parent(id) {
                     self.dispatch(self.active, req);
@@ -799,7 +852,10 @@ impl App {
                 let id = self.next_id();
                 match self.active_panel_mut().begin_enter(id) {
                     AsyncEnter::Opened(path) => self.activate_file(path),
-                    AsyncEnter::Load(req) => self.dispatch(self.active, req),
+                    AsyncEnter::Load(req) => {
+                        self.invalidate_probe();
+                        self.dispatch(self.active, req);
+                    }
                     AsyncEnter::Nothing => self.show_panel_error(),
                 }
             }
@@ -1063,13 +1119,51 @@ impl App {
             self.run_rule(&rule, path);
             return;
         }
+        self.probe_gen += 1;
+        let req = ProbeReq {
+            id: self.probe_gen,
+            path,
+            active: self.active,
+            cwd: self.active_panel().cwd.clone(),
+        };
+        if self.probe.is_some() {
+            // One probe at a time: the newest request replaces any waiting one.
+            self.probe_next = Some(req);
+        } else {
+            self.start_probe(req);
+        }
+    }
+
+    /// Drop every pending text probe's result (a newer action took over).
+    fn invalidate_probe(&mut self) {
+        self.probe_gen += 1;
+        self.probe_next = None;
+    }
+
+    fn start_probe(&mut self, req: ProbeReq) {
         let (tx, rx) = mpsc::channel();
         let probe = Arc::clone(&self.text_probe);
-        let target = path.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(probe(&target));
-        });
-        self.probe = Some(ProbeLoad { rx, path });
+        let target = req.path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hdir-probe".into())
+            .spawn(move || {
+                let _ = tx.send(probe(&target));
+            });
+        match spawned {
+            Ok(_) => self.probe = Some(ProbeLoad { rx, req }),
+            Err(e) => self.status = Some(format!("오류: 파일 형식 확인 실패: {e}")),
+        }
+    }
+
+    /// Whether the UI is still where `req` was made.
+    fn probe_state_holds(&self, req: &ProbeReq) -> bool {
+        req.id == self.probe_gen
+            && self.dialog.is_none()
+            && self.screen.is_none()
+            && self.viewer.is_none()
+            && self.menu.is_none()
+            && self.active == req.active
+            && self.panels[req.active].cwd == req.cwd
     }
 
     /// Apply a finished text probe; true when the screen changed.
@@ -1077,21 +1171,37 @@ impl App {
         let Some(load) = self.probe.as_ref() else {
             return false;
         };
-        let is_text = match load.rx.try_recv() {
-            Ok(t) => t,
+        let result = match load.rx.try_recv() {
+            Ok(r) => r,
             Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => {
-                self.probe = None;
-                self.status = Some("오류: 파일 형식 확인 실패".into());
-                return true;
-            }
+            Err(TryRecvError::Disconnected) => Err("파일 형식 확인 실패".into()),
         };
-        let path = self.probe.take().map(|l| l.path).unwrap_or_default();
-        match assoc::default_action(is_text) {
-            DefaultAction::View => self.view_path(path),
-            DefaultAction::OpenWithSystem => self.run_system(path),
+        let Some(load) = self.probe.take() else {
+            return false;
+        };
+        let mut changed = false;
+        if self.probe_state_holds(&load.req) {
+            changed = true;
+            let path = load.req.path;
+            match result {
+                Ok(is_text) => match assoc::default_action(is_text) {
+                    DefaultAction::View => self.view_path(path),
+                    DefaultAction::OpenWithSystem => self.run_system(path),
+                },
+                Err(e) if e == SPECIAL_FILE => self.status = Some(e),
+                Err(e) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    self.status = Some(format!("오류: {name}: {e}"));
+                }
+            }
         }
-        true
+        if let Some(next) = self.probe_next.take()
+            && next.id == self.probe_gen
+        {
+            self.start_probe(next);
+            changed = true;
+        }
+        changed
     }
 
     fn run_rule(&mut self, rule: &AssocRule, path: PathBuf) {
@@ -1133,10 +1243,24 @@ impl App {
     ) {
         let name = path.file_name().map(OsString::from).unwrap_or_default();
         if mode == RunMode::Background {
-            self.status = Some(match self.launcher.spawn_detached(&argv, &cwd) {
-                Ok(()) => format!("실행: {}", name.to_string_lossy()),
-                Err(e) => format!("오류: {label}: {e}"),
-            });
+            // spawn() can be slow (PATH search, a hung mount): keep it off
+            // the UI thread and report through `tick`.
+            let launcher = Arc::clone(&self.launcher);
+            let tx = self.spawn_tx.clone();
+            let shown = name.to_string_lossy().into_owned();
+            let err_label = label.clone();
+            let spawned = std::thread::Builder::new()
+                .name("hdir-spawn".into())
+                .spawn(move || {
+                    let msg = match launcher.spawn_detached(&argv, &cwd) {
+                        Ok(()) => format!("실행: {shown}"),
+                        Err(e) => format!("오류: {err_label}: {e}"),
+                    };
+                    let _ = tx.send(msg);
+                });
+            if let Err(e) = spawned {
+                self.status = Some(format!("오류: {label}: {e}"));
+            }
             return;
         }
         self.status = None;
@@ -1161,6 +1285,7 @@ impl App {
     /// Shift+Enter / Ctrl+O / F9 item: choose how to open the current file.
     fn open_with_menu(&mut self) {
         self.status = None;
+        self.invalidate_probe();
         let Some(path) = self.current_file() else {
             self.status = Some("파일을 선택하세요".into());
             return;
@@ -1356,8 +1481,19 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let loaded = self.drain_loads();
         let task = self.tick_task() | self.tick_viewer_load() | self.tick_probe();
+        let spawned = self.tick_spawn();
         let preview = self.tick_preview();
-        self.tick_job() || loaded || task || preview
+        self.tick_job() || loaded || task || preview || spawned
+    }
+
+    /// Show the newest finished background-spawn result.
+    fn tick_spawn(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(msg) = self.spawn_rx.try_recv() {
+            self.status = Some(msg);
+            changed = true;
+        }
+        changed
     }
 
     fn tick_task(&mut self) -> bool {
@@ -5559,6 +5695,7 @@ mod tests {
             log: Arc<Mutex<Vec<String>>>,
             fail_run: Mutex<Option<String>>,
             fail_spawn: Mutex<Option<String>>,
+            spawn_delay: Mutex<Option<Duration>>,
         }
 
         fn line(kind: &str, argv: &[OsString], cwd: &Path) -> String {
@@ -5572,6 +5709,10 @@ mod tests {
                 self.fail_run.lock().unwrap().clone().map_or(Ok(()), Err)
             }
             fn spawn_detached(&self, argv: &[OsString], cwd: &Path) -> Result<(), String> {
+                let delay = *self.spawn_delay.lock().unwrap();
+                if let Some(d) = delay {
+                    std::thread::sleep(d);
+                }
                 self.log.lock().unwrap().push(line("spawn", argv, cwd));
                 self.fail_spawn.lock().unwrap().clone().map_or(Ok(()), Err)
             }
@@ -5678,10 +5819,12 @@ mod tests {
             let mut e = env(&format!("{CAT}background = true\n"));
             press(&mut e.app, KeyCode::Enter);
             assert!(!e.app.has_pending_run());
+            tick_until(&mut e.app, "status", |a| {
+                a.status.as_deref() == Some("실행: f.txt")
+            });
             let got = log(&e);
             assert_eq!(got.len(), 1, "{got:?}");
             assert!(got[0].starts_with("spawn ") && got[0].contains("cat \"$1\""));
-            assert_eq!(e.app.status.as_deref(), Some("실행: f.txt"));
         }
 
         #[cfg(unix)]
@@ -5695,7 +5838,9 @@ mod tests {
             let mut e = env(&format!("{CAT}background = true\n"));
             *e.fake.fail_spawn.lock().unwrap() = Some("boom".into());
             press(&mut e.app, KeyCode::Enter);
-            assert_eq!(e.app.status.as_deref(), Some("오류: cat {}: boom"));
+            tick_until(&mut e.app, "error", |a| {
+                a.status.as_deref() == Some("오류: cat {}: boom")
+            });
         }
 
         #[cfg(unix)]
@@ -5711,7 +5856,7 @@ mod tests {
         #[test]
         fn no_rule_text_opens_the_viewer_without_launching() {
             let mut e = env("");
-            e.app.text_probe = Arc::new(|_| true);
+            e.app.text_probe = Arc::new(|_| Ok(true));
             press(&mut e.app, KeyCode::Enter);
             tick_until(&mut e.app, "viewer", |a| a.viewer.is_some());
             assert!(log(&e).is_empty() && !e.app.has_pending_run());
@@ -5741,10 +5886,12 @@ mod tests {
         #[test]
         fn no_rule_binary_goes_to_the_system_opener_in_the_background() {
             let mut e = env("");
-            e.app.text_probe = Arc::new(|_| false);
+            e.app.text_probe = Arc::new(|_| Ok(false));
             press(&mut e.app, KeyCode::Enter);
             let l = Arc::clone(&e.log);
-            tick_until(&mut e.app, "spawn", move |_| !l.lock().unwrap().is_empty());
+            tick_until(&mut e.app, "spawn", move |a| {
+                !l.lock().unwrap().is_empty() && a.status.is_some()
+            });
             let got = log(&e);
             let cwd = e.app.panels[0].cwd.display().to_string();
             assert_eq!(
@@ -5762,7 +5909,7 @@ mod tests {
         #[test]
         fn system_opener_spawn_failure_reports_error() {
             let mut e = env("");
-            e.app.text_probe = Arc::new(|_| false);
+            e.app.text_probe = Arc::new(|_| Ok(false));
             *e.fake.fail_spawn.lock().unwrap() = Some("no such file".into());
             press(&mut e.app, KeyCode::Enter);
             let want = format!("오류: {}: no such file", crate::assoc::system_opener());
@@ -5776,7 +5923,7 @@ mod tests {
             let rx = Mutex::new(rx);
             e.app.text_probe = Arc::new(move |_| {
                 let _ = rx.lock().unwrap().recv();
-                true
+                Ok(true)
             });
             press(&mut e.app, KeyCode::Enter); // returns while the probe waits
             assert!(e.app.viewer.is_none());
@@ -5806,10 +5953,201 @@ mod tests {
         #[test]
         fn windows_system_opener_shows_the_planned_message() {
             let mut e = env("");
-            e.app.text_probe = Arc::new(|_| false);
+            e.app.text_probe = Arc::new(|_| Ok(false));
             press(&mut e.app, KeyCode::Enter);
             tick_until(&mut e.app, "msg", |a| {
                 a.status.as_deref() == Some("Windows 지원 예정")
+            });
+        }
+
+        // ---- review fixes: stale probes, probe errors, special files, bg spawn ----
+
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AO};
+
+        fn add_file(e: &mut Env, name: &str) {
+            let root = e.app.panels[0].cwd.clone();
+            fs::write(root.join(name), "y").unwrap();
+            e.app.reload_panel(0, None);
+            settle(&mut e.app);
+        }
+
+        fn quiet_ticks(app: &mut App) {
+            for _ in 0..40 {
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// A probe that blocks for `f.txt` until `open` is set (text), and
+        /// answers `Ok(false)` at once for any other file.
+        fn gated_probe(open: &Arc<AtomicBool>, calls: &Arc<AtomicUsize>) -> TextProbe {
+            let (open, calls) = (Arc::clone(open), Arc::clone(calls));
+            Arc::new(move |p| {
+                calls.fetch_add(1, AO::SeqCst);
+                if p.file_name().is_some_and(|n| n == "f.txt") {
+                    while !open.load(AO::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    return Ok(true);
+                }
+                Ok(false)
+            })
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn stale_probe_is_ignored_after_a_newer_enter() {
+            let mut e = env("");
+            add_file(&mut e, "g.txt");
+            let (open, calls) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            e.app.text_probe = gated_probe(&open, &calls);
+            cursor_to(&mut e.app, "f.txt");
+            press(&mut e.app, KeyCode::Enter); // A pending
+            cursor_to(&mut e.app, "g.txt");
+            press(&mut e.app, KeyCode::Enter); // B supersedes A
+            open.store(true, AO::SeqCst); // release A
+            let l = Arc::clone(&e.log);
+            tick_until(&mut e.app, "B spawn", move |_| {
+                !l.lock().unwrap().is_empty()
+            });
+            quiet_ticks(&mut e.app);
+            assert!(e.app.viewer.is_none(), "A's text result must be dropped");
+            let got = log(&e);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert!(got[0].contains("g.txt"), "{got:?}");
+        }
+
+        #[test]
+        fn stale_probe_is_ignored_after_a_screen_opened_and_closed() {
+            let mut e = env("");
+            let (open, calls) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            e.app.text_probe = gated_probe(&open, &calls);
+            press(&mut e.app, KeyCode::Enter); // A pending
+            press(&mut e.app, KeyCode::F(1));
+            assert!(e.app.screen.is_some());
+            press(&mut e.app, KeyCode::Esc);
+            assert!(e.app.screen.is_none());
+            open.store(true, AO::SeqCst);
+            quiet_ticks(&mut e.app);
+            assert!(e.app.viewer.is_none() && log(&e).is_empty());
+        }
+
+        #[test]
+        fn stale_probe_is_ignored_after_tab() {
+            let mut e = env("");
+            let (open, calls) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            e.app.text_probe = gated_probe(&open, &calls);
+            press(&mut e.app, KeyCode::Enter);
+            press(&mut e.app, KeyCode::Tab);
+            press(&mut e.app, KeyCode::Tab);
+            open.store(true, AO::SeqCst);
+            quiet_ticks(&mut e.app);
+            assert!(e.app.viewer.is_none() && log(&e).is_empty());
+        }
+
+        fn status_starts(e: &mut Env, prefix: &str) {
+            let prefix = prefix.to_string();
+            tick_until(&mut e.app, "probe error", move |a| {
+                a.status.as_deref().is_some_and(|s| s.starts_with(&prefix))
+            });
+            assert!(e.app.viewer.is_none() && log(e).is_empty());
+            assert!(!e.app.has_pending_run());
+        }
+
+        #[test]
+        fn vanished_file_reports_an_error_instead_of_opening() {
+            let mut e = env("");
+            let root = e.app.panels[0].cwd.clone();
+            fs::remove_file(root.join("f.txt")).unwrap();
+            press(&mut e.app, KeyCode::Enter);
+            status_starts(&mut e, "오류: f.txt: ");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn unreadable_file_reports_an_error_instead_of_opening() {
+            use std::os::unix::fs::PermissionsExt;
+            let mut e = env("");
+            let root = e.app.panels[0].cwd.clone();
+            let f = root.join("f.txt");
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::File::open(&f).is_ok() {
+                return; // running as root: cannot make it unreadable
+            }
+            press(&mut e.app, KeyCode::Enter);
+            status_starts(&mut e, "오류: f.txt: ");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn broken_symlink_reports_an_error_instead_of_opening() {
+            let mut e = env("");
+            let root = e.app.panels[0].cwd.clone();
+            std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling.txt")).unwrap();
+            e.app.reload_panel(0, None);
+            settle(&mut e.app);
+            cursor_to(&mut e.app, "dangling.txt");
+            press(&mut e.app, KeyCode::Enter);
+            status_starts(&mut e, "오류: dangling.txt: ");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn fifo_is_rejected_without_a_blocking_read() {
+            let mut e = env("");
+            let root = e.app.panels[0].cwd.clone();
+            let fifo = root.join("pipe");
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            e.app.reload_panel(0, None);
+            settle(&mut e.app);
+            cursor_to(&mut e.app, "pipe");
+            press(&mut e.app, KeyCode::Enter);
+            tick_until(&mut e.app, "special", |a| {
+                a.status.as_deref() == Some("특수 파일은 열 수 없음")
+            });
+            assert!(e.app.viewer.is_none() && log(&e).is_empty());
+        }
+
+        #[test]
+        fn probe_spam_keeps_one_in_flight_and_at_most_two_runs() {
+            let mut e = env("");
+            let (open, calls) = (
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicUsize::new(0)),
+            );
+            e.app.text_probe = gated_probe(&open, &calls);
+            for _ in 0..10 {
+                press(&mut e.app, KeyCode::Enter);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(calls.load(AO::SeqCst), 1, "one probe in flight");
+            open.store(true, AO::SeqCst);
+            tick_until(&mut e.app, "viewer", |a| a.viewer.is_some());
+            quiet_ticks(&mut e.app);
+            assert!(calls.load(AO::SeqCst) <= 2, "{}", calls.load(AO::SeqCst));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn background_spawn_does_not_block_the_ui_thread() {
+            let mut e = env(&format!("{CAT}background = true\n"));
+            *e.fake.spawn_delay.lock().unwrap() = Some(Duration::from_millis(600));
+            let t0 = Instant::now();
+            press(&mut e.app, KeyCode::Enter);
+            press(&mut e.app, KeyCode::Down);
+            assert!(t0.elapsed() < Duration::from_millis(300), "UI blocked");
+            tick_until(&mut e.app, "status", |a| {
+                a.status.as_deref() == Some("실행: f.txt")
             });
         }
 
@@ -5864,6 +6202,8 @@ mod tests {
             press(&mut e.app, KeyCode::Down);
             press(&mut e.app, KeyCode::Down); // system
             press(&mut e.app, KeyCode::Enter);
+            let l = Arc::clone(&e.log);
+            tick_until(&mut e.app, "spawn", move |_| !l.lock().unwrap().is_empty());
             let got = log(&e);
             assert_eq!(got.len(), 1, "{got:?}");
             assert!(got[0].starts_with(&format!("spawn {}|", crate::assoc::system_opener())));
