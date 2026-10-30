@@ -8,6 +8,11 @@
 //! - BSD listing prints the name via `printf '%s\0'` instead of `stat %N`
 //!   (which appends ` -> target` for symlinks), so the record layout is the
 //!   same as Linux: `kind \t size \t mtime \t perm \t name \0`.
+//! - Symlinks carry `target_is_dir` (`find %Y` / `stat -L -f %HT`), so the
+//!   record layout is `kind \t size \t mtime \t perm \t target-kind \t name \0`.
+//! - scp: OpenSSH >= 9.0 speaks SFTP by default, where the remote path is not
+//!   shell-interpreted (quotes would be literal) but glob characters in a
+//!   *source* path are still expanded. See [`ScpMode`].
 //! - ssh commands put `--` before the host; scp hosts starting with `-` are
 //!   rejected.
 
@@ -49,6 +54,8 @@ pub struct RemoteEntry {
     pub size: u64,
     pub mtime: Option<SystemTime>,
     pub mode: u32,
+    /// Symlinks only: the target is a directory (false if unknown/dangling).
+    pub target_is_dir: bool,
 }
 
 pub enum Endpoint<'a> {
@@ -157,7 +164,8 @@ pub fn list_cmd(os: &RemoteOs, dir: &[u8], show_hidden: bool) -> Vec<u8> {
                 b" && for f in ",
                 globs,
                 b"; do [ -e \"$f\" ] || [ -L \"$f\" ] || continue; \
-stat -f '%HT%t%z%t%m%t%Lp%t' -- \"./$f\" && printf '%s\\0' \"$f\"; done",
+t=$(stat -L -f %HT -- \"./$f\" 2>/dev/null) || t=; \
+stat -n -f '%HT%t%z%t%m%t%Lp%t' -- \"./$f\" && printf '%s\\t%s\\0' \"$t\" \"$f\"; done",
             ])
         }
         _ => {
@@ -167,7 +175,7 @@ stat -f '%HT%t%z%t%m%t%Lp%t' -- \"./$f\" && printf '%s\\0' \"$f\"; done",
                 &q,
                 b" && find . -mindepth 1 -maxdepth 1",
                 filter,
-                b" -printf '%y\\t%s\\t%T@\\t%m\\t%P\\0'",
+                b" -printf '%y\\t%s\\t%T@\\t%m\\t%Y\\t%P\\0'",
             ])
         }
     }
@@ -211,11 +219,12 @@ fn parse_mtime(f: &[u8]) -> Option<SystemTime> {
 }
 
 fn parse_record(os: &RemoteOs, rec: &[u8]) -> Option<RemoteEntry> {
-    let mut it = rec.splitn(5, |&b| b == b'\t');
+    let mut it = rec.splitn(6, |&b| b == b'\t');
     let kind = parse_kind(os, it.next()?)?;
     let size: u64 = std::str::from_utf8(it.next()?).ok()?.parse().ok()?;
     let mtime = parse_mtime(it.next()?);
     let mode = u32::from_str_radix(std::str::from_utf8(it.next()?).ok()?, 8).ok()?;
+    let target_is_dir = matches!(it.next()?, b"d" | b"Directory") && kind == RemoteKind::Symlink;
     let name = it.next()?;
     if name.is_empty() || mode > 0o7777 {
         return None;
@@ -226,6 +235,7 @@ fn parse_record(os: &RemoteOs, rec: &[u8]) -> Option<RemoteEntry> {
         size,
         mtime,
         mode,
+        target_is_dir,
     })
 }
 
@@ -268,13 +278,62 @@ pub fn rm_cmd(paths: &[&[u8]]) -> Vec<u8> {
     o
 }
 
-fn remote_arg(t: &SshTarget, path: &[u8]) -> Result<OsString, String> {
+/// How the local `scp` interprets remote paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScpMode {
+    /// OpenSSH >= 9.0: SFTP protocol, remote paths are not shell-interpreted.
+    Sftp,
+    /// Older scp: the remote path goes through the remote shell.
+    Legacy,
+}
+
+/// Decide the scp mode from the local `ssh -V` output (e.g.
+/// `OpenSSH_9.6p1 Ubuntu-...`, `OpenSSH_for_Windows_9.5p2`). Unparsable
+/// output is assumed to be a modern (sftp) scp.
+pub fn scp_mode_from_version(ssh_v_output: &str) -> ScpMode {
+    let major = ssh_v_output.split("OpenSSH_").nth(1).and_then(|r| {
+        let r = r.strip_prefix("for_Windows_").unwrap_or(r);
+        let digits: String = r.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u32>().ok()
+    });
+    match major {
+        Some(m) if m < 9 => ScpMode::Legacy,
+        _ => ScpMode::Sftp,
+    }
+}
+
+/// Backslash-escape the glob metacharacters `* ? [ ] \` of an SFTP *source*
+/// path. Verified against OpenSSH 10.4 client / 9.6 server: unescaped they
+/// expand (`star*` also fetched `starX`), `\\` is needed for a literal
+/// backslash, and `{}`, `~`, `%`, `$`, quotes and spaces are literal.
+/// Destination paths are not globbed and must stay raw.
+pub fn sftp_glob_escape(path: &[u8]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(path.len());
+    for &b in path {
+        if matches!(b, b'*' | b'?' | b'[' | b']' | b'\\') {
+            o.push(b'\\');
+        }
+        o.push(b);
+    }
+    o
+}
+
+fn remote_arg(
+    t: &SshTarget,
+    path: &[u8],
+    mode: ScpMode,
+    is_source: bool,
+) -> Result<OsString, String> {
     if t.host.is_empty() || t.host.starts_with('-') {
         return Err(format!("invalid host: {:?}", t.host));
     }
     let mut b = t.host.as_bytes().to_vec();
     b.push(b':');
-    b.extend_from_slice(&sh_quote(path));
+    match (mode, is_source) {
+        (ScpMode::Legacy, _) => b.extend_from_slice(&sh_quote(path)),
+        (ScpMode::Sftp, true) => b.extend_from_slice(&sftp_glob_escape(path)),
+        (ScpMode::Sftp, false) => b.extend_from_slice(path),
+    }
     Ok(os_from_bytes(b))
 }
 
@@ -310,18 +369,28 @@ fn local_arg(p: &Path) -> OsString {
 }
 
 /// scp argv copying `src` into directory `dst_dir`.
-pub fn scp_argv(src: &Endpoint, dst_dir: &Endpoint) -> Result<Vec<OsString>, String> {
+pub fn scp_argv(
+    src: &Endpoint,
+    dst_dir: &Endpoint,
+    mode: ScpMode,
+) -> Result<Vec<OsString>, String> {
     let mut v = vec![os("scp")];
     let (ctrl, port, a, b) = match (src, dst_dir) {
         (Endpoint::Local(_), Endpoint::Local(_)) => {
             return Err("local to local copy is not an scp route (use fs_ops)".into());
         }
-        (Endpoint::Local(p), Endpoint::Remote(t, d)) => {
-            (Some(*t), t.port, local_arg(p), remote_arg(t, d)?)
-        }
-        (Endpoint::Remote(t, s), Endpoint::Local(p)) => {
-            (Some(*t), t.port, remote_arg(t, s)?, local_arg(p))
-        }
+        (Endpoint::Local(p), Endpoint::Remote(t, d)) => (
+            Some(*t),
+            t.port,
+            local_arg(p),
+            remote_arg(t, d, mode, false)?,
+        ),
+        (Endpoint::Remote(t, s), Endpoint::Local(p)) => (
+            Some(*t),
+            t.port,
+            remote_arg(t, s, mode, true)?,
+            local_arg(p),
+        ),
         (Endpoint::Remote(ts, s), Endpoint::Remote(td, d)) => {
             if ts.port != td.port {
                 return Err("remote to remote with different ports is unsupported".into());
@@ -329,7 +398,12 @@ pub fn scp_argv(src: &Endpoint, dst_dir: &Endpoint) -> Result<Vec<OsString>, Str
             v.push(os("-3"));
             // Only share ControlPath when both ends use the same master.
             let ctrl = (ts.control_path == td.control_path).then_some(*ts);
-            (ctrl, ts.port, remote_arg(ts, s)?, remote_arg(td, d)?)
+            (
+                ctrl,
+                ts.port,
+                remote_arg(ts, s, mode, true)?,
+                remote_arg(td, d, mode, false)?,
+            )
         }
     };
     v.push(os("-rp"));
@@ -345,13 +419,12 @@ pub fn scp_argv(src: &Endpoint, dst_dir: &Endpoint) -> Result<Vec<OsString>, Str
 }
 
 impl RemoteEntry {
-    /// Convert for panel display. Symlink targets are unknown (`target_is_dir: false`);
-    /// special files are shown as plain files.
+    /// Convert for panel display. Special files are shown as plain files.
     pub fn to_entry(&self) -> Entry {
         let kind = match self.kind {
             RemoteKind::Dir => EntryKind::Dir,
             RemoteKind::Symlink => EntryKind::Symlink {
-                target_is_dir: false,
+                target_is_dir: self.target_is_dir,
             },
             RemoteKind::File | RemoteKind::Special => EntryKind::File,
         };
@@ -493,7 +566,7 @@ mod tests {
         let c = s(list_cmd(&RemoteOs::Linux, b"/srv/a b", true));
         assert_eq!(
             c,
-            "cd -- '/srv/a b' && find . -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%m\\t%P\\0'"
+            "cd -- '/srv/a b' && find . -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%T@\\t%m\\t%Y\\t%P\\0'"
         );
         let c = s(list_cmd(&RemoteOs::Linux, b"/x'y\nz", false));
         assert!(c.starts_with("cd -- '/x'\\''y\nz' && find ."));
@@ -509,8 +582,9 @@ mod tests {
         let c = s(list_cmd(&RemoteOs::Bsd, b"/Users/a b", true));
         assert!(c.starts_with("cd -- '/Users/a b' && for f in * .[!.]* ..?*; do "));
         assert!(c.contains("[ -e \"$f\" ] || [ -L \"$f\" ] || continue;"));
-        assert!(c.contains("stat -f '%HT%t%z%t%m%t%Lp%t' -- \"./$f\""));
-        assert!(c.contains("printf '%s\\0' \"$f\""));
+        assert!(c.contains("t=$(stat -L -f %HT -- \"./$f\" 2>/dev/null) || t=;"));
+        assert!(c.contains("stat -n -f '%HT%t%z%t%m%t%Lp%t' -- \"./$f\""));
+        assert!(c.contains("printf '%s\\t%s\\0' \"$t\" \"$f\""));
         assert!(c.ends_with("done"));
         let c = s(list_cmd(&RemoteOs::Bsd, b"/it's", false));
         assert!(c.contains("'/it'\\''s'"));
@@ -521,14 +595,16 @@ mod tests {
     #[test]
     fn parse_linux_sample() {
         let mut out = Vec::new();
-        out.extend_from_slice(b"d\t4096\t1700000000.5000000000\t755\tsub dir\0");
-        out.extend_from_slice(b"f\t12\t1700000001.0000000000\t644\t\xed\x95\x9c\xea\xb8\x80.txt\0");
-        out.extend_from_slice(b"l\t5\t1700000002.25\t777\tlink\0");
-        out.extend_from_slice(b"p\t0\t1700000003.0\t600\tfifo\0");
-        out.extend_from_slice(b"s\t0\t1700000003.0\t600\tsock\0");
-        out.extend_from_slice(b"c\t0\t1700000003.0\t600\tchr\0");
-        out.extend_from_slice(b"f\t1\t1700000004.0\t644\ttab\tin\nname\0");
-        out.extend_from_slice(b"f\t1\t1700000004.0\t644\tbad\xff\xfename\0");
+        out.extend_from_slice(b"d\t4096\t1700000000.5000000000\t755\td\tsub dir\0");
+        out.extend_from_slice(
+            b"f\t12\t1700000001.0000000000\t644\tf\t\xed\x95\x9c\xea\xb8\x80.txt\0",
+        );
+        out.extend_from_slice(b"l\t5\t1700000002.25\t777\td\tlink\0");
+        out.extend_from_slice(b"p\t0\t1700000003.0\t600\tp\tfifo\0");
+        out.extend_from_slice(b"s\t0\t1700000003.0\t600\ts\tsock\0");
+        out.extend_from_slice(b"c\t0\t1700000003.0\t600\tc\tchr\0");
+        out.extend_from_slice(b"f\t1\t1700000004.0\t644\tf\ttab\tin\nname\0");
+        out.extend_from_slice(b"f\t1\t1700000004.0\t644\tf\tbad\xff\xfename\0");
         let (e, bad) = parse_listing(&RemoteOs::Linux, &out);
         assert_eq!(bad, 0);
         assert_eq!(e.len(), 8);
@@ -543,6 +619,8 @@ mod tests {
         assert_eq!(e[1].name, OsString::from("한글.txt"));
         assert_eq!(e[1].kind, RemoteKind::File);
         assert_eq!(e[2].kind, RemoteKind::Symlink);
+        assert!(e[2].target_is_dir);
+        assert!(!e[1].target_is_dir);
         assert_eq!(
             e[2].mtime,
             Some(UNIX_EPOCH + Duration::new(1_700_000_002, 250_000_000))
@@ -559,17 +637,23 @@ mod tests {
 
     #[test]
     fn parse_bsd_sample() {
-        let out = b"Directory\t96\t1700000000\t755\td\0Regular File\t3\t1700000001\t644\tf f\0\
-Symbolic Link\t4\t1700000002\t755\tl\0Fifo File\t0\t1700000003\t644\tq\0Socket\t0\t1\t644\ts\0\
-Character Device\t0\t1\t600\tc\0Block Device\t0\t1\t600\tb\0";
+        let out = b"Directory\t96\t1700000000\t755\tDirectory\td\0Regular File\t3\t1700000001\t644\tRegular File\tf f\0\
+Symbolic Link\t4\t1700000002\t755\tDirectory\tl\0Fifo File\t0\t1700000003\t644\tFifo File\tq\0Socket\t0\t1\t644\tSocket\ts\0\
+Character Device\t0\t1\t600\tCharacter Device\tc\0Block Device\t0\t1\t600\tBlock Device\tb\0\
+Symbolic Link\t4\t1\t755\t\tbroken\0Symbolic Link\t4\t1\t755\tRegular File\tlf\0";
         let (e, bad) = parse_listing(&RemoteOs::Bsd, out);
         assert_eq!(bad, 0);
         let k: Vec<_> = e.iter().map(|x| x.kind).collect();
         use RemoteKind::*;
         assert_eq!(
             k,
-            vec![Dir, File, Symlink, Special, Special, Special, Special]
+            vec![
+                Dir, File, Symlink, Special, Special, Special, Special, Symlink, Symlink
+            ]
         );
+        assert!(e[2].target_is_dir);
+        assert!(!e[7].target_is_dir, "broken link: target unknown");
+        assert!(!e[8].target_is_dir);
         assert_eq!(e[1].name, OsString::from("f f"));
         assert_eq!(
             e[0].mtime,
@@ -580,16 +664,92 @@ Character Device\t0\t1\t600\tc\0Block Device\t0\t1\t600\tb\0";
 
     #[test]
     fn parse_malformed_counted() {
-        let out = b"f\t1\t1.0\t644\tok\0garbage\0f\tNaN\t1.0\t644\tx\0f\t1\t1.0\t999\tbadmode\0\
-f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
+        let out =
+            b"f\t1\t1.0\t644\tf\tok\0garbage\0f\tNaN\t1.0\t644\tf\tx\0f\t1\t1.0\t999\tf\tbadmode\0\
+f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\t644\told-layout\0";
         let (e, bad) = parse_listing(&RemoteOs::Linux, out);
         assert_eq!(e.len(), 2);
-        assert_eq!(bad, 6);
+        assert_eq!(bad, 7);
         assert_eq!(e[1].name, OsString::from("ok2"));
-        let (e, bad) = parse_listing(&RemoteOs::Bsd, b"Weird\t1\t1\t644\tn\0");
+        let (e, bad) = parse_listing(&RemoteOs::Bsd, b"Weird\t1\t1\t644\t\tn\0");
         assert!(e.is_empty());
         assert_eq!(bad, 1);
         assert_eq!(parse_listing(&RemoteOs::Linux, b""), (vec![], 0));
+    }
+
+    /// Fixture for the real-shell listing tests.
+    #[cfg(unix)]
+    fn list_fixture(d: &Path) {
+        use std::os::unix::fs::symlink;
+        std::fs::write(d.join("plain"), "abc").unwrap();
+        std::fs::write(d.join(".hid"), "").unwrap();
+        std::fs::write(d.join("한글\t탭\n개행 'q'"), "xy").unwrap();
+        std::fs::create_dir(d.join("sub dir")).unwrap();
+        symlink("sub dir", d.join("lnd")).unwrap();
+        symlink("plain", d.join("lnf")).unwrap();
+        symlink("nope", d.join("bad")).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn run_list(os: &RemoteOs, show_hidden: bool) -> (Vec<RemoteEntry>, usize, tempfile::TempDir) {
+        let d = tempfile::tempdir().unwrap();
+        list_fixture(d.path());
+        let cmd = list_cmd(os, os_bytes(d.path().as_os_str()).as_ref(), show_hidden);
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(os_from_bytes(cmd))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (e, bad) = parse_listing(os, &out.stdout);
+        (e, bad, d)
+    }
+
+    #[cfg(unix)]
+    fn check_real_listing(os: &RemoteOs) {
+        let (mut e, bad, _d) = run_list(os, true);
+        assert_eq!(bad, 0);
+        assert_eq!(e.len(), 7);
+        e.sort_by(|a, b| a.name.cmp(&b.name));
+        let get = |n: &str| e.iter().find(|x| x.name == n).unwrap();
+        let p = get("plain");
+        assert_eq!((p.kind, p.size, p.mode), (RemoteKind::File, 3, 0o644));
+        assert!(p.mtime.is_some());
+        let k = get("한글\t탭\n개행 'q'");
+        assert_eq!((k.kind, k.size), (RemoteKind::File, 2));
+        assert_eq!(get(".hid").size, 0);
+        let sd = get("sub dir");
+        assert_eq!(sd.kind, RemoteKind::Dir);
+        assert!(!sd.target_is_dir);
+        let ld = get("lnd");
+        assert_eq!(ld.kind, RemoteKind::Symlink);
+        assert!(ld.target_is_dir, "symlink to dir");
+        let lf = get("lnf");
+        assert_eq!(lf.kind, RemoteKind::Symlink);
+        assert!(!lf.target_is_dir, "symlink to file");
+        let b = get("bad");
+        assert_eq!(b.kind, RemoteKind::Symlink);
+        assert!(!b.target_is_dir, "dangling symlink");
+        let (visible, bad, _d) = run_list(os, false);
+        assert_eq!(bad, 0);
+        assert_eq!(visible.len(), 6);
+        assert!(visible.iter().all(|x| x.name != ".hid"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bsd_list_cmd_real_stat() {
+        check_real_listing(&RemoteOs::Bsd);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_list_cmd_real_find() {
+        check_real_listing(&RemoteOs::Linux);
     }
 
     #[test]
@@ -600,6 +760,7 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
             size: 7,
             mtime: None,
             mode: 0o777,
+            target_is_dir: true,
         };
         let e = r.to_entry();
         assert_eq!(e.name, "한글");
@@ -607,7 +768,7 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         assert_eq!(
             e.kind,
             EntryKind::Symlink {
-                target_is_dir: false
+                target_is_dir: true
             }
         );
         assert_eq!(e.size, 7);
@@ -632,11 +793,12 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
     }
 
     #[test]
-    fn scp_routes() {
+    fn scp_routes_legacy_quoted() {
         let a = t(None);
         let up = scp_argv(
             &Endpoint::Local(Path::new("/l/f x")),
             &Endpoint::Remote(&a, b"/r/d"),
+            ScpMode::Legacy,
         )
         .unwrap();
         assert_eq!(
@@ -655,6 +817,7 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         let down = scp_argv(
             &Endpoint::Remote(&b, b"/r/it's"),
             &Endpoint::Local(Path::new("/l")),
+            ScpMode::Legacy,
         )
         .unwrap();
         assert_eq!(
@@ -674,13 +837,23 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         let mut c = t(None);
         c.host = "other".into();
         c.control_path = PathBuf::from("/c/cm-2");
-        let rr = scp_argv(&Endpoint::Remote(&a, b"/s"), &Endpoint::Remote(&c, b"/d")).unwrap();
+        let rr = scp_argv(
+            &Endpoint::Remote(&a, b"/s"),
+            &Endpoint::Remote(&c, b"/d"),
+            ScpMode::Legacy,
+        )
+        .unwrap();
         // distinct masters: no ControlPath (it would be applied to the wrong host)
         assert_eq!(
             rr,
             v(&["scp", "-3", "-rp", "--", "prod:'/s'", "other:'/d'"])
         );
-        let same = scp_argv(&Endpoint::Remote(&a, b"/s"), &Endpoint::Remote(&a, b"/d")).unwrap();
+        let same = scp_argv(
+            &Endpoint::Remote(&a, b"/s"),
+            &Endpoint::Remote(&a, b"/d"),
+            ScpMode::Legacy,
+        )
+        .unwrap();
         assert_eq!(
             same,
             v(&[
@@ -697,12 +870,75 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
     }
 
     #[test]
+    fn scp_mode_detection() {
+        use ScpMode::*;
+        let m = scp_mode_from_version;
+        assert_eq!(
+            m("OpenSSH_9.6p1 Ubuntu-3ubuntu13.20, OpenSSL 3.0.13\n"),
+            Sftp
+        );
+        assert_eq!(m("OpenSSH_10.4p1, OpenSSL 3.6.4"), Sftp);
+        assert_eq!(m("OpenSSH_9.0p1"), Sftp);
+        assert_eq!(m("OpenSSH_8.9p1 Ubuntu"), Legacy);
+        assert_eq!(m("OpenSSH_7.4p1, OpenSSL 1.0.2k-fips"), Legacy);
+        assert_eq!(m("OpenSSH_for_Windows_9.5p2, LibreSSL 3.8.2"), Sftp);
+        assert_eq!(m("OpenSSH_for_Windows_8.1p1, LibreSSL 3.0.2"), Legacy);
+        // unparsable output: assume a modern (sftp) scp
+        assert_eq!(m(""), Sftp);
+        assert_eq!(m("dropbear v2022.83"), Sftp);
+    }
+
+    #[test]
+    fn sftp_glob_escape_rules() {
+        assert_eq!(sftp_glob_escape(b"/a b/it's$x"), b"/a b/it's$x");
+        assert_eq!(sftp_glob_escape(b"star*"), b"star\\*");
+        assert_eq!(sftp_glob_escape(b"q?[a]\\x"), b"q\\?\\[a\\]\\\\x");
+        // braces / tilde / percent are not glob syntax for sftp scp (verified)
+        assert_eq!(sftp_glob_escape(b"{a,b}~%"), b"{a,b}~%");
+        assert_eq!(
+            sftp_glob_escape("한글 파일".as_bytes()),
+            "한글 파일".as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scp_sftp_source_escaped_dest_raw() {
+        let a = t(None);
+        let up = scp_argv(
+            &Endpoint::Local(Path::new("/l/f x")),
+            &Endpoint::Remote(&a, b"/r/it's d*r"),
+            ScpMode::Sftp,
+        )
+        .unwrap();
+        // destination of an upload is not globbed by sftp: raw, no quotes
+        assert_eq!(up[up.len() - 1], OsString::from("prod:/r/it's d*r"));
+        let down = scp_argv(
+            &Endpoint::Remote(&a, b"/r/it's *.txt"),
+            &Endpoint::Local(Path::new("/l")),
+            ScpMode::Sftp,
+        )
+        .unwrap();
+        assert_eq!(down[down.len() - 2], OsString::from("prod:/r/it's \\*.txt"));
+        let rr = scp_argv(
+            &Endpoint::Remote(&a, b"/s[1]"),
+            &Endpoint::Remote(&a, b"/d[1]"),
+            ScpMode::Sftp,
+        )
+        .unwrap();
+        assert_eq!(rr[rr.len() - 2], OsString::from("prod:/s\\[1\\]"));
+        assert_eq!(rr[rr.len() - 1], OsString::from("prod:/d[1]"));
+        assert!(!rr.contains(&OsString::from("-O")));
+    }
+
+    #[test]
     fn scp_errors_and_edge() {
         let a = t(None);
         assert!(
             scp_argv(
                 &Endpoint::Local(Path::new("/a")),
-                &Endpoint::Local(Path::new("/b"))
+                &Endpoint::Local(Path::new("/b")),
+                ScpMode::Sftp
             )
             .is_err()
         );
@@ -711,17 +947,26 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         assert!(
             scp_argv(
                 &Endpoint::Local(Path::new("/a")),
-                &Endpoint::Remote(&bad, b"/d")
+                &Endpoint::Remote(&bad, b"/d"),
+                ScpMode::Sftp
             )
             .is_err()
         );
         let mut c = t(Some(1));
         c.host = "o".into();
         c.control_path = PathBuf::from("/c/cm-2");
-        assert!(scp_argv(&Endpoint::Remote(&a, b"/s"), &Endpoint::Remote(&c, b"/d")).is_err());
+        assert!(
+            scp_argv(
+                &Endpoint::Remote(&a, b"/s"),
+                &Endpoint::Remote(&c, b"/d"),
+                ScpMode::Sftp
+            )
+            .is_err()
+        );
         let r = scp_argv(
             &Endpoint::Local(Path::new("a:b")),
             &Endpoint::Remote(&a, b"/d"),
+            ScpMode::Sftp,
         )
         .unwrap();
         #[cfg(unix)]
@@ -739,12 +984,14 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         let up = scp_argv(
             &Endpoint::Local(Path::new(r"C:\Users\x\f.txt")),
             &Endpoint::Remote(&a, b"/r/d"),
+            ScpMode::Legacy,
         )
         .unwrap();
         assert_eq!(up[up.len() - 2], OsString::from(r"C:\Users\x\f.txt"));
         let down = scp_argv(
             &Endpoint::Remote(&a, b"/r/f"),
             &Endpoint::Local(Path::new(r"D:\한글 dir")),
+            ScpMode::Legacy,
         )
         .unwrap();
         assert_eq!(down[down.len() - 1], OsString::from(r"D:\한글 dir"));
@@ -752,6 +999,7 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         let rel = scp_argv(
             &Endpoint::Local(Path::new(r"a:b\f")),
             &Endpoint::Remote(&a, b"/d"),
+            ScpMode::Legacy,
         )
         .unwrap();
         assert_eq!(rel[rel.len() - 2], OsString::from(r".\a:b\f"));
@@ -766,8 +1014,108 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         let r = scp_argv(
             &Endpoint::Local(Path::new(r"C:\x")),
             &Endpoint::Remote(&a, "/r/한 글's".as_bytes()),
+            ScpMode::Legacy,
         )
         .unwrap();
         assert_eq!(r[r.len() - 1], OsString::from("prod:'/r/한 글'\\''s'"));
+    }
+
+    /// Real round trip against a server (manual):
+    /// `HDIR_SCP_HOST=user@host cargo test --lib scp_real -- --ignored`.
+    /// Uploads and downloads files with hostile names using the built argv.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn scp_real_round_trip() {
+        use std::process::Command;
+        let Ok(host) = std::env::var("HDIR_SCP_HOST") else {
+            return;
+        };
+        let ver = Command::new("ssh").arg("-V").output().unwrap();
+        let mode = scp_mode_from_version(&String::from_utf8_lossy(&ver.stderr));
+        let tgt = SshTarget {
+            host,
+            port: None,
+            control_path: PathBuf::from("/nonexistent/hdir-cm"),
+        };
+        let run = |argv: Vec<OsString>| {
+            // ControlPath points nowhere: ssh just opens a normal connection
+            let o = Command::new(&argv[0]).args(&argv[1..]).output().unwrap();
+            assert!(
+                o.status.success(),
+                "{argv:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        let sh = |cmd: &[u8]| {
+            Command::new("ssh")
+                .arg("--")
+                .arg(&tgt.host)
+                .arg(os_from_bytes(cmd.to_vec()))
+                .output()
+                .unwrap()
+        };
+        let base = b"/tmp/hdir-scp-test";
+        let rdir = b"/tmp/hdir-scp-test/d ir's $x*";
+        assert!(
+            sh(&cat(&[b"mkdir -p -- ", &sh_quote(rdir)]))
+                .status
+                .success()
+        );
+        let names = [
+            "a b",
+            "it's",
+            "dollar$HOME",
+            "star*",
+            "q?m",
+            "br[ack]et",
+            "back\\slash",
+            "한글 파일",
+            "-dash",
+        ];
+        let local = tempfile::tempdir().unwrap();
+        // decoys that a wrongly-expanded glob would also fetch
+        let decoys = ["starX", "q.m", "back-slash"];
+        for n in names.iter().chain(decoys.iter()) {
+            std::fs::write(local.path().join(n), n).unwrap();
+        }
+        for n in names.iter().chain(decoys.iter()) {
+            run(scp_argv(
+                &Endpoint::Local(&local.path().join(n)),
+                &Endpoint::Remote(&tgt, rdir),
+                mode,
+            )
+            .unwrap());
+        }
+        let back = tempfile::tempdir().unwrap();
+        for n in names {
+            let mut rp = rdir.to_vec();
+            rp.push(b'/');
+            rp.extend_from_slice(n.as_bytes());
+            run(scp_argv(
+                &Endpoint::Remote(&tgt, &rp),
+                &Endpoint::Local(back.path()),
+                mode,
+            )
+            .unwrap());
+            assert_eq!(std::fs::read_to_string(back.path().join(n)).unwrap(), n);
+        }
+        // exactly the names we sent exist remotely, and nothing was fetched twice
+        let got = sh(&cat(&[b"ls -1A -- ", &sh_quote(rdir)])).stdout;
+        let mut have: Vec<String> = String::from_utf8(got)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        have.sort();
+        let mut want: Vec<String> = names
+            .iter()
+            .chain(decoys.iter())
+            .map(|s| s.to_string())
+            .collect();
+        want.sort();
+        assert_eq!(have, want);
+        assert_eq!(std::fs::read_dir(back.path()).unwrap().count(), names.len());
+        sh(&cat(&[b"rm -rf -- ", &sh_quote(base)]));
     }
 }
