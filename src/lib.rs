@@ -10,6 +10,7 @@ pub mod loader;
 pub mod panel;
 pub mod platform;
 pub mod preview;
+pub mod servers;
 pub mod term;
 pub mod theme;
 pub mod trash;
