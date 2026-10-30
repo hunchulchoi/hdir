@@ -178,8 +178,12 @@ fn undo_trash(store: &dyn TrashStore, entries: Vec<TrashEntry>) -> UndoApplied {
     let report = crate::trash::restore_entries(store, &jobs, OnConflict::Report);
     let ok = report.restored.len();
     if ok == total {
+        let mut msg = format!("되돌림: 휴지통 복원 {ok}개");
+        if let Some(w) = report.warnings.first() {
+            msg.push_str(&format!(" · {w}"));
+        }
         return UndoApplied {
-            message: Ok(format!("되돌림: 휴지통 복원 {ok}개")),
+            message: Ok(msg),
             retry: None,
         };
     }
@@ -471,8 +475,9 @@ mod tests {
     fn trash_op(i: usize) -> UndoOp {
         UndoOp::Trash {
             entries: vec![TrashEntry {
-                id: format!("/nonexistent/hdir-undo-test/{i}"),
+                id: format!("/nonexistent/hdir-undo-test/{i}").into(),
                 name: format!("n{i}"),
+                os_name: format!("n{i}").into(),
                 original_parent: None,
                 deleted_at: Some(i as i64),
                 size: None,
@@ -484,7 +489,7 @@ mod tests {
     fn trash_files(store: &FakeTrashStore, paths: &[&Path]) -> UndoOp {
         let paths: Vec<PathBuf> = paths.iter().map(|p| p.to_path_buf()).collect();
         UndoOp::Trash {
-            entries: store.trash(&paths).unwrap(),
+            entries: store.trash(&paths).unwrap().entries,
         }
     }
 

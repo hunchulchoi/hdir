@@ -12,8 +12,11 @@
 //! with temp directories on every OS.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,10 +25,13 @@ use serde::{Deserialize, Serialize};
 /// One item in the trash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrashEntry {
-    /// Backend identifier (Linux: `.trashinfo` path, macOS: path inside the trash).
-    pub id: String,
-    /// Original file name (lossy UTF-8).
+    /// Backend identifier (Linux: `.trashinfo` path, macOS: path inside the
+    /// trash). Raw path, so non-UTF-8 names survive.
+    pub id: PathBuf,
+    /// Original file name for display (lossy UTF-8).
     pub name: String,
+    /// Original file name, raw.
+    pub os_name: OsString,
     pub original_parent: Option<PathBuf>,
     /// Unix seconds.
     pub deleted_at: Option<i64>,
@@ -35,7 +41,7 @@ pub struct TrashEntry {
 
 impl TrashEntry {
     pub fn original_path(&self) -> Option<PathBuf> {
-        self.original_parent.as_ref().map(|p| p.join(&self.name))
+        self.original_parent.as_ref().map(|p| p.join(&self.os_name))
     }
 }
 
@@ -59,15 +65,34 @@ impl TrashListing {
 pub const PARTIAL_LISTING_WARNING: &str =
     "Finder 휴지통 전체 목록은 전체 디스크 접근 권한이 필요함 · hdir가 지운 항목만 표시";
 
+/// Result of trashing several paths: what worked (and can be undone), what
+/// failed, and a warning when the items moved but bookkeeping did not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrashOutcome {
+    pub entries: Vec<TrashEntry>,
+    pub errors: Vec<(PathBuf, String)>,
+    pub warning: Option<String>,
+}
+
 pub trait TrashStore: Send + Sync {
-    /// Move `paths` to the trash; returns the created entries (best effort:
-    /// may be empty when the backend cannot identify them).
-    fn trash(&self, paths: &[PathBuf]) -> io::Result<Vec<TrashEntry>>;
+    /// Move `paths` to the trash. Partial results are kept: entries may be
+    /// empty when the backend cannot identify them.
+    fn trash(&self, paths: &[PathBuf]) -> io::Result<TrashOutcome>;
     /// Newest first.
     fn list(&self) -> io::Result<TrashListing>;
     /// Move the item to `dest` (full target path). Never overwrites:
     /// `AlreadyExists` when `dest` exists.
     fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()>;
+    /// Like [`restore`](Self::restore) but bookkeeping cleanup is deferred to
+    /// [`finish_restore`](Self::finish_restore) so a batch cleans up once.
+    fn restore_move(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
+        self.restore(entry, dest)
+    }
+    /// Clean up after `done` (entry, restored path) were restored; returns
+    /// warnings for failures that do not undo the restore.
+    fn finish_restore(&self, _done: &[(TrashEntry, PathBuf)]) -> Vec<String> {
+        Vec::new()
+    }
     fn purge(&self, entries: &[TrashEntry]) -> io::Result<()>;
 }
 
@@ -81,12 +106,43 @@ fn is_denied(e: &io::Error) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    pub id: String,
+    #[serde(with = "pathser")]
+    pub id: PathBuf,
+    #[serde(with = "pathser")]
     pub trashed_path: PathBuf,
+    #[serde(with = "pathser")]
     pub original_path: PathBuf,
     pub deleted_at: i64,
     pub size: Option<u64>,
     pub is_dir: bool,
+}
+
+/// JSON form of a path: a string when valid UTF-8, else an array of bytes
+/// (serde refuses non-UTF-8 paths, which Linux file names can be).
+mod pathser {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Text(String),
+        Bytes(Vec<u8>),
+    }
+
+    pub fn serialize<S: Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
+        match p.to_str() {
+            Some(t) => s.serialize_str(t),
+            None => s.collect_seq(p.as_os_str().as_bytes()),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        Ok(match Repr::deserialize(d)? {
+            Repr::Text(t) => PathBuf::from(t),
+            Repr::Bytes(b) => PathBuf::from(OsString::from_vec(b)),
+        })
+    }
 }
 
 /// Records in file order; a missing file is empty, unparsable lines are skipped.
@@ -114,12 +170,17 @@ pub fn append_records(path: &Path, records: &[Record]) -> io::Result<()> {
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)?;
+    // The index lists original paths: keep it private, repairing old files.
+    if f.metadata()?.permissions().mode() & 0o077 != 0 {
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     f.write_all(out.as_bytes())
 }
 
 /// Remove the records with these ids by rewriting the file (temp + rename).
-pub fn drop_records(path: &Path, ids: &[String]) -> io::Result<()> {
+pub fn drop_records(path: &Path, ids: &[PathBuf]) -> io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -135,8 +196,20 @@ pub fn drop_records(path: &Path, ids: &[String]) -> io::Result<()> {
         out.push_str(&serde_json::to_string(r).map_err(io::Error::other)?);
         out.push('\n');
     }
-    fs::write(&tmp, out)?;
-    fs::rename(&tmp, path).inspect_err(|_| {
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let write = || -> io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(out.as_bytes())?;
+        fs::rename(&tmp, path)
+    };
+    write().inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
 }
@@ -171,8 +244,9 @@ pub fn merge_listing(records: Vec<Record>, found: Vec<Found>) -> Vec<TrashEntry>
         .filter(|f| !seen.contains(f.path.as_path()))
         .filter(|f| f.path.file_name().is_some_and(|n| n != ".DS_Store"))
         .map(|f| TrashEntry {
-            id: f.path.to_string_lossy().into_owned(),
+            id: f.path.clone(),
             name: file_name_lossy(&f.path),
+            os_name: os_file_name(&f.path),
             original_parent: None,
             deleted_at: None,
             size: f.size,
@@ -190,11 +264,17 @@ fn entry_from_record(r: &Record, found: Option<&Found>) -> TrashEntry {
     TrashEntry {
         id: r.id.clone(),
         name: file_name_lossy(&r.original_path),
+        os_name: os_file_name(&r.original_path),
         original_parent: r.original_path.parent().map(Path::to_path_buf),
         deleted_at: Some(r.deleted_at),
         size: r.size.or(found.and_then(|f| f.size)),
         is_dir: r.is_dir || found.is_some_and(|f| f.is_dir),
     }
+}
+
+fn os_file_name(p: &Path) -> OsString {
+    p.file_name()
+        .map_or_else(|| p.as_os_str().to_os_string(), OsStr::to_os_string)
 }
 
 fn file_name_lossy(p: &Path) -> String {
@@ -205,11 +285,22 @@ fn file_name_lossy(p: &Path) -> String {
 
 /// `name (복원됨)` for `n == 1`, `name (복원됨 2)` for `n == 2`, ...
 pub fn restore_name(name: &str, n: usize) -> String {
+    format!("{name}{}", restore_suffix(n))
+}
+
+fn restore_suffix(n: usize) -> String {
     if n <= 1 {
-        format!("{name} (복원됨)")
+        " (복원됨)".to_string()
     } else {
-        format!("{name} (복원됨 {n})")
+        format!(" (복원됨 {n})")
     }
+}
+
+/// [`restore_name`] for raw (possibly non-UTF-8) names.
+pub fn restore_os_name(name: &OsStr, n: usize) -> OsString {
+    let mut out = name.to_os_string();
+    out.push(restore_suffix(n));
+    out
 }
 
 /// Move `src` to `dest` creating missing parents, never overwriting.
@@ -256,12 +347,20 @@ fn read_dir_paths(dir: &Path) -> io::Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Appends records to the index (injectable for tests).
+pub type Appender = Box<dyn Fn(&Path, &[Record]) -> io::Result<()> + Send + Sync>;
+
+/// Removes records by id from the index (injectable for tests).
+pub type Dropper = Box<dyn Fn(&Path, &[PathBuf]) -> io::Result<()> + Send + Sync>;
+
 pub struct IndexTrash {
     trash_dir: PathBuf,
     scanner: Scanner,
     index_path: PathBuf,
     trasher: Trasher,
     clock: fn() -> i64,
+    appender: Appender,
+    dropper: Dropper,
 }
 
 fn now_secs() -> i64 {
@@ -278,6 +377,8 @@ impl IndexTrash {
             index_path,
             trasher,
             clock: now_secs,
+            appender: Box::new(append_records),
+            dropper: Box::new(drop_records),
         }
     }
 
@@ -290,37 +391,67 @@ impl IndexTrash {
         self.clock = clock;
         self
     }
+
+    pub fn with_appender(mut self, appender: Appender) -> Self {
+        self.appender = appender;
+        self
+    }
+
+    pub fn with_dropper(mut self, dropper: Dropper) -> Self {
+        self.dropper = dropper;
+        self
+    }
+
+    fn drop_ids(&self, entries: &[TrashEntry]) -> io::Result<()> {
+        let ids: Vec<PathBuf> = entries.iter().map(|e| e.id.clone()).collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        (self.dropper)(&self.index_path, &ids)
+    }
 }
 
 impl TrashStore for IndexTrash {
-    fn trash(&self, paths: &[PathBuf]) -> io::Result<Vec<TrashEntry>> {
+    fn trash(&self, paths: &[PathBuf]) -> io::Result<TrashOutcome> {
         let mut records = Vec::new();
-        let mut failure = None;
+        let mut errors = Vec::new();
         for p in paths {
-            let abs = std::path::absolute(p)?;
-            let meta = fs::symlink_metadata(&abs)?;
+            let abs = match std::path::absolute(p) {
+                Ok(a) => a,
+                Err(e) => {
+                    errors.push((p.clone(), e.to_string()));
+                    continue;
+                }
+            };
+            let meta = match fs::symlink_metadata(&abs) {
+                Ok(m) => m,
+                Err(e) => {
+                    errors.push((abs, e.to_string()));
+                    continue;
+                }
+            };
             match (self.trasher)(&abs) {
                 Ok(trashed) => records.push(Record {
-                    id: trashed.to_string_lossy().into_owned(),
+                    id: trashed.clone(),
                     trashed_path: trashed,
                     original_path: abs,
                     deleted_at: (self.clock)(),
                     size: (!meta.is_dir()).then_some(meta.len()),
                     is_dir: meta.is_dir(),
                 }),
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
+                Err(e) => errors.push((abs, e.to_string())),
             }
         }
-        // Record what was trashed even when a later path failed. A failed
-        // index write only loses the original path, not the item.
-        let _ = append_records(&self.index_path, &records);
-        if let Some(e) = failure {
-            return Err(e);
-        }
-        Ok(records.iter().map(|r| entry_from_record(r, None)).collect())
+        // Whatever was trashed is recorded even when other paths failed. A
+        // failed index write keeps the entries (for undo) but is reported.
+        let warning = (self.appender)(&self.index_path, &records)
+            .err()
+            .map(|e| format!("휴지통으로 이동했지만 복원 정보 저장 실패: {e}"));
+        Ok(TrashOutcome {
+            entries: records.iter().map(|r| entry_from_record(r, None)).collect(),
+            errors,
+            warning,
+        })
     }
 
     fn list(&self) -> io::Result<TrashListing> {
@@ -370,24 +501,36 @@ impl TrashStore for IndexTrash {
     }
 
     fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
-        move_no_replace(Path::new(&entry.id), dest)?;
+        move_no_replace(&entry.id, dest)?;
         // A stale record is filtered out by `list` anyway.
-        let _ = drop_records(&self.index_path, std::slice::from_ref(&entry.id));
+        let _ = self.drop_ids(std::slice::from_ref(entry));
         Ok(())
+    }
+
+    fn restore_move(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
+        move_no_replace(&entry.id, dest)
+    }
+
+    fn finish_restore(&self, done: &[(TrashEntry, PathBuf)]) -> Vec<String> {
+        let entries: Vec<TrashEntry> = done.iter().map(|(e, _)| e.clone()).collect();
+        match self.drop_ids(&entries) {
+            Ok(()) => Vec::new(),
+            Err(e) => vec![format!("복원됨, 복원 정보 정리 실패: {e}")],
+        }
     }
 
     fn purge(&self, entries: &[TrashEntry]) -> io::Result<()> {
         let mut first_err = None;
         let mut done = Vec::new();
         for e in entries {
-            match remove_any(Path::new(&e.id)) {
-                Ok(()) => done.push(e.id.clone()),
+            match remove_any(&e.id) {
+                Ok(()) => done.push(e.clone()),
                 Err(err) => {
                     first_err.get_or_insert(err);
                 }
             }
         }
-        let _ = drop_records(&self.index_path, &done);
+        let _ = self.drop_ids(&done);
         first_err.map_or(Ok(()), Err)
     }
 }
@@ -422,11 +565,11 @@ struct Unavailable;
 
 #[cfg(target_os = "macos")]
 impl TrashStore for Unavailable {
-    fn trash(&self, _: &[PathBuf]) -> io::Result<Vec<TrashEntry>> {
+    fn trash(&self, _: &[PathBuf]) -> io::Result<TrashOutcome> {
         Err(io::Error::other("홈 폴더를 찾을 수 없음"))
     }
     fn list(&self) -> io::Result<TrashListing> {
-        self.trash(&[]).map(TrashListing::new)
+        self.trash(&[]).map(|_| TrashListing::default())
     }
     fn restore(&self, _: &TrashEntry, _: &Path) -> io::Result<()> {
         self.trash(&[]).map(|_| ())
@@ -464,7 +607,7 @@ pub fn freedesktop_purge(info: &Path) -> io::Result<()> {
 /// original path equal to one of `paths`; newest per path.
 pub fn match_trashed(
     paths: &[PathBuf],
-    before: &HashSet<String>,
+    before: &HashSet<PathBuf>,
     after: Vec<TrashEntry>,
 ) -> Vec<TrashEntry> {
     paths
@@ -479,68 +622,357 @@ pub fn match_trashed(
         .collect()
 }
 
-#[cfg(not(target_os = "macos"))]
-pub struct FreedesktopTrash;
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
-#[cfg(not(target_os = "macos"))]
-impl FreedesktopTrash {
-    fn entries() -> io::Result<Vec<TrashEntry>> {
-        let items = trash::os_limited::list().map_err(io::Error::other)?;
-        let mut out: Vec<TrashEntry> = items
-            .into_iter()
-            .map(|it| {
-                let info = PathBuf::from(&it.id);
-                let meta = fs::symlink_metadata(freedesktop_file(&info)).ok();
-                TrashEntry {
-                    id: it.id.to_string_lossy().into_owned(),
-                    name: it.name.to_string_lossy().into_owned(),
-                    original_parent: Some(it.original_parent),
-                    deleted_at: Some(it.time_deleted),
-                    size: meta.as_ref().filter(|m| !m.is_dir()).map(|m| m.len()),
-                    is_dir: meta.is_some_and(|m| m.is_dir()),
+/// Percent-encode a path for a `.trashinfo` `Path=` line (raw bytes).
+pub fn encode_trash_path(p: &Path) -> String {
+    let mut out = String::new();
+    for &b in p.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 15) as usize] as char);
+        }
+    }
+    out
+}
+
+pub fn decode_trash_path(s: &str) -> PathBuf {
+    let bytes = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(h), Some(l)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    PathBuf::from(OsString::from_vec(out))
+}
+
+/// `<$XDG_DATA_HOME or ~/.local/share>/Trash`.
+pub fn default_root_from(xdg: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    match xdg.filter(|p| p.is_absolute()) {
+        Some(x) => Some(x.join("Trash")),
+        None => home.map(|h| h.join(".local/share/Trash")),
+    }
+}
+
+pub fn default_root() -> Option<PathBuf> {
+    default_root_from(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+fn local_tm(ts: i64) -> Option<libc::tm> {
+    let t = ts as libc::time_t;
+    // SAFETY: `tm` is plain data; localtime_r only writes into it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the duration of the call.
+    let ok = !unsafe { libc::localtime_r(&t, &mut tm) }.is_null();
+    ok.then_some(tm)
+}
+
+/// `YYYY-MM-DDThh:mm:ss` in local time (the `DeletionDate=` format).
+pub fn format_deletion_date(ts: i64) -> String {
+    match local_tm(ts) {
+        Some(tm) => format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        ),
+        None => "1970-01-01T00:00:00".to_string(),
+    }
+}
+
+pub fn parse_deletion_date(s: &str) -> Option<i64> {
+    let (d, t) = s.trim().split_once('T')?;
+    let mut dp = d.split('-').map(|x| x.parse::<i32>().ok());
+    let mut tp = t.split(':').map(|x| x.parse::<i32>().ok());
+    let (y, mo, da) = (dp.next()??, dp.next()??, dp.next()??);
+    let (h, mi, se) = (tp.next()??, tp.next()??, tp.next()??);
+    // SAFETY: `tm` is plain data and is fully initialised below.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    tm.tm_year = y - 1900;
+    tm.tm_mon = mo - 1;
+    tm.tm_mday = da;
+    tm.tm_hour = h;
+    tm.tm_min = mi;
+    tm.tm_sec = se;
+    tm.tm_isdst = -1;
+    // SAFETY: `tm` is a valid, exclusive pointer.
+    let t = unsafe { libc::mktime(&mut tm) };
+    (t != -1).then_some(t as i64)
+}
+
+/// A `.trashinfo` file: original path and deletion time.
+fn parse_trashinfo(text: &str) -> (Option<PathBuf>, Option<i64>) {
+    let (mut path, mut date) = (None, None);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("Path=") {
+            path = Some(decode_trash_path(v));
+        } else if let Some(v) = line.strip_prefix("DeletionDate=") {
+            date = parse_deletion_date(v);
+        }
+    }
+    (path, date)
+}
+
+/// All entries of the freedesktop trash at `root` (newest first).
+fn list_root(root: &Path) -> io::Result<Vec<TrashEntry>> {
+    let infos = match fs::read_dir(root.join("info")) {
+        Ok(d) => d,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for ent in infos.filter_map(Result::ok) {
+        let info = ent.path();
+        if info.extension().is_none_or(|x| x != "trashinfo") {
+            continue;
+        }
+        let Ok(text) = fs::read(&info) else { continue };
+        let (path, date) = parse_trashinfo(&String::from_utf8_lossy(&text));
+        let Some(orig) = path else { continue };
+        let meta = fs::symlink_metadata(freedesktop_file(&info)).ok();
+        out.push(TrashEntry {
+            id: info,
+            name: file_name_lossy(&orig),
+            os_name: os_file_name(&orig),
+            original_parent: orig.parent().map(Path::to_path_buf),
+            deleted_at: date,
+            size: meta.as_ref().filter(|m| !m.is_dir()).map(|m| m.len()),
+            is_dir: meta.is_some_and(|m| m.is_dir()),
+        });
+    }
+    out.sort_by(|a, b| {
+        b.deleted_at
+            .cmp(&a.deleted_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(out)
+}
+
+const MAX_NAME_TRIES: usize = 10_000;
+
+/// Move `p` into the freedesktop trash at `root` (same filesystem only).
+fn trash_into_root(root: &Path, p: &Path) -> io::Result<()> {
+    let abs = std::path::absolute(p)?;
+    let name = abs
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "이름 없는 경로"))?
+        .to_os_string();
+    // Record the canonical parent, as the `trash` crate does.
+    let orig = match abs.parent().map(fs::canonicalize) {
+        Some(Ok(parent)) => parent.join(&name),
+        _ => abs.clone(),
+    };
+    fs::symlink_metadata(&abs)?;
+    let (files, infos) = (root.join("files"), root.join("info"));
+    for d in [&files, &infos] {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(d)?;
+    }
+    let body = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        encode_trash_path(&orig),
+        format_deletion_date(now_secs())
+    );
+    for i in 1..=MAX_NAME_TRIES {
+        let mut cand = name.clone();
+        if i > 1 {
+            cand.push(format!(".{i}"));
+        }
+        let mut info_name = cand.clone();
+        info_name.push(".trashinfo");
+        let info = infos.join(info_name);
+        let mut f = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&info)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let target = files.join(&cand);
+        let moved = if fs::symlink_metadata(&target).is_ok() {
+            Err(io::Error::from(io::ErrorKind::AlreadyExists))
+        } else {
+            f.write_all(body.as_bytes())
+                .and_then(|()| fs::rename(&abs, &target))
+        };
+        match moved {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&info);
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    continue;
                 }
-            })
-            .collect();
-        out.sort_by_key(|e| std::cmp::Reverse(e.deleted_at));
-        Ok(out)
+                return Err(e);
+            }
+        }
+    }
+    Err(io::Error::other("휴지통 이름 충돌이 너무 많음"))
+}
+
+/// Lists every entry of a freedesktop trash (injectable for tests).
+pub type Lister = Box<dyn Fn() -> io::Result<Vec<TrashEntry>> + Send + Sync>;
+
+/// Moves one path into a freedesktop trash.
+pub type PathTrasher = Box<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
+/// Freedesktop-layout trash; trashing and listing are injectable.
+pub struct FreedesktopTrash {
+    lister: Lister,
+    trasher: PathTrasher,
+}
+
+impl FreedesktopTrash {
+    pub fn with_parts(lister: Lister, trasher: PathTrasher) -> Self {
+        Self { lister, trasher }
+    }
+
+    /// A self-contained freedesktop trash rooted at `root` (files/ + info/).
+    /// Trashing only works within one filesystem.
+    pub fn with_root(root: PathBuf) -> Self {
+        let list_root_dir = root.clone();
+        Self::with_parts(
+            Box::new(move || list_root(&list_root_dir)),
+            Box::new(move |p| trash_into_root(&root, p)),
+        )
+    }
+
+    /// `None`: the system trash (all volumes, via the `trash` crate); `Some`:
+    /// a trash at that root (default location: [`default_root`]).
+    #[cfg(not(target_os = "macos"))]
+    pub fn new(root: Option<PathBuf>) -> Self {
+        root.map_or_else(Self::system, Self::with_root)
+    }
+
+    /// The system trash (all volumes) through the `trash` crate.
+    #[cfg(not(target_os = "macos"))]
+    pub fn system() -> Self {
+        Self::with_parts(
+            Box::new(system_entries),
+            Box::new(|p| trash::delete(p).map_err(io::Error::other)),
+        )
     }
 }
 
 #[cfg(not(target_os = "macos"))]
+fn system_entries() -> io::Result<Vec<TrashEntry>> {
+    let items = trash::os_limited::list().map_err(io::Error::other)?;
+    let mut out: Vec<TrashEntry> = items
+        .into_iter()
+        .map(|it| {
+            let info = PathBuf::from(&it.id);
+            let meta = fs::symlink_metadata(freedesktop_file(&info)).ok();
+            TrashEntry {
+                id: info,
+                name: it.name.to_string_lossy().into_owned(),
+                os_name: it.name,
+                original_parent: Some(it.original_parent),
+                deleted_at: Some(it.time_deleted),
+                size: meta.as_ref().filter(|m| !m.is_dir()).map(|m| m.len()),
+                is_dir: meta.is_some_and(|m| m.is_dir()),
+            }
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.deleted_at));
+    Ok(out)
+}
+
+const UNDO_UNKNOWN_WARNING: &str = "되돌리기 정보 없음 (휴지통 목록 조회 실패)";
+const UNDO_UNMATCHED_WARNING: &str = "되돌리기 정보 없음 (휴지통 항목 식별 실패)";
+
 impl TrashStore for FreedesktopTrash {
-    fn trash(&self, paths: &[PathBuf]) -> io::Result<Vec<TrashEntry>> {
-        // The trash crate records the canonical parent as the original location.
-        let norm: Vec<PathBuf> = paths
-            .iter()
-            .map(|p| {
-                let abs = std::path::absolute(p).unwrap_or_else(|_| p.clone());
-                match (abs.parent().map(fs::canonicalize), abs.file_name()) {
-                    (Some(Ok(parent)), Some(name)) => parent.join(name),
-                    _ => abs,
+    fn trash(&self, paths: &[PathBuf]) -> io::Result<TrashOutcome> {
+        let mut out = TrashOutcome::default();
+        let before = (self.lister)();
+        let mut done: Vec<PathBuf> = Vec::new();
+        for p in paths {
+            // The trash crate records the canonical parent as the original location.
+            let abs = std::path::absolute(p).unwrap_or_else(|_| p.clone());
+            let norm = match (abs.parent().map(fs::canonicalize), abs.file_name()) {
+                (Some(Ok(parent)), Some(name)) => parent.join(name),
+                _ => abs,
+            };
+            match (self.trasher)(p) {
+                Ok(()) => done.push(norm),
+                Err(e) => out.errors.push((p.clone(), e.to_string())),
+            }
+        }
+        if done.is_empty() {
+            return Ok(out);
+        }
+        match (before, (self.lister)()) {
+            (Ok(before), Ok(after)) => {
+                let before: HashSet<PathBuf> = before.into_iter().map(|e| e.id).collect();
+                out.entries = match_trashed(&done, &before, after);
+                if out.entries.len() < done.len() {
+                    out.warning = Some(UNDO_UNMATCHED_WARNING.into());
                 }
-            })
-            .collect();
-        let before: HashSet<String> = Self::entries()
-            .map(|v| v.into_iter().map(|e| e.id).collect())
-            .unwrap_or_default();
-        trash::delete_all(paths).map_err(io::Error::other)?;
-        Ok(Self::entries()
-            .map(|after| match_trashed(&norm, &before, after))
-            .unwrap_or_default())
+            }
+            _ => out.warning = Some(UNDO_UNKNOWN_WARNING.into()),
+        }
+        Ok(out)
     }
 
     fn list(&self) -> io::Result<TrashListing> {
-        Self::entries().map(TrashListing::new)
+        (self.lister)().map(TrashListing::new)
     }
 
     fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
-        freedesktop_restore(Path::new(&entry.id), dest)
+        self.restore_move(entry, dest)?;
+        let _ = self.finish_restore(&[(entry.clone(), dest.to_path_buf())]);
+        Ok(())
+    }
+
+    fn restore_move(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
+        move_no_replace(&freedesktop_file(&entry.id), dest)
+    }
+
+    fn finish_restore(&self, done: &[(TrashEntry, PathBuf)]) -> Vec<String> {
+        done.iter()
+            .filter_map(|(e, dest)| match fs::remove_file(&e.id) {
+                Ok(()) => None,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => Some(format!(
+                    "복원됨 {} (.trashinfo 삭제 실패: {err})",
+                    dest.display()
+                )),
+            })
+            .collect()
     }
 
     fn purge(&self, entries: &[TrashEntry]) -> io::Result<()> {
-        entries
-            .iter()
-            .try_for_each(|e| freedesktop_purge(Path::new(&e.id)))
+        let mut first = None;
+        for e in entries {
+            if let Err(err) = freedesktop_purge(&e.id) {
+                first.get_or_insert(err);
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 }
 
@@ -555,7 +987,7 @@ pub fn system_store() -> Arc<dyn TrashStore> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Arc::new(FreedesktopTrash)
+        Arc::new(FreedesktopTrash::system())
     }
 }
 
@@ -580,6 +1012,48 @@ pub struct RestoreReport {
     pub restored: Vec<PathBuf>,
     pub conflicts: Vec<(TrashEntry, PathBuf)>,
     pub failed: Vec<Failure>,
+    /// Restored, but cleanup (index / `.trashinfo`) failed.
+    pub warnings: Vec<String>,
+}
+
+/// Result of [`purge_verified`].
+#[derive(Debug, Default)]
+pub struct PurgeReport {
+    pub purged: usize,
+    /// Requested entries that no longer match the trash listing.
+    pub skipped: Vec<TrashEntry>,
+    pub error: Option<io::Error>,
+}
+
+/// Purge `entries`, but only those still identical (id, deleted_at, size) to
+/// the backend's current listing, so an id reused by a newer item is safe.
+pub fn purge_verified(store: &dyn TrashStore, entries: &[TrashEntry]) -> PurgeReport {
+    let current = match store.list() {
+        Ok(l) => l.entries,
+        Err(e) => {
+            return PurgeReport {
+                purged: 0,
+                skipped: entries.to_vec(),
+                error: Some(e),
+            };
+        }
+    };
+    let (ok, skipped): (Vec<TrashEntry>, Vec<TrashEntry>) =
+        entries.iter().cloned().partition(|e| {
+            current
+                .iter()
+                .any(|c| c.id == e.id && c.deleted_at == e.deleted_at && c.size == e.size)
+        });
+    let error = if ok.is_empty() {
+        None
+    } else {
+        store.purge(&ok).err()
+    };
+    PurgeReport {
+        purged: if error.is_some() { 0 } else { ok.len() },
+        skipped,
+        error,
+    }
 }
 
 const MAX_RENAME_TRIES: usize = 1000;
@@ -592,15 +1066,16 @@ pub fn restore_entries(
     mode: OnConflict,
 ) -> RestoreReport {
     let mut report = RestoreReport::default();
+    let mut done: Vec<(TrashEntry, PathBuf)> = Vec::new();
     for (entry, dest) in jobs {
-        let mut result = store.restore(entry, dest).map(|()| dest.clone());
+        let mut result = store.restore_move(entry, dest).map(|()| dest.clone());
         if mode == OnConflict::Rename
             && matches!(&result, Err(e) if e.kind() == io::ErrorKind::AlreadyExists)
         {
-            let name = file_name_lossy(dest);
+            let name = os_file_name(dest);
             for n in 1..=MAX_RENAME_TRIES {
-                let alt = dest.with_file_name(restore_name(&name, n));
-                match store.restore(entry, &alt) {
+                let alt = dest.with_file_name(restore_os_name(&name, n));
+                match store.restore_move(entry, &alt) {
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                     other => {
                         result = other.map(|()| alt);
@@ -610,7 +1085,10 @@ pub fn restore_entries(
             }
         }
         match result {
-            Ok(path) => report.restored.push(path),
+            Ok(path) => {
+                done.push((entry.clone(), path.clone()));
+                report.restored.push(path);
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 report.conflicts.push((entry.clone(), dest.clone()));
             }
@@ -620,6 +1098,9 @@ pub fn restore_entries(
                 retry: e.kind() != io::ErrorKind::NotFound,
             }),
         }
+    }
+    if !done.is_empty() {
+        report.warnings = store.finish_restore(&done);
     }
     report
 }
@@ -634,7 +1115,7 @@ pub fn build_jobs(
         .iter()
         .filter_map(|e| {
             e.original_path()
-                .or_else(|| fallback_dir.map(|d| d.join(&e.name)))
+                .or_else(|| fallback_dir.map(|d| d.join(&e.os_name)))
                 .map(|dest| (e.clone(), dest))
         })
         .collect()
@@ -672,7 +1153,7 @@ pub struct TrashView {
     pub entries: Vec<TrashEntry>,
     pub cursor: usize,
     pub scroll: usize,
-    pub selected: HashSet<String>,
+    pub selected: HashSet<PathBuf>,
     pub prev_cwd: PathBuf,
     pub loading: bool,
     pub error: Option<String>,
@@ -700,8 +1181,8 @@ impl TrashView {
             self.cursor = i;
         }
         self.cursor = self.cursor.min(self.last_index());
-        let ids: HashSet<&str> = self.entries.iter().map(|e| e.id.as_str()).collect();
-        self.selected.retain(|id| ids.contains(id.as_str()));
+        let ids: HashSet<&Path> = self.entries.iter().map(|e| e.id.as_path()).collect();
+        self.selected.retain(|id| ids.contains(id.as_path()));
         self.loading = false;
         self.error = None;
     }
@@ -843,7 +1324,7 @@ pub mod fake {
     }
 
     impl TrashStore for FakeTrashStore {
-        fn trash(&self, paths: &[PathBuf]) -> io::Result<Vec<TrashEntry>> {
+        fn trash(&self, paths: &[PathBuf]) -> io::Result<TrashOutcome> {
             let gate = self.gate.lock().unwrap().clone();
             if let Some(g) = gate {
                 let start = std::time::Instant::now();
@@ -863,6 +1344,12 @@ pub mod fake {
         fn restore(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
             self.inner.restore(entry, dest)
         }
+        fn restore_move(&self, entry: &TrashEntry, dest: &Path) -> io::Result<()> {
+            self.inner.restore_move(entry, dest)
+        }
+        fn finish_restore(&self, done: &[(TrashEntry, PathBuf)]) -> Vec<String> {
+            self.inner.finish_restore(done)
+        }
         fn purge(&self, entries: &[TrashEntry]) -> io::Result<()> {
             self.inner.purge(entries)
         }
@@ -878,7 +1365,7 @@ mod tests {
     fn rec(dir: &Path, name: &str, orig: &str, at: i64) -> Record {
         let trashed = dir.join(name);
         Record {
-            id: trashed.to_string_lossy().into_owned(),
+            id: trashed.clone(),
             trashed_path: trashed,
             original_path: PathBuf::from(orig),
             deleted_at: at,
@@ -997,7 +1484,7 @@ mod tests {
         assert_eq!(got[2].original_parent, None);
         assert_eq!(got[2].deleted_at, None);
         assert!(got[2].is_dir);
-        assert_eq!(got[3].id, "/trash/zeta");
+        assert_eq!(got[3].id, Path::new("/trash/zeta"));
     }
 
     #[test]
@@ -1038,7 +1525,7 @@ mod tests {
         fs::write(&file, "hello").unwrap();
         let dir = f.root.join("work/adir");
         fs::create_dir(&dir).unwrap();
-        let entries = f.store.trash(&[file.clone(), dir.clone()]).unwrap();
+        let entries = f.store.trash(&[file.clone(), dir.clone()]).unwrap().entries;
         assert_eq!(entries.len(), 2);
         assert!(!file.exists() && !dir.exists());
         assert_eq!(entries[0].name, "내 파일 'q'.txt");
@@ -1066,6 +1553,7 @@ mod tests {
             .store
             .trash(std::slice::from_ref(&file))
             .unwrap()
+            .entries
             .remove(0);
         f.store.restore(&e, &file).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
@@ -1082,6 +1570,7 @@ mod tests {
             .store
             .trash(std::slice::from_ref(&file))
             .unwrap()
+            .entries
             .remove(0);
         fs::write(&file, "new").unwrap();
         let err = f.store.restore(&e, &file).unwrap_err();
@@ -1096,7 +1585,12 @@ mod tests {
         let dir = f.root.join("work/d");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("in.txt"), "x").unwrap();
-        let e = f.store.trash(std::slice::from_ref(&dir)).unwrap().remove(0);
+        let e = f
+            .store
+            .trash(std::slice::from_ref(&dir))
+            .unwrap()
+            .entries
+            .remove(0);
         let dest = f.root.join("elsewhere/deep/d");
         f.store.restore(&e, &dest).unwrap();
         assert_eq!(fs::read_to_string(dest.join("in.txt")).unwrap(), "x");
@@ -1124,7 +1618,7 @@ mod tests {
         fs::write(&file, "x").unwrap();
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("i"), "x").unwrap();
-        let es = f.store.trash(&[file, dir]).unwrap();
+        let es = f.store.trash(&[file, dir]).unwrap().entries;
         f.store.purge(&es).unwrap();
         assert!(f.store.list().unwrap().entries.is_empty());
         assert_eq!(fs::read_dir(&f.trash_dir).unwrap().count(), 0);
@@ -1163,7 +1657,7 @@ mod tests {
         let b = f.root.join("work/b.txt");
         fs::write(&a, "1").unwrap();
         fs::write(&b, "2").unwrap();
-        let es = f.store.trash(&[a, b]).unwrap();
+        let es = f.store.trash(&[a, b]).unwrap().entries;
         let store = denied_store(&f, io::Error::from(io::ErrorKind::PermissionDenied));
         let listing = store.list().unwrap();
         assert_eq!(listing.entries.len(), 2);
@@ -1196,7 +1690,7 @@ mod tests {
         let b = f.root.join("work/b.txt");
         fs::write(&a, "1").unwrap();
         fs::write(&b, "2").unwrap();
-        let es = f.store.trash(&[a, b]).unwrap();
+        let es = f.store.trash(&[a, b]).unwrap().entries;
         fs::remove_file(&es.iter().find(|e| e.name == "a.txt").unwrap().id).unwrap();
         let store = denied_store(&f, io::Error::from(io::ErrorKind::PermissionDenied));
         let listing = store.list().unwrap();
@@ -1288,6 +1782,7 @@ mod tests {
         TrashEntry {
             id: id.into(),
             name: name.into(),
+            os_name: name.into(),
             original_parent: Some(PathBuf::from(parent)),
             deleted_at: Some(at),
             size: None,
@@ -1297,7 +1792,7 @@ mod tests {
 
     #[test]
     fn match_trashed_picks_new_entries_for_given_paths() {
-        let before: HashSet<String> = ["i1".to_string()].into();
+        let before: HashSet<PathBuf> = [PathBuf::from("i1")].into();
         let after = vec![
             entry("i1", "/w", "a", 1),
             entry("i2", "/w", "a", 5),
@@ -1310,7 +1805,7 @@ mod tests {
             &before,
             after,
         );
-        let ids: Vec<_> = got.iter().map(|e| e.id.as_str()).collect();
+        let ids: Vec<_> = got.iter().map(|e| e.id.to_str().unwrap()).collect();
         assert_eq!(ids, ["i3", "i4"]);
     }
 
@@ -1319,7 +1814,12 @@ mod tests {
     fn trashed(f: &Fixture, name: &str, content: &str) -> (TrashEntry, PathBuf) {
         let p = f.root.join("work").join(name);
         fs::write(&p, content).unwrap();
-        let e = f.store.trash(std::slice::from_ref(&p)).unwrap().remove(0);
+        let e = f
+            .store
+            .trash(std::slice::from_ref(&p))
+            .unwrap()
+            .entries
+            .remove(0);
         (e, p)
     }
 
@@ -1443,8 +1943,8 @@ mod tests {
             entry("id2", "/p", "n2", 2),
             entry("id3", "/p", "n3", 3),
         ]);
-        assert_eq!(v.current().unwrap().id, "id2");
-        assert_eq!(v.selected, HashSet::from(["id2".to_string()]));
+        assert_eq!(v.current().unwrap().id, Path::new("id2"));
+        assert_eq!(v.selected, HashSet::from([PathBuf::from("id2")]));
     }
 
     #[test]
@@ -1472,12 +1972,12 @@ mod tests {
     fn view_toggle_and_targets() {
         let mut v = view_with(4);
         assert_eq!(v.targets().len(), 1);
-        assert_eq!(v.targets()[0].id, "id0");
+        assert_eq!(v.targets()[0].id, Path::new("id0"));
         v.toggle_current(); // select id0, cursor -> 1
         v.move_down();
         v.toggle_current(); // select id2, cursor -> 3
         let ids: Vec<_> = v.targets().into_iter().map(|e| e.id).collect();
-        assert_eq!(ids, ["id0", "id2"]);
+        assert_eq!(ids, [PathBuf::from("id0"), PathBuf::from("id2")]);
         v.home();
         v.toggle_current(); // deselect id0
         assert_eq!(v.targets().len(), 1);
@@ -1493,6 +1993,460 @@ mod tests {
         v.cursor = 2;
         v.ensure_visible(5);
         assert_eq!(v.scroll, 2);
+    }
+
+    // ---- review fixes ----
+
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn mode(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    fn store_with(f: &Fixture, trasher: Trasher) -> IndexTrash {
+        IndexTrash::new(f.trash_dir.clone(), f.index.clone(), trasher).with_clock(|| 1_700_000_000)
+    }
+
+    // fix 1: partial results
+
+    #[test]
+    fn trash_keeps_earlier_items_when_a_later_path_vanishes() {
+        let f = fixture();
+        let a = f.root.join("work/a.txt");
+        let c = f.root.join("work/c.txt");
+        fs::write(&a, "1").unwrap();
+        fs::write(&c, "3").unwrap();
+        let gone = f.root.join("work/gone.txt");
+        let out = f.store.trash(&[a, gone.clone(), c]).unwrap();
+        let names: Vec<_> = out.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "c.txt"]);
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(out.errors[0].0, gone);
+        assert_eq!(read_index(&f.index).len(), 2, "recorded in the index");
+    }
+
+    #[test]
+    fn trash_keeps_first_item_when_trasher_fails_on_second() {
+        let f = fixture();
+        let inner = mover(f.trash_dir.clone());
+        let store = store_with(
+            &f,
+            Box::new(move |p| {
+                if p.file_name().is_some_and(|n| n == "b.txt") {
+                    return Err(io::Error::other("nope"));
+                }
+                inner(p)
+            }),
+        );
+        let a = f.root.join("work/a.txt");
+        let b = f.root.join("work/b.txt");
+        fs::write(&a, "1").unwrap();
+        fs::write(&b, "2").unwrap();
+        let out = store.trash(&[a, b.clone()]).unwrap();
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].name, "a.txt");
+        assert_eq!(out.errors, vec![(b.clone(), "nope".to_string())]);
+        assert!(b.exists());
+        assert_eq!(read_index(&f.index).len(), 1);
+    }
+
+    // fix 2: index write errors + permissions
+
+    #[test]
+    fn index_append_failure_is_reported_and_entries_kept() {
+        let f = fixture();
+        let store = store_with(&f, mover(f.trash_dir.clone()))
+            .with_appender(Box::new(|_, _| Err(io::Error::other("disk full"))));
+        let a = f.root.join("work/a.txt");
+        fs::write(&a, "1").unwrap();
+        let out = store.trash(&[a]).unwrap();
+        assert_eq!(out.entries.len(), 1, "kept in memory for undo");
+        let w = out.warning.expect("warning");
+        assert!(
+            w.starts_with("휴지통으로 이동했지만 복원 정보 저장 실패:") && w.contains("disk full"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn index_file_is_created_private_and_existing_perms_repaired() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("sub/idx.jsonl");
+        let a = rec(tmp.path(), "a", "/x/a", 1);
+        append_records(&path, std::slice::from_ref(&a)).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        append_records(&path, std::slice::from_ref(&a)).unwrap();
+        assert_eq!(mode(&path), 0o600, "append repairs perms");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        drop_records(&path, &[PathBuf::from("zzz")]).unwrap();
+        assert_eq!(mode(&path), 0o600, "rewrite is private too");
+    }
+
+    #[test]
+    fn drop_records_replaces_a_stale_world_readable_tmp() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("idx.jsonl");
+        append_records(&path, &[rec(tmp.path(), "a", "/x/a", 1)]).unwrap();
+        let stale = tmp.path().join("idx.jsonl.tmp");
+        fs::write(&stale, "old").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        drop_records(&path, &[PathBuf::from("zzz")]).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert!(!stale.exists());
+    }
+
+    // fix 3: non-UTF-8 names
+
+    fn bad_name() -> std::ffi::OsString {
+        OsStr::from_bytes(b"bad\xff").to_os_string()
+    }
+
+    #[test]
+    fn record_with_non_utf8_paths_roundtrips_through_json() {
+        let dir = Path::new("/trash");
+        let mut r = rec(dir, "x", "/orig/x", 5);
+        r.id = dir.join(bad_name());
+        r.trashed_path = dir.join(bad_name());
+        r.original_path = Path::new("/orig").join(bad_name());
+        let line = serde_json::to_string(&r).expect("serializes");
+        assert_eq!(serde_json::from_str::<Record>(&line).unwrap(), r);
+    }
+
+    #[test]
+    fn non_utf8_index_roundtrip_keeps_raw_names() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("idx.jsonl");
+        let mut r = rec(tmp.path(), "x", "/orig/x", 5);
+        r.original_path = Path::new("/orig").join(bad_name());
+        append_records(&path, std::slice::from_ref(&r)).unwrap();
+        assert_eq!(read_index(&path), vec![r.clone()]);
+        let e = entry_from_record(&r, None);
+        assert_eq!(e.os_name, bad_name());
+        assert_eq!(e.original_path().unwrap(), r.original_path);
+        assert!(e.name.contains('\u{FFFD}'), "display is lossy");
+    }
+
+    #[test]
+    fn restore_rename_keeps_raw_bytes_of_non_utf8_dest() {
+        struct Rec(std::sync::Mutex<Vec<PathBuf>>);
+        impl TrashStore for Rec {
+            fn trash(&self, _: &[PathBuf]) -> io::Result<TrashOutcome> {
+                unreachable!()
+            }
+            fn list(&self) -> io::Result<TrashListing> {
+                unreachable!()
+            }
+            fn restore(&self, _: &TrashEntry, dest: &Path) -> io::Result<()> {
+                let mut v = self.0.lock().unwrap();
+                v.push(dest.to_path_buf());
+                if v.len() == 1 {
+                    Err(io::Error::from(io::ErrorKind::AlreadyExists))
+                } else {
+                    Ok(())
+                }
+            }
+            fn purge(&self, _: &[TrashEntry]) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let store = Rec(Default::default());
+        let mut e = entry("id", "/p", "x", 1);
+        e.os_name = bad_name();
+        let dest = Path::new("/p").join(bad_name());
+        restore_entries(&store, &[(e, dest.clone())], OnConflict::Rename);
+        let tried = store.0.lock().unwrap().clone();
+        let mut want = dest.into_os_string();
+        want.push(" (복원됨)");
+        assert_eq!(tried[1].as_os_str(), want.as_os_str());
+    }
+
+    #[test]
+    fn build_jobs_fallback_uses_raw_name() {
+        let mut e = entry("id", "/x", "n", 1);
+        e.original_parent = None;
+        e.os_name = bad_name();
+        let jobs = build_jobs(&[e], Some(Path::new("/dst")));
+        assert_eq!(jobs[0].1, Path::new("/dst").join(bad_name()));
+    }
+
+    #[test]
+    fn non_utf8_file_through_index_trash_when_fs_allows() {
+        let f = fixture();
+        let p = f.root.join("work").join(bad_name());
+        if fs::write(&p, "raw").is_err() {
+            return; // APFS refuses invalid UTF-8 names; helpers covered above
+        }
+        let e = f
+            .store
+            .trash(std::slice::from_ref(&p))
+            .unwrap()
+            .entries
+            .remove(0);
+        assert_eq!(e.os_name, bad_name());
+        let listed = f.store.list().unwrap().entries;
+        assert_eq!(listed, vec![e.clone()]);
+        f.store.restore(&e, &p).unwrap();
+        assert_eq!(fs::read_to_string(&p).unwrap(), "raw");
+    }
+
+    // fix 4: purge identity
+
+    #[test]
+    fn purge_verified_skips_entries_whose_id_was_reused() {
+        let f = fixture();
+        let p = f.root.join("work/a.txt");
+        fs::write(&p, "old").unwrap();
+        let stale = f
+            .store
+            .trash(std::slice::from_ref(&p))
+            .unwrap()
+            .entries
+            .remove(0);
+        f.store.purge(std::slice::from_ref(&stale)).unwrap();
+        // a new item now occupies the same trash path (same id), later time
+        fs::write(&p, "new-and-longer").unwrap();
+        let store = IndexTrash::new(
+            f.trash_dir.clone(),
+            f.index.clone(),
+            mover(f.trash_dir.clone()),
+        )
+        .with_clock(|| 1_700_000_999);
+        let fresh = store
+            .trash(std::slice::from_ref(&p))
+            .unwrap()
+            .entries
+            .remove(0);
+        assert_eq!(fresh.id, stale.id);
+        let rep = purge_verified(&store, std::slice::from_ref(&stale));
+        assert_eq!(rep.purged, 0);
+        assert_eq!(rep.skipped, vec![stale]);
+        assert!(rep.error.is_none());
+        assert_eq!(store.list().unwrap().entries, vec![fresh.clone()]);
+        let rep = purge_verified(&store, std::slice::from_ref(&fresh));
+        assert_eq!(rep.purged, 1);
+        assert!(store.list().unwrap().entries.is_empty());
+    }
+
+    // fix 5: cleanup failure after a successful restore
+
+    fn fd_store(root: PathBuf) -> FreedesktopTrash {
+        FreedesktopTrash::with_parts(
+            Box::new(move || {
+                Ok(vec![TrashEntry {
+                    id: root.join("info/a.txt.trashinfo"),
+                    name: "a.txt".into(),
+                    os_name: "a.txt".into(),
+                    original_parent: None,
+                    deleted_at: Some(1),
+                    size: None,
+                    is_dir: false,
+                }])
+            }),
+            Box::new(|_| Ok(())),
+        )
+    }
+
+    #[test]
+    fn restore_with_trashinfo_removal_failure_is_restored_with_warning() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("Trash");
+        let info = fd_item(&root, "a.txt", "payload");
+        fs::remove_file(&info).unwrap();
+        fs::create_dir(&info).unwrap(); // remove_file on a directory fails
+        fs::write(info.join("keep"), "x").unwrap();
+        let store = fd_store(root.clone());
+        let e = store.list().unwrap().entries.remove(0);
+        let dest = tmp.path().join("out/a.txt");
+        let r = restore_entries(&store, &[(e, dest.clone())], OnConflict::Report);
+        assert_eq!(r.restored, vec![dest.clone()]);
+        assert!(r.failed.is_empty() && r.conflicts.is_empty());
+        assert_eq!(r.warnings.len(), 1);
+        assert!(
+            r.warnings[0].contains(&*dest.to_string_lossy()),
+            "{:?}",
+            r.warnings
+        );
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "payload");
+    }
+
+    // fix 6: list failures around trashing
+
+    fn flaky_fd(fail_on: Vec<usize>) -> (FreedesktopTrash, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let store = FreedesktopTrash::with_parts(
+            Box::new(move || {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                if fail_on.contains(&n) {
+                    Err(io::Error::other("list broke"))
+                } else {
+                    Ok(Vec::new())
+                }
+            }),
+            Box::new(|p| fs::remove_file(p)),
+        );
+        (store, calls)
+    }
+
+    #[test]
+    fn list_failure_before_or_after_trashing_warns_but_trashes() {
+        for fail_on in [vec![0usize], vec![1]] {
+            let (store, _) = flaky_fd(fail_on.clone());
+            let tmp = tempdir().unwrap();
+            let p = tmp.path().join("a.txt");
+            fs::write(&p, "x").unwrap();
+            let out = store
+                .trash(std::slice::from_ref(&p))
+                .expect("trash itself succeeds");
+            assert!(!p.exists());
+            assert!(out.entries.is_empty());
+            assert_eq!(
+                out.warning.as_deref(),
+                Some("되돌리기 정보 없음 (휴지통 목록 조회 실패)"),
+                "{fail_on:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn freedesktop_partial_trash_keeps_successes() {
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        fs::write(&a, "x").unwrap();
+        let gone = tmp.path().join("gone.txt");
+        let (store, _) = flaky_fd(vec![]);
+        let out = store.trash(&[gone.clone(), a.clone()]).unwrap();
+        assert!(!a.exists());
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(out.errors[0].0, gone);
+    }
+
+    // fix 8: batched index updates
+
+    fn counting_store(f: &Fixture) -> (IndexTrash, Arc<AtomicUsize>) {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&n);
+        let store =
+            store_with(f, mover(f.trash_dir.clone())).with_dropper(Box::new(move |p, ids| {
+                c.fetch_add(1, Ordering::SeqCst);
+                drop_records(p, ids)
+            }));
+        (store, n)
+    }
+
+    fn three_trashed(f: &Fixture, store: &IndexTrash) -> Vec<(TrashEntry, PathBuf)> {
+        let paths: Vec<PathBuf> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                let p = f.root.join("work").join(n);
+                fs::write(&p, n).unwrap();
+                p
+            })
+            .collect();
+        let out = store.trash(&paths).unwrap();
+        out.entries.into_iter().zip(paths).collect()
+    }
+
+    #[test]
+    fn restore_of_many_rewrites_the_index_once() {
+        let f = fixture();
+        let (store, n) = counting_store(&f);
+        let jobs = three_trashed(&f, &store);
+        let r = restore_entries(&store, &jobs, OnConflict::Report);
+        assert_eq!(r.restored.len(), 3);
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        assert!(read_index(&f.index).is_empty());
+    }
+
+    #[test]
+    fn purge_of_many_rewrites_the_index_once() {
+        let f = fixture();
+        let (store, n) = counting_store(&f);
+        let entries: Vec<_> = three_trashed(&f, &store).into_iter().map(|j| j.0).collect();
+        store.purge(&entries).unwrap();
+        assert_eq!(n.load(Ordering::SeqCst), 1);
+        assert!(read_index(&f.index).is_empty());
+    }
+
+    // fix 9: isolated freedesktop root (auto-run roundtrip)
+
+    #[test]
+    fn freedesktop_root_roundtrip_trash_list_restore_purge() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let store = FreedesktopTrash::with_root(base.join("Trash"));
+        let work = base.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let name = "한글 100% a b.txt";
+        let file = work.join(name);
+        fs::write(&file, "payload").unwrap();
+        let out = store.trash(std::slice::from_ref(&file)).unwrap();
+        assert!(!file.exists());
+        assert!(out.errors.is_empty() && out.warning.is_none());
+        assert_eq!(out.entries.len(), 1);
+        let listed = store.list().unwrap().entries;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, out.entries[0].id);
+        assert_eq!(listed[0].name, name);
+        assert_eq!(listed[0].original_parent.as_deref(), Some(work.as_path()));
+        assert_eq!(listed[0].size, Some(7));
+        let info = fs::read_to_string(&listed[0].id).unwrap();
+        assert!(info.starts_with("[Trash Info]\nPath="), "{info}");
+        assert!(info.contains("%25") && info.contains("%20"), "{info}");
+        assert!(info.contains("\nDeletionDate="), "{info}");
+        store.restore(&listed[0], &file).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "payload");
+        assert!(store.list().unwrap().entries.is_empty());
+        // same name again, then purge
+        let again = store.trash(std::slice::from_ref(&file)).unwrap().entries;
+        assert_eq!(again.len(), 1);
+        store.purge(&again).unwrap();
+        assert!(store.list().unwrap().entries.is_empty());
+        assert_eq!(fs::read_dir(base.join("Trash/files")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn freedesktop_root_same_names_get_distinct_ids() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let store = FreedesktopTrash::with_root(base.join("Trash"));
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let p = base.join("a.txt");
+            fs::write(&p, "x").unwrap();
+            ids.push(store.trash(&[p]).unwrap().entries.remove(0).id);
+        }
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(store.list().unwrap().entries.len(), 2);
+    }
+
+    #[test]
+    fn trashinfo_path_encoding_roundtrips_raw_bytes() {
+        let p = Path::new("/a b/%/한글").join(bad_name());
+        let enc = encode_trash_path(&p);
+        assert!(enc.is_ascii() && !enc.contains(' '), "{enc}");
+        assert_eq!(decode_trash_path(&enc), p);
+    }
+
+    #[test]
+    fn default_root_follows_xdg_data_home() {
+        assert_eq!(
+            default_root_from(Some("/x/data".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/x/data/Trash"))
+        );
+        assert_eq!(
+            default_root_from(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.local/share/Trash"))
+        );
+    }
+
+    #[test]
+    fn deletion_date_parses_back_to_the_same_second() {
+        let ts = 1_700_000_000;
+        assert_eq!(parse_deletion_date(&format_deletion_date(ts)), Some(ts));
     }
 
     // ---- real platform trash (run manually: cargo test -- --ignored) ----
@@ -1514,9 +2468,8 @@ mod tests {
             .find(|e| e.name == name && e.original_parent.as_deref() == Some(dir.as_path()))
             .unwrap_or_else(|| panic!("{name} not listed"))
             .clone();
-        if let Some(m) = made.first() {
-            assert_eq!(m.id, mine.id);
-        }
+        assert_eq!(made.entries.len(), 1, "{:?}", made.warning);
+        assert_eq!(made.entries[0].id, mine.id);
         store.restore(&mine, &file).unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "payload");
         assert!(
@@ -1529,6 +2482,7 @@ mod tests {
         );
         // purge path
         let again = store.trash(std::slice::from_ref(&file)).unwrap();
+        assert_eq!(again.entries.len(), 1);
         let listed = store.list().unwrap().entries;
         let mine = listed
             .iter()

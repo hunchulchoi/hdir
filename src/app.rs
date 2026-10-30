@@ -104,19 +104,18 @@ enum BgKind {
     },
     TrashPurge {
         panel: usize,
-        count: usize,
     },
 }
 
 type TrashListing = std::io::Result<crate::trash::TrashListing>;
 
 enum BgResult {
-    Trash(std::io::Result<Vec<TrashEntry>>),
+    Trash(std::io::Result<trash::TrashOutcome>),
     TrashList(TrashListing),
     /// Restore report plus the refreshed listing.
     TrashRestore(RestoreReport, TrashListing),
     /// Purge result plus the refreshed listing.
-    TrashPurge(std::io::Result<()>, TrashListing),
+    TrashPurge(trash::PurgeReport, TrashListing),
     Undo(UndoApplied),
     Mkdir(std::io::Result<PathBuf>),
     Rename(std::io::Result<PathBuf>),
@@ -487,13 +486,30 @@ impl App {
         match (task.kind, result) {
             (BgKind::Trash { panel, cwd, paths }, Some(BgResult::Trash(res))) => {
                 let status = match res {
-                    Ok(entries) => {
-                        let n = paths.len();
-                        if !entries.is_empty() {
-                            self.undo.push(UndoOp::Trash { entries });
+                    Ok(outcome) => {
+                        let ok = paths.len().saturating_sub(outcome.errors.len());
+                        let done: Vec<PathBuf> = paths
+                            .iter()
+                            .filter(|p| !outcome.errors.iter().any(|(f, _)| f == *p))
+                            .cloned()
+                            .collect();
+                        if !outcome.entries.is_empty() {
+                            self.undo.push(UndoOp::Trash {
+                                entries: outcome.entries,
+                            });
                         }
-                        self.clear_selection(panel, &cwd, &paths);
-                        format!("휴지통: {n}개")
+                        self.clear_selection(panel, &cwd, &done);
+                        let mut status = match outcome.errors.first() {
+                            Some((_, first)) if ok == 0 => format!("오류: {first}"),
+                            Some((_, first)) => {
+                                format!("휴지통: {ok}개, 실패 {}개: {first}", outcome.errors.len())
+                            }
+                            None => format!("휴지통: {ok}개"),
+                        };
+                        if let Some(w) = outcome.warning {
+                            status = format!("{status} · {w}");
+                        }
+                        status
                     }
                     Err(e) => format!("오류: {e}"),
                 };
@@ -529,7 +545,7 @@ impl App {
                 }
             },
             (BgKind::TrashList { panel }, Some(BgResult::TrashList(res))) => {
-                self.status = match self.apply_trash_listing(panel, res) {
+                self.status = match self.apply_trash_listing(panel, &res) {
                     Ok(warning) => warning,
                     Err(e) => Some(format!("오류: {e}")),
                 };
@@ -537,11 +553,16 @@ impl App {
             (BgKind::TrashRestore { panel }, Some(BgResult::TrashRestore(report, list))) => {
                 self.finish_trash_restore(panel, report, list);
             }
-            (BgKind::TrashPurge { panel, count }, Some(BgResult::TrashPurge(res, list))) => {
-                let _ = self.apply_trash_listing(panel, list);
-                self.status = Some(match res {
-                    Ok(()) => format!("영구 삭제: {count}개"),
-                    Err(e) => format!("오류: {e}"),
+            (BgKind::TrashPurge { panel }, Some(BgResult::TrashPurge(report, list))) => {
+                let _ = self.apply_trash_listing_all(panel, &list);
+                let skipped = report.skipped.len();
+                self.status = Some(match report.error {
+                    Some(e) => format!("오류: {e}"),
+                    None if skipped > 0 => format!(
+                        "영구 삭제: {}개, 건너뜀 {skipped}개 (목록이 변경됨)",
+                        report.purged
+                    ),
+                    None => format!("영구 삭제: {}개", report.purged),
                 });
             }
             (BgKind::Undo, Some(BgResult::Undo(done))) => {
@@ -852,15 +873,15 @@ impl App {
     fn apply_trash_listing(
         &mut self,
         panel: usize,
-        res: TrashListing,
+        res: &TrashListing,
     ) -> Result<Option<String>, String> {
         let Some(view) = self.trash_views[panel].as_mut() else {
             return Ok(None);
         };
         match res {
             Ok(listing) => {
-                view.set_entries(listing.entries);
-                Ok(listing.warning)
+                view.set_entries(listing.entries.clone());
+                Ok(listing.warning.clone())
             }
             Err(e) => {
                 view.loading = false;
@@ -870,8 +891,19 @@ impl App {
         }
     }
 
+    /// Apply one listing to every open trash view (a change in one panel
+    /// affects the other); returns `panel`'s warning or error.
+    fn apply_trash_listing_all(
+        &mut self,
+        panel: usize,
+        res: &TrashListing,
+    ) -> Result<Option<String>, String> {
+        let _ = self.apply_trash_listing(1 - panel, res);
+        self.apply_trash_listing(panel, res)
+    }
+
     fn finish_trash_restore(&mut self, panel: usize, report: RestoreReport, list: TrashListing) {
-        let _ = self.apply_trash_listing(panel, list);
+        let _ = self.apply_trash_listing_all(panel, &list);
         let dirs: Vec<PathBuf> = report
             .restored
             .iter()
@@ -883,36 +915,43 @@ impl App {
             }
         }
         let n = report.restored.len();
+        let (c, f) = (report.conflicts.len(), report.failed.len());
         let mut status = format!("복원: {n}개");
-        if let Some(f) = report.failed.first() {
-            status = format!("복원 {n}개, 실패 {}개: {}", report.failed.len(), f.message);
-        }
-        if !report.conflicts.is_empty() {
-            status = format!("복원 {n}개, 충돌 {}개", report.conflicts.len());
-            if self.dialog.is_none() {
-                let mut msg: Vec<String> = report
-                    .conflicts
-                    .iter()
-                    .take(5)
-                    .map(|(e, _)| format!("이미 존재: {}", e.name))
-                    .collect();
-                if report.conflicts.len() > 5 {
-                    msg.push(format!("외 {}개", report.conflicts.len() - 5));
-                }
-                let dialog = Dialog::choice_with_default(
-                    "복원 충돌",
-                    msg,
-                    ["Rename", "Skip", "Cancel"].map(String::from).to_vec(),
-                    1,
-                );
-                self.dialog = Some((
-                    dialog,
-                    PendingAction::TrashConflict {
-                        panel,
-                        jobs: report.conflicts,
-                    },
-                ));
+        if c > 0 || f > 0 {
+            status = format!("복원 {n}개");
+            if c > 0 {
+                status.push_str(&format!(", 충돌 {c}개"));
             }
+            if let Some(first) = report.failed.first() {
+                status.push_str(&format!(", 실패 {f}개: {}", first.message));
+            }
+        }
+        if let Some(w) = report.warnings.first() {
+            status.push_str(&format!(" · {w}"));
+        }
+        if !report.conflicts.is_empty() && self.dialog.is_none() {
+            let mut msg: Vec<String> = report
+                .conflicts
+                .iter()
+                .take(5)
+                .map(|(e, _)| format!("이미 존재: {}", e.name))
+                .collect();
+            if report.conflicts.len() > 5 {
+                msg.push(format!("외 {}개", report.conflicts.len() - 5));
+            }
+            let dialog = Dialog::choice_with_default(
+                "복원 충돌",
+                msg,
+                ["Rename", "Skip", "Cancel"].map(String::from).to_vec(),
+                1,
+            );
+            self.dialog = Some((
+                dialog,
+                PendingAction::TrashConflict {
+                    panel,
+                    jobs: report.conflicts,
+                },
+            ));
         }
         self.status = Some(status);
     }
@@ -1004,14 +1043,10 @@ impl App {
                     return;
                 }
                 let store = Arc::clone(&self.trash);
-                let count = entries.len();
-                self.task = Some(BgTask::spawn(
-                    BgKind::TrashPurge { panel, count },
-                    move || {
-                        let res = store.purge(&entries);
-                        BgResult::TrashPurge(res, store.list())
-                    },
-                ));
+                self.task = Some(BgTask::spawn(BgKind::TrashPurge { panel }, move || {
+                    let report = trash::purge_verified(&*store, &entries);
+                    BgResult::TrashPurge(report, store.list())
+                }));
                 self.status = Some("영구 삭제 중…".into());
             }
             (PendingAction::Transfer { kind, sources }, DialogResult::Submitted(input)) => {
@@ -2910,8 +2945,8 @@ mod tests {
     fn trash_listing_warning_is_shown_in_status() {
         struct Partial;
         impl TrashStore for Partial {
-            fn trash(&self, _: &[PathBuf]) -> std::io::Result<Vec<TrashEntry>> {
-                Ok(vec![])
+            fn trash(&self, _: &[PathBuf]) -> std::io::Result<crate::trash::TrashOutcome> {
+                Ok(Default::default())
             }
             fn list(&self) -> std::io::Result<crate::trash::TrashListing> {
                 Ok(crate::trash::TrashListing {
@@ -2944,8 +2979,8 @@ mod tests {
     fn trash_list_error_is_shown() {
         struct Broken;
         impl TrashStore for Broken {
-            fn trash(&self, _: &[PathBuf]) -> std::io::Result<Vec<TrashEntry>> {
-                Ok(vec![])
+            fn trash(&self, _: &[PathBuf]) -> std::io::Result<crate::trash::TrashOutcome> {
+                Ok(Default::default())
             }
             fn list(&self) -> std::io::Result<crate::trash::TrashListing> {
                 Err(std::io::Error::new(
@@ -2971,5 +3006,204 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some(msg.as_str()));
         assert!(!app.trash_views[0].as_ref().unwrap().loading);
         assert!(screen_text(&mut app).contains("휴지통 접근 권한 없음"));
+    }
+
+    // ---- review fixes: partial trash, both views, mixed restore results ----
+
+    fn tentry(name: &str, parent: Option<&str>) -> TrashEntry {
+        TrashEntry {
+            id: PathBuf::from(format!("/t/{name}")),
+            name: name.into(),
+            os_name: name.into(),
+            original_parent: parent.map(PathBuf::from),
+            deleted_at: Some(5),
+            size: Some(1),
+            is_dir: false,
+        }
+    }
+
+    /// Store with canned answers: restore of `conflict*` names conflicts,
+    /// other names fail with "boom".
+    struct Scripted {
+        outcome: crate::trash::TrashOutcome,
+        entries: Vec<TrashEntry>,
+        restore_warnings: Vec<String>,
+    }
+
+    impl TrashStore for Scripted {
+        fn trash(&self, _: &[PathBuf]) -> std::io::Result<crate::trash::TrashOutcome> {
+            Ok(self.outcome.clone())
+        }
+        fn list(&self) -> std::io::Result<crate::trash::TrashListing> {
+            Ok(crate::trash::TrashListing::new(self.entries.clone()))
+        }
+        fn restore(&self, e: &TrashEntry, _: &std::path::Path) -> std::io::Result<()> {
+            if e.name.starts_with("conflict") {
+                Err(std::io::ErrorKind::AlreadyExists.into())
+            } else if e.name.starts_with("fine") {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("boom"))
+            }
+        }
+        fn finish_restore(&self, _: &[(TrashEntry, PathBuf)]) -> Vec<String> {
+            self.restore_warnings.clone()
+        }
+        fn purge(&self, _: &[TrashEntry]) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn scripted_app(store: Scripted) -> (TempDir, App) {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        fs::write(tmp.path().join("g.txt"), "x").unwrap();
+        let app = App::with_trash(
+            tmp.path().to_path_buf(),
+            tmp.path().to_path_buf(),
+            Arc::new(store),
+        );
+        (tmp, app)
+    }
+
+    fn trash_selected_f(app: &mut App) {
+        press(app, KeyCode::Down);
+        press(app, KeyCode::F(8));
+        press(app, KeyCode::Enter);
+        wait_idle(app);
+    }
+
+    #[test]
+    fn partial_trash_reports_failures_and_still_records_undo() {
+        let (_t, mut app) = scripted_app(Scripted {
+            outcome: crate::trash::TrashOutcome {
+                entries: vec![tentry("a", Some("/p"))],
+                errors: vec![(PathBuf::from("/p/b"), "boom".into())],
+                warning: None,
+            },
+            entries: vec![],
+            restore_warnings: vec![],
+        });
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert_eq!(app.status.as_deref(), Some("휴지통: 1개, 실패 1개: boom"));
+        assert_eq!(app.undo.len(), 1);
+    }
+
+    #[test]
+    fn trash_warning_is_part_of_the_status() {
+        let w = "휴지통으로 이동했지만 복원 정보 저장 실패: disk full";
+        let (_t, mut app) = scripted_app(Scripted {
+            outcome: crate::trash::TrashOutcome {
+                entries: vec![tentry("a", Some("/p"))],
+                errors: vec![],
+                warning: Some(w.into()),
+            },
+            entries: vec![],
+            restore_warnings: vec![],
+        });
+        trash_selected_f(&mut app);
+        assert!(
+            app.status.as_deref().unwrap().contains(w),
+            "{:?}",
+            app.status
+        );
+        assert_eq!(app.undo.len(), 1, "entries stay in memory for undo");
+    }
+
+    #[test]
+    fn purge_in_one_panel_refreshes_the_other_trash_view() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        for n in ["f.txt", "g.txt"] {
+            trash_files(&fake, &[root.join(n)]);
+        }
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(view_names(&app, 1).len(), 2);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(view_names(&app, 0).is_empty());
+        assert!(view_names(&app, 1).is_empty(), "other panel is stale");
+    }
+
+    #[test]
+    fn restore_in_one_panel_refreshes_the_other_trash_view() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(view_names(&app, 1).is_empty(), "other panel is stale");
+    }
+
+    #[test]
+    fn purge_skips_entries_changed_since_the_listing() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        let stale = app.trash_views[0].as_ref().unwrap().entries[0].clone();
+        // Behind the view's back the item is replaced under the same id.
+        fake.purge(std::slice::from_ref(&stale)).unwrap();
+        fs::write(root.join("f.txt"), "newer").unwrap();
+        trash_files(&fake, &[root.join("f.txt")]);
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert_eq!(fake.list().unwrap().entries.len(), 1, "new item survives");
+        let s = app.status.clone().unwrap();
+        assert!(s.contains("건너뜀 1개"), "{s}");
+    }
+
+    #[test]
+    fn restore_with_conflicts_and_errors_shows_both_counts_and_first_error() {
+        let (_t, mut app) = scripted_app(Scripted {
+            outcome: Default::default(),
+            entries: vec![
+                tentry("fine1", Some("/p")),
+                tentry("conflict1", Some("/p")),
+                tentry("broken1", Some("/p")),
+            ],
+            restore_warnings: vec![],
+        });
+        enter_trash(&mut app);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char(' '));
+        }
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        let s = app.status.clone().unwrap();
+        assert!(s.contains("복원 1개"), "{s}");
+        assert!(s.contains("충돌 1개"), "{s}");
+        assert!(s.contains("실패 1개"), "{s}");
+        assert!(s.contains("boom"), "{s}");
+    }
+
+    #[test]
+    fn restore_cleanup_warning_is_shown() {
+        let (_t, mut app) = scripted_app(Scripted {
+            outcome: Default::default(),
+            entries: vec![tentry("fine1", Some("/p"))],
+            restore_warnings: vec!["정리 실패 W".into()],
+        });
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        let s = app.status.clone().unwrap();
+        assert!(s.contains("복원: 1개") && s.contains("정리 실패 W"), "{s}");
     }
 }

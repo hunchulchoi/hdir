@@ -730,8 +730,9 @@ mod tests {
 
     fn tentry(name: &str, parent: Option<&str>, at: Option<i64>, size: Option<u64>) -> TrashEntry {
         TrashEntry {
-            id: format!("id-{name}"),
+            id: format!("id-{name}").into(),
             name: name.into(),
+            os_name: name.into(),
             original_parent: parent.map(PathBuf::from),
             deleted_at: at,
             size,
