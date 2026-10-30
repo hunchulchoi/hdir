@@ -137,14 +137,22 @@ const KEY_COL: usize = 26;
 
 /// Help text: every context's bindings, generated from the live keymap.
 pub fn help_lines(km: &Keymap) -> Vec<String> {
+    help_lines_for(
+        km,
+        &[
+            Context::Panel,
+            Context::Trash,
+            Context::Viewer,
+            Context::Dialog,
+            Context::Menu,
+        ],
+    )
+}
+
+/// Help text for just the given contexts.
+pub fn help_lines_for(km: &Keymap, contexts: &[Context]) -> Vec<String> {
     let mut out = Vec::new();
-    for ctx in [
-        Context::Panel,
-        Context::Trash,
-        Context::Viewer,
-        Context::Dialog,
-        Context::Menu,
-    ] {
+    for &ctx in contexts {
         let rows = km.describe(ctx);
         if rows.is_empty() {
             continue;

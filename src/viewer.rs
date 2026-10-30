@@ -1,6 +1,7 @@
 //! F3 full-screen text viewer: state, scrolling, search and rendering.
 //! Loading happens elsewhere (a background task); this module is pure.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ratatui::Frame;
@@ -30,6 +31,34 @@ pub enum Content {
     Message(String),
 }
 
+/// Display-column index of one line: where each grapheme starts (byte offset)
+/// and ends (column), so rendering can start at a column without rescanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LineIndex {
+    byte_starts: Vec<usize>,
+    /// Column where grapheme `i` starts; `col_starts[i] + width(i)` is its end.
+    col_starts: Vec<usize>,
+    col_ends: Vec<usize>,
+}
+
+impl LineIndex {
+    fn build(s: &str) -> Self {
+        let mut idx = Self {
+            byte_starts: Vec::new(),
+            col_starts: Vec::new(),
+            col_ends: Vec::new(),
+        };
+        let mut col = 0;
+        for (b, g) in s.grapheme_indices(true) {
+            idx.byte_starts.push(b);
+            idx.col_starts.push(col);
+            col += g.width();
+            idx.col_ends.push(col);
+        }
+        idx
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewer {
     pub path: PathBuf,
@@ -43,6 +72,14 @@ pub struct Viewer {
     pub match_line: Option<usize>,
     /// Transient footer message (e.g. "찾을 수 없음").
     pub notice: Option<String>,
+    /// Test seam: how many times the whole document was lowercased.
+    pub lower_builds: usize,
+    /// Lowercase copy of every line, built on the first search of a document.
+    lower: Option<Vec<String>>,
+    /// Column indexes of the visible long lines (by line number).
+    line_index: HashMap<usize, LineIndex>,
+    /// Test seam: how many per-line column indexes were built.
+    pub index_builds: usize,
     rows: usize,
     cols: usize,
     max_width: usize,
@@ -59,6 +96,10 @@ impl Viewer {
             query: None,
             match_line: None,
             notice: None,
+            lower_builds: 0,
+            lower: None,
+            line_index: HashMap::new(),
+            index_builds: 0,
             rows: 10,
             cols: 80,
             max_width: 0,
@@ -71,6 +112,8 @@ impl Viewer {
         self.hscroll = 0;
         self.match_line = None;
         self.notice = None;
+        self.lower = None;
+        self.line_index.clear();
         self.content = match p {
             Preview::Text { lines, truncated } => {
                 self.max_width = lines.iter().map(|l| l.width()).max().unwrap_or(0);
@@ -132,10 +175,15 @@ impl Viewer {
             return;
         };
         let needle = q.to_lowercase();
-        let n = self.lines().len();
+        if self.lower.is_none() {
+            self.lower_builds += 1;
+            self.lower = Some(self.lines().iter().map(|l| l.to_lowercase()).collect());
+        }
+        let lower = self.lower.as_deref().unwrap_or_default();
+        let n = lower.len();
         let hit = (0..n)
             .map(|i| (from + i) % n)
-            .find(|&idx| self.lines()[idx].to_lowercase().contains(&needle));
+            .find(|&idx| lower[idx].contains(&needle));
         match hit {
             Some(idx) => {
                 self.match_line = Some(idx);
@@ -221,6 +269,33 @@ pub fn window(s: &str, start: usize, width: usize) -> String {
     out
 }
 
+/// Same result as [`window`], but starts at the grapheme found through the
+/// prebuilt `idx` instead of scanning from the line start.
+fn window_indexed(s: &str, idx: &LineIndex, start: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    // First grapheme that begins at or after `start`.
+    let first = idx.col_starts.partition_point(|&c| c < start);
+    if first > 0 && idx.col_ends[first - 1] > start {
+        // A wide cluster straddles the left edge: blank its visible part.
+        let pad = (idx.col_ends[first - 1] - start).min(width);
+        out.push_str(&" ".repeat(pad));
+        used += pad;
+    }
+    if let Some(&b) = idx.byte_starts.get(first) {
+        for g in s[b..].graphemes(true) {
+            let w = g.width();
+            if used + w > width {
+                break;
+            }
+            out.push_str(g);
+            used += w;
+        }
+    }
+    out.push_str(&" ".repeat(width.saturating_sub(used)));
+    out
+}
+
 pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str) {
     let area = frame.area();
     let (w, h) = (area.width as usize, area.height as usize);
@@ -248,13 +323,28 @@ pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str
 
     match &v.content {
         Content::Text { lines: text, .. } => {
+            let visible = v.scroll..(v.scroll + v.rows).min(text.len());
+            v.line_index.retain(|i, _| visible.contains(i));
             for (i, l) in text.iter().enumerate().skip(v.scroll).take(v.rows) {
                 let style = if v.match_line == Some(i) {
                     Style::default().fg(theme.cursor_fg).bg(theme.cursor_bg)
                 } else {
                     base
                 };
-                lines.push(Line::styled(window(l, v.hscroll, w), style));
+                let row = if v.hscroll == 0 {
+                    window(l, 0, w)
+                } else if l.len() <= v.hscroll {
+                    // Every cluster is at least one column and one byte wide
+                    // or zero columns: nothing can reach the visible area.
+                    " ".repeat(w)
+                } else {
+                    let idx = v.line_index.entry(i).or_insert_with(|| {
+                        v.index_builds += 1;
+                        LineIndex::build(l)
+                    });
+                    window_indexed(l, idx, v.hscroll, w)
+                };
+                lines.push(Line::styled(row, style));
             }
         }
         Content::Loading => lines.push(Line::styled(fit_width(" 읽는 중…", w), base)),
@@ -395,6 +485,29 @@ mod tests {
     }
 
     #[test]
+    fn window_indexed_matches_window_for_every_start_and_width() {
+        let zwj = "👩\u{200d}💻";
+        for s in [
+            "",
+            "abcdef",
+            "한글 mixed 텍스트 abc",
+            &format!("a{zwj}b한c"),
+            "e\u{301}x가",
+        ] {
+            let idx = LineIndex::build(s);
+            for start in 0..(s.width() + 3) {
+                for width in 0..8 {
+                    assert_eq!(
+                        window_indexed(s, &idx, start, width),
+                        window(s, start, width),
+                        "{s:?} start={start} width={width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hscrolled_render_shows_the_shifted_text() {
         let mut v = Viewer::loading(PathBuf::from("/x"));
         v.set_preview(Preview::Text {
@@ -452,6 +565,61 @@ mod tests {
         assert_eq!(v.input.as_deref(), Some(""));
         v.input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(v.input.is_none());
+    }
+
+    #[test]
+    fn repeated_next_does_not_relowercase_the_document() {
+        let mut v = Viewer::loading(PathBuf::from("/x"));
+        v.set_preview(Preview::Text {
+            lines: ["Alpha", "beta", "BETA2", "gamma", "beta3"]
+                .map(String::from)
+                .to_vec(),
+            truncated: false,
+        });
+        draw(&mut v, 30, 4);
+        v.apply(Action::Search);
+        typed(&mut v, "Beta");
+        enter(&mut v);
+        assert_eq!(v.match_line, Some(1));
+        for want in [2, 4, 1, 2] {
+            v.apply(Action::SearchNext);
+            assert_eq!(v.match_line, Some(want));
+        }
+        assert_eq!(v.lower_builds, 1, "lowercased once per loaded document");
+        // A new document gets its own copy.
+        v.set_preview(Preview::Text {
+            lines: vec!["Zeta".into()],
+            truncated: false,
+        });
+        v.apply(Action::Search);
+        typed(&mut v, "zeta");
+        enter(&mut v);
+        assert_eq!(v.match_line, Some(0));
+        assert_eq!(v.lower_builds, 2);
+    }
+
+    #[test]
+    fn hscroll_renders_a_long_korean_line_from_a_cached_index() {
+        let long: String = "가나다abc라마".repeat(2000); // 14 columns per unit
+        let mut v = Viewer::loading(PathBuf::from("/x"));
+        v.set_preview(Preview::Text {
+            lines: vec!["short".into(), long.clone()],
+            truncated: false,
+        });
+        draw(&mut v, 20, 5);
+        v.hscroll = 1001; // lands in the middle of a wide char
+        let first = draw(&mut v, 20, 5);
+        let again = draw(&mut v, 20, 5);
+        assert_eq!(first, again);
+        assert_eq!(first[2].trim_end(), window(&long, 1001, 20).trim_end());
+        assert_eq!(first[1].trim_end(), "", "short line is scrolled out");
+        assert_eq!(
+            v.index_builds, 1,
+            "only the long visible line is indexed, once across frames"
+        );
+        v.hscroll += 8;
+        draw(&mut v, 20, 5);
+        assert_eq!(v.index_builds, 1, "scrolling reuses the index");
     }
 
     #[test]
