@@ -680,8 +680,11 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     /// Fixture for the real-shell listing tests.
     #[cfg(unix)]
     fn list_fixture(d: &Path) {
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::fs::symlink;
         std::fs::write(d.join("plain"), "abc").unwrap();
+        // independent of the umask
+        std::fs::set_permissions(d.join("plain"), std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::write(d.join(".hid"), "").unwrap();
         std::fs::write(d.join("한글\t탭\n개행 'q'"), "xy").unwrap();
         std::fs::create_dir(d.join("sub dir")).unwrap();
