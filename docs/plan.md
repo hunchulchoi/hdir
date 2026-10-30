@@ -35,7 +35,7 @@ src/
   preview.rs  # 텍스트 앞부분 N KB, 바이너리 감지(NUL 바이트), 디렉터리 요약(파일/폴더 수)
   dialog.rs   # 확인(Y/N), 입력(새 폴더명, 이름 변경, 대상 경로) 프롬프트
   ui.rs       # 헤더 / 좌우 패널 / 미리보기(Dev) / 명령줄 / F키 바 렌더링, 테마
-  keymap.rs   # 키 → Action 매핑
+  keymap.rs   # Action enum + 기본 키맵(mdir 프리셋) + 사용자 [keys] 병합, 키 문자열 파서
   config.rs   # ~/.config/hdir/config.toml 로드(없으면 기본값), 파싱 오류 시 상태줄 경고 + 기본값
   assoc.rs    # 확장자 연결: 확장자/glob → 명령 템플릿 매칭, 실행
   theme.rs    # Theme 구조체(색 슬롯), 내장 프리셋, 사용자 테마 로드
@@ -168,6 +168,26 @@ shell/
    - 진행률: 선택 항목별 scp 실행 → `전송 중 3/12 · prod-web` 표시, 시작 전 원격 `du -sb`로 총 크기 계산해 바이트 진행률 근사.
    - 덮어쓰기 충돌: 대상 존재 여부 사전 확인 → 기존 충돌 dialog 재사용.
    - Esc로 전송 취소(scp 프로세스 kill, 부분 파일 남음을 알림).
+12-1. **키 설정 (키맵 변경)**
+   - 모든 조작은 `Action` enum(`cursor_up`, `enter`, `parent`, `switch_panel`, `toggle_select`, `view`, `edit`, `copy`, `move`, `mkdir`, `rename`, `delete`, `menu`, `quit`, `quit_no_cd`, `undo`, `command_line`, `toggle_mode`, `toggle_hidden`, `connect_left`, `connect_right`, `open_with` …)로 정의. 키 → Action은 테이블 조회만 → 하드코딩 금지.
+   - 내장 프리셋: `mdir`(기본, 위 F키 표), `vim`(hjkl·`/`·`yy`→copy 등 단일키 위주). `keys.preset = "mdir"`.
+   - 사용자 재정의 (`config.toml`):
+     ```toml
+     [keys]
+     preset = "mdir"
+     [keys.bind]
+     copy        = ["F5", "c"]          # 여러 키 바인딩
+     delete      = ["F8", "Delete"]
+     quit        = ["F10", "Ctrl+Q"]
+     toggle_mode = "Ctrl+T"
+     view        = []                    # 빈 배열 = 비활성화
+     ```
+   - 키 문자열 문법: `Ctrl+`/`Alt+`/`Shift+` 수식어 + `F1`~`F12`, `Enter`, `Esc`, `Tab`, `Backspace`, `Delete`, `Insert`, `Home`, `End`, `PageUp`, `PageDown`, `Up`/`Down`/`Left`/`Right`, `Space`, 단일 문자. 대소문자 무시.
+   - 검증: 알 수 없는 action/키 → 상태줄 경고 + 해당 항목 무시. 같은 키가 두 action에 바인딩 → 경고, 사용자 정의가 프리셋보다 우선.
+   - 문맥별 키맵: `panel`(기본), `viewer`(F3), `dialog`, `menu` 섹션 분리 (`[keys.viewer]` 등). Esc/Enter는 dialog에서 고정(잠금 방지).
+   - F키 바·F1 도움말 화면은 현재 키맵에서 자동 생성 → 재정의가 화면에 즉시 반영.
+   - F9 메뉴 "키 설정 보기": 현재 바인딩 목록 + 설정 파일 경로 표시, `$EDITOR`로 열기 → 저장 후 자동 재로드.
+   - 터미널이 못 받는 키(macOS Terminal의 F키 등) 대비: `mdir` 프리셋에 F키와 함께 대체키(Alt+숫자: Alt+5=copy) 기본 포함.
 13. **긴 작업** — copy/move는 `job.rs` 워커 스레드에서 실행, 상태줄에 `복사 중 3/12 · 45%`. 이벤트 루프는 `crossterm::event::poll(50ms)`로 키 입력과 job 메시지 동시 처리. 덮어쓰기 충돌 시 dialog(덮어쓰기/건너뛰기/모두).
 
 ## 구현 순서 (마일스톤)
@@ -177,7 +197,7 @@ shell/
 3. fs_ops (mkdir/rename/trash/copy/move) + dialog + undo + 단위 테스트
 4. job 스레드 진행률 표시
 5. F3 뷰어, F4 편집, 미리보기, Dev 모드 토글
-6. config.rs + theme.rs: 내장 3종 테마(기본 mdir), 확장자 그룹 색, 사용자 테마, 테마 선택 메뉴 (마일스톤 2의 하드코딩 색을 테마 슬롯으로 교체)
+6. config.rs + keymap 설정(프리셋·재정의·검증·F1 도움말) + theme.rs: 내장 테마(기본 mdir), 확장자 그룹 색, 사용자 테마, 테마 선택 메뉴 (마일스톤 2의 하드코딩 색을 테마 슬롯으로 교체)
 7. assoc.rs: 확장자 연결 + Enter 기본 동작 + 연결 프로그램 선택
 8. 명령줄 + `--cwd-file` + `shell/hdir.{zsh,bash}`
 9. Vfs trait 추출(로컬 코드 이전) → ssh.rs: ControlMaster 연결, 목록, 미리보기, 원격 파일 작업
@@ -208,6 +228,7 @@ shell/
   - `:git status` 실행 후 복귀, `:cd src` 내부 이동
   - F10 종료 후 셸 `pwd`가 마지막 경로인지 확인
   - Ctrl+T로 Classic ↔ Dev 전환
+  - `[keys.bind] copy = "c"` 설정 후 `c`로 복사, F키 바·F1 도움말에 반영, 중복 바인딩 경고 표시
   - `.md` Enter → `$EDITOR`, `.png` Enter → 미리보기 앱 열림 + TUI 유지, 규칙 없는 확장자 → 기본 동작
   - F9 → 테마 선택에서 커서 이동 시 즉시 색 변경, Esc 원복, Enter 후 재실행해도 유지
   - 사용자 테마 파일 추가 후 목록에 표시
@@ -283,11 +304,11 @@ frontmatter `model: haiku`, tools: Bash/Read/Edit. 본문: plane CLI 사용법(`
 | **M1 코어 TUI·탐색** | 프로젝트 scaffold·Cargo 의존성·.gitignore (high) · 터미널 setup/restore·panic hook·이벤트 루프 (high) · Panel 디렉터리 로딩·정렬·숨김 토글·권한오류 처리 (high) · 키 탐색(↑↓/PgUp/Home/Enter/Backspace 커서 복원) (high) · 듀얼 패널·Tab 전환·Space 선택 (high) · 레이아웃: 헤더/패널/F키 바 렌더링, 한글 폭 처리 (medium) |
 | **M2 파일 작업** | fs_ops 복사(재귀)·이동(cross-fs 대체) (high) · F7 mkdir·F2 이름변경·F8 휴지통 + dialog (high) · 덮어쓰기 충돌 dialog (medium) · undo 스택(Ctrl+Z) (medium) · job 워커 스레드·진행률 상태줄·취소 (high) · fs_ops 단위 테스트(tempfile) (medium) |
 | **M3 뷰어·미리보기·모드** | F3 전체화면 텍스트 뷰어 (medium) · F4 `$EDITOR` suspend/resume (medium) · 미리보기 패널(64KB/200줄, 바이너리 감지, 디렉터리 요약) (medium) · Classic/Dev 모드 레이아웃 + Ctrl+T·F9 메뉴 (medium) |
-| **M4 테마** | config.rs: config.toml 로드·기본값·오류 경고 (high) · Theme 슬롯·색 파싱(이름/hex/256)·base 상속 (high) · 내장 테마 mdir(기본)·mdir-red·mdir-green·dark·light (high) · 확장자 그룹 색 `[ext_colors]` (medium) · 테마 선택 메뉴(즉시 미리보기/Esc 원복/저장) (medium) · truecolor 미지원 256색 근사 (low) |
+| **M4 설정·테마·키** | config.rs: config.toml 로드·기본값·오류 경고 (high) · 키 문자열 파서·Action enum·프리셋(mdir/vim) (high) · `[keys.bind]` 재정의·문맥별 키맵·중복/오류 검증 (high) · F키 바·F1 도움말 키맵 자동 생성, 키 설정 보기·재로드 (medium) · Theme 슬롯·색 파싱(이름/hex/256)·base 상속 (high) · 내장 테마 mdir(기본)·mdir-red·mdir-green·dark·light (high) · 확장자 그룹 색 `[ext_colors]` (medium) · 테마 선택 메뉴(즉시 미리보기/Esc 원복/저장) (medium) · truecolor 미지원 256색 근사 (low) |
 | **M5 확장자 연결** | assoc 규칙 파싱·매칭(glob→ext→기본) (high) · 명령 템플릿 `{}`/`{dir}`/`{name}` 이스케이프·실행(wait/background) (high) · Enter 기본 동작(텍스트→뷰어, 그외 open) (medium) · 연결 프로그램 선택 메뉴 (low) · assoc 단위 테스트 (medium) |
 | **M6 셸 통합** | 명령줄 `:`·내부 `cd`·`$SHELL -c` 실행 후 복귀 (high) · `--cwd-file` 종료 시 cwd 기록·Ctrl+Q cd 없이 종료 (high) · shell/hdir.zsh·hdir.bash 함수 (high) |
 | **M7 SSH 원격 패널** | Vfs trait 추출·로컬 구현 이전 (high) · ControlMaster 연결(suspend 후 인증)·끊김 감지·재연결 (high) · 원격 OS 감지 + 목록(find -printf / stat -f) NUL 파서 (high) · 비동기 원격 로딩 `읽는 중…` (high) · 원격 mkdir/mv/rm(영구 삭제 경고) (medium) · 원격 미리보기·F3 (medium) · 원격 F4 편집(다운로드→편집→업로드)·원격 확장자 연결 (medium) · 원격 명령줄 `ssh -t` (low) · servers.rs: ssh config 파싱 + `[[servers]]` 병합 (high) · Alt+F1/F2 위치 선택·`:ssh host:/path`·`:local` (high) · 서버별 테마(패널 단위, 활성 패널 기준 상태줄) (high) |
 | **M8 scp 전송** | transfer 라우팅 4종(local↔local/local↔remote/remote↔local/remote↔remote `-3`) (high) · F6 이동 = 전송 성공 후 원본 삭제 (high) · 진행률(`du -sb` 총량, 항목별) (medium) · 전송 전 대상 충돌 확인 (medium) · Esc 취소·부분 파일 안내 (medium) · ssh/scp 인자 생성·파서 단위 테스트 (medium) · Docker openssh 컨테이너 통합 테스트 환경 (low) |
 | **M9 문서·릴리스** | README: 설치·셸 함수·config 예시(assoc/테마/서버) (medium) · `cargo build --release`·clippy 무경고 정리 (low) |
 
-총 9 모듈 / 약 52 이슈. 생성 후 모듈별 이슈 수 표로 보고.
+총 9 모듈 / 약 55 이슈. 생성 후 모듈별 이슈 수 표로 보고.
