@@ -14,6 +14,7 @@ use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
 use crate::loader::Loader;
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
+use crate::theme::{self, Theme};
 use crate::trash::{
     self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
 };
@@ -185,6 +186,8 @@ pub struct App {
     pub loader: Loader,
     next_load_id: u64,
     page_height: usize,
+    /// Effective theme for the current mode (after any color-depth fallback).
+    pub theme: Theme,
 }
 
 impl Default for App {
@@ -227,6 +230,7 @@ impl App {
             loader: Loader::default(),
             next_load_id: 0,
             page_height: 1,
+            theme: theme::builtin("mdir").expect("mdir is built in"),
         }
     }
 
@@ -1083,10 +1087,11 @@ impl App {
             shell: &self.shell,
             os: std::env::consts::OS,
             trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
+            theme: &self.theme,
         };
         ui::draw(frame, &view);
         if let Some((dlg, _)) = &self.dialog {
-            dialog::render(frame, frame.area(), dlg);
+            dialog::render_themed(frame, frame.area(), dlg, &self.theme);
         }
     }
 }
