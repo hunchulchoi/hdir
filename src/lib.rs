@@ -8,6 +8,7 @@ pub mod keymap;
 pub mod loader;
 pub mod panel;
 pub mod platform;
+pub mod preview;
 pub mod term;
 pub mod theme;
 pub mod trash;
