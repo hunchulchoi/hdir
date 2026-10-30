@@ -6,14 +6,24 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::platform::os_bytes;
+use crate::platform::{os_bytes, os_from_bytes};
 use crate::preview::{self, Limits, Preview};
 use crate::remote::{Endpoint, scp_argv};
 use crate::remote::{
     PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING, PREVIEW_SPECIAL, RENAME_EXISTS, home_cmd,
     mkdir_cmd, preview_cmd, rename_cmd, replace_cmd, rm_cmd, rm_file_cmd, rmdir_cmd,
 };
-use crate::session::{CmdOutput, RemoteSession, first_line};
+use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
+
+/// Resolve `target` (as typed after `cd`) against `cwd` on the host.
+pub fn resolve_cd(s: &RemoteSession, cwd: &Path, target: &str) -> Result<PathBuf, String> {
+    let out = run_ok(s, &cd_cmd(&os_bytes(cwd.as_os_str()), target))?;
+    let end = out.stdout.iter().position(|&b| b == 0).unwrap_or(0);
+    if end == 0 || out.stdout[0] != b'/' {
+        return Err("원격 경로를 알 수 없음".into());
+    }
+    Ok(PathBuf::from(os_from_bytes(out.stdout[..end].to_vec())))
+}
 
 /// Text shown for a FIFO, socket or device (same as the local Enter message).
 pub const SPECIAL_FILE: &str = "특수 파일은 열 수 없음";
@@ -773,6 +783,39 @@ mod tests {
         let cmds = f.remote_cmds();
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[1], "rm -f -- '/srv/.hdir-edit-TK'");
+    }
+
+    // ---- HDIR-41: cd ----
+
+    #[test]
+    fn resolve_cd_returns_the_pwd_printed_by_the_remote_shell() {
+        let f = FakeCmd::new(|_| ok("/srv/data/sub\nx\0trailing"));
+        let s = session(Arc::clone(&f));
+        assert_eq!(
+            resolve_cd(&s, &p("/srv/data"), "sub").unwrap(),
+            p("/srv/data/sub\nx")
+        );
+        assert_eq!(
+            f.remote_cmds(),
+            vec!["cd -- '/srv/data' && cd -- 'sub' && printf '%s\\0' \"$PWD\"".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_cd_errors() {
+        let f = FakeCmd::new(|_| fail(1, "sh: 1: cd: can't cd to nope\nmore\n"));
+        let e = resolve_cd(&session(f), &p("/srv"), "nope").unwrap_err();
+        assert_eq!(e, "sh: 1: cd: can't cd to nope");
+        for out in [ok(""), ok("\0"), ok("relative\0"), ok("/no/nul")] {
+            let o = out.clone();
+            let f = FakeCmd::new(move |_| o.clone());
+            assert!(resolve_cd(&session(f), &p("/srv"), "x").is_err());
+        }
+        let f = FakeCmd::new(|_| code(255));
+        assert_eq!(
+            resolve_cd(&session(f), &p("/srv"), "x").unwrap_err(),
+            crate::session::DISCONNECTED_MSG
+        );
     }
 
     #[test]

@@ -146,6 +146,28 @@ pub fn check_argv(t: &SshTarget) -> Vec<OsString> {
     v
 }
 
+/// `ssh -t` argv that runs `cmd` in `cwd` on the host, on a terminal, over
+/// the master. The command is wrapped in a brace group so a `;` or a trailing
+/// comment in it cannot escape the `cd` guard. Unlike [`exec_argv`] there is
+/// no `BatchMode`: the command itself may prompt.
+pub fn remote_shell_argv(t: &SshTarget, cwd: &[u8], cmd: &str) -> Vec<OsString> {
+    let mut v = vec![os("ssh"), os("-o"), control_opt(t)];
+    net_opts(&mut v);
+    port_args(t.port, "-p", &mut v);
+    v.push(os("-t"));
+    v.push(os("--"));
+    v.push(os(&t.host));
+    let remote = cat(&[
+        b"cd -- ",
+        &sh_quote(cwd),
+        b" && {\n",
+        cmd.as_bytes(),
+        b"\n}",
+    ]);
+    v.push(os_from_bytes(remote));
+    v
+}
+
 /// Run one remote command over the master; the command is a single argv item.
 pub fn exec_argv(t: &SshTarget, remote_cmd: &[u8]) -> Vec<OsString> {
     let mut v = vec![
@@ -971,6 +993,34 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
              && rm -f -- '/d/.hdir-edit-1'; else mv -- '/d/.hdir-edit-1' '/d/it'\\''s'; fi"
         );
         assert_eq!(s(rm_file_cmd(b"/d/-x y")), "rm -f -- '/d/-x y'");
+    }
+
+    #[test]
+    fn remote_shell_argv_runs_the_command_in_the_cwd_on_a_tty_over_the_master() {
+        assert_eq!(
+            remote_shell_argv(&t(Some(2222)), b"/srv/it's d", "ls -l\necho 한글"),
+            v(&[
+                "ssh",
+                "-o",
+                "ControlPath=/c/cm-1",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-p",
+                "2222",
+                "-t",
+                "--",
+                "prod",
+                "cd -- '/srv/it'\\''s d' && {\nls -l\necho 한글\n}"
+            ])
+        );
+        // no BatchMode: the command itself may prompt on the tty
+        let a = remote_shell_argv(&t(None), b"/", "top");
+        assert!(!a.contains(&OsString::from("BatchMode=yes")));
+        assert!(!a.contains(&OsString::from("-p")));
     }
 
     #[test]

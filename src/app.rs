@@ -23,8 +23,9 @@ use crate::launcher::{self, SharedLauncher};
 use crate::loader::Loader;
 use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
+use crate::platform::os_bytes;
 use crate::preview::{self, Preview};
-use crate::remote::SshTarget;
+use crate::remote::{self, SshTarget};
 use crate::remote_ops::{self, EditCopy};
 use crate::screen::{self, TextScreen};
 use crate::servers::{self, Server, SshHost};
@@ -235,6 +236,8 @@ struct UploadDone {
 struct ShellJob {
     cmd: String,
     cwd: PathBuf,
+    /// Set for a remote panel: the command runs there over `ssh -t`.
+    session: Option<Arc<RemoteSession>>,
 }
 
 /// An in-flight text-or-not decision for a file without a rule.
@@ -382,6 +385,11 @@ enum BgKind {
         remote: PathBuf,
         purpose: FetchPurpose,
     },
+    /// Resolve a remote `cd` on the server.
+    RemoteCd {
+        panel: usize,
+        session: Arc<RemoteSession>,
+    },
     OpenOsTrash,
     /// Re-read config.toml, themes, keymap and assoc.
     ConfigReload,
@@ -421,6 +429,7 @@ enum BgResult {
     RemoteRename(Result<PathBuf, String>),
     RemoteDelete(Result<(), String>),
     RemoteFetch(Result<EditCopy, String>),
+    RemoteCd(Result<PathBuf, String>),
 }
 
 /// The F3 viewer's own load slot (independent of the shared [`BgTask`]).
@@ -1091,11 +1100,11 @@ impl App {
             }
             return;
         }
-        if self.active_panel().location.is_remote() {
-            self.status = Some(REMOTE_UNSUPPORTED.into());
+        let cwd = self.active_panel().cwd.clone();
+        if let Some(session) = self.active_panel().location.session().cloned() {
+            self.run_remote_command_line(session, cwd, cmd);
             return;
         }
-        let cwd = self.active_panel().cwd.clone();
         if let Some(target) = cmdline::parse_cd(cmd, self.home_dir.as_deref()) {
             self.change_dir_to(&cwd, &target);
             return;
@@ -1107,7 +1116,53 @@ impl App {
         self.pending_shell = Some(ShellJob {
             cmd: cmd.to_string(),
             cwd,
+            session: None,
         });
+    }
+
+    /// A command line on a remote panel: `cd` is resolved on the server
+    /// (never leaves the TUI), everything else runs on `ssh -t`.
+    fn run_remote_command_line(&mut self, session: Arc<RemoteSession>, cwd: PathBuf, cmd: &str) {
+        if !session.is_alive() {
+            self.status = Some(DISCONNECTED_MSG.into());
+            return;
+        }
+        // "~" stands for the remote home; `~/x` becomes `~/x` again.
+        match cmdline::parse_cd(cmd, Some(Path::new("~"))) {
+            None => {
+                self.pending_shell = Some(ShellJob {
+                    cmd: cmd.to_string(),
+                    cwd,
+                    session: Some(session),
+                });
+            }
+            Some(target) => {
+                let text = match target {
+                    CdTarget::Home => "~".to_string(),
+                    CdTarget::Prev => match &self.prev_dirs[self.active] {
+                        Some(p) => p.to_string_lossy().into_owned(),
+                        None => {
+                            self.status = Some("이전 디렉터리 없음".into());
+                            return;
+                        }
+                    },
+                    CdTarget::Path(p) => p.to_string_lossy().into_owned(),
+                };
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
+                }
+                let sess = Arc::clone(&session);
+                self.task = Some(BgTask::spawn(
+                    BgKind::RemoteCd {
+                        panel: self.active,
+                        session,
+                    },
+                    move || BgResult::RemoteCd(remote_ops::resolve_cd(&sess, &cwd, &text)),
+                ));
+                self.status = Some("이동 중…".into());
+            }
+        }
     }
 
     fn change_dir_to(&mut self, cwd: &Path, target: &CdTarget) {
@@ -1427,14 +1482,25 @@ impl App {
             return;
         };
         let launcher = Arc::clone(&self.launcher);
-        let argv = [
-            self.shell_path.clone(),
-            OsString::from("-c"),
-            OsString::from(&job.cmd),
-        ];
+        // A remote command runs through the local `ssh`; the local process
+        // has no meaningful cwd of its own.
+        let (argv, run_cwd) = match &job.session {
+            Some(s) => (
+                remote::remote_shell_argv(&s.target, &os_bytes(job.cwd.as_os_str()), &job.cmd),
+                PathBuf::from("."),
+            ),
+            None => (
+                vec![
+                    self.shell_path.clone(),
+                    OsString::from("-c"),
+                    OsString::from(&job.cmd),
+                ],
+                job.cwd.clone(),
+            ),
+        };
         let mut result: Result<i32, String> = Err("실행되지 않음".into());
         let outcome = suspend(&mut || {
-            let r = launcher.run_shell(&argv, &job.cwd);
+            let r = launcher.run_shell(&argv, &run_cwd);
             if let Ok(code) = &r {
                 launcher.wait_key_after(*code);
             }
@@ -2588,6 +2654,24 @@ impl App {
                 },
                 Some(BgResult::RemoteFetch(res)),
             ) => self.finish_fetch(panel, session, remote, purpose, res),
+            (BgKind::RemoteCd { panel, session }, Some(BgResult::RemoteCd(res))) => {
+                let same = self.panels[panel]
+                    .location
+                    .session()
+                    .is_some_and(|s| Arc::ptr_eq(s, &session));
+                match res {
+                    Ok(dir) if same => {
+                        self.status = None;
+                        self.invalidate_probe();
+                        let id = self.next_id();
+                        let req =
+                            self.panels[panel].begin_change_dir(id, dir, None, LoadKind::Enter);
+                        self.dispatch(panel, req);
+                    }
+                    Ok(_) => self.status = None, // the panel left that host meanwhile
+                    Err(e) => self.status = Some(e),
+                }
+            }
             (BgKind::OpenOsTrash, Some(BgResult::OpenOsTrash(res))) => {
                 self.status = Some(match res {
                     Ok(()) => "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".to_string(),
@@ -7850,6 +7934,16 @@ mod tests {
                 .collect()
         }
 
+        /// Every remote shell command, listings included.
+        fn all_cmds(f: &FakeSsh) -> Vec<String> {
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|a| crate::testutil::remote_cmd(a).map(str::to_string))
+                .collect()
+        }
+
         fn script(f: &FakeSsh, h: impl Fn(&[String]) -> Option<CmdOutput> + Send + Sync + 'static) {
             *f.hook.lock().unwrap() = Some(Box::new(h));
         }
@@ -9019,8 +9113,188 @@ mod tests {
             assert!(app.viewer.is_some());
         }
 
+        // ---- HDIR-41: remote command line ----
+
+        /// Launcher fake for command line runs: logs argv/cwd and the prompt.
+        struct ShellLog {
+            log: Arc<Mutex<Vec<String>>>,
+            code: i32,
+        }
+
+        impl crate::launcher::Launcher for ShellLog {
+            fn run(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                unreachable!("command lines use run_shell")
+            }
+            fn spawn_detached(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait_key(&self) {}
+            fn run_shell(&self, argv: &[OsString], cwd: &Path) -> Result<i32, String> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("shell {} @{}", join(argv), cwd.display()));
+                Ok(self.code)
+            }
+            fn wait_key_after(&self, code: i32) {
+                self.log.lock().unwrap().push(format!("prompt {code}"));
+            }
+        }
+
+        fn shell_log(app: &mut App, code: i32) -> Arc<Mutex<Vec<String>>> {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            app.launcher = Arc::new(ShellLog {
+                log: Arc::clone(&log),
+                code,
+            });
+            log
+        }
+
+        fn listings(f: &FakeSsh) -> usize {
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|a| crate::testutil::remote_cmd(a))
+                .filter(|c| c.contains("find "))
+                .count()
+        }
+
         #[test]
-        fn file_operations_on_remote_panels_are_not_supported_yet() {
+        fn remote_command_runs_over_ssh_t_in_the_remote_cwd_then_prompts_and_reloads() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            let log = shell_log(&mut app, 7);
+            let before = listings(&f);
+            submit(&mut app, "ls -la \"it's\"");
+            assert!(app.has_pending_shell(), "queued for the main loop");
+            assert!(log.lock().unwrap().is_empty());
+            app.run_shell(|f| Ok(f()));
+            let t = app.panels[1].location.session().unwrap().target.clone();
+            let want = crate::remote::remote_shell_argv(&t, b"/srv/data", "ls -la \"it's\"");
+            let got = log.lock().unwrap().clone();
+            assert_eq!(
+                got,
+                vec![format!("shell {} @.", join(&want)), "prompt 7".to_string()]
+            );
+            assert!(got[0].contains("|-t|--|prod-web|cd -- '/srv/data' && {\nls -la \"it's\"\n}"));
+            assert_eq!(app.status.as_deref(), Some("종료 코드 7: ls -la \"it's\""));
+            wait_remote(&mut app);
+            assert!(listings(&f) > before, "remote panels are reloaded");
+            assert!(!app.has_pending_shell());
+        }
+
+        #[test]
+        fn remote_cd_is_resolved_on_the_server_without_leaving_the_tui() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.contains("&& cd -- "))
+                    .map(|c| {
+                        if c.contains("'nope'") {
+                            CmdOutput {
+                                code: Some(1),
+                                stdout: Vec::new(),
+                                stderr: b"sh: cd: nope: No such file or directory\n".to_vec(),
+                            }
+                        } else {
+                            out(0, "/srv/data/sub\0")
+                        }
+                    })
+            });
+            connect_prod(&mut app);
+            submit(&mut app, "cd sub");
+            assert!(!app.has_pending_shell(), "cd never suspends");
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data/sub"));
+            assert_eq!(names(&app, 1), vec!["..", "deep.txt"]);
+            assert!(all_cmds(&f).contains(
+                &"cd -- '/srv/data' && cd -- 'sub' && printf '%s\\0' \"$PWD\"".to_string()
+            ));
+            // cd - returns, cd to a missing dir reports the server's reason
+            submit(&mut app, "cd -");
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(
+                app.panels[1].cwd,
+                PathBuf::from("/srv/data/sub"),
+                "scripted pwd"
+            );
+            submit(&mut app, "cd nope");
+            wait_idle(&mut app);
+            assert!(app.status.as_deref().unwrap().contains("No such file"));
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data/sub"));
+        }
+
+        #[test]
+        fn remote_cd_variants_build_the_right_targets() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.contains("&& cd -- "))
+                    .map(|_| out(0, "/srv/data\0"))
+            });
+            connect_prod(&mut app);
+            for line in ["cd", "cd ~", "cd ~/ab", "cd '/x y'", "cd .."] {
+                submit(&mut app, line);
+                wait_idle(&mut app);
+                wait_remote(&mut app);
+            }
+            let cds: Vec<String> = all_cmds(&f)
+                .into_iter()
+                .filter(|c| c.contains("&& cd -- "))
+                .collect();
+            let tail = " && printf '%s\\0' \"$PWD\"";
+            let pre = "cd -- '/srv/data' && cd -- ";
+            assert_eq!(
+                cds,
+                vec![
+                    format!("{pre}\"$HOME\"{tail}"),
+                    format!("{pre}\"$HOME\"{tail}"),
+                    format!("{pre}\"$HOME\"'/ab'{tail}"),
+                    format!("{pre}'/x y'{tail}"),
+                    format!("{pre}'..'{tail}"),
+                ]
+            );
+        }
+
+        #[test]
+        fn complex_cd_lines_go_to_the_remote_shell() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            submit(&mut app, "cd sub && ls");
+            assert!(app.has_pending_shell());
+        }
+
+        #[test]
+        fn remote_command_on_a_dead_connection_does_not_start() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            app.panels[1].location.session().unwrap().set_alive(false);
+            submit(&mut app, "ls");
+            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert!(!app.has_pending_shell());
+            submit(&mut app, "cd sub");
+            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+        }
+
+        #[test]
+        fn local_panels_still_run_commands_locally_with_the_shell() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Tab);
+            submit(&mut app, "echo hi");
+            assert!(app.has_pending_shell());
+            let log = shell_log(&mut app, 0);
+            app.run_shell(|f| Ok(f()));
+            let got = log.lock().unwrap().clone();
+            assert!(got[0].contains("|-c|echo hi @"), "{got:?}");
+            assert!(!got[0].starts_with("shell ssh"), "{got:?}");
+        }
+
+        #[test]
+        fn remote_transfers_stay_unsupported_until_m8() {
             let (_t, mut app, _f) = env();
             connect_prod(&mut app);
             for f in [5u8, 6] {
@@ -9029,10 +9303,6 @@ mod tests {
                 assert_eq!(app.status.as_deref(), Some(UNSUPPORTED), "F{f}");
                 assert!(app.dialog.is_none() && app.viewer.is_none(), "F{f}");
             }
-            // command line: shell commands never run locally
-            submit(&mut app, "ls");
-            assert_eq!(app.status.as_deref(), Some(UNSUPPORTED));
-            assert!(!app.has_pending_shell());
         }
 
         #[test]

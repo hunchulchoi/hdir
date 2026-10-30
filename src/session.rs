@@ -418,6 +418,19 @@ pub fn start_path_cmd(path: &str) -> Vec<u8> {
     .concat()
 }
 
+/// Remote command that changes to `cwd`, then to `target` (see
+/// [`start_path_cmd`] for the forms: `~`, `~/x`, plain paths) and prints the
+/// resulting absolute directory, NUL-terminated.
+pub fn cd_cmd(cwd: &[u8], target: &str) -> Vec<u8> {
+    [
+        b"cd -- ".as_slice(),
+        &sh_quote(cwd),
+        b" && ",
+        &start_path_cmd(target),
+    ]
+    .concat()
+}
+
 /// A freshly established session plus the directory to show first.
 #[derive(Debug)]
 pub struct Established {
@@ -687,6 +700,22 @@ mod tests {
         );
         assert_eq!(s("~"), format!("cd -- \"$HOME\"{tail}"));
         assert_eq!(s("~/my dir"), format!("cd -- \"$HOME\"'/my dir'{tail}"));
+    }
+
+    #[test]
+    fn cd_cmd_resolves_relative_to_the_cwd_and_prints_the_new_pwd() {
+        let s = |cwd: &str, t: &str| String::from_utf8(cd_cmd(cwd.as_bytes(), t)).unwrap();
+        let tail = r#" && printf '%s\0' "$PWD""#;
+        assert_eq!(
+            s("/srv/it's", "sub dir"),
+            format!("cd -- '/srv/it'\\''s' && cd -- 'sub dir'{tail}")
+        );
+        assert_eq!(s("/x", "~"), format!("cd -- '/x' && cd -- \"$HOME\"{tail}"));
+        assert_eq!(
+            s("/x", "~/a b"),
+            format!("cd -- '/x' && cd -- \"$HOME\"'/a b'{tail}")
+        );
+        assert_eq!(s("/x", "-v"), format!("cd -- '/x' && cd -- '-v'{tail}"));
     }
 
     fn establish_fake(ssh_v: &'static str, uname: &'static str, pwd: &'static [u8]) -> Arc<Fake> {
