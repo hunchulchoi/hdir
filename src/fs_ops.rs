@@ -3,10 +3,14 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::platform::{
+    create_private_dir, create_private_file, create_symlink, is_cross_device, is_link_refused,
+    is_symlink_privilege_error, is_unsupported, open_source, rename_noreplace_os, rename_replace,
+    same_file, set_dir_modified, truncated_name,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
@@ -109,7 +113,6 @@ impl Acc {
 }
 
 const CHUNK: usize = 1 << 20;
-const EXDEV: i32 = 18;
 
 /// Result of one entry operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,10 +253,12 @@ const PARK_ATTEMPTS: usize = 16;
 
 fn sibling_named(dest: &Path, kind: &str) -> PathBuf {
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = dest.file_name().map(|n| n.as_bytes()).unwrap_or_default();
-    let name = &name[..name.len().min(100)];
+    let name = dest
+        .file_name()
+        .map(|n| truncated_name(n, 100))
+        .unwrap_or_default();
     let mut tmp = OsString::from(format!(".hdir-{kind}-{}-{n}-", std::process::id()));
-    tmp.push(OsString::from_vec(name.to_vec()));
+    tmp.push(name);
     dest.with_file_name(tmp)
 }
 
@@ -269,30 +274,18 @@ fn copy_file(
     acc: &mut Acc,
     approved: bool,
 ) -> io::Result<Step> {
-    // The entry may have been swapped since the lstat: never follow a symlink
-    // (O_NOFOLLOW) and never block on a FIFO (O_NONBLOCK), then trust fstat only.
-    let mut input = match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(src)
-    {
-        Ok(f) => f,
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return skip_changed(src, acc);
-        }
-        Err(e) => return Err(e),
+    // The entry may have been swapped since the lstat: never follow a link and
+    // never block on a FIFO (see `open_source`), then trust the handle's metadata only.
+    let Some(mut input) = open_source(src)? else {
+        return skip_changed(src, acc);
     };
     let meta = &input.metadata()?;
     if !meta.is_file() {
         return skip_changed(src, acc);
     }
     let tmp = temp_sibling(dest);
-    let mut out = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        // Private until the data is complete; source permissions are applied below.
-        .mode(0o600)
-        .open(&tmp)?;
+    // Private until the data is complete; source permissions are applied below.
+    let mut out = create_private_file(&tmp)?;
     let mut buf = vec![0u8; CHUNK];
     let res = (|| -> io::Result<bool> {
         loop {
@@ -351,13 +344,13 @@ fn place(
 ) -> io::Result<Step> {
     let mut replaced = approved && exists(dest);
     let res = if approved {
-        fs::rename(tmp, dest)
+        rename_replace(tmp, dest)
     } else {
         match rename_noreplace(tmp, dest) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match ctl.on_conflict(dest) {
                 ConflictAction::Overwrite => {
                     replaced = true;
-                    fs::rename(tmp, dest)
+                    rename_replace(tmp, dest)
                 }
                 ConflictAction::Skip => {
                     let _ = fs::remove_file(tmp);
@@ -391,7 +384,17 @@ fn copy_symlink(
     approved: bool,
 ) -> io::Result<Step> {
     let tmp = temp_sibling(dest);
-    std::os::unix::fs::symlink(fs::read_link(src)?, &tmp)?;
+    if let Err(e) = create_symlink(&fs::read_link(src)?, &tmp, src) {
+        if is_symlink_privilege_error(&e) {
+            acc.skipped += 1;
+            acc.warnings.push(format!(
+                "{}: symlink 생성 권한 없음 (개발자 모드 필요)",
+                src.display()
+            ));
+            return Ok(Step::Skipped);
+        }
+        return Err(e);
+    }
     let step = place(&tmp, dest, approved, ctl, acc)?;
     if step == Step::Done {
         ctl.on_file_done(dest);
@@ -446,7 +449,7 @@ fn copy_dir(
         }
         // Atomic: never adopts a directory that appeared since the conflict check.
         // Private until complete; the source mode is applied after the children.
-        match fs::DirBuilder::new().mode(0o700).create(dest) {
+        match create_private_dir(dest) {
             Ok(()) => {
                 acc.created.push(dest.to_path_buf());
                 created = true;
@@ -487,7 +490,7 @@ fn copy_dir(
             }
         }
         if created {
-            fs::File::open(dest)?.set_modified(meta.modified()?)?;
+            set_dir_modified(dest, meta.modified()?)?;
             fs::set_permissions(dest, meta.permissions())?;
         }
         Ok(Step::Done)
@@ -598,7 +601,7 @@ fn copy_loop(
 
 pub fn move_items(sources: &[PathBuf], dest_dir: &Path, ctl: &mut dyn OpControl) -> OpReport {
     let r = Renamer {
-        replace: &|a, b| fs::rename(a, b),
+        replace: &rename_replace,
         noreplace: &rename_noreplace,
         remove: &remove_source,
     };
@@ -907,11 +910,6 @@ fn move_path_with(
     }
 }
 
-/// Whether a rename failure means "different filesystem" (EXDEV).
-fn is_cross_device(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(EXDEV)
-}
-
 /// The data was restored/copied to the new place but the old place could not be
 /// fully removed; both copies are kept.
 #[derive(Debug)]
@@ -951,11 +949,7 @@ fn rename_noreplace_with(from: &Path, to: &Path, os: RenameFn, link: RenameFn) -
                     Ok(())
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
-                Err(e)
-                    if is_cross_device(&e)
-                        || is_unsupported(&e)
-                        || matches!(e.raw_os_error(), Some(libc::EPERM)) =>
-                {
+                Err(e) if is_cross_device(&e) || is_unsupported(&e) || is_link_refused(&e) => {
                     Err(unsafe_rename())
                 }
                 Err(e) => Err(e),
@@ -972,56 +966,11 @@ fn unsafe_rename() -> io::Error {
     )
 }
 
-fn is_unsupported(e: &io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)
-    )
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rename_noreplace_os(from: &Path, to: &Path) -> io::Result<()> {
-    use std::ffi::CString;
-    let f = CString::new(from.as_os_str().as_bytes()).map_err(|_| invalid("nul in path"))?;
-    let t = CString::new(to.as_os_str().as_bytes()).map_err(|_| invalid("nul in path"))?;
-    #[cfg(target_os = "macos")]
-    // SAFETY: both pointers are valid NUL-terminated strings for the call.
-    let rc = unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) };
-    #[cfg(target_os = "linux")]
-    // SAFETY: both pointers are valid NUL-terminated strings for the call.
-    let rc = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            f.as_ptr(),
-            libc::AT_FDCWD,
-            t.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn rename_noreplace_os(_from: &Path, _to: &Path) -> io::Result<()> {
-    Err(io::Error::from_raw_os_error(libc::ENOSYS))
-}
-
 pub fn make_dir(parent: &Path, name: &str) -> io::Result<PathBuf> {
     validate_name(name)?;
     let p = parent.join(name);
     fs::create_dir(&p)?;
     Ok(p)
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
-        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
-        _ => false,
-    }
 }
 
 /// `path` -> temp -> `target`, for a case-only rename. The temp step never
@@ -1063,8 +1012,11 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     struct Ctl {
@@ -1134,6 +1086,7 @@ mod tests {
         assert_eq!(c.done, vec![dst.join("a.txt")]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn copy_nested_dir_preserves_content_perms_mtime() {
         let t = tempdir().unwrap();
@@ -1159,6 +1112,7 @@ mod tests {
         assert_eq!(m.modified().unwrap(), mt);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_preserved() {
         let t = tempdir().unwrap();
@@ -1275,6 +1229,7 @@ mod tests {
         assert!(c.progress < 3 * 1024 * 1024);
     }
 
+    #[cfg(unix)]
     #[test]
     fn progress_sum_equals_measure() {
         let t = tempdir().unwrap();
@@ -1453,7 +1408,9 @@ mod tests {
     // ---- HDIR-12 edge cases ----
 
     /// Restore permissions so tempdir cleanup can delete everything.
+    #[cfg(unix)]
     struct Unlock(PathBuf);
+    #[cfg(unix)]
     impl Drop for Unlock {
         fn drop(&mut self) {
             let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
@@ -1490,6 +1447,7 @@ mod tests {
         assert!(d2.join("empty2").is_dir() && !e2.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn readonly_source_keeps_perms_and_can_be_overwritten_twice() {
         let (_t, s, d) = two_dirs();
@@ -1525,6 +1483,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&dest).unwrap(), "v2");
     }
 
+    #[cfg(unix)]
     #[test]
     fn readonly_dest_dir_errors_without_panic_or_partial() {
         let (_t, s, d) = two_dirs();
@@ -1548,6 +1507,7 @@ mod tests {
         assert!(src.exists() && tree.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_to_parent_is_copied_as_link_not_followed() {
         let (_t, s, d) = two_dirs();
@@ -1582,6 +1542,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_to_dir_as_source_is_copied_as_link() {
         let (_t, s, d) = two_dirs();
@@ -1642,6 +1603,7 @@ mod tests {
         assert!(r.is_dir());
     }
 
+    #[cfg(unix)]
     #[test]
     fn measure_matches_bytes_copied_with_symlinks() {
         let (_t, s, d) = two_dirs();
@@ -1694,6 +1656,7 @@ mod tests {
         assert!(d2.join("root/l0").is_dir());
     }
 
+    #[cfg(unix)]
     #[test]
     fn readonly_source_dir_copies_contents() {
         let (_t, s, d) = two_dirs();
@@ -1737,6 +1700,7 @@ mod tests {
         assert_eq!(names(&d), vec!["big"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn overwrite_with_unreadable_source_keeps_original() {
         let (_t, s, d) = two_dirs();
@@ -1994,7 +1958,7 @@ mod tests {
     }
 
     fn exdev_err(_: &Path, _: &Path) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(EXDEV))
+        Err(crate::platform::test_exdev())
     }
 
     fn dir_over_file_setup() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -2052,6 +2016,7 @@ mod tests {
         assert_eq!(names(&d), vec!["x"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn copy_dir_over_file_failure_keeps_file() {
         let (_t, s, d) = dir_over_file_setup();
@@ -2143,10 +2108,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct ModeProbe {
         dir: PathBuf,
         seen: Vec<u32>,
     }
+    #[cfg(unix)]
     impl OpControl for ModeProbe {
         fn on_progress(&mut self, _: u64, _: &Path) {
             for e in fs::read_dir(&self.dir).unwrap() {
@@ -2165,6 +2132,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn temp_file_is_private_until_complete() {
         let (_t, s, d) = two_dirs();
@@ -2394,10 +2362,12 @@ mod tests {
         assert_eq!(names(&d), vec!["f"]);
     }
 
+    #[cfg(unix)]
     struct DirProbe {
         dir: PathBuf,
         seen: Vec<u32>,
     }
+    #[cfg(unix)]
     impl OpControl for DirProbe {
         fn on_progress(&mut self, _: u64, _: &Path) {
             if let Ok(m) = fs::metadata(&self.dir) {
@@ -2412,6 +2382,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn copied_dir_is_private_until_complete() {
         let (_t, s, d) = two_dirs();
@@ -2459,6 +2430,7 @@ mod tests {
         assert_eq!(fs::read_to_string(d.join("x/a")).unwrap(), "OLD");
     }
 
+    #[cfg(unix)]
     #[test]
     fn merge_with_unremovable_source_dir_is_partial_with_warning() {
         let (_t, s, d) = two_dirs();
@@ -2677,6 +2649,7 @@ mod tests {
         assert_eq!(fs::read_to_string(s.join("x/f")).unwrap(), "inner");
     }
 
+    #[cfg(unix)]
     #[test]
     fn copy_file_helper_never_follows_a_swapped_symlink() {
         let (_t, s, d) = two_dirs();
@@ -2713,7 +2686,7 @@ mod tests {
     }
 
     fn os_unsupported(_: &Path, _: &Path) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        Err(crate::platform::test_unsupported())
     }
 
     #[test]
@@ -2745,7 +2718,7 @@ mod tests {
         assert!(s.join("x").is_dir() && !d.join("x").exists());
 
         fs::write(s.join("f"), "F").unwrap();
-        for code in [libc::EXDEV, libc::EPERM, libc::ENOTSUP] {
+        for code in crate::platform::test_link_failures() {
             let bad = move |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(code));
             let e = rename_noreplace_with(&s.join("f"), &d.join("f"), &os_unsupported, &bad)
                 .unwrap_err();

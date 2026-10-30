@@ -363,9 +363,36 @@ fn mode_of(meta: &fs::Metadata) -> u32 {
     meta.mode() & 0o7777
 }
 
-#[cfg(not(unix))]
+/// Windows has only the readonly attribute: report 0o444 if readonly, else 0o666.
+#[cfg(windows)]
+fn mode_of(meta: &fs::Metadata) -> u32 {
+    if meta.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn mode_of(_meta: &fs::Metadata) -> u32 {
     0
+}
+
+/// Hidden by the platform: a leading dot everywhere, plus the hidden attribute on Windows.
+fn is_hidden(name: &str, meta: &fs::Metadata) -> bool {
+    name.starts_with('.') || hidden_attr(meta)
+}
+
+#[cfg(windows)]
+fn hidden_attr(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    meta.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
+#[cfg(not(windows))]
+fn hidden_attr(_meta: &fs::Metadata) -> bool {
+    false
 }
 
 fn parent_only(cwd: &Path) -> Vec<Entry> {
@@ -395,15 +422,18 @@ fn build_listing(
             continue;
         };
         let name = os_name.to_string_lossy().into_owned();
-        let hidden = name.starts_with('.');
+        let path = cwd.join(&os_name);
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            // Hidden entries stay out of the error count when hidden are not shown.
+            if !(name.starts_with('.') && !show_hidden) {
+                skipped += 1;
+            }
+            continue;
+        };
+        let hidden = is_hidden(&name, &meta);
         if hidden && !show_hidden {
             continue;
         }
-        let path = cwd.join(&os_name);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            skipped += 1;
-            continue;
-        };
         let kind = if meta.file_type().is_symlink() {
             let target_is_dir = fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
             EntryKind::Symlink { target_is_dir }

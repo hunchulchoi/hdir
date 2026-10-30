@@ -197,6 +197,7 @@ pub const SYMLINK_MSG: &str = "심볼릭 링크 항목은 파일 관리자에서
 
 /// Linux: the stored payload of a trash entry, from its `…/info/X.trashinfo`
 /// id to `…/files/X`.
+#[cfg(unix)]
 pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let info = Path::new(id);
@@ -216,6 +217,7 @@ pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
 
 /// Whether the payload of `id` is a symlink. Fails closed: anything but a
 /// definite answer (or a plain NotFound) is an error.
+#[cfg(unix)]
 pub fn payload_is_link(id: &OsStr) -> Result<bool, String> {
     let p = payload_path(id).ok_or("저장 위치를 알 수 없음")?;
     match p.symlink_metadata() {
@@ -518,6 +520,47 @@ pub fn fmt_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM` in local time.
+#[cfg(windows)]
+pub fn format_local(ts: i64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows_sys::Win32::System::Time::FileTimeToSystemTime;
+    // Unix seconds -> 100ns ticks since 1601-01-01.
+    let Some(ticks) = ts
+        .checked_add(11_644_473_600)
+        .filter(|s| *s >= 0)
+        .and_then(|s| (s as u64).checked_mul(10_000_000))
+    else {
+        return "-".to_string();
+    };
+    let utc = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut local = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: plain-data structs; both pointers are valid for the call.
+    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe {
+        FileTimeToLocalFileTime(&utc, &mut local) != 0 && FileTimeToSystemTime(&local, &mut st) != 0
+    };
+    if !ok {
+        return "-".to_string();
+    }
+    fmt_datetime(
+        st.wYear as i32,
+        st.wMonth as u32,
+        st.wDay as u32,
+        st.wHour as u32,
+        st.wMinute as u32,
+    )
+}
+
+/// `YYYY-MM-DD HH:MM` in local time.
+#[cfg(unix)]
 pub fn format_local(ts: i64) -> String {
     let t = ts as libc::time_t;
     // SAFETY: `tm` is plain data; localtime_r only writes into it.
@@ -978,6 +1021,7 @@ mod tests {
         assert_eq!(lost.deleted_at(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_names_display_lossy_but_keep_the_raw_name() {
         use std::os::unix::ffi::OsStringExt;
@@ -1122,6 +1166,7 @@ mod tests {
         assert_eq!((keep.len(), skipped), (1, 0));
     }
 
+    #[cfg(unix)]
     #[test]
     fn payload_path_maps_info_id_to_files_dir() {
         assert_eq!(
@@ -1132,6 +1177,7 @@ mod tests {
         assert_eq!(payload_path(OsStr::new("id7")), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restore_refuses_symlink_items_and_restores_the_rest() {
         use std::os::unix::fs::symlink;
@@ -1316,6 +1362,7 @@ mod tests {
 
     // ---- payload / guard ----
 
+    #[cfg(unix)]
     #[test]
     fn payload_path_keeps_non_utf8_names() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -1331,6 +1378,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn payload_is_link_fails_closed() {
         let dir = tempfile::tempdir().unwrap();

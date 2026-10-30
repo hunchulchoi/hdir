@@ -1,0 +1,296 @@
+//! Platform-specific filesystem primitives (unix / windows).
+//!
+//! Everything that needs `std::os::unix`, `libc` or Win32 lives here so that
+//! `fs_ops` stays platform-neutral.
+//!
+//! Known platform differences (documented limitations):
+//! - Private temp permissions (0600 files / 0700 dirs) exist on unix only. On
+//!   Windows only the readonly attribute is copied from the source.
+//! - Windows has no `O_NOFOLLOW`; sources are opened with
+//!   `FILE_FLAG_OPEN_REPARSE_POINT` after an `lstat`, and the opened handle is
+//!   re-checked for a reparse point.
+//! - Windows has no `file_index` on stable std, so the case-only rename identity
+//!   check compares canonicalized paths case-insensitively.
+
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io;
+use std::path::Path;
+
+// ---------------------------------------------------------------- names
+
+/// `name` capped to `max` bytes (unix, byte-exact) or characters (windows).
+#[cfg(unix)]
+pub fn truncated_name(name: &OsStr, max: usize) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let b = name.as_bytes();
+    OsString::from_vec(b[..b.len().min(max)].to_vec())
+}
+
+#[cfg(windows)]
+pub fn truncated_name(name: &OsStr, max: usize) -> OsString {
+    name.to_string_lossy()
+        .chars()
+        .take(max)
+        .collect::<String>()
+        .into()
+}
+
+// ----------------------------------------------------------- open / create
+
+/// Open a copy source for reading without following links.
+///
+/// `Ok(None)` means the entry is not (or no longer) a plain file: a symlink or
+/// reparse point was swapped in since the caller's lstat.
+#[cfg(unix)]
+pub fn open_source(src: &Path) -> io::Result<Option<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Never follow a symlink (O_NOFOLLOW) and never block on a FIFO (O_NONBLOCK).
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(src)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(windows)]
+pub fn open_source(src: &Path) -> io::Result<Option<fs::File>> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let lmeta = fs::symlink_metadata(src)?;
+    if lmeta.file_type().is_symlink() || !lmeta.is_file() {
+        return Ok(None);
+    }
+    // Do not traverse a reparse point swapped in after the lstat, then verify the
+    // handle we actually got.
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(src)?;
+    if f.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(None);
+    }
+    Ok(Some(f))
+}
+
+/// New file, private (0600) until complete on unix.
+#[cfg(unix)]
+pub fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(windows)]
+pub fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+/// New directory (atomic, fails if present), private (0700) on unix.
+#[cfg(unix)]
+pub fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(windows)]
+pub fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+/// Set the modification time of a directory.
+#[cfg(unix)]
+pub fn set_dir_modified(dir: &Path, t: std::time::SystemTime) -> io::Result<()> {
+    fs::File::open(dir)?.set_modified(t)
+}
+
+#[cfg(windows)]
+pub fn set_dir_modified(dir: &Path, t: std::time::SystemTime) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .set_modified(t)
+}
+
+// ----------------------------------------------------------------- rename
+
+/// Rename that replaces an existing `to` on purpose.
+#[cfg(unix)]
+pub fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+pub fn rename_replace(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// Whether a rename failure means "different filesystem" (EXDEV).
+#[cfg(unix)]
+pub fn is_cross_device(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(libc::EXDEV)
+}
+
+#[cfg(windows)]
+pub fn is_cross_device(e: &io::Error) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE;
+    e.kind() == io::ErrorKind::CrossesDevices
+        || e.raw_os_error() == Some(ERROR_NOT_SAME_DEVICE as i32)
+}
+
+/// The atomic no-replace rename is unavailable here (fall back to link + unlink).
+#[cfg(unix)]
+pub fn is_unsupported(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP)
+    )
+}
+
+#[cfg(windows)]
+pub fn is_unsupported(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Unsupported
+}
+
+/// A hard link was refused by the filesystem (e.g. EPERM on some mounts).
+#[cfg(unix)]
+pub fn is_link_refused(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn is_link_refused(_e: &io::Error) -> bool {
+    false
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn rename_noreplace_os(from: &Path, to: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let bad = || io::Error::new(io::ErrorKind::InvalidInput, "nul in path");
+    let f = CString::new(from.as_os_str().as_bytes()).map_err(|_| bad())?;
+    let t = CString::new(to.as_os_str().as_bytes()).map_err(|_| bad())?;
+    #[cfg(target_os = "macos")]
+    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    let rc = unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(target_os = "linux")]
+    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            f.as_ptr(),
+            libc::AT_FDCWD,
+            t.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+pub fn rename_noreplace_os(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOSYS))
+}
+
+#[cfg(windows)]
+pub fn rename_noreplace_os(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+// ------------------------------------------------------------ test helpers
+
+/// A cross-device rename failure as the OS reports it.
+#[cfg(all(test, unix))]
+pub fn test_exdev() -> io::Error {
+    io::Error::from_raw_os_error(libc::EXDEV)
+}
+
+#[cfg(all(test, windows))]
+pub fn test_exdev() -> io::Error {
+    io::Error::from_raw_os_error(windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE as i32)
+}
+
+/// "Atomic no-replace rename unsupported" as the OS reports it.
+#[cfg(all(test, unix))]
+pub fn test_unsupported() -> io::Error {
+    io::Error::from_raw_os_error(libc::ENOTSUP)
+}
+
+#[cfg(all(test, windows))]
+pub fn test_unsupported() -> io::Error {
+    io::Error::from(io::ErrorKind::Unsupported)
+}
+
+/// Raw OS codes a hard link can fail with that must all end as "unsupported".
+#[cfg(all(test, unix))]
+pub fn test_link_failures() -> Vec<i32> {
+    vec![libc::EXDEV, libc::EPERM, libc::ENOTSUP]
+}
+
+#[cfg(all(test, windows))]
+pub fn test_link_failures() -> Vec<i32> {
+    vec![windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE as i32]
+}
+
+// --------------------------------------------------------------- identity
+
+/// Whether `a` and `b` are the same filesystem object (no symlink following).
+#[cfg(unix)]
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+pub fn same_file(_a: &Path, _b: &Path) -> bool {
+    false
+}
+
+// --------------------------------------------------------------- symlinks
+
+/// Create a symlink at `link` pointing to `target`. `src` is the link being
+/// copied, used on Windows to choose a file or directory symlink.
+#[cfg(unix)]
+pub fn create_symlink(target: &Path, link: &Path, _src: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+pub fn create_symlink(target: &Path, link: &Path, _src: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+/// Creating a symlink was refused for lack of privilege (Windows without
+/// developer mode / `SeCreateSymbolicLinkPrivilege`).
+#[cfg(unix)]
+pub fn is_symlink_privilege_error(_e: &io::Error) -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub fn is_symlink_privilege_error(_e: &io::Error) -> bool {
+    false
+}
