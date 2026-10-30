@@ -226,6 +226,28 @@ fn backup_sibling(dest: &Path) -> PathBuf {
     sibling_named(dest, "bak")
 }
 
+/// Move `dest` aside to a fresh backup name without ever replacing anything.
+fn park_aside(dest: &Path) -> io::Result<PathBuf> {
+    park_aside_with(dest, &mut || backup_sibling(dest))
+}
+
+fn park_aside_with(dest: &Path, next: &mut dyn FnMut() -> PathBuf) -> io::Result<PathBuf> {
+    for _ in 0..PARK_ATTEMPTS {
+        let b = next();
+        match rename_noreplace(dest, &b) {
+            Ok(()) => return Ok(b),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "백업 이름을 정하지 못함",
+    ))
+}
+
+const PARK_ATTEMPTS: usize = 16;
+
 fn sibling_named(dest: &Path, kind: &str) -> PathBuf {
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = dest.file_name().map(|n| n.as_bytes()).unwrap_or_default();
@@ -420,9 +442,7 @@ fn copy_dir(
                 break;
             }
             // Park the existing file; it is deleted only once the copy succeeded.
-            let b = backup_sibling(dest);
-            fs::rename(dest, &b)?;
-            backup = Some(b);
+            backup = Some(park_aside(dest)?);
         }
         // Atomic: never adopts a directory that appeared since the conflict check.
         // Private until complete; the source mode is applied after the children.
@@ -450,6 +470,7 @@ fn copy_dir(
             }
         }
     }
+    let skipped_before = acc.skipped;
     let mut run = || -> io::Result<Step> {
         for entry in fs::read_dir(src)? {
             let entry = entry?;
@@ -471,9 +492,20 @@ fn copy_dir(
         }
         Ok(Step::Done)
     };
-    let res = run();
+    let mut res = run();
     if let Some(b) = backup {
-        if matches!(res, Ok(Step::Done)) {
+        if matches!(res, Ok(Step::Done)) && acc.skipped != skipped_before {
+            // Incomplete copy: it must not replace the original. Drop it, put the
+            // original back and report the item as partial.
+            let _ = remove_source(dest);
+            acc.created.retain(|c| c != dest);
+            restore_backup(&b, dest, acc)?;
+            acc.warnings.push(format!(
+                "{}: 일부 항목을 건너뛰어 복사하지 않고 원본 파일을 유지함",
+                dest.display()
+            ));
+            res = Ok(Step::Partial);
+        } else if matches!(res, Ok(Step::Done)) {
             acc.overwritten += 1;
             let _ = fs::remove_file(&b);
         } else {
@@ -553,7 +585,8 @@ fn copy_loop(
                 acc.copied += 1;
                 acc.done_sources.push(src.clone());
             }
-            Step::Skipped | Step::Partial | Step::SourceLeft => {}
+            Step::Partial => acc.partial += 1,
+            Step::Skipped | Step::SourceLeft => {}
         }
         ctl.on_item_done(src);
     }
@@ -721,9 +754,7 @@ fn move_entry(
         if src_dir {
             // rename(dir, file) is not allowed; the user confirmed replacing the
             // file. Park it and delete it only once the move succeeded.
-            let b = backup_sibling(dest);
-            fs::rename(dest, &b)?;
-            backup = Some(b);
+            backup = Some(park_aside(dest)?);
         }
         // File onto file: rename replaces atomically, dest survives any failure.
         replaced = true;
@@ -1765,13 +1796,10 @@ mod tests {
         let tree = s.join("tree");
         fs::create_dir(&tree).unwrap();
         fs::write(tree.join("reg"), "r").unwrap();
-        match std::process::Command::new("mkfifo")
+        let st = std::process::Command::new("mkfifo")
             .arg(tree.join("pipe"))
-            .status()
-        {
-            Ok(st) if st.success() => {}
-            _ => return,
-        }
+            .status();
+        assert!(matches!(st, Ok(st) if st.success()), "mkfifo failed");
         let (tx, rx) = std::sync::mpsc::channel();
         let (t2, d2) = (tree.clone(), d.clone());
         std::thread::spawn(move || {
@@ -2157,19 +2185,109 @@ mod tests {
         let tree = s.join("tree");
         fs::create_dir(&tree).unwrap();
         fs::write(tree.join("reg"), "r").unwrap();
-        match std::process::Command::new("mkfifo")
+        let st = std::process::Command::new("mkfifo")
             .arg(tree.join("pipe"))
-            .status()
-        {
-            Ok(st) if st.success() => {}
-            _ => return,
-        }
+            .status();
+        assert!(matches!(st, Ok(st) if st.success()), "mkfifo failed");
         let r = move_items_with(std::slice::from_ref(&tree), &d, &mut ctl(), &exdev_err);
         assert_eq!(r.outcome, OpOutcome::Done);
         assert_eq!((r.copied, r.partial), (0, 1));
         assert!(r.moved.is_empty());
         assert!(tree.join("reg").exists());
         assert!(tree.join("pipe").exists());
+    }
+
+    // ---- round-5 review fixes ----
+
+    #[test]
+    fn park_aside_never_overwrites_existing_backup_name() {
+        let (_t, _s, d) = two_dirs();
+        let dest = d.join("x");
+        fs::write(&dest, "ORIGINAL").unwrap();
+        let taken = d.join("taken");
+        fs::write(&taken, "OTHER").unwrap();
+        let fresh = d.join("fresh");
+        let mut names_iter = vec![taken.clone(), fresh.clone()].into_iter();
+        let b = park_aside_with(&dest, &mut || names_iter.next().unwrap()).unwrap();
+        assert_eq!(b, fresh);
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "OTHER");
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "ORIGINAL");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn park_aside_gives_up_after_bounded_attempts() {
+        let (_t, _s, d) = two_dirs();
+        let dest = d.join("x");
+        fs::write(&dest, "ORIGINAL").unwrap();
+        let taken = d.join("taken");
+        fs::write(&taken, "OTHER").unwrap();
+        let mut calls = 0;
+        let e = park_aside_with(&dest, &mut || {
+            calls += 1;
+            taken.clone()
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert!(calls <= 32, "unbounded: {calls}");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "ORIGINAL");
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "OTHER");
+    }
+
+    #[test]
+    fn copy_dir_over_file_with_fifo_child_restores_backup_as_partial() {
+        let (_t, s, d) = dir_over_file_setup();
+        let st = std::process::Command::new("mkfifo")
+            .arg(s.join("x/pipe"))
+            .status();
+        assert!(matches!(st, Ok(st) if st.success()), "mkfifo failed");
+        let mut c = Ctl::new(ConflictAction::Overwrite);
+        let r = copy_items(&[s.join("x")], &d, &mut c);
+        assert_eq!(r.outcome, OpOutcome::Done);
+        assert_eq!(fs::read_to_string(d.join("x")).unwrap(), "ORIGINAL");
+        assert_eq!(names(&d), vec!["x"]);
+        assert_eq!((r.copied, r.partial, r.overwritten), (0, 1, 0));
+        assert!(!r.warnings.is_empty());
+    }
+
+    /// First conflict (the top-level one) overwrites, later ones skip; creates
+    /// `intruder` on the first progress callback.
+    struct SkipChild {
+        intruder: Option<PathBuf>,
+        asked: usize,
+    }
+    impl OpControl for SkipChild {
+        fn on_progress(&mut self, _: u64, _: &Path) {
+            if let Some(p) = self.intruder.take() {
+                fs::write(p, "INTRUDER").unwrap();
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        fn on_conflict(&mut self, _: &Path) -> ConflictAction {
+            self.asked += 1;
+            if self.asked == 1 {
+                ConflictAction::Overwrite
+            } else {
+                ConflictAction::Skip
+            }
+        }
+    }
+
+    #[test]
+    fn copy_dir_over_file_with_skipped_child_restores_backup_as_partial() {
+        let (_t, s, d) = dir_over_file_setup();
+        let mut c = SkipChild {
+            intruder: Some(d.join("x/f")),
+            asked: 0,
+        };
+        let r = copy_items(&[s.join("x")], &d, &mut c);
+        assert_eq!(c.asked, 2);
+        assert_eq!(fs::read_to_string(d.join("x")).unwrap(), "ORIGINAL");
+        assert_eq!(names(&d), vec!["x"]);
+        assert_eq!((r.copied, r.partial, r.overwritten), (0, 1, 0));
+        assert!(!r.warnings.is_empty());
     }
 
     // ---- round-3 review fixes ----

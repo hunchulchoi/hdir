@@ -499,7 +499,20 @@ impl App {
 
     fn reload_both(&mut self) {
         for i in 0..2 {
-            self.reload_panel(i, None);
+            self.reload_after_op(i, None);
+        }
+    }
+
+    /// Reload after a finished task/job. A panel that is already navigating
+    /// (Enter/Parent) keeps its pending load: it reads the directory fresh anyway
+    /// and a reload would supersede the navigation.
+    fn reload_after_op(&mut self, idx: usize, focus: Option<OsString>) {
+        let navigating = self.panels[idx]
+            .loading
+            .as_ref()
+            .is_some_and(|r| r.kind != LoadKind::Reload);
+        if !navigating {
+            self.reload_panel(idx, focus);
         }
     }
 
@@ -753,9 +766,9 @@ impl App {
         status: String,
     ) {
         if self.panels[1 - idx].cwd == dir {
-            self.reload_panel(1 - idx, None);
+            self.reload_after_op(1 - idx, None);
         }
-        self.reload_panel(idx, focus.map(OsString::from));
+        self.reload_after_op(idx, focus.map(OsString::from));
         self.status = Some(status);
     }
 
@@ -1899,7 +1912,11 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::F(7)); // mkdir dialog while job runs
         let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(300) {
+        while app.pending_conflict.is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "conflict event never arrived"
+            );
             app.tick();
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -2032,6 +2049,54 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert!(app.panels[0].selected.is_empty());
         assert_eq!(app.undo.len(), 1);
+    }
+
+    #[test]
+    fn task_finish_does_not_clobber_in_flight_navigation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("adir")).unwrap();
+        fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        let released = Arc::new(AtomicBool::new(false));
+        let trash = GatedTrash {
+            released: Arc::clone(&released),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let root = tmp.path().to_path_buf();
+        let mut app = App::with_trash(root.clone(), root.clone(), Arc::new(trash));
+        // Entries: .., adir, f.txt. Trash f.txt in the background.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.task.is_some());
+        // Meanwhile start a slow Enter on adir.
+        let gate = gate_loader(&mut app);
+        let guard = gate.lock().unwrap();
+        press(&mut app, KeyCode::Up); // adir
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.panels[0].loading.as_ref().map(|r| r.kind),
+            Some(LoadKind::Enter)
+        );
+        released.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while app.task.is_some() {
+            assert!(start.elapsed() < Duration::from_secs(5), "task stuck");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            app.panels[0].loading.as_ref().map(|r| r.kind),
+            Some(LoadKind::Enter),
+            "task finish replaced the pending navigation"
+        );
+        drop(guard);
+        settle(&mut app);
+        assert_eq!(
+            app.panels[0].cwd.canonicalize().unwrap(),
+            root.join("adir").canonicalize().unwrap()
+        );
     }
 
     #[test]

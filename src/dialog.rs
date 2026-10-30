@@ -734,4 +734,97 @@ mod tests {
             .collect();
         assert_eq!(hl, "[ Skip all ]");
     }
+
+    fn rows_50x12(d: &Dialog) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        t.draw(|f| render(f, f.area(), d)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..12)
+            .map(|y| (0..50).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_input_dialog_full_buffer() {
+        let d = Dialog::input("Rename", "New name:", "abc");
+        let expected: [&str; 12] = [
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "     ┌ Rename ──────────────────────────────┐     ",
+            "     │ New name:                            │     ",
+            "     │ abc                                  │     ",
+            "     └──────────────────────────────────────┘     ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+        ];
+        assert_eq!(rows_50x12(&d), expected);
+    }
+
+    #[test]
+    fn snapshot_confirm_dialog_full_buffer() {
+        let d = Dialog::confirm("Delete", vec!["Delete foo.txt?".into()]);
+        let expected: [&str; 12] = [
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "     ┌ Delete ──────────────────────────────┐     ",
+            "     │ Delete foo.txt?                      │     ",
+            "     │                                      │     ",
+            "     │ Enter: Yes   N/Esc: No               │     ",
+            "     └──────────────────────────────────────┘     ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+        ];
+        assert_eq!(rows_50x12(&d), expected);
+    }
+
+    #[test]
+    fn snapshot_danger_dialog_full_buffer() {
+        let d = Dialog::danger("Purge", vec!["Cannot be undone".into()]);
+        let expected: [&str; 12] = [
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "     ┌ Purge ───────────────────────────────┐     ",
+            "     │ Cannot be undone                     │     ",
+            "     │                                      │     ",
+            "     │ Enter: Yes   N/Esc: No               │     ",
+            "     └──────────────────────────────────────┘     ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+        ];
+        assert_eq!(rows_50x12(&d), expected);
+    }
+
+    #[test]
+    fn snapshot_choice_dialog_full_buffer() {
+        let d = {
+            let mut d = Dialog::choice("Conflict", vec!["exists: a.txt".into()], opts());
+            d.handle_key(key(KeyCode::Right));
+            d
+        };
+        let expected: [&str; 12] = [
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+            "  ┌ Conflict ──────────────────────────────────┐  ",
+            "  │ exists: a.txt                              │  ",
+            "  │                                            │  ",
+            "  │ [ Overwrite ] [ Skip ] [ Overwrite all ]   │  ",
+            "  │ [ Skip all ] [ Cancel ]                    │  ",
+            "  └────────────────────────────────────────────┘  ",
+            "                                                  ",
+            "                                                  ",
+            "                                                  ",
+        ];
+        assert_eq!(rows_50x12(&d), expected);
+    }
 }
