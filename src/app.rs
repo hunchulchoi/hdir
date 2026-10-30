@@ -4510,8 +4510,10 @@ mod tests {
     }
     // ---- HDIR-14: F4 editor ----
 
+    #[cfg(unix)]
     type Log = Arc<Mutex<Vec<String>>>;
 
+    #[cfg(unix)]
     /// Fake editor that logs its argv and creates `new.txt` next to the file.
     fn fake_editor(app: &mut App, log: &Log, result: EditResult) {
         let log = Arc::clone(log);
@@ -4529,6 +4531,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     fn run_logged(app: &mut App, log: &Log) {
         let l = Arc::clone(log);
         app.run_edit(move |f| {
