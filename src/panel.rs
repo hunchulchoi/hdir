@@ -1105,6 +1105,7 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)] // Windows-only readonly attribute
     #[test]
     fn readonly_attribute_maps_to_mode_444_else_666() {
         let t = tempfile::tempdir().unwrap();

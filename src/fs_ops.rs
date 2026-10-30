@@ -2776,6 +2776,7 @@ mod tests {
     // ---- Windows (HDIR-65) ----
 
     #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)] // Windows-only readonly attribute
     mod windows {
         use super::*;
         use crate::platform::test_exdev;
