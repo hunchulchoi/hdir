@@ -7,6 +7,7 @@ pub mod job;
 pub mod panel;
 pub mod term;
 pub mod ui;
+pub mod undo;
 
 pub const APP_NAME: &str = "hdir";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

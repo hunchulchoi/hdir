@@ -10,6 +10,7 @@ use crate::dialog::{self, Dialog, DialogResult};
 use crate::fs_ops::{self, SystemTrash, Trash};
 use crate::panel::{EnterResult, EntryKind, Panel};
 use crate::ui::{self, View};
+use crate::undo::{UndoOp, UndoStack};
 
 /// Rows taken by header (1) + status (1) + fkey bar (1) + panel borders (2).
 const CHROME_ROWS: u16 = 5;
@@ -35,6 +36,7 @@ pub struct App {
     pub shell: String,
     pub dialog: Option<(Dialog, PendingAction)>,
     trash: Box<dyn Trash>,
+    pub undo: UndoStack,
     page_height: usize,
 }
 
@@ -68,6 +70,7 @@ impl App {
             shell,
             dialog: None,
             trash,
+            undo: UndoStack::default(),
             page_height: 1,
         }
     }
@@ -121,6 +124,7 @@ impl App {
         }
         let page = self.page_height.max(1);
         match key.code {
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => self.undo(),
             KeyCode::F(7) => self.open_mkdir(),
             KeyCode::F(2) => self.open_rename(),
             KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => self.open_rename(),
@@ -225,13 +229,22 @@ impl App {
             (PendingAction::Mkdir, DialogResult::Submitted(name)) => {
                 let cwd = self.active_panel().cwd.clone();
                 match fs_ops::make_dir(&cwd, &name) {
-                    Ok(_) => self.after_fs_op(Some(&name), format!("폴더 생성: {name}")),
+                    Ok(_) => {
+                        self.undo.push(UndoOp::Mkdir {
+                            path: cwd.join(&name),
+                        });
+                        self.after_fs_op(Some(&name), format!("폴더 생성: {name}"));
+                    }
                     Err(e) => self.status = Some(format!("오류: {e}")),
                 }
             }
             (PendingAction::Rename { from }, DialogResult::Submitted(name)) => {
                 match fs_ops::rename(&from, &name) {
-                    Ok(_) => self.after_fs_op(Some(&name), format!("이름 변경: {name}")),
+                    Ok(_) => {
+                        let to = from.with_file_name(&name);
+                        self.undo.push(UndoOp::Rename { from, to });
+                        self.after_fs_op(Some(&name), format!("이름 변경: {name}"));
+                    }
                     Err(e) => self.status = Some(format!("오류: {e}")),
                 }
             }
@@ -239,6 +252,7 @@ impl App {
                 match self.trash.trash(&paths) {
                     Ok(()) => {
                         let n = paths.len();
+                        self.undo.push(UndoOp::Trash { count: n });
                         self.active_panel_mut().selected.clear();
                         self.after_fs_op(None, format!("휴지통: {n}개"));
                     }
@@ -247,6 +261,18 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Ctrl+Z: reverse the latest undoable operation and reload both panels.
+    fn undo(&mut self) {
+        let status = match self.undo.undo() {
+            Ok(msg) => msg,
+            Err(e) => e,
+        };
+        for p in &mut self.panels {
+            p.reload();
+        }
+        self.status = Some(status);
     }
 
     /// Reload the active panel (cursor on `focus` if given) and the other panel
@@ -768,5 +794,62 @@ mod tests {
             }
         }
         assert!(text.contains("새 폴더"));
+    }
+    // ---- HDIR-10: undo ----
+
+    fn ctrl_z(app: &mut App) {
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::Char('z'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        ));
+    }
+
+    #[test]
+    fn ctrl_z_undoes_f7_mkdir_and_reloads() {
+        let (tmp, mut app, _f) = fixture_trash();
+        press(&mut app, KeyCode::F(7));
+        type_str(&mut app, "새폴더");
+        press(&mut app, KeyCode::Enter);
+        assert!(tmp.path().join("새폴더").is_dir());
+        ctrl_z(&mut app);
+        assert!(!tmp.path().join("새폴더").exists());
+        assert!(app.panels[0].entries.iter().all(|e| e.name != "새폴더"));
+        assert!(app.panels[1].entries.iter().all(|e| e.name != "새폴더"));
+        assert_eq!(app.status.as_deref(), Some("되돌림: 폴더 생성 취소 새폴더"));
+    }
+
+    #[test]
+    fn ctrl_z_undoes_f2_rename() {
+        let (tmp, mut app, _f) = fixture_trash();
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Up); // f.txt
+        press(&mut app, KeyCode::F(2));
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, "h.txt");
+        press(&mut app, KeyCode::Enter);
+        ctrl_z(&mut app);
+        assert!(tmp.path().join("f.txt").exists());
+        assert!(!tmp.path().join("h.txt").exists());
+        assert!(app.panels[0].entries.iter().any(|e| e.name == "f.txt"));
+    }
+
+    #[test]
+    fn ctrl_z_after_trash_explains() {
+        let (_t, mut app, _f) = fixture_trash();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Char('y'));
+        ctrl_z(&mut app);
+        assert!(app.status.as_deref().unwrap().contains("복원"));
+    }
+
+    #[test]
+    fn ctrl_z_empty_stack_status() {
+        let (_t, mut app, _f) = fixture_trash();
+        ctrl_z(&mut app);
+        assert_eq!(app.status.as_deref(), Some("되돌릴 작업 없음"));
     }
 }
