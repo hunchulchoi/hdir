@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{self, Event};
 fn main() -> anyhow::Result<()> {
     term::install_panic_hook();
     let mut terminal = term::init()?;
-    let mut app = App::new();
+    let mut app = App::default();
 
     let result = run(&mut terminal, &mut app);
     term::restore()?;
