@@ -12,11 +12,11 @@
 //!   rejected.
 
 use std::ffi::OsString;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::panel::{Entry, EntryKind};
+use crate::platform::{os_bytes, os_from_bytes};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteOs {
@@ -137,7 +137,7 @@ pub fn exec_argv(t: &SshTarget, remote_cmd: &[u8]) -> Vec<OsString> {
     port_args(t.port, "-p", &mut v);
     v.push(os("--"));
     v.push(os(&t.host));
-    v.push(OsString::from_vec(remote_cmd.to_vec()));
+    v.push(os_from_bytes(remote_cmd.to_vec()));
     v
 }
 
@@ -221,7 +221,7 @@ fn parse_record(os: &RemoteOs, rec: &[u8]) -> Option<RemoteEntry> {
         return None;
     }
     Some(RemoteEntry {
-        name: OsString::from_vec(name.to_vec()),
+        name: os_from_bytes(name.to_vec()),
         kind,
         size,
         mtime,
@@ -275,18 +275,37 @@ fn remote_arg(t: &SshTarget, path: &[u8]) -> Result<OsString, String> {
     let mut b = t.host.as_bytes().to_vec();
     b.push(b':');
     b.extend_from_slice(&sh_quote(path));
-    Ok(OsString::from_vec(b))
+    Ok(os_from_bytes(b))
 }
 
+/// Local path as an scp argument (kept native, never converted to POSIX).
+///
+/// scp treats the part before the first `:` as a host, so a relative path whose
+/// first component contains `:` gets a `./` (unix) or `.\` (windows) prefix.
+/// Windows absolute paths (`C:\Users\x\f.txt`) are passed unchanged: OpenSSH
+/// for Windows (Win32-OpenSSH `scp`) recognizes a single-letter drive prefix
+/// as a local path, so no rewriting is needed (and `\\?\` forms are avoided
+/// because they would confuse the same check).
 fn local_arg(p: &Path) -> OsString {
-    let b = p.as_os_str().as_bytes();
-    let first = b.split(|&c| c == b'/').next().unwrap_or(b);
-    if !p.is_absolute() && first.contains(&b':') {
-        let mut o = b"./".to_vec();
-        o.extend_from_slice(b);
-        OsString::from_vec(o)
+    let os = p.as_os_str();
+    if p.is_absolute() {
+        return os.to_os_string();
+    }
+    let b = os_bytes(os);
+    let first = b
+        .split(|&c| c == b'/' || (cfg!(windows) && c == b'\\'))
+        .next()
+        .unwrap_or(&b);
+    if first.contains(&b':') {
+        let mut o = if cfg!(windows) {
+            b".\\".to_vec()
+        } else {
+            b"./".to_vec()
+        };
+        o.extend_from_slice(&b);
+        os_from_bytes(o)
     } else {
-        p.as_os_str().to_os_string()
+        os.to_os_string()
     }
 }
 
@@ -343,7 +362,7 @@ impl RemoteEntry {
             size: self.size,
             modified: self.mtime,
             mode: self.mode,
-            hidden: self.name.as_bytes().first() == Some(&b'.'),
+            hidden: os_bytes(&self.name).first() == Some(&b'.'),
         }
     }
 }
@@ -452,8 +471,21 @@ mod tests {
         assert_eq!(a[5], OsString::from("-p"));
         assert_eq!(a[6], OsString::from("2200"));
         assert_eq!(a.last().unwrap(), &OsString::from("x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_argv_keeps_raw_bytes() {
+        use std::os::unix::ffi::OsStrExt;
         let a = exec_argv(&t(None), b"cat \xff");
         assert_eq!(a.last().unwrap().as_bytes(), b"cat \xff");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exec_argv_non_utf8_is_lossy_on_windows() {
+        let a = exec_argv(&t(None), b"cat \xff");
+        assert_eq!(a.last().unwrap(), &OsString::from("cat \u{fffd}"));
     }
 
     #[test]
@@ -518,8 +550,11 @@ mod tests {
         assert_eq!(e[3].kind, RemoteKind::Special);
         assert_eq!(e[4].kind, RemoteKind::Special);
         assert_eq!(e[5].kind, RemoteKind::Special);
-        assert_eq!(e[6].name.as_bytes(), b"tab\tin\nname");
-        assert_eq!(e[7].name.as_bytes(), b"bad\xff\xfename");
+        assert_eq!(&*os_bytes(&e[6].name), b"tab\tin\nname");
+        #[cfg(unix)]
+        assert_eq!(&*os_bytes(&e[7].name), b"bad\xff\xfename");
+        #[cfg(windows)]
+        assert_eq!(e[7].name, OsString::from("bad\u{fffd}\u{fffd}name"));
     }
 
     #[test]
@@ -690,5 +725,46 @@ f\t1\t1.0\t644\t\0zz\t1\t1.0\t644\tn\0\0f\t2\t2.0\t600\tok2\0";
         )
         .unwrap();
         assert_eq!(r[r.len() - 2], OsString::from("./a:b"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scp_windows_local_paths_stay_local() {
+        let a = t(None);
+        // absolute drive paths are passed natively (Win32-OpenSSH scp treats a
+        // single-letter drive prefix as local, not as host "C")
+        let up = scp_argv(
+            &Endpoint::Local(Path::new(r"C:\Users\x\f.txt")),
+            &Endpoint::Remote(&a, b"/r/d"),
+        )
+        .unwrap();
+        assert_eq!(up[up.len() - 2], OsString::from(r"C:\Users\x\f.txt"));
+        let down = scp_argv(
+            &Endpoint::Remote(&a, b"/r/f"),
+            &Endpoint::Local(Path::new(r"D:\한글 dir")),
+        )
+        .unwrap();
+        assert_eq!(down[down.len() - 1], OsString::from(r"D:\한글 dir"));
+        // relative path with a colon in its first component is made explicit
+        let rel = scp_argv(
+            &Endpoint::Local(Path::new(r"a:b\f")),
+            &Endpoint::Remote(&a, b"/d"),
+        )
+        .unwrap();
+        assert_eq!(rel[rel.len() - 2], OsString::from(r".\a:b\f"));
+        // remote side stays POSIX-quoted
+        assert_eq!(up[up.len() - 1], OsString::from("prod:'/r/d'"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_remote_quote_uses_utf8_of_local_names() {
+        let a = t(None);
+        let r = scp_argv(
+            &Endpoint::Local(Path::new(r"C:\x")),
+            &Endpoint::Remote(&a, "/r/한 글's".as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(r[r.len() - 1], OsString::from("prod:'/r/한 글'\\''s'"));
     }
 }

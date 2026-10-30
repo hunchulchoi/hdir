@@ -179,7 +179,6 @@ pub fn summarize_dir(mut entries: impl Iterator<Item = io::Result<(bool, u64)>>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn text(p: Preview) -> (Vec<String>, bool) {
         match p {
@@ -326,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn path_text_dir_and_broken_symlink() {
+    fn path_text_empty_and_dir() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("한 글 'q'.txt");
         fs::write(&f, "hi\n").unwrap();
@@ -340,6 +339,24 @@ mod tests {
         let e = d.path().join("empty");
         fs::write(&e, "").unwrap();
         assert_eq!(preview_path(&e), Preview::Empty);
+        assert!(matches!(
+            preview_path(d.path()),
+            Preview::Dir {
+                files: 2,
+                dirs: 0,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_symlink_and_broken_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("한 글 'q'.txt");
+        fs::write(&f, "hi\n").unwrap();
+        let e = d.path().join("empty");
+        fs::write(&e, "").unwrap();
         let ln = d.path().join("ln");
         std::os::unix::fs::symlink(&f, &ln).unwrap();
         assert!(matches!(preview_path(&ln), Preview::Text { .. }));
@@ -366,8 +383,10 @@ mod tests {
         assert_eq!(lines[0].len(), MAX_BYTES);
     }
 
+    #[cfg(unix)]
     #[test]
     fn permission_denied_is_error() {
+        use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("secret");
         fs::write(&f, "x").unwrap();

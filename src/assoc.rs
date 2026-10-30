@@ -1,7 +1,6 @@
 //! Extension associations: rule matching and shell-safe command templates.
 
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -191,22 +190,23 @@ fn glob_match(toks: &[Tok], name: &str) -> bool {
 }
 
 /// Expands `{}`, `{dir}`, `{name}`; `{{`/`}}` are literal braces. Placeholders
-/// are shell-escaped. If no placeholder is present the escaped path is appended.
+/// are shell-escaped for the local shell (POSIX on unix, PowerShell on
+/// windows). If no placeholder is present the escaped path is appended.
 pub fn render_command(template: &str, path: &Path, cwd: &Path) -> OsString {
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => cwd,
     };
     let stem = path.file_stem().unwrap_or_default();
-    let mut out: Vec<u8> = Vec::new();
+    let mut out = OsString::new();
     let mut used = false;
     let mut rest = template;
     while let Some(c) = rest.chars().next() {
         if let Some(r) = rest.strip_prefix("{{") {
-            out.push(b'{');
+            out.push("{");
             rest = r;
         } else if let Some(r) = rest.strip_prefix("}}") {
-            out.push(b'}');
+            out.push("}");
             rest = r;
         } else if let Some((r, val)) = [
             ("{}", path.as_os_str()),
@@ -216,24 +216,26 @@ pub fn render_command(template: &str, path: &Path, cwd: &Path) -> OsString {
         .into_iter()
         .find_map(|(p, v)| rest.strip_prefix(p).map(|r| (r, v)))
         {
-            out.extend(shell_escape(val).as_bytes());
+            out.push(shell_escape(val));
             used = true;
             rest = r;
         } else {
             let mut buf = [0u8; 4];
-            out.extend(c.encode_utf8(&mut buf).as_bytes());
+            out.push(&*c.encode_utf8(&mut buf));
             rest = &rest[c.len_utf8()..];
         }
     }
     if !used {
-        out.push(b' ');
-        out.extend(shell_escape(path.as_os_str()).as_bytes());
+        out.push(" ");
+        out.push(shell_escape(path.as_os_str()));
     }
-    OsString::from_vec(out)
+    out
 }
 
 /// POSIX single-quote escaping, byte-preserving.
+#[cfg(unix)]
 pub fn shell_escape(s: &OsStr) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let mut out = Vec::with_capacity(s.len() + 2);
     out.push(b'\'');
     for &b in s.as_bytes() {
@@ -245,6 +247,38 @@ pub fn shell_escape(s: &OsStr) -> OsString {
     }
     out.push(b'\'');
     OsString::from_vec(out)
+}
+
+/// PowerShell single-quote escaping (non-UTF-16-clean names become U+FFFD).
+#[cfg(windows)]
+pub fn shell_escape(s: &OsStr) -> OsString {
+    OsString::from(powershell_quote(&s.to_string_lossy()))
+}
+
+/// Single-quoted PowerShell literal: inside `'...'` nothing is expanded
+/// (`$`, backtick, `"` are literal); only a single quote must be doubled.
+/// PowerShell also treats the typographic quotes U+2018/2019/201A/201B as
+/// single quotes, so those are doubled too.
+#[cfg(any(windows, test))]
+fn powershell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        out.push(c);
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Shell used for association commands on windows: PowerShell 7.
+///
+/// If `pwsh` is not installed, the caller may fall back to Windows PowerShell
+/// (`"powershell"`, same `-NoProfile -Command` flags) by replacing argv[0].
+pub fn windows_shell() -> &'static str {
+    "pwsh"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,7 +302,26 @@ pub fn plan_run(
     } else {
         RunMode::Foreground
     };
-    (vec![OsString::from(shell), OsString::from("-c"), cmd], mode)
+    (shell_argv(shell, cmd), mode)
+}
+
+/// unix: `<shell> -c <cmd>`.
+#[cfg(unix)]
+fn shell_argv(shell: &str, cmd: OsString) -> Vec<OsString> {
+    vec![OsString::from(shell), OsString::from("-c"), cmd]
+}
+
+/// windows: `pwsh -NoProfile -Command <cmd>`; `shell` (a unix `$SHELL`
+/// concept, possibly a stray bash path) is ignored in favor of
+/// [`windows_shell`].
+#[cfg(windows)]
+fn shell_argv(_shell: &str, cmd: OsString) -> Vec<OsString> {
+    vec![
+        OsString::from(windows_shell()),
+        OsString::from("-NoProfile"),
+        OsString::from("-Command"),
+        cmd,
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,11 +338,40 @@ pub fn default_action(preview_is_text: bool) -> DefaultAction {
     }
 }
 
+/// Program of the platform's "open with default application" command.
 pub fn system_opener() -> &'static str {
     if cfg!(target_os = "macos") {
         "open"
+    } else if cfg!(windows) {
+        "cmd"
     } else {
         "xdg-open"
+    }
+}
+
+/// Full argv to open `path` with the system default application.
+///
+/// windows: `cmd /c start "" <path>`. `start` treats a first quoted argument
+/// as the window title, so a path with spaces would be swallowed as the title;
+/// the empty title `""` (the literal two characters) must come first. It is a
+/// separate argv item. Note for the executor: `std::process::Command` escapes
+/// embedded quotes as `\"`, which cmd does not understand, so spawn this with
+/// `CommandExt::raw_arg` for the title item. cmd metacharacters (`&`, `^`) in
+/// a path without spaces are not protected by this argv.
+pub fn system_opener_argv(path: &Path) -> Vec<OsString> {
+    if cfg!(windows) {
+        vec![
+            OsString::from("cmd"),
+            OsString::from("/c"),
+            OsString::from("start"),
+            OsString::from("\"\""),
+            path.as_os_str().to_os_string(),
+        ]
+    } else {
+        vec![
+            OsString::from(system_opener()),
+            path.as_os_str().to_os_string(),
+        ]
     }
 }
 
@@ -447,8 +529,10 @@ mod tests {
         assert_eq!(cmd_of(&t, "a.md"), Some("both"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_file_name_matches_by_ext() {
+        use std::os::unix::ffi::OsStrExt;
         let t = table(vec![ext_rule(&["txt"], "t")]);
         let name = OsStr::from_bytes(b"\xff\xfe.TXT");
         assert!(t.find(name).is_some());
@@ -518,6 +602,7 @@ name = "build"
         assert!(!d.wait && !d.background);
     }
 
+    #[cfg(unix)]
     #[test]
     fn escape_basic() {
         assert_eq!(esc("abc"), "'abc'");
@@ -534,12 +619,15 @@ name = "build"
         assert_eq!(esc("한글 파일.txt"), "'한글 파일.txt'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn escape_keeps_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
         let out = shell_escape(OsStr::from_bytes(b"a\xffb'c"));
         assert_eq!(out.as_bytes(), b"'a\xffb'\\''c'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn render_path_placeholder() {
         assert_eq!(render("vi {}", "/a b/it's.txt"), r"vi '/a b/it'\''s.txt'");
@@ -547,6 +635,7 @@ name = "build"
         assert_eq!(render("cp {} {}.bak", "/x"), "cp '/x' '/x'.bak");
     }
 
+    #[cfg(unix)]
     #[test]
     fn render_dir_and_name() {
         assert_eq!(
@@ -557,11 +646,13 @@ name = "build"
         assert_eq!(render("echo {name}", "/x/Makefile"), "echo 'Makefile'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn render_relative_path_dir_falls_back_to_cwd() {
         assert_eq!(render("ls {dir}", "file.txt"), "ls '/cwd'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn render_brace_escapes_and_unknown() {
         assert_eq!(render("echo {{}} {}", "/p"), "echo {} '/p'");
@@ -570,6 +661,7 @@ name = "build"
         assert_eq!(render("lone { and } {}", "/p"), "lone { and } '/p'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn render_auto_append_path() {
         assert_eq!(render("less", "/a b"), "less '/a b'");
@@ -577,19 +669,23 @@ name = "build"
         assert_eq!(render("echo {name}", "/p/q.txt"), "echo 'q'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn render_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
         let p = Path::new(OsStr::from_bytes(b"/d/\xff\xfe.txt"));
         let out = render_command("vi {}", p, Path::new("/cwd"));
         assert_eq!(out.as_bytes(), b"vi '/d/\xff\xfe.txt'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn render_hostile_name_stays_one_word() {
         let out = render("cat {}", "/d/$(rm -rf ~); `id` -x'\n.txt");
         assert_eq!(out, "cat '/d/$(rm -rf ~); `id` -x'\\''\n.txt'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn plan_run_modes() {
         let p = Path::new("/d/a b.sh");
@@ -624,8 +720,133 @@ name = "build"
     fn system_opener_per_platform() {
         if cfg!(target_os = "macos") {
             assert_eq!(system_opener(), "open");
+        } else if cfg!(windows) {
+            assert_eq!(system_opener(), "cmd");
         } else {
             assert_eq!(system_opener(), "xdg-open");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opener_argv_unix() {
+        let argv = system_opener_argv(Path::new("/d/a b.png"));
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from(system_opener()),
+                OsString::from("/d/a b.png")
+            ]
+        );
+    }
+
+    // PowerShell quoting is pure, so it is verified on every platform.
+    #[test]
+    fn powershell_quote_rules() {
+        assert_eq!(powershell_quote("abc"), "'abc'");
+        assert_eq!(powershell_quote(""), "''");
+        assert_eq!(powershell_quote("a b"), "'a b'");
+        assert_eq!(powershell_quote("it's"), "'it''s'");
+        assert_eq!(powershell_quote("'"), "''''");
+        assert_eq!(
+            powershell_quote("$env:X `n $(y) \"q\" ; & |"),
+            "'$env:X `n $(y) \"q\" ; & |'"
+        );
+        assert_eq!(powershell_quote("a\nb"), "'a\nb'");
+        assert_eq!(powershell_quote("한글 파일.txt"), "'한글 파일.txt'");
+        // typographic quotes are quote characters to PowerShell
+        assert_eq!(
+            powershell_quote("\u{2018}x\u{2019}"),
+            "'\u{2018}\u{2018}x\u{2019}\u{2019}'"
+        );
+    }
+
+    #[test]
+    fn windows_shell_is_pwsh() {
+        assert_eq!(windows_shell(), "pwsh");
+    }
+
+    #[cfg(windows)]
+    mod win {
+        use super::*;
+
+        fn render_w(t: &str, p: &str) -> String {
+            s(render_command(t, Path::new(p), Path::new(r"C:\cwd")))
+        }
+
+        #[test]
+        fn escape_windows() {
+            assert_eq!(esc("abc"), "'abc'");
+            assert_eq!(esc("a b"), "'a b'");
+            assert_eq!(esc("it's"), "'it''s'");
+            assert_eq!(esc("$HOME `x`"), "'$HOME `x`'");
+            assert_eq!(esc(r"C:\Users\x\f.txt"), r"'C:\Users\x\f.txt'");
+            assert_eq!(esc("한글 파일.txt"), "'한글 파일.txt'");
+        }
+
+        #[test]
+        fn render_windows_paths() {
+            assert_eq!(
+                render_w("code {}", r"C:\My Docs\it's.txt"),
+                r"code 'C:\My Docs\it''s.txt'"
+            );
+            assert_eq!(
+                render_w(r"mv {} {dir}\{name}.old", r"D:\a b\c.tar.gz"),
+                r"mv 'D:\a b\c.tar.gz' 'D:\a b'\'c.tar'.old"
+            );
+            assert_eq!(render_w("less", r"C:\한글\x.md"), r"less 'C:\한글\x.md'");
+            assert_eq!(render_w("echo {{}} {}", r"C:\p"), r"echo {} 'C:\p'");
+        }
+
+        #[test]
+        fn render_relative_dir_falls_back_to_cwd() {
+            assert_eq!(render_w("ls {dir}", "file.txt"), r"ls 'C:\cwd'");
+        }
+
+        #[test]
+        fn hostile_name_stays_one_word() {
+            assert_eq!(
+                render_w("cat {}", r"C:\d\$(rm x); `id` 'q'.txt"),
+                r"cat 'C:\d\$(rm x); `id` ''q''.txt'"
+            );
+        }
+
+        #[test]
+        fn plan_run_argv_windows() {
+            let p = Path::new(r"C:\d\a b.ps1");
+            let cwd = Path::new(r"C:\d");
+            let mut r = ext_rule(&["ps1"], "& {}");
+            let (argv, mode) = plan_run(&r, p, cwd, "/bin/bash");
+            assert_eq!(mode, RunMode::Foreground);
+            assert_eq!(
+                argv,
+                vec![
+                    OsString::from("pwsh"),
+                    OsString::from("-NoProfile"),
+                    OsString::from("-Command"),
+                    OsString::from(r"& 'C:\d\a b.ps1'")
+                ]
+            );
+            r.wait = true;
+            assert_eq!(plan_run(&r, p, cwd, "").1, RunMode::Wait);
+            r.wait = false;
+            r.background = true;
+            assert_eq!(plan_run(&r, p, cwd, "").1, RunMode::Background);
+        }
+
+        #[test]
+        fn opener_argv_windows() {
+            let argv = system_opener_argv(Path::new(r"C:\My Docs\한글.png"));
+            assert_eq!(
+                argv,
+                vec![
+                    OsString::from("cmd"),
+                    OsString::from("/c"),
+                    OsString::from("start"),
+                    OsString::from("\"\""),
+                    OsString::from(r"C:\My Docs\한글.png"),
+                ]
+            );
         }
     }
 }
