@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::assoc::{self, AssocRule, DefaultAction, RunMode};
-use crate::cmdline::{self, CdTarget, CmdEvent, CmdLine, History};
+use crate::cmdline::{self, CdTarget, CmdEvent, CmdLine, History, LocationCmd};
 use crate::config::{self, Mode, Settings};
 use crate::dialog::{self, Dialog, DialogResult};
 use crate::editor::{self, EditResult, EditorRunner};
@@ -23,13 +23,17 @@ use crate::loader::Loader;
 use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
 use crate::preview::{self, Preview};
+use crate::remote::SshTarget;
 use crate::screen::{self, TextScreen};
+use crate::servers::{self, Server, SshHost};
+use crate::session::{self, Cmd, DISCONNECTED_MSG, Established, RemoteSession, SystemCmd};
 use crate::theme::{self, Theme};
 use crate::trash::{
     self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
 };
 use crate::ui::{self, PreviewBody, PreviewView, View};
 use crate::undo::{UndoApplied, UndoOp, UndoStack};
+use crate::vfs::Location;
 use crate::viewer::{self, Viewer};
 
 pub use crate::ui::panel_rows;
@@ -60,6 +64,43 @@ pub enum PendingAction {
     },
 }
 
+/// Shown for every file operation a remote panel does not support yet.
+const REMOTE_UNSUPPORTED: &str = "원격: 다음 단계에서 지원";
+
+/// What a connect worker should establish.
+#[derive(Clone)]
+enum ConnectKind {
+    New {
+        server: Server,
+        path: Option<String>,
+    },
+    Reconnect(Arc<RemoteSession>),
+}
+
+/// One connect attempt for a panel; `attempt` identifies the latest attempt.
+#[derive(Clone)]
+struct ConnectJob {
+    idx: usize,
+    attempt: u64,
+    kind: ConnectKind,
+    target: SshTarget,
+}
+
+enum ConnectDone {
+    Established(Established),
+    Revived,
+}
+
+enum ConnectMsg {
+    /// The master is not running: ssh must run on the real terminal.
+    NeedAuth(ConnectJob),
+    Done {
+        idx: usize,
+        attempt: u64,
+        result: Result<ConnectDone, String>,
+    },
+}
+
 /// What an open F9 menu is choosing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MenuKind {
@@ -70,6 +111,11 @@ enum MenuKind {
     OpenWith {
         path: PathBuf,
         choices: Vec<OpenChoice>,
+    },
+    /// Alt+F1/F2 location picker for `panel`: item 0 is local, then `servers`.
+    Location {
+        panel: usize,
+        servers: Vec<Server>,
     },
 }
 
@@ -310,6 +356,17 @@ impl BgTask {
 }
 
 /// Expand a leading `~` and resolve relative paths against `cwd`.
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
 fn resolve_dest(input: &str, cwd: &std::path::Path) -> PathBuf {
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     let expanded = if input == "~" {
@@ -415,6 +472,23 @@ pub struct App {
     /// Results of background spawns, shown by `tick`.
     spawn_tx: Sender<String>,
     spawn_rx: Receiver<String>,
+    /// Runs ssh; tests inject a fake.
+    pub cmd: Arc<dyn Cmd>,
+    /// ssh ControlPath template (`cm-%C` inside a private directory).
+    pub control_path: PathBuf,
+    /// Hosts from `~/.ssh/config`, merged with `[[servers]]` for the picker.
+    pub ssh_hosts: Vec<SshHost>,
+    /// `~/.ssh/config` to read in `configure`.
+    pub ssh_config_path: Option<PathBuf>,
+    /// Per panel: the local directory to return to with `:local`.
+    local_cwds: [Option<PathBuf>; 2],
+    /// Per panel: generation of the connect attempt in flight.
+    connecting: [Option<u64>; 2],
+    connect_gen: u64,
+    connect_tx: Sender<ConnectMsg>,
+    connect_rx: Receiver<ConnectMsg>,
+    /// A connect that needs the terminal for ssh's prompts.
+    pending_master: Option<ConnectJob>,
 }
 
 impl Default for App {
@@ -431,6 +505,7 @@ impl App {
 
     pub fn with_trash(left: PathBuf, right: PathBuf, trash: Arc<dyn TrashBackend>) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel();
+        let (connect_tx, connect_rx) = mpsc::channel();
         let shell = std::env::var("SHELL")
             .ok()
             .and_then(|s| {
@@ -491,6 +566,16 @@ impl App {
             probe_gen: 0,
             spawn_tx,
             spawn_rx,
+            cmd: Arc::new(SystemCmd),
+            control_path: session::control_path(dirs::cache_dir().as_deref(), current_uid()),
+            ssh_hosts: Vec::new(),
+            ssh_config_path: None,
+            local_cwds: [None, None],
+            connecting: [None, None],
+            connect_gen: 0,
+            connect_tx,
+            connect_rx,
+            pending_master: None,
         }
     }
 
@@ -503,6 +588,11 @@ impl App {
         self.config_dir = config_dir;
         self.truecolor = theme::supports_truecolor(colorterm);
         self.reload_settings();
+        if let Some(path) = self.ssh_config_path.clone() {
+            let (hosts, warnings) = servers::load_ssh_config(&path);
+            self.ssh_hosts = hosts;
+            self.settings.warnings.extend(warnings);
+        }
         if let Some(s) = config::warning_summary(&self.settings.warnings) {
             self.status = Some(s);
         }
@@ -672,6 +762,21 @@ impl App {
         let theme_names = match &open.kind {
             MenuKind::Theme(names) => Some(names.clone()),
             MenuKind::Main => None,
+            MenuKind::Location { panel, servers } => {
+                let (panel, servers) = (*panel, servers.clone());
+                match event {
+                    MenuEvent::Chosen(i) => {
+                        self.menu = None;
+                        match i.checked_sub(1).and_then(|n| servers.get(n)) {
+                            None => self.switch_local(panel),
+                            Some(sv) => self.connect_server(panel, sv.clone(), None),
+                        }
+                    }
+                    MenuEvent::Cancelled => self.menu = None,
+                    _ => {}
+                }
+                return;
+            }
             MenuKind::OpenWith { path, choices } => {
                 let (path, choices) = (path.clone(), choices.clone());
                 match event {
@@ -839,7 +944,14 @@ impl App {
 
     /// Directory the shell should `cd` to on exit, or `None` (quit without cd).
     pub fn exit_cwd(&self) -> Option<&Path> {
-        self.cd_on_exit.then(|| self.active_panel().cwd.as_path())
+        if !self.cd_on_exit {
+            return None;
+        }
+        if self.active_panel().location.is_remote() {
+            // The shell cannot cd to a remote path: use the last local dir.
+            return self.local_cwds[self.active].as_deref();
+        }
+        Some(self.active_panel().cwd.as_path())
     }
 
     fn handle_cmdline_key(&mut self, key: KeyEvent) {
@@ -862,6 +974,18 @@ impl App {
         }
         self.cmd_history.push(cmd);
         self.status = None;
+        if let Some(lc) = cmdline::parse_location_cmd(cmd) {
+            match lc {
+                LocationCmd::Local => self.switch_local(self.active),
+                LocationCmd::Ssh { host, path } => self.connect_by_name(self.active, &host, path),
+                LocationCmd::SshUsage => self.status = Some("사용법: ssh 호스트[:경로]".into()),
+            }
+            return;
+        }
+        if self.active_panel().location.is_remote() {
+            self.status = Some(REMOTE_UNSUPPORTED.into());
+            return;
+        }
         let cwd = self.active_panel().cwd.clone();
         if let Some(target) = cmdline::parse_cd(cmd, self.home_dir.as_deref()) {
             self.change_dir_to(&cwd, &target);
@@ -890,6 +1014,284 @@ impl App {
             }
             Err(e) => self.status = Some(e),
         }
+    }
+
+    // ---- ssh panels (HDIR-35/43/44) ----
+
+    /// `[[servers]]` merged with `~/.ssh/config` aliases (picker order).
+    fn servers(&self) -> Vec<Server> {
+        servers::merge(&self.ssh_hosts, &self.settings.config.servers).0
+    }
+
+    /// Alt+F1/F2: choose local or a server for panel `idx`.
+    fn open_location_menu(&mut self, idx: usize) {
+        let servers = self.servers();
+        let mut items = vec!["로컬".to_string()];
+        items.extend(servers.iter().map(|s| {
+            // ssh aliases show where they point (user@hostname) when known.
+            let detail = self
+                .ssh_hosts
+                .iter()
+                .find(|h| s.from_ssh_config && h.alias == s.host)
+                .and_then(|h| {
+                    let host = h.hostname.as_deref()?;
+                    Some(match &h.user {
+                        Some(u) => format!("{u}@{host}"),
+                        None => host.to_string(),
+                    })
+                })
+                .unwrap_or_else(|| s.host.clone());
+            if detail == s.name {
+                s.name.clone()
+            } else {
+                format!("{}  ({detail})", s.name)
+            }
+        }));
+        let title = if idx == 0 {
+            "왼쪽 패널"
+        } else {
+            "오른쪽 패널"
+        };
+        self.status = None;
+        self.menu = Some(OpenMenu {
+            menu: Menu::new(title, items, 0),
+            kind: MenuKind::Location {
+                panel: idx,
+                servers,
+            },
+        });
+    }
+
+    /// `:ssh host[:path]`: a known server name, else an ssh destination as is.
+    fn connect_by_name(&mut self, idx: usize, host: &str, path: Option<String>) {
+        let server = self
+            .servers()
+            .into_iter()
+            .find(|s| s.name == host)
+            .unwrap_or_else(|| Server {
+                name: host.to_string(),
+                host: host.to_string(),
+                port: None,
+                start_path: None,
+                theme: None,
+                from_ssh_config: false,
+            });
+        self.connect_server(idx, server, path);
+    }
+
+    fn connect_server(&mut self, idx: usize, server: Server, path: Option<String>) {
+        let path = path.or_else(|| server.start_path.clone());
+        let target = SshTarget {
+            host: server.host.clone(),
+            port: server.port,
+            control_path: self.control_path.clone(),
+        };
+        self.start_connect(idx, ConnectKind::New { server, path }, target);
+    }
+
+    fn start_connect(&mut self, idx: usize, kind: ConnectKind, target: SshTarget) {
+        if cfg!(windows) {
+            self.status = Some("SSH: Windows 지원 예정".into());
+            return;
+        }
+        self.connect_gen += 1;
+        let job = ConnectJob {
+            idx,
+            attempt: self.connect_gen,
+            kind,
+            target,
+        };
+        self.connecting[idx] = Some(job.attempt);
+        self.pending_master = self.pending_master.take().filter(|j| j.idx != idx);
+        self.status = Some(format!("연결 중… {}", job.target.host));
+        self.spawn_connect(job, false);
+    }
+
+    /// Run the non-interactive part of a connect on a worker. `authed`: the
+    /// master was just started on the terminal, skip the liveness check.
+    fn spawn_connect(&self, job: ConnectJob, authed: bool) {
+        let cmd = Arc::clone(&self.cmd);
+        let tx = self.connect_tx.clone();
+        std::thread::spawn(move || {
+            let (idx, attempt) = (job.idx, job.attempt);
+            if !authed {
+                if let Err(e) = session::ensure_control_dir(&job.target.control_path) {
+                    let result = Err(format!("소켓 디렉터리: {e}"));
+                    let _ = tx.send(ConnectMsg::Done {
+                        idx,
+                        attempt,
+                        result,
+                    });
+                    return;
+                }
+                if !session::master_alive(&*cmd, &job.target) {
+                    let _ = tx.send(ConnectMsg::NeedAuth(job));
+                    return;
+                }
+            }
+            let result = match &job.kind {
+                ConnectKind::New { server, path } => {
+                    session::establish(&cmd, &server.name, job.target.clone(), path.as_deref())
+                        .map(ConnectDone::Established)
+                }
+                ConnectKind::Reconnect(s) => {
+                    if s.revive() {
+                        Ok(ConnectDone::Revived)
+                    } else {
+                        Err("연결 끊김".to_string())
+                    }
+                }
+            };
+            let _ = tx.send(ConnectMsg::Done {
+                idx,
+                attempt,
+                result,
+            });
+        });
+    }
+
+    /// Is a connect in flight (including one waiting for the terminal)?
+    pub fn is_connecting(&self) -> bool {
+        self.connecting.iter().any(Option::is_some)
+    }
+
+    pub fn has_pending_master(&self) -> bool {
+        self.pending_master.is_some()
+    }
+
+    /// Run the queued `ssh -fN` on the real terminal (password / host key
+    /// prompts): `suspend` leaves the TUI, runs the closure, and re-enters.
+    pub fn run_master(
+        &mut self,
+        suspend: impl FnOnce(&mut dyn FnMut() -> EditResult) -> std::io::Result<EditResult>,
+    ) {
+        let Some(job) = self.pending_master.take() else {
+            return;
+        };
+        if self.connecting[job.idx] != Some(job.attempt) {
+            return; // superseded
+        }
+        let cmd = Arc::clone(&self.cmd);
+        let mut result: EditResult = Err("실행되지 않음".into());
+        let outcome = suspend(&mut || {
+            result = session::start_master(&*cmd, &job.target);
+            result.clone()
+        });
+        match (outcome, result) {
+            (Err(e), _) => {
+                self.connecting[job.idx] = None;
+                self.status = Some(format!("터미널 복귀 실패: {e}"));
+            }
+            (Ok(_), Ok(())) => {
+                self.status = Some(format!("연결 중… {}", job.target.host));
+                self.spawn_connect(job, true);
+            }
+            (Ok(_), Err(e)) => {
+                self.connecting[job.idx] = None;
+                self.status = Some(format!("연결 실패: {e}"));
+            }
+        }
+    }
+
+    /// Apply finished connect attempts; returns true when anything changed.
+    fn tick_connect(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(msg) = self.connect_rx.try_recv() {
+            match msg {
+                ConnectMsg::NeedAuth(job) => {
+                    if self.connecting[job.idx] == Some(job.attempt) {
+                        self.status = Some(format!("인증 필요: {}", job.target.host));
+                        self.pending_master = Some(job);
+                        changed = true;
+                    }
+                }
+                ConnectMsg::Done {
+                    idx,
+                    attempt,
+                    result,
+                } => {
+                    if self.connecting[idx] != Some(attempt) {
+                        continue;
+                    }
+                    self.connecting[idx] = None;
+                    changed = true;
+                    match result {
+                        Ok(ConnectDone::Established(e)) => self.attach_remote(idx, e),
+                        Ok(ConnectDone::Revived) => {
+                            self.status = Some("재연결됨".into());
+                            self.reload_remote_panels();
+                        }
+                        Err(e) => self.status = Some(format!("연결 실패: {e}")),
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn attach_remote(&mut self, idx: usize, est: Established) {
+        if !self.panels[idx].location.is_remote() {
+            self.local_cwds[idx] = Some(self.panels[idx].cwd.clone());
+        }
+        self.trash_views[idx] = None;
+        self.prev_dirs[idx] = None;
+        self.invalidate_probe();
+        self.status = Some(format!("{} 연결됨", est.session.name));
+        self.panels[idx].set_location(Location::Remote(est.session), est.start);
+        self.active = idx;
+        self.reload_panel(idx, None);
+    }
+
+    /// Reload every panel showing a remote location (after a reconnect).
+    fn reload_remote_panels(&mut self) {
+        for i in 0..2 {
+            if self.panels[i].location.is_remote() {
+                self.reload_panel(i, None);
+            }
+        }
+    }
+
+    /// `:local` / picking "로컬": back to the last local directory.
+    fn switch_local(&mut self, idx: usize) {
+        self.connecting[idx] = None;
+        self.pending_master = self.pending_master.take().filter(|j| j.idx != idx);
+        if !self.panels[idx].location.is_remote() {
+            self.status = Some("이미 로컬 패널".into());
+            return;
+        }
+        let cwd = self.local_cwds[idx]
+            .take()
+            .or_else(|| self.home_dir.clone())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        self.invalidate_probe();
+        self.prev_dirs[idx] = None;
+        self.panels[idx].set_location(Location::Local, cwd);
+        self.status = None;
+        self.reload_panel(idx, None);
+    }
+
+    /// Theme used to draw panel `idx`: remote panels follow their server's
+    /// theme rule, everything else the current mode's theme.
+    pub fn panel_theme(&self, idx: usize) -> Theme {
+        let Some(sess) = self.panels[idx].location.session() else {
+            return self.theme.clone();
+        };
+        let server = Server {
+            name: sess.name.clone(),
+            host: sess.target.host.clone(),
+            port: sess.target.port,
+            start_path: None,
+            theme: None,
+            from_ssh_config: false,
+        };
+        let global = self.settings.config.theme.name_for(self.mode);
+        let name = servers::theme_for(&server, &self.settings.config.servers, global);
+        if name == global {
+            return self.theme.clone();
+        }
+        let (t, _) = theme::resolve(&name, &self.settings.user_themes);
+        if self.truecolor { t } else { t.to_256() }
     }
 
     pub fn has_pending_shell(&self) -> bool {
@@ -930,13 +1332,26 @@ impl App {
         });
     }
 
-    fn unsupported(&mut self, what: &str) {
-        self.status = Some(format!("{what}: 아직 지원하지 않음"));
-    }
-
     /// Run a panel-context action.
     fn panel_action(&mut self, action: Action) {
         let page = self.page_height.max(1);
+        let remote_here = self.active_panel().location.is_remote();
+        let remote_any = remote_here || self.other_panel().location.is_remote();
+        let blocked = match action {
+            Action::Copy | Action::Move => remote_any,
+            Action::Mkdir
+            | Action::Rename
+            | Action::Delete
+            | Action::TrashView
+            | Action::View
+            | Action::Edit
+            | Action::OpenWith => remote_here,
+            _ => false,
+        };
+        if blocked {
+            self.status = Some(REMOTE_UNSUPPORTED.into());
+            return;
+        }
         match action {
             Action::CancelJob => {
                 if let Some(job) = self.job.as_mut() {
@@ -979,8 +1394,19 @@ impl App {
             }
             Action::Enter => {
                 self.status = None;
+                if let Some(sess) = self.active_panel().location.session()
+                    && !sess.is_alive()
+                {
+                    let sess = Arc::clone(sess);
+                    let target = sess.target.clone();
+                    self.start_connect(self.active, ConnectKind::Reconnect(sess), target);
+                    return;
+                }
                 let id = self.next_id();
                 match self.active_panel_mut().begin_enter(id) {
+                    AsyncEnter::Opened(_) if remote_here => {
+                        self.status = Some(REMOTE_UNSUPPORTED.into());
+                    }
                     AsyncEnter::Opened(path) => self.activate_file(path),
                     AsyncEnter::Load(req) => {
                         self.invalidate_probe();
@@ -1012,7 +1438,8 @@ impl App {
                 self.status = None;
                 self.cmdline = Some(CmdLine::default());
             }
-            Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
+            Action::ConnectLeft => self.open_location_menu(0),
+            Action::ConnectRight => self.open_location_menu(1),
             Action::OpenWith => self.open_with_menu(),
             Action::Menu => self.open_main_menu(),
             Action::Help => self.open_help(),
@@ -1082,6 +1509,7 @@ impl App {
         if self.mode != Mode::Dev
             || self.viewer.is_some()
             || self.trash_views[self.active].is_some()
+            || self.active_panel().location.is_remote()
         {
             return None;
         }
@@ -1570,7 +1998,12 @@ impl App {
     /// Hand a panel's pending load request to the background loader.
     fn dispatch(&mut self, idx: usize, req: LoadRequest) {
         let hidden = self.panels[idx].show_hidden;
-        self.loader.request(idx, req.id, req.dir, hidden);
+        // Local panels use the loader's default reader; remote ones list over ssh.
+        let vfs = self.panels[idx]
+            .location
+            .is_remote()
+            .then(|| self.panels[idx].location.vfs());
+        self.loader.request_vfs(idx, req.id, req.dir, hidden, vfs);
     }
 
     /// Start an async reload of panel `idx` (cursor on `focus` if given).
@@ -1606,6 +2039,14 @@ impl App {
                 {
                     self.status = Some(err);
                 }
+                if idx == self.active
+                    && self.panels[idx]
+                        .location
+                        .session()
+                        .is_some_and(|s| !s.is_alive())
+                {
+                    self.status = Some(DISCONNECTED_MSG.into());
+                }
                 if std::mem::take(&mut self.panels[idx].reload_after_load) {
                     self.reload_panel(idx, None);
                 }
@@ -1616,7 +2057,7 @@ impl App {
 
     /// Poll background loads and the job; returns true when the screen needs a redraw.
     pub fn tick(&mut self) -> bool {
-        let loaded = self.drain_loads();
+        let loaded = self.drain_loads() | self.tick_connect();
         let task = self.tick_task() | self.tick_viewer_load() | self.tick_probe();
         let spawned = self.tick_spawn();
         let preview = self.tick_preview();
@@ -2311,6 +2752,7 @@ impl App {
             };
             PreviewView { title, body }
         });
+        let themes = [self.panel_theme(0), self.panel_theme(1)];
         let view = View {
             panels: [&self.panels[0], &self.panels[1]],
             active: self.active,
@@ -2321,7 +2763,8 @@ impl App {
             mode: self.mode,
             preview: preview_view,
             trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
-            theme: &self.theme,
+            theme: &themes[self.active],
+            panel_themes: [&themes[0], &themes[1]],
             fkeys: &fkeys,
             cmdline: self.cmdline.as_ref().map(|c| (c.value.as_str(), c.cursor)),
         };
@@ -2412,6 +2855,7 @@ fn job_summary(kind: JobKind, report: &OpReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::SshTarget;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
@@ -6680,5 +7124,504 @@ mod tests {
             press_mods(&mut app, KeyCode::F(10), KeyModifiers::SHIFT);
             assert!(!app.running && !app.cd_on_exit);
         }
+    }
+
+    // ---- HDIR-35/37/43/44: ssh panels ----
+
+    #[cfg(unix)]
+    mod ssh_panels {
+        use super::*;
+        use crate::config::Mode;
+        use crate::remote::{check_argv, master_argv};
+        use crate::servers::ServerConfig;
+        use crate::session::{CmdOutput, DISCONNECTED_MSG};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const UNSUPPORTED: &str = "원격: 다음 단계에서 지원";
+
+        struct FakeSsh {
+            master_up: AtomicBool,
+            auth_ok: AtomicBool,
+            down: AtomicBool,
+            interactive: Mutex<Vec<Vec<String>>>,
+            checks: Mutex<usize>,
+            tree: HashMap<&'static str, Vec<(&'static str, &'static str)>>,
+        }
+
+        impl FakeSsh {
+            fn new(master_up: bool) -> Arc<Self> {
+                let mut tree = HashMap::new();
+                tree.insert(
+                    "/srv/data",
+                    vec![("d", "sub"), ("f", "a.txt"), ("f", "한글 b.txt")],
+                );
+                tree.insert("/srv/data/sub", vec![("f", "deep.txt")]);
+                tree.insert("/home/choi", vec![("d", "work")]);
+                Arc::new(Self {
+                    master_up: AtomicBool::new(master_up),
+                    auth_ok: AtomicBool::new(true),
+                    down: AtomicBool::new(false),
+                    interactive: Mutex::new(Vec::new()),
+                    checks: Mutex::new(0),
+                    tree,
+                })
+            }
+        }
+
+        fn out(code: i32, stdout: &str) -> CmdOutput {
+            CmdOutput {
+                code: Some(code),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }
+        }
+
+        fn strs(argv: &[OsString]) -> Vec<String> {
+            argv.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        }
+
+        impl Cmd for FakeSsh {
+            fn run(&self, argv: &[OsString]) -> CmdOutput {
+                let a = strs(argv);
+                if a == ["ssh", "-V"] {
+                    return CmdOutput {
+                        code: Some(0),
+                        stdout: Vec::new(),
+                        stderr: b"OpenSSH_9.6p1\n".to_vec(),
+                    };
+                }
+                if a.iter().any(|x| x == "-O") {
+                    *self.checks.lock().unwrap() += 1;
+                    return out(
+                        if self.master_up.load(Ordering::SeqCst) {
+                            0
+                        } else {
+                            255
+                        },
+                        "",
+                    );
+                }
+                if self.down.load(Ordering::SeqCst) {
+                    return out(255, "");
+                }
+                let i = a.iter().position(|s| s == "--").unwrap();
+                let cmd = a[i + 2].as_str();
+                if cmd == "uname -s" {
+                    return out(0, "Linux\n");
+                }
+                let dir = cmd
+                    .strip_prefix("cd -- ")
+                    .map(|r| r.split(" && ").next().unwrap().trim_matches('\''))
+                    .unwrap();
+                if cmd.ends_with("&& pwd") {
+                    let dir = if dir == "." || dir == "\"$HOME\"" {
+                        "/home/choi"
+                    } else {
+                        dir
+                    };
+                    return out(0, &format!("{dir}\n"));
+                }
+                match self.tree.get(dir) {
+                    Some(items) => {
+                        let recs: String = items
+                            .iter()
+                            .map(|(k, n)| format!("{k}\t5\t1700000000.0\t644\t\t{n}\0"))
+                            .collect();
+                        out(0, &recs)
+                    }
+                    None => CmdOutput {
+                        code: Some(1),
+                        stdout: Vec::new(),
+                        stderr: b"cd: no such directory\n".to_vec(),
+                    },
+                }
+            }
+            fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
+                self.interactive.lock().unwrap().push(strs(argv));
+                if self.auth_ok.load(Ordering::SeqCst) {
+                    self.master_up.store(true, Ordering::SeqCst);
+                    out(0, "")
+                } else {
+                    out(255, "")
+                }
+            }
+        }
+
+        fn env_with(master_up: bool) -> (TempDir, App, Arc<FakeSsh>) {
+            let (t, mut app) = fixture();
+            let fake = FakeSsh::new(master_up);
+            app.cmd = fake.clone();
+            app.control_path = t.path().join("cm/cm-%C");
+            app.ssh_hosts = vec![SshHost {
+                alias: "web".into(),
+                hostname: Some("web.example.com".into()),
+                user: Some("choi".into()),
+                port: None,
+                source: PathBuf::new(),
+            }];
+            app.settings.config.servers = vec![ServerConfig {
+                name: Some("prod".into()),
+                host: Some("prod-web".into()),
+                path: Some("/srv/data".into()),
+                theme: Some("mdir-red".into()),
+                ..ServerConfig::default()
+            }];
+            (t, app, fake)
+        }
+
+        fn env() -> (TempDir, App, Arc<FakeSsh>) {
+            env_with(true)
+        }
+
+        fn alt(app: &mut App, f: u8) {
+            press_mods(app, KeyCode::F(f), KeyModifiers::ALT);
+        }
+
+        /// Tick until connecting and loading are over, or auth is needed.
+        fn wait_remote(app: &mut App) {
+            let start = Instant::now();
+            while (app.is_connecting() || app.panels.iter().any(|p| p.loading.is_some()))
+                && !app.has_pending_master()
+            {
+                assert!(start.elapsed() < Duration::from_secs(5), "remote timeout");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            app.tick();
+        }
+
+        fn run_master_ok(app: &mut App) {
+            app.run_master(|f| Ok(f()));
+        }
+
+        /// Connect the right panel to "prod" (picker item 1) and make it active.
+        fn connect_prod(app: &mut App) {
+            alt(app, 2);
+            press(app, KeyCode::Down);
+            press(app, KeyCode::Enter);
+            wait_remote(app);
+        }
+
+        fn names(app: &App, i: usize) -> Vec<String> {
+            app.panels[i]
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect()
+        }
+
+        fn submit(app: &mut App, cmd: &str) {
+            press(app, KeyCode::Char(':'));
+            type_str(app, cmd);
+            press(app, KeyCode::Enter);
+        }
+
+        #[test]
+        fn alt_f1_opens_picker_with_local_and_servers() {
+            let (_t, mut app, _f) = env();
+            alt(&mut app, 1);
+            let items = app.menu.as_ref().expect("picker").menu.items.clone();
+            assert_eq!(items[0], "로컬");
+            assert!(
+                items[1].contains("prod") && items[1].contains("prod-web"),
+                "{items:?}"
+            );
+            assert!(
+                items[2].contains("web") && items[2].contains("web.example.com"),
+                "{items:?}"
+            );
+            assert_eq!(items.len(), 3);
+            press(&mut app, KeyCode::Esc);
+            assert!(app.menu.is_none());
+        }
+
+        #[test]
+        fn picking_a_server_connects_lists_and_activates_that_panel() {
+            let (_t, mut app, f) = env();
+            alt(&mut app, 2);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.is_connecting());
+            wait_remote(&mut app);
+            assert!(app.panels[1].location.is_remote());
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data"));
+            assert_eq!(names(&app, 1), vec!["..", "sub", "a.txt", "한글 b.txt"]);
+            assert_eq!(app.active, 1);
+            assert!(!app.panels[0].location.is_remote());
+            assert!(f.interactive.lock().unwrap().is_empty(), "master was alive");
+            assert!(*f.checks.lock().unwrap() >= 1);
+        }
+
+        #[test]
+        fn server_without_start_path_opens_the_remote_home() {
+            let (_t, mut app, _f) = env();
+            alt(&mut app, 1);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // web
+            press(&mut app, KeyCode::Enter);
+            wait_remote(&mut app);
+            assert_eq!(app.panels[0].cwd, PathBuf::from("/home/choi"));
+            assert_eq!(names(&app, 0), vec!["..", "work"]);
+        }
+
+        #[test]
+        fn dead_master_runs_ssh_interactively_then_connects() {
+            let (_t, mut app, f) = env_with(false);
+            alt(&mut app, 2);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            wait_remote(&mut app);
+            assert!(app.has_pending_master());
+            assert!(!app.panels[1].location.is_remote());
+            run_master_ok(&mut app);
+            assert!(!app.has_pending_master());
+            wait_remote(&mut app);
+            let t = SshTarget {
+                host: "prod-web".into(),
+                port: None,
+                control_path: app.control_path.clone(),
+            };
+            assert_eq!(f.interactive.lock().unwrap()[0], strs(&master_argv(&t)));
+            assert_eq!(strs(&check_argv(&t))[..3], ["ssh", "-O", "check"]);
+            assert!(app.panels[1].location.is_remote());
+            assert_eq!(names(&app, 1)[1], "sub");
+        }
+
+        #[test]
+        fn failed_auth_reports_and_keeps_the_panel_local() {
+            let (_t, mut app, f) = env_with(false);
+            f.auth_ok.store(false, Ordering::SeqCst);
+            let before = app.panels[1].cwd.clone();
+            alt(&mut app, 2);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            wait_remote(&mut app);
+            run_master_ok(&mut app);
+            wait_remote(&mut app);
+            assert!(!app.is_connecting());
+            assert!(
+                app.status.as_deref().unwrap_or("").contains("연결 실패"),
+                "{:?}",
+                app.status
+            );
+            assert!(!app.panels[1].location.is_remote());
+            assert_eq!(app.panels[1].cwd, before);
+        }
+
+        #[test]
+        fn picking_local_returns_to_the_last_local_dir() {
+            let (_t, mut app, _f) = env();
+            let local = app.panels[1].cwd.clone();
+            connect_prod(&mut app);
+            alt(&mut app, 2);
+            press(&mut app, KeyCode::Home); // 로컬
+            press(&mut app, KeyCode::Enter);
+            wait_remote(&mut app);
+            assert!(!app.panels[1].location.is_remote());
+            assert_eq!(app.panels[1].cwd, local);
+            assert!(names(&app, 1).contains(&"f.txt".to_string()));
+        }
+
+        #[test]
+        fn ssh_command_connects_the_active_panel_and_local_returns() {
+            let (_t, mut app, _f) = env();
+            let local = app.panels[0].cwd.clone();
+            submit(&mut app, "ssh web:/srv/data/sub");
+            wait_remote(&mut app);
+            assert!(app.panels[0].location.is_remote());
+            assert_eq!(app.panels[0].cwd, PathBuf::from("/srv/data/sub"));
+            assert_eq!(names(&app, 0), vec!["..", "deep.txt"]);
+            assert!(app.cmdline.is_none() && !app.has_pending_shell());
+            submit(&mut app, "local");
+            wait_remote(&mut app);
+            assert!(!app.panels[0].location.is_remote());
+            assert_eq!(app.panels[0].cwd, local);
+        }
+
+        #[test]
+        fn ssh_command_uses_server_name_and_start_path() {
+            let (_t, mut app, _f) = env();
+            submit(&mut app, "ssh prod");
+            wait_remote(&mut app);
+            assert_eq!(app.panels[0].cwd, PathBuf::from("/srv/data"));
+            assert_eq!(app.panels[0].location.session().unwrap().name, "prod");
+        }
+
+        #[test]
+        fn ssh_command_without_host_shows_usage_and_local_on_local_is_a_noop() {
+            let (_t, mut app, _f) = env();
+            submit(&mut app, "ssh");
+            assert!(
+                app.status.as_deref().unwrap_or("").contains("ssh"),
+                "{:?}",
+                app.status
+            );
+            assert!(!app.is_connecting());
+            let cwd = app.panels[0].cwd.clone();
+            submit(&mut app, "local");
+            assert_eq!(app.panels[0].cwd, cwd);
+            assert!(!app.has_pending_shell());
+        }
+
+        #[test]
+        fn enter_and_backspace_navigate_remote_paths() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down); // sub
+            press(&mut app, KeyCode::Enter);
+            assert!(app.panels[1].loading.is_some(), "loads asynchronously");
+            wait_remote(&mut app);
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data/sub"));
+            assert_eq!(names(&app, 1), vec!["..", "deep.txt"]);
+            press(&mut app, KeyCode::Backspace);
+            wait_remote(&mut app);
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data"));
+            assert_eq!(name_at(&app, 1), "sub", "cursor returns to the dir we left");
+        }
+
+        #[test]
+        fn disconnect_is_marked_and_enter_reconnects() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            f.down.store(true, Ordering::SeqCst);
+            f.master_up.store(false, Ordering::SeqCst);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter); // into sub: ssh dies
+            wait_remote(&mut app);
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data"), "stays put");
+            assert_eq!(app.panels[1].error.as_deref(), Some(DISCONNECTED_MSG));
+            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert!(!app.panels[1].location.session().unwrap().is_alive());
+            // network is back, master gone: Enter asks for auth again
+            f.down.store(false, Ordering::SeqCst);
+            press(&mut app, KeyCode::Enter);
+            wait_remote(&mut app);
+            assert!(app.has_pending_master());
+            run_master_ok(&mut app);
+            wait_remote(&mut app);
+            assert!(app.panels[1].location.session().unwrap().is_alive());
+            assert!(app.panels[1].error.is_none(), "{:?}", app.panels[1].error);
+            assert_eq!(names(&app, 1)[1], "sub");
+        }
+
+        #[test]
+        fn reconnect_with_a_live_master_needs_no_terminal() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            app.panels[1].location.session().unwrap().set_alive(false);
+            press(&mut app, KeyCode::Enter);
+            wait_remote(&mut app);
+            assert!(!app.has_pending_master());
+            assert!(app.panels[1].location.session().unwrap().is_alive());
+            assert!(f.interactive.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn file_operations_on_remote_panels_are_not_supported_yet() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            for f in [2u8, 3, 4, 5, 6, 7, 8] {
+                app.status = None;
+                press(&mut app, KeyCode::F(f));
+                assert_eq!(app.status.as_deref(), Some(UNSUPPORTED), "F{f}");
+                assert!(app.dialog.is_none() && app.viewer.is_none(), "F{f}");
+            }
+            // Enter on a remote file
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // a.txt
+            app.status = None;
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.status.as_deref(), Some(UNSUPPORTED));
+            // command line: shell commands never run locally
+            submit(&mut app, "ls");
+            assert_eq!(app.status.as_deref(), Some(UNSUPPORTED));
+            assert!(!app.has_pending_shell());
+        }
+
+        #[test]
+        fn copy_from_a_local_panel_to_a_remote_one_is_blocked_too() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Tab); // back to the local left panel
+            assert_eq!(app.active, 0);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::F(5));
+            assert_eq!(app.status.as_deref(), Some(UNSUPPORTED));
+            assert!(app.dialog.is_none());
+        }
+
+        #[test]
+        fn each_panel_gets_its_server_theme() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            assert_eq!(app.panel_theme(1).name, "mdir-red");
+            assert_eq!(app.panel_theme(0).name, app.theme.name);
+            let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            t.draw(|f| app.draw(f)).unwrap();
+            let buf = t.backend().buffer().clone();
+            let red = crate::theme::builtin("mdir-red").unwrap();
+            assert_eq!(buf[(75, 8)].bg, red.bg, "remote panel");
+            assert_ne!(buf[(10, 8)].bg, red.bg, "local panel");
+            assert_eq!(
+                buf[(0, 0)].bg,
+                red.bg,
+                "header follows the active remote panel"
+            );
+        }
+
+        #[test]
+        fn remote_without_theme_rule_uses_the_global_theme() {
+            let (_t, mut app, _f) = env();
+            app.settings.config.servers.clear();
+            submit(&mut app, "ssh web:/srv/data");
+            wait_remote(&mut app);
+            assert_eq!(app.panel_theme(0).name, app.theme.name);
+        }
+
+        #[test]
+        fn exit_cwd_and_preview_ignore_remote_panels() {
+            let (_t, mut app, _f) = env();
+            let local = app.panels[1].cwd.clone();
+            app.set_mode(Mode::Dev);
+            connect_prod(&mut app);
+            assert_eq!(app.exit_cwd(), Some(local.as_path()));
+            assert!(app.preview_target().is_none());
+        }
+    }
+
+    #[test]
+    fn configure_reads_ssh_config_hosts_for_the_picker() {
+        let (t, mut app) = fixture();
+        let cfg = t.path().join("ssh_config");
+        fs::write(&cfg, "Host web\n  HostName web.example.com\n  User choi\n").unwrap();
+        app.ssh_config_path = Some(cfg);
+        app.configure(None, Some("truecolor"));
+        assert_eq!(app.ssh_hosts.len(), 1);
+        assert_eq!(app.ssh_hosts[0].alias, "web");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ssh_connect_on_windows_is_a_stub() {
+        let (_t, mut app) = fixture();
+        app.settings.config.servers = vec![crate::servers::ServerConfig {
+            name: Some("prod".into()),
+            host: Some("prod-web".into()),
+            ..Default::default()
+        }];
+        press_mods(&mut app, KeyCode::F(2), KeyModifiers::ALT);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("Windows 지원 예정")
+        );
+        assert!(!app.panels[1].location.is_remote());
     }
 }

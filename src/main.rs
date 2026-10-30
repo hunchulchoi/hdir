@@ -37,6 +37,7 @@ fn main() -> ExitCode {
     }
 
     let mut app = App::new(start.clone(), start);
+    app.ssh_config_path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));
     let result = run_app(&mut app);
     // The terminal is back to normal here, so errors are visible.
     let mut code = ExitCode::SUCCESS;
@@ -85,6 +86,10 @@ fn run(
         }
         if app.has_pending_shell() {
             app.run_shell(|f| term::suspend(terminal, f));
+            dirty = true;
+        }
+        if app.has_pending_master() {
+            app.run_master(|f| term::suspend(terminal, f));
             dirty = true;
         }
         if app.has_pending_run() {

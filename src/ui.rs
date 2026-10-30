@@ -16,6 +16,7 @@ use crate::panel::{Entry, EntryKind, Panel};
 use crate::preview::Preview;
 use crate::theme::Theme;
 use crate::trash::{TrashEntry, TrashView, format_local};
+use crate::vfs::Location;
 
 /// What the Dev-mode preview area shows.
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +46,10 @@ pub struct View<'a> {
     pub os: &'a str,
     /// A panel showing the trash instead of its directory.
     pub trash: [Option<&'a TrashView>; 2],
+    /// Theme of the active panel: header, status line, F-key bar and preview.
     pub theme: &'a Theme,
+    /// Each panel's own theme (remote panels may differ per server).
+    pub panel_themes: [&'a Theme; 2],
     /// F-key bar `(key, label)` slots, see [`fkey_bar`].
     pub fkeys: &'a [(String, String)],
     /// The open `:` line as (text, cursor char index).
@@ -219,7 +223,16 @@ fn tilde(path: &std::path::Path) -> String {
 }
 
 fn title_for(panel: &Panel, width: usize) -> String {
-    let mut s = tilde(&panel.cwd);
+    let mut s = match &panel.location {
+        Location::Local => tilde(&panel.cwd),
+        Location::Remote(sess) => {
+            let mut t = format!("{}:{}", sess.name, panel.cwd.to_string_lossy());
+            if !sess.is_alive() {
+                t.push_str(" [끊김]");
+            }
+            t
+        }
+    };
     if panel.loading.is_some() {
         s.push_str(" 읽는 중…");
     }
@@ -590,14 +603,16 @@ pub fn draw(frame: &mut Frame, view: &View) {
         .split(areas.panels);
     for i in 0..2 {
         match view.trash[i] {
-            Some(tv) => draw_trash_panel(frame, cols[i], tv, view.active == i, view.theme),
+            Some(tv) => {
+                draw_trash_panel(frame, cols[i], tv, view.active == i, view.panel_themes[i])
+            }
             None => draw_panel(
                 frame,
                 cols[i],
                 view.panels[i],
                 view.active == i,
                 view.assoc,
-                view.theme,
+                view.panel_themes[i],
             ),
         }
     }
@@ -823,6 +838,7 @@ mod tests {
             preview: None,
             trash: [None, None],
             theme: &th(),
+            panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
         };
@@ -845,6 +861,7 @@ mod tests {
             preview: None,
             trash: [None, None],
             theme: &th(),
+            panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: Some((text, cursor)),
         };
@@ -1033,6 +1050,78 @@ mod tests {
 
     // ---- HDIR-21/22/23: theme-driven colors ----
 
+    fn remote_panel(name: &str, cwd: &str) -> Panel {
+        use crate::remote::{RemoteOs, ScpMode, SshTarget};
+        use crate::session::{RemoteSession, SystemCmd};
+        let mut p = fixed_panel(cwd, &[("a.txt", EntryKind::File, 1)]);
+        p.location = crate::vfs::Location::Remote(std::sync::Arc::new(RemoteSession::new(
+            name.into(),
+            SshTarget {
+                host: "h".into(),
+                port: None,
+                control_path: "/tmp/x".into(),
+            },
+            RemoteOs::Linux,
+            ScpMode::Sftp,
+            std::sync::Arc::new(SystemCmd),
+        )));
+        p
+    }
+
+    fn render_two_themes(a: &Panel, b: &Panel, active: usize, ta: &Theme, tb: &Theme) -> Buffer {
+        let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let view = View {
+            panels: [a, b],
+            active,
+            status: None,
+            shell: "zsh",
+            assoc: &AssocTable::default(),
+            os: "macos",
+            mode: Mode::Classic,
+            preview: None,
+            trash: [None, None],
+            theme: if active == 0 { ta } else { tb },
+            panel_themes: [ta, tb],
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+            cmdline: None,
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    #[test]
+    fn each_panel_draws_with_its_own_theme_and_chrome_follows_active() {
+        let local = th();
+        let red = crate::theme::builtin("mdir-red").unwrap();
+        assert_ne!(local.bg, red.bg);
+        let pa = fixed_panel("/tmp/a", &[("a.txt", EntryKind::File, 1)]);
+        let pb = remote_panel("prod", "/srv");
+        // left (local mdir) active: header follows it
+        let buf = render_two_themes(&pa, &pb, 0, &local, &red);
+        assert_eq!(buf[(5, 5)].bg, local.bg, "left panel body");
+        assert_eq!(buf[(35, 5)].bg, red.bg, "right panel body");
+        assert_eq!(buf[(0, 0)].bg, local.bg, "header follows active");
+        // right (remote mdir-red) active
+        let buf = render_two_themes(&pa, &pb, 1, &local, &red);
+        assert_eq!(buf[(5, 5)].bg, local.bg);
+        assert_eq!(buf[(35, 5)].bg, red.bg);
+        assert_eq!(buf[(0, 0)].bg, red.bg, "header follows active");
+        assert_eq!(buf[(1, 10)].bg, red.status_bg, "status follows active");
+    }
+
+    #[test]
+    fn remote_panel_title_shows_server_and_path_and_disconnect() {
+        let pa = fixed_panel("/tmp/a", &[]);
+        let pb = remote_panel("prod", "/srv/한글");
+        let buf = render_two_themes(&pa, &pb, 0, &th(), &th());
+        let row: String = (30..60).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert!(row.replace(' ', "").contains("prod:/srv/한글"), "{row:?}");
+        pb.location.session().unwrap().set_alive(false);
+        let buf = render_two_themes(&pa, &pb, 0, &th(), &th());
+        let row: String = (30..60).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert!(row.replace(' ', "").contains("끊김"), "{row:?}");
+    }
+
     fn render_themed(a: &Panel, b: &Panel, theme: &Theme) -> Buffer {
         render_assoc(a, b, theme, &AssocTable::default())
     }
@@ -1050,6 +1139,7 @@ mod tests {
             preview: None,
             trash: [None, None],
             theme,
+            panel_themes: [theme, theme],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
         };
@@ -1309,6 +1399,7 @@ mod tests {
             preview: None,
             trash: [None, None],
             theme: &th(),
+            panel_themes: [&th(), &th()],
             fkeys: &fkeys,
             cmdline: None,
         };
@@ -1418,6 +1509,7 @@ mod tests {
             preview: None,
             trash: [Some(tv), None],
             theme: &th(),
+            panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
             cmdline: None,
         };
@@ -1556,6 +1648,7 @@ mod tests {
             preview: None,
             trash: [None, None],
             theme: &th(),
+            panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
         };
@@ -1698,6 +1791,7 @@ mod tests {
             mode: Mode::Dev,
             trash: [None, None],
             theme,
+            panel_themes: [theme, theme],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
         };
