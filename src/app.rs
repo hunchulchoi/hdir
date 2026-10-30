@@ -17,6 +17,7 @@ use crate::keymap::{Action, Context};
 use crate::loader::Loader;
 use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
+use crate::preview::{self, Preview};
 use crate::screen::{self, TextScreen};
 use crate::theme::{self, Theme};
 use crate::trash::{
@@ -24,6 +25,7 @@ use crate::trash::{
 };
 use crate::ui::{self, View};
 use crate::undo::{UndoApplied, UndoOp, UndoStack};
+use crate::viewer::{self, Viewer};
 
 /// Rows taken by header (1) + status (1) + fkey bar (1) + panel borders (2).
 const CHROME_ROWS: u16 = 5;
@@ -129,6 +131,10 @@ enum BgKind {
     TrashPurge {
         panel: usize,
     },
+    /// Load the F3 viewer's file.
+    View {
+        path: PathBuf,
+    },
 }
 
 type TrashListing = Result<Vec<TrashEntry>, String>;
@@ -147,6 +153,7 @@ enum BgResult {
     Undo(UndoApplied),
     Mkdir(std::io::Result<PathBuf>),
     Rename(std::io::Result<PathBuf>),
+    View(Preview),
 }
 
 /// A short blocking filesystem operation (trash, undo) running on a worker
@@ -232,6 +239,8 @@ pub struct App {
     truecolor: bool,
     /// A full-screen text page (help, key settings, warnings) over the panels.
     pub screen: Option<TextScreen>,
+    /// The F3 file viewer (full screen).
+    pub viewer: Option<Viewer>,
     /// The F9 popup menu (or theme picker).
     pub menu: Option<OpenMenu>,
 }
@@ -282,6 +291,7 @@ impl App {
             settings: config::load_settings(None),
             truecolor: true,
             screen: None,
+            viewer: None,
             menu: None,
         }
     }
@@ -568,6 +578,10 @@ impl App {
             self.handle_dialog_key(key);
             return;
         }
+        if self.viewer.is_some() {
+            self.handle_viewer_key(key);
+            return;
+        }
         if self.screen.is_some() {
             self.handle_screen_key(key);
             return;
@@ -662,14 +676,62 @@ impl App {
                 self.set_mode(self.mode.toggled());
                 self.status = Some(format!("모드: {:?}", self.mode));
             }
-            Action::View => self.unsupported("보기"),
+            Action::View => self.open_viewer(),
             Action::Edit => self.unsupported("편집"),
             Action::CommandLine => self.unsupported("명령줄"),
             Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
             Action::OpenWith => self.unsupported("연결 프로그램 선택"),
             Action::Menu => self.open_main_menu(),
             Action::Help => self.open_help(),
-            Action::Confirm | Action::Cancel => {}
+            Action::Confirm
+            | Action::Cancel
+            | Action::ScrollLeft
+            | Action::ScrollRight
+            | Action::Search
+            | Action::SearchNext => {}
+        }
+    }
+
+    /// F3: view the current file (directories and `..` do nothing).
+    fn open_viewer(&mut self) {
+        let panel = self.active_panel();
+        let Some(e) = panel.current() else {
+            return;
+        };
+        let is_dir = match e.kind {
+            EntryKind::Parent | EntryKind::Dir => true,
+            EntryKind::Symlink { target_is_dir } => target_is_dir,
+            EntryKind::File => false,
+        };
+        if is_dir {
+            return;
+        }
+        if self.task.is_some() {
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
+        let path = panel.cwd.join(&e.os_name);
+        self.status = None;
+        self.viewer = Some(Viewer::loading(path.clone()));
+        let load = path.clone();
+        self.task = Some(BgTask::spawn(BgKind::View { path }, move || {
+            BgResult::View(preview::preview_path_with(&load, preview::Limits::VIEWER))
+        }));
+    }
+
+    fn handle_viewer_key(&mut self, key: KeyEvent) {
+        let Some(v) = self.viewer.as_mut() else {
+            return;
+        };
+        if v.input.is_some() {
+            v.input_key(key);
+            return;
+        }
+        let Some(action) = self.settings.keymap.lookup(Context::Viewer, &key) else {
+            return;
+        };
+        if v.apply(action) {
+            self.viewer = None;
         }
     }
 
@@ -901,6 +963,12 @@ impl App {
                     Ok(()) => format!("테마 저장: {name} ({})", mode.key()),
                     Err(e) => format!("테마 저장 실패: {e}"),
                 });
+            }
+            (BgKind::View { path }, Some(BgResult::View(p))) => {
+                // Closed (or replaced) while loading: drop the result.
+                if let Some(v) = self.viewer.as_mut().filter(|v| v.path == path) {
+                    v.set_preview(p);
+                }
             }
             (BgKind::Undo, Some(BgResult::Undo(done))) => {
                 if let Some(retry) = done.retry {
@@ -1456,7 +1524,11 @@ impl App {
             theme: &self.theme,
             fkeys: &fkeys,
         };
-        if let Some(scr) = self.screen.as_mut() {
+        let viewer_hint = format!("{} · /: 검색 · n: 다음", self.close_hint());
+        if let Some(v) = self.viewer.as_mut() {
+            let hint = &viewer_hint;
+            viewer::render(frame, v, &self.theme, hint);
+        } else if let Some(scr) = self.screen.as_mut() {
             screen::render(frame, scr, &self.theme);
         } else {
             ui::draw(frame, &view);
@@ -1673,14 +1745,21 @@ mod tests {
     #[test]
     fn empty_binding_disables_the_action() {
         let (_t, mut app) = fixture();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::F(3));
+        assert!(app.viewer.is_some(), "default: view is bound");
+        let (_t, mut app) = configured("[keys.bind]\nview = []\n", Some("truecolor"));
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
         press(&mut app, KeyCode::F(3));
         assert!(
-            app.status.is_some(),
-            "default: view is bound (not yet implemented)"
+            app.viewer.is_none() && app.status.is_none(),
+            "{:?}",
+            app.status
         );
-        let (_t, mut app) = configured("[keys.bind]\nview = []\n", Some("truecolor"));
-        press(&mut app, KeyCode::F(3));
-        assert!(app.status.is_none(), "{:?}", app.status);
     }
 
     #[test]
@@ -4160,5 +4239,191 @@ mod tests {
         assert_eq!(app.undo.len(), 1, "failed item kept for retry");
         assert_eq!(fake.count(), 1);
         let _ = tmp;
+    }
+    // ---- HDIR-13: F3 viewer ----
+
+    fn cursor_to(app: &mut App, name: &str) {
+        let i = app
+            .active_panel()
+            .entries
+            .iter()
+            .position(|e| e.name == name)
+            .unwrap();
+        app.active_panel_mut().cursor = i;
+    }
+
+    fn open_view(app: &mut App, name: &str) {
+        cursor_to(app, name);
+        press(app, KeyCode::F(3));
+    }
+
+    fn draw_app(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        use unicode_width::UnicodeWidthStr;
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < w {
+                    let sym = buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += sym.width().max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn f3_opens_viewer_and_loads_text_on_the_worker() {
+        let (t, mut app) = fixture();
+        fs::write(t.path().join("f.txt"), "하나\ntwo\n\tthree\n").unwrap();
+        open_view(&mut app, "f.txt");
+        let v = app.viewer.as_ref().unwrap();
+        assert_eq!(v.path.file_name().unwrap(), "f.txt");
+        assert_eq!(v.content, crate::viewer::Content::Loading);
+        assert!(app.task.is_some(), "load runs on a BgTask");
+        settle_task(&mut app);
+        match &app.viewer.as_ref().unwrap().content {
+            crate::viewer::Content::Text { lines, truncated } => {
+                assert_eq!(lines[..2], ["하나", "two"]);
+                assert!(!truncated);
+            }
+            c => panic!("{c:?}"),
+        }
+        let rows = draw_app(&mut app, 60, 10);
+        assert!(
+            rows[0].contains("f.txt") && rows[0].contains("1/3"),
+            "{rows:?}"
+        );
+        assert!(rows[1].starts_with("하나"));
+    }
+
+    #[test]
+    fn f3_on_dir_or_parent_does_nothing() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(3)); // ".."
+        assert!(app.viewer.is_none() && app.task.is_none() && app.status.is_none());
+        open_view(&mut app, "adir");
+        assert!(app.viewer.is_none() && app.task.is_none() && app.status.is_none());
+    }
+
+    #[test]
+    fn viewer_swallows_panel_keys_and_closes_with_q_esc_f3_f10() {
+        for close in [
+            KeyCode::Char('q'),
+            KeyCode::Esc,
+            KeyCode::F(3),
+            KeyCode::F(10),
+        ] {
+            let (_t, mut app) = fixture();
+            open_view(&mut app, "f.txt");
+            settle_task(&mut app);
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.active, 0, "Tab goes to the viewer, not the panels");
+            press(&mut app, close);
+            assert!(app.viewer.is_none() && app.running, "{close:?}");
+        }
+    }
+
+    #[test]
+    fn viewer_scrolls_searches_and_hscrolls_through_the_keymap() {
+        let (t, mut app) = fixture();
+        let body: String = (0..50).map(|i| format!("line{i}\n")).collect();
+        fs::write(t.path().join("f.txt"), body).unwrap();
+        open_view(&mut app, "f.txt");
+        settle_task(&mut app);
+        draw_app(&mut app, 40, 12); // 10 body rows
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 10);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.viewer.as_ref().unwrap().scroll, 40);
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Char('/'));
+        for c in "line1".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let rows = draw_app(&mut app, 40, 12);
+        assert!(rows[11].contains("/line1"), "{:?}", rows[11]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.viewer.as_ref().unwrap().match_line, Some(1));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.viewer.as_ref().unwrap().match_line, Some(10));
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Left);
+        assert!(app.viewer.is_some());
+    }
+
+    #[test]
+    fn typing_q_in_search_input_does_not_close_the_viewer() {
+        let (_t, mut app) = fixture();
+        open_view(&mut app, "f.txt");
+        settle_task(&mut app);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.viewer.is_some());
+        assert_eq!(app.viewer.as_ref().unwrap().input.as_deref(), Some("q"));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.viewer.is_some(), "Esc only closes the input line");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn closing_the_viewer_while_loading_drops_the_result() {
+        let (_t, mut app) = fixture();
+        open_view(&mut app, "f.txt");
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.viewer.is_none());
+        settle_task(&mut app);
+        assert!(app.viewer.is_none());
+    }
+
+    #[test]
+    fn binary_file_shows_kind_and_size_summary() {
+        let (t, mut app) = fixture();
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[0u8; 2000]);
+        fs::write(t.path().join("f.txt"), &bytes).unwrap();
+        open_view(&mut app, "f.txt");
+        settle_task(&mut app);
+        let rows = draw_app(&mut app, 60, 8);
+        assert!(
+            rows.join("").contains("바이너리 파일 (PNG 이미지, 2.0K)"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn viewer_uses_the_larger_cap_and_marks_truncation() {
+        let (t, mut app) = fixture();
+        let many: String = (0..120_000).map(|_| "x\n").collect();
+        fs::write(t.path().join("f.txt"), many).unwrap();
+        open_view(&mut app, "f.txt");
+        settle_task(&mut app);
+        match &app.viewer.as_ref().unwrap().content {
+            crate::viewer::Content::Text { lines, truncated } => {
+                assert_eq!(lines.len(), 100_000);
+                assert!(truncated);
+            }
+            c => panic!("{c:?}"),
+        }
+        let rows = draw_app(&mut app, 70, 6);
+        assert!(
+            rows[0].contains("잘림") && rows[0].contains("/100000"),
+            "{:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn viewer_is_refused_while_another_task_runs() {
+        let (_t, mut app) = fixture();
+        app.reload_config();
+        open_view(&mut app, "f.txt");
+        assert!(app.viewer.is_none());
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
     }
 }

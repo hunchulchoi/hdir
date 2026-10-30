@@ -31,7 +31,29 @@ pub enum Preview {
     Error(String),
 }
 
+/// Read caps for a preview (`PREVIEW` for the panel, `VIEWER` for F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_bytes: usize,
+    pub max_lines: usize,
+}
+
+impl Limits {
+    pub const PREVIEW: Limits = Limits {
+        max_bytes: MAX_BYTES,
+        max_lines: MAX_LINES,
+    };
+    pub const VIEWER: Limits = Limits {
+        max_bytes: 4 * 1024 * 1024,
+        max_lines: 100_000,
+    };
+}
+
 pub fn preview_path(path: &Path) -> Preview {
+    preview_path_with(path, Limits::PREVIEW)
+}
+
+pub fn preview_path_with(path: &Path, limits: Limits) -> Preview {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(e) => {
@@ -58,10 +80,10 @@ pub fn preview_path(path: &Path) -> Preview {
         };
     }
     let mut buf = Vec::new();
-    let read =
-        fs::File::open(path).and_then(|f| f.take((MAX_BYTES + 3) as u64).read_to_end(&mut buf));
+    let read = fs::File::open(path)
+        .and_then(|f| f.take((limits.max_bytes + 3) as u64).read_to_end(&mut buf));
     match read {
-        Ok(_) => classify(&buf, meta.len()),
+        Ok(_) => classify_with(&buf, meta.len(), limits),
         Err(e) => Preview::Error(e.to_string()),
     }
 }
@@ -108,6 +130,10 @@ fn clean_line(line: &str) -> String {
 }
 
 pub fn classify(bytes: &[u8], file_size: u64) -> Preview {
+    classify_with(bytes, file_size, Limits::PREVIEW)
+}
+
+pub fn classify_with(bytes: &[u8], file_size: u64, limits: Limits) -> Preview {
     if bytes.is_empty() {
         return if file_size == 0 {
             Preview::Empty
@@ -126,9 +152,9 @@ pub fn classify(bytes: &[u8], file_size: u64) -> Preview {
     if kind != "바이너리" || bytes[..bytes.len().min(8192)].contains(&0) {
         return binary;
     }
-    // Cut at MAX_BYTES, extending over continuation bytes of a split char.
-    let mut end = bytes.len().min(MAX_BYTES);
-    while end < bytes.len() && end < MAX_BYTES + 3 && (bytes[end] & 0xC0) == 0x80 {
+    // Cut at limits.max_bytes, extending over continuation bytes of a split char.
+    let mut end = bytes.len().min(limits.max_bytes);
+    while end < bytes.len() && end < limits.max_bytes + 3 && (bytes[end] & 0xC0) == 0x80 {
         end += 1;
     }
     let mut truncated = (end as u64) < file_size || end < bytes.len();
@@ -150,8 +176,8 @@ pub fn classify(bytes: &[u8], file_size: u64) -> Preview {
         }
     };
     let mut lines: Vec<String> = decoded.lines().map(clean_line).collect();
-    if lines.len() > MAX_LINES {
-        lines.truncate(MAX_LINES);
+    if lines.len() > limits.max_lines {
+        lines.truncate(limits.max_lines);
         truncated = true;
     }
     Preview::Text { lines, truncated }
@@ -196,6 +222,44 @@ mod tests {
             Preview::Text { lines, truncated } => (lines, truncated),
             o => panic!("expected Text, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn viewer_limits_keep_more_than_the_preview_cap() {
+        let big: String = (0..1000).map(|i| format!("line{i}\n")).collect();
+        let (lines, truncated) = text(classify(big.as_bytes(), big.len() as u64));
+        assert_eq!((lines.len(), truncated), (MAX_LINES, true));
+        let (lines, truncated) = text(classify_with(
+            big.as_bytes(),
+            big.len() as u64,
+            Limits::VIEWER,
+        ));
+        assert_eq!((lines.len(), truncated), (1000, false));
+    }
+
+    #[test]
+    fn custom_limits_truncate_by_lines_and_bytes() {
+        let small = Limits {
+            max_bytes: 20,
+            max_lines: 2,
+        };
+        let (lines, truncated) = text(classify_with(b"a\nb\nc\n", 6, small));
+        assert_eq!((lines, truncated), (vec!["a".into(), "b".into()], true));
+        let data = "x".repeat(100);
+        let (lines, truncated) = text(classify_with(data.as_bytes(), 100, small));
+        assert_eq!((lines[0].len(), truncated), (20, true));
+    }
+
+    #[test]
+    fn preview_path_with_reads_past_the_preview_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("big.txt");
+        let big: String = (0..5000).map(|i| format!("행{i}\n")).collect();
+        std::fs::write(&f, &big).unwrap();
+        let (lines, truncated) = text(preview_path_with(&f, Limits::VIEWER));
+        assert_eq!((lines.len(), truncated), (5000, false));
+        let (lines, truncated) = text(preview_path(&f));
+        assert_eq!((lines.len(), truncated), (MAX_LINES, true));
     }
 
     #[test]

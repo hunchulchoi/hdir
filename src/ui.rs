@@ -142,7 +142,7 @@ pub fn fit_width(s: &str, width: usize) -> String {
 
 /// Keep the tail of `s` within `width` columns, prefixed with `…` when cut.
 /// Never splits a grapheme cluster.
-fn tail_width(s: &str, width: usize) -> String {
+pub(crate) fn tail_width(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
     }
@@ -164,7 +164,7 @@ fn tail_width(s: &str, width: usize) -> String {
     tail.concat()
 }
 
-fn human_size(size: u64) -> String {
+pub(crate) fn human_size(size: u64) -> String {
     const UNITS: [&str; 3] = ["K", "M", "G"];
     if size < 1024 {
         return format!("{size}B");

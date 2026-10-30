@@ -57,6 +57,12 @@ pub enum Action {
     ConnectRight,
     OpenWith,
     CancelJob,
+    /// Viewer: horizontal scroll.
+    ScrollLeft,
+    ScrollRight,
+    /// Viewer: start a forward search / jump to the next match.
+    Search,
+    SearchNext,
     /// Dialog: accept.
     Confirm,
     /// Dialog/menu: dismiss.
@@ -276,6 +282,10 @@ const MDIR_VIEWER: &[(Action, &[&str])] = &[
     (A::PageDown, &["PageDown", "Space"]),
     (A::Home, &["Home"]),
     (A::End, &["End"]),
+    (A::ScrollLeft, &["Left"]),
+    (A::ScrollRight, &["Right"]),
+    (A::Search, &["/"]),
+    (A::SearchNext, &["n"]),
     (A::Edit, &["F4"]),
     (A::Help, &["F1"]),
     (A::Quit, &["Esc", "q", "F3", "F10"]),
@@ -810,6 +820,23 @@ mod tests {
                 "Alt+{d}"
             );
         }
+    }
+
+    #[test]
+    fn mdir_viewer_search_and_horizontal_scroll_keys() {
+        let km = mdir();
+        for (code, want) in [
+            (KeyCode::Left, Action::ScrollLeft),
+            (KeyCode::Right, Action::ScrollRight),
+            (KeyCode::Char('/'), Action::Search),
+            (KeyCode::Char('n'), Action::SearchNext),
+            (KeyCode::F(3), Action::Quit),
+            (KeyCode::F(10), Action::Quit),
+        ] {
+            assert_eq!(look(&km, Context::Viewer, code, NONE), Some(want));
+        }
+        assert_eq!(Action::from_name("scroll_left"), Some(Action::ScrollLeft));
+        assert_eq!(Action::from_name("search_next"), Some(Action::SearchNext));
     }
 
     #[test]

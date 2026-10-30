@@ -114,6 +114,10 @@ pub fn action_label(a: Action) -> &'static str {
         Action::ConnectRight => "오른쪽 패널 연결",
         Action::OpenWith => "연결 프로그램 선택",
         Action::CancelJob => "작업 취소",
+        Action::ScrollLeft => "왼쪽으로 스크롤",
+        Action::ScrollRight => "오른쪽으로 스크롤",
+        Action::Search => "검색",
+        Action::SearchNext => "다음 검색 결과",
         Action::Confirm => "확인",
         Action::Cancel => "취소",
     }
