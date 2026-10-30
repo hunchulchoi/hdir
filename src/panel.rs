@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::loader::LoadResult;
+use crate::vfs::Location;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
@@ -65,6 +66,9 @@ pub struct LoadRequest {
 
 #[derive(Debug, Clone)]
 pub struct Panel {
+    /// Where `cwd` lives. Remote paths are byte strings stored as `PathBuf`
+    /// (unix); never hand them to local filesystem calls.
+    pub location: Location,
     pub cwd: PathBuf,
     pub entries: Vec<Entry>,
     pub cursor: usize,
@@ -83,6 +87,7 @@ impl Panel {
         let path = path.into();
         let cwd = fs::canonicalize(&path).unwrap_or(path);
         let mut panel = Panel {
+            location: Location::Local,
             cwd,
             entries: Vec::new(),
             cursor: 0,
@@ -124,6 +129,20 @@ impl Panel {
     fn apply_listing(&mut self, (entries, skipped): (Vec<Entry>, usize)) {
         self.entries = entries;
         self.error = (skipped > 0).then(|| format!("{skipped}개 항목을 읽지 못함"));
+    }
+
+    /// Point the panel at another location: the old listing, selection and any
+    /// pending load are dropped; the caller starts a reload.
+    pub fn set_location(&mut self, location: Location, cwd: PathBuf) {
+        self.location = location;
+        self.cwd = cwd;
+        self.entries.clear();
+        self.cursor = 0;
+        self.scroll = 0;
+        self.selected.clear();
+        self.error = None;
+        self.loading = None;
+        self.reload_after_load = false;
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -467,6 +486,12 @@ fn build_listing_with(
         });
     }
 
+    (finish_listing(cwd, items), skipped)
+}
+
+/// Sort entries (dirs first, then case-insensitive by name) and put `..`
+/// first unless `cwd` is a root.
+pub(crate) fn finish_listing(cwd: &Path, mut items: Vec<Entry>) -> Vec<Entry> {
     let is_dirlike = |e: &Entry| {
         matches!(
             e.kind,
@@ -485,11 +510,41 @@ fn build_listing_with(
 
     let mut out = parent_only(cwd);
     out.extend(items);
-    (out, skipped)
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn set_location_resets_listing_state() {
+        use crate::remote::{RemoteOs, ScpMode, SshTarget};
+        use crate::session::{RemoteSession, SystemCmd};
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "x").unwrap();
+        let mut p = Panel::new(t.path());
+        p.selected.insert("a".into());
+        p.cursor = 1;
+        p.error = Some("x".into());
+        p.begin_reload(1, None);
+        let s = std::sync::Arc::new(RemoteSession::new(
+            "web".into(),
+            SshTarget {
+                host: "h".into(),
+                port: None,
+                control_path: "/tmp/x".into(),
+            },
+            RemoteOs::Linux,
+            ScpMode::Sftp,
+            std::sync::Arc::new(SystemCmd),
+        ));
+        p.set_location(Location::Remote(s), PathBuf::from("/srv"));
+        assert!(p.location.is_remote());
+        assert_eq!(p.cwd, PathBuf::from("/srv"));
+        assert!(p.entries.is_empty() && p.selected.is_empty());
+        assert!(p.error.is_none() && p.loading.is_none());
+        assert_eq!((p.cursor, p.scroll), (0, 0));
+    }
+
     use super::*;
     use std::fs;
 

@@ -317,8 +317,75 @@ impl CmdLine {
     }
 }
 
+/// The `:ssh` / `:local` commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocationCmd {
+    Local,
+    /// `:ssh host[:/path]`; `host` is a server name or an ssh destination.
+    Ssh {
+        host: String,
+        path: Option<String>,
+    },
+    /// `:ssh` without a destination.
+    SshUsage,
+}
+
+/// Recognize `ssh <host>[:<path>]` and `local` (a leading `:` is tolerated).
+/// Everything else is `None` and goes on to the shell.
+pub fn parse_location_cmd(cmd: &str) -> Option<LocationCmd> {
+    let cmd = cmd.trim().trim_start_matches(':').trim();
+    if cmd == "local" {
+        return Some(LocationCmd::Local);
+    }
+    let rest = cmd.strip_prefix("ssh")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None; // sshfs, ssh-add, ...
+    }
+    let arg = rest.trim();
+    let (host, path) = match arg.split_once(':') {
+        Some((h, p)) => (h, Some(p).filter(|p| !p.is_empty())),
+        None => (arg, None),
+    };
+    if host.is_empty() {
+        return Some(LocationCmd::SshUsage);
+    }
+    Some(LocationCmd::Ssh {
+        host: host.to_string(),
+        path: path.map(String::from),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn location_cmd_parsing() {
+        let ssh = |h: &str, p: Option<&str>| {
+            Some(LocationCmd::Ssh {
+                host: h.into(),
+                path: p.map(String::from),
+            })
+        };
+        assert_eq!(parse_location_cmd("local"), Some(LocationCmd::Local));
+        assert_eq!(parse_location_cmd(" :local "), Some(LocationCmd::Local));
+        assert_eq!(parse_location_cmd("local x"), None);
+        assert_eq!(parse_location_cmd("ssh web"), ssh("web", None));
+        assert_eq!(
+            parse_location_cmd("ssh web:/srv/a b"),
+            ssh("web", Some("/srv/a b"))
+        );
+        assert_eq!(
+            parse_location_cmd("ssh choi@h:~/x"),
+            ssh("choi@h", Some("~/x"))
+        );
+        assert_eq!(parse_location_cmd("ssh web:"), ssh("web", None));
+        assert_eq!(parse_location_cmd("ssh   web  "), ssh("web", None));
+        assert_eq!(parse_location_cmd("ssh"), Some(LocationCmd::SshUsage));
+        assert_eq!(parse_location_cmd("ssh  "), Some(LocationCmd::SshUsage));
+        assert_eq!(parse_location_cmd("ssh :/x"), Some(LocationCmd::SshUsage));
+        assert_eq!(parse_location_cmd("sshfs a b"), None);
+        assert_eq!(parse_location_cmd("ls ssh"), None);
+    }
+
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 

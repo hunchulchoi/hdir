@@ -19,11 +19,13 @@ pub mod preview;
 pub mod remote;
 pub mod screen;
 pub mod servers;
+pub mod session;
 pub mod term;
 pub mod theme;
 pub mod trash;
 pub mod ui;
 pub mod undo;
+pub mod vfs;
 pub mod viewer;
 
 pub const APP_NAME: &str = "hdir";

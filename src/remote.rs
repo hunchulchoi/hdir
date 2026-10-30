@@ -105,6 +105,18 @@ fn port_args(port: Option<u16>, flag: &str, v: &mut Vec<OsString>) {
     }
 }
 
+/// Options that keep a dead network from hanging ssh forever.
+fn net_opts(v: &mut Vec<OsString>) {
+    for o in [
+        "ConnectTimeout=10",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=2",
+    ] {
+        v.push(os("-o"));
+        v.push(os(o));
+    }
+}
+
 /// `ssh` argv that starts the persistent master connection.
 pub fn master_argv(t: &SshTarget) -> Vec<OsString> {
     let mut v = vec![
@@ -116,6 +128,7 @@ pub fn master_argv(t: &SshTarget) -> Vec<OsString> {
         os("-o"),
         control_opt(t),
     ];
+    net_opts(&mut v);
     port_args(t.port, "-p", &mut v);
     v.push(os("-fN"));
     v.push(os("--"));
@@ -126,6 +139,7 @@ pub fn master_argv(t: &SshTarget) -> Vec<OsString> {
 /// `ssh -O check` argv (is the master alive?).
 pub fn check_argv(t: &SshTarget) -> Vec<OsString> {
     let mut v = vec![os("ssh"), os("-O"), os("check"), os("-o"), control_opt(t)];
+    net_opts(&mut v);
     port_args(t.port, "-p", &mut v);
     v.push(os("--"));
     v.push(os(&t.host));
@@ -141,6 +155,7 @@ pub fn exec_argv(t: &SshTarget, remote_cmd: &[u8]) -> Vec<OsString> {
         os("-o"),
         os("BatchMode=yes"),
     ];
+    net_opts(&mut v);
     port_args(t.port, "-p", &mut v);
     v.push(os("--"));
     v.push(os(&t.host));
@@ -491,6 +506,12 @@ mod tests {
                 "ControlPersist=10m",
                 "-o",
                 "ControlPath=/c/cm-1",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "-fN",
                 "--",
                 "prod"
@@ -506,6 +527,12 @@ mod tests {
                 "ControlPersist=10m",
                 "-o",
                 "ControlPath=/c/cm-1",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "-p",
                 "2222",
                 "-fN",
@@ -521,6 +548,12 @@ mod tests {
                 "check",
                 "-o",
                 "ControlPath=/c/cm-1",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "-p",
                 "22",
                 "--",
@@ -535,14 +568,20 @@ mod tests {
                 "ControlPath=/c/cm-1",
                 "-o",
                 "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
                 "--",
                 "prod",
                 "ls 'a b'"
             ])
         );
         let a = exec_argv(&t(Some(2200)), b"x");
-        assert_eq!(a[5], OsString::from("-p"));
-        assert_eq!(a[6], OsString::from("2200"));
+        assert_eq!(a[11], OsString::from("-p"));
+        assert_eq!(a[12], OsString::from("2200"));
         assert_eq!(a.last().unwrap(), &OsString::from("x"));
     }
 
