@@ -77,11 +77,22 @@ impl Dialog {
     }
 
     pub fn choice(title: &str, message: Vec<String>, options: Vec<String>) -> Self {
+        Self::choice_with_default(title, message, options, 0)
+    }
+
+    /// Like [`choice`](Self::choice) with `selected` pre-highlighted (clamped into range).
+    pub fn choice_with_default(
+        title: &str,
+        message: Vec<String>,
+        options: Vec<String>,
+        selected: usize,
+    ) -> Self {
+        let selected = selected.min(options.len().saturating_sub(1));
         Dialog::Choice {
             title: title.to_string(),
             message,
             options,
-            selected: 0,
+            selected,
         }
     }
 

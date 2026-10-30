@@ -8,7 +8,8 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModif
 
 use crate::dialog::{self, Dialog, DialogResult};
 use crate::fs_ops::{self, SystemTrash, Trash};
-use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobOutcome, JobSpec, ProgressView};
+use crate::fs_ops::{OpOutcome, OpReport};
+use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
 use crate::loader::Loader;
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
 use crate::ui::{self, View};
@@ -69,6 +70,22 @@ fn resolve_dest(input: &str, cwd: &std::path::Path) -> PathBuf {
     }
 }
 
+fn conflict_dialog(dest: &std::path::Path) -> Dialog {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Default to Skip so a stray Enter never destroys data.
+    Dialog::choice_with_default(
+        "덮어쓰기 확인",
+        vec![format!("이미 존재: {name}")],
+        ["Overwrite", "Skip", "Overwrite all", "Skip all", "Cancel"]
+            .map(String::from)
+            .to_vec(),
+        1,
+    )
+}
+
 pub struct App {
     pub running: bool,
     pub panels: [Panel; 2],
@@ -77,6 +94,8 @@ pub struct App {
     pub shell: String,
     pub dialog: Option<(Dialog, PendingAction)>,
     pub job: Option<RunningJob>,
+    /// A conflict question that arrived while another dialog was open.
+    pending_conflict: Option<PathBuf>,
     trash: Box<dyn Trash>,
     pub undo: UndoStack,
     /// Background directory reader; tests may swap in a gated one.
@@ -115,6 +134,7 @@ impl App {
             shell,
             dialog: None,
             job: None,
+            pending_conflict: None,
             trash,
             undo: UndoStack::default(),
             loader: Loader::default(),
@@ -269,8 +289,9 @@ impl App {
             self.status = Some("작업 진행 중".into());
             return;
         }
-        let dest_dir = resolve_dest(input.trim(), &self.active_panel().cwd);
-        if !dest_dir.is_dir() {
+        // Only reject blank input; surrounding spaces may be part of a real name.
+        let dest_dir = resolve_dest(input, &self.active_panel().cwd);
+        if input.trim().is_empty() || !dest_dir.is_dir() {
             self.status = Some("오류: 대상 폴더 없음".into());
             return;
         }
@@ -352,27 +373,19 @@ impl App {
             job.view.apply(ev);
             match ev {
                 JobEvent::Conflict { dest } => {
-                    let name = dest
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    self.dialog = Some((
-                        Dialog::choice(
-                            "덮어쓰기 확인",
-                            vec![format!("이미 존재: {name}")],
-                            ["Overwrite", "Skip", "Overwrite all", "Skip all", "Cancel"]
-                                .map(String::from)
-                                .to_vec(),
-                        ),
-                        PendingAction::Conflict,
-                    ));
+                    if self.dialog.is_some() {
+                        // Never replace an open dialog; ask once it closes.
+                        self.pending_conflict = Some(dest.clone());
+                    } else {
+                        self.dialog = Some((conflict_dialog(dest), PendingAction::Conflict));
+                    }
                 }
-                JobEvent::Finished { outcome } => finished = Some(outcome.clone()),
+                JobEvent::Finished { report } => finished = Some(report.clone()),
                 _ => {}
             }
         }
         match finished {
-            Some(outcome) => self.finish_job(outcome),
+            Some(report) => self.finish_job(report),
             None => {
                 if !job.cancelling {
                     self.status = Some(job.view.status_line());
@@ -382,36 +395,41 @@ impl App {
         true
     }
 
-    fn finish_job(&mut self, outcome: JobOutcome) {
+    fn finish_job(&mut self, report: OpReport) {
         let Some(job) = self.job.take() else {
             return;
         };
-        let n = job.sources.len();
-        let status = match outcome {
-            JobOutcome::Done => {
-                if job.kind == JobKind::Move {
-                    let pairs: Vec<(PathBuf, PathBuf)> = job
-                        .sources
-                        .iter()
-                        .filter_map(|src| {
-                            let dest = job.dest_dir.join(src.file_name()?);
-                            (src.symlink_metadata().is_err() && dest.symlink_metadata().is_ok())
-                                .then(|| (src.clone(), dest))
-                        })
-                        .collect();
-                    if !pairs.is_empty() {
-                        self.undo.push(UndoOp::Move { pairs });
-                    }
-                }
-                self.active_panel_mut().selected.clear();
-                match job.kind {
+        self.pending_conflict = None;
+        // Partial moves are undoable whatever the outcome.
+        if job.kind == JobKind::Move && !report.moved.is_empty() {
+            self.undo.push(UndoOp::Move {
+                pairs: report.moved.clone(),
+            });
+        }
+        if report.copied > 0 || !report.moved.is_empty() {
+            self.active_panel_mut().selected.clear();
+        }
+        let n = report.copied;
+        let mut status = match &report.outcome {
+            OpOutcome::Done => {
+                let mut s = match job.kind {
                     JobKind::Copy => format!("복사 완료: {n}개"),
                     JobKind::Move => format!("이동 완료: {n}개"),
+                };
+                if report.skipped > 0 {
+                    s.push_str(&format!(", 건너뜀 {}개", report.skipped));
                 }
+                s
             }
-            JobOutcome::Cancelled => "취소됨".to_string(),
-            JobOutcome::Failed(msg) => format!("오류: {msg}"),
+            OpOutcome::Cancelled => format!("취소됨 (처리 {n}개)"),
+            OpOutcome::Failed(msg) => format!("오류: {msg} (처리 {n}개)"),
         };
+        if job.kind == JobKind::Move && report.overwritten > 0 {
+            status.push_str(&format!(
+                " · 덮어쓴 파일 {}개는 되돌릴 수 없음",
+                report.overwritten
+            ));
+        }
         // A conflict dialog may still be open for a job that just ended.
         if matches!(self.dialog, Some((_, PendingAction::Conflict))) {
             self.dialog = None;
@@ -420,6 +438,18 @@ impl App {
             self.reload_panel(i, None);
         }
         self.status = Some(status);
+    }
+
+    /// Open the queued conflict question once no other dialog is showing.
+    fn open_pending_conflict(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        if let Some(dest) = self.pending_conflict.take()
+            && self.job.is_some()
+        {
+            self.dialog = Some((conflict_dialog(&dest), PendingAction::Conflict));
+        }
     }
 
     fn open_mkdir(&mut self) {
@@ -467,6 +497,11 @@ impl App {
     }
 
     fn handle_dialog_key(&mut self, key: KeyEvent) {
+        self.dispatch_dialog_key(key);
+        self.open_pending_conflict();
+    }
+
+    fn dispatch_dialog_key(&mut self, key: KeyEvent) {
         let Some((dlg, _)) = self.dialog.as_mut() else {
             return;
         };
@@ -1284,9 +1319,8 @@ mod tests {
         press(&mut app, KeyCode::F(5));
         press(&mut app, KeyCode::Enter);
         wait_dialog(&mut app);
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Right);
-        press(&mut app, KeyCode::Enter); // Overwrite all
+        press(&mut app, KeyCode::Right); // default Skip -> Overwrite all
+        press(&mut app, KeyCode::Enter);
         let mut dialogs = 0;
         let start = std::time::Instant::now();
         while app.job.is_some() {
@@ -1315,7 +1349,7 @@ mod tests {
         start_conflict(&mut app, &tmp);
         press(&mut app, KeyCode::Esc);
         wait_job(&mut app);
-        assert_eq!(app.status.as_deref(), Some("취소됨"));
+        assert_eq!(app.status.as_deref(), Some("취소됨 (처리 0개)"));
         assert_eq!(
             fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
             "OLD"
@@ -1371,7 +1405,7 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.status.as_deref(), Some("취소 중…"));
         wait_job(&mut app);
-        assert_eq!(app.status.as_deref(), Some("취소됨"));
+        assert_eq!(app.status.as_deref(), Some("취소됨 (처리 0개)"));
     }
 
     #[test]
@@ -1513,5 +1547,87 @@ mod tests {
         settle(&mut app);
         assert_eq!(app.panels[0].cwd, root);
         assert!(app.status.as_deref().is_some_and(|s| !s.is_empty()));
+    }
+
+    // ---- review fixes (phase A) ----
+
+    #[test]
+    fn conflict_dialog_defaults_to_skip() {
+        let (tmp, mut app) = fixture_job();
+        start_conflict(&mut app, &tmp);
+        match &app.dialog.as_ref().unwrap().0 {
+            Dialog::Choice { selected, .. } => assert_eq!(*selected, 1),
+            d => panic!("{d:?}"),
+        }
+        press(&mut app, KeyCode::Enter); // bare Enter must be Skip
+        wait_job(&mut app);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("dst/a.txt")).unwrap(),
+            "OLD"
+        );
+    }
+
+    #[test]
+    fn conflict_event_does_not_replace_open_dialog() {
+        let (tmp, mut app) = fixture_job();
+        fs::write(tmp.path().join("dst/a.txt"), "OLD").unwrap();
+        app.panels[1].reload();
+        select_down(&mut app);
+        press(&mut app, KeyCode::F(5));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::F(7)); // mkdir dialog while job runs
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(300) {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(
+            app.dialog.as_ref().unwrap().0,
+            Dialog::Input { .. }
+        ));
+        press(&mut app, KeyCode::Esc);
+        match &app.dialog.as_ref().expect("conflict dialog queued").0 {
+            Dialog::Choice { selected, .. } => assert_eq!(*selected, 1),
+            d => panic!("{d:?}"),
+        }
+        press(&mut app, KeyCode::Esc);
+        wait_job(&mut app);
+    }
+
+    #[test]
+    fn dest_with_surrounding_spaces_is_not_trimmed() {
+        let (tmp, mut app) = fixture_job();
+        let odd = tmp.path().join(" sp ");
+        fs::create_dir(&odd).unwrap();
+        select_down(&mut app);
+        press(&mut app, KeyCode::F(5));
+        for _ in 0..500 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        type_str(&mut app, &odd.to_string_lossy());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.job.is_some(), "status: {:?}", app.status);
+        wait_job(&mut app);
+        assert!(odd.join("a.txt").exists());
+    }
+
+    #[test]
+    fn cancelled_move_keeps_partial_moves_undoable() {
+        let (tmp, mut app) = fixture_job();
+        fs::write(tmp.path().join("dst/b.txt"), "OLD").unwrap();
+        app.panels[1].reload();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::F(6));
+        press(&mut app, KeyCode::Enter);
+        wait_dialog(&mut app); // a.txt moved, b.txt conflicts
+        press(&mut app, KeyCode::Esc);
+        wait_job(&mut app);
+        assert!(tmp.path().join("dst/a.txt").exists());
+        assert_eq!(app.undo.len(), 1);
+        assert_eq!(app.status.as_deref(), Some("취소됨 (처리 1개)"));
+        ctrl_z(&mut app);
+        assert!(tmp.path().join("src/a.txt").exists());
     }
 }

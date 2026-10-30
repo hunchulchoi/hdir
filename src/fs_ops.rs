@@ -1,8 +1,12 @@
 //! Pure filesystem operations (copy / move / mkdir / rename / trash). No UI.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAction {
@@ -14,6 +18,8 @@ pub enum ConflictAction {
 pub trait OpControl {
     fn on_progress(&mut self, bytes_done_delta: u64, current: &Path);
     fn on_file_done(&mut self, _path: &Path) {}
+    /// A top-level source finished (moved, copied or skipped).
+    fn on_item_done(&mut self, _src: &Path) {}
     fn is_cancelled(&self) -> bool;
     fn on_conflict(&mut self, dest: &Path) -> ConflictAction;
 }
@@ -24,20 +30,68 @@ pub struct Totals {
     pub bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpOutcome {
     Done,
     Cancelled,
+    Failed(String),
+}
+
+/// What a copy/move did, even when it did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpReport {
+    pub outcome: OpOutcome,
+    /// Exactly what was relocated: `(src, dest)`. A directory merged into an
+    /// existing one records its children, not the directory.
+    pub moved: Vec<(PathBuf, PathBuf)>,
+    /// Destination files that were replaced.
+    pub overwritten: usize,
+    /// Entries not processed (conflict skip, special files).
+    pub skipped: usize,
+    /// Top-level sources fully copied / moved.
+    pub copied: usize,
+}
+
+impl OpReport {
+    pub fn failed(msg: impl Into<String>) -> Self {
+        Self {
+            outcome: OpOutcome::Failed(msg.into()),
+            moved: vec![],
+            overwritten: 0,
+            skipped: 0,
+            copied: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Acc {
+    moved: Vec<(PathBuf, PathBuf)>,
+    overwritten: usize,
+    skipped: usize,
+    copied: usize,
+}
+
+impl Acc {
+    fn into_report(self, outcome: OpOutcome) -> OpReport {
+        OpReport {
+            outcome,
+            moved: self.moved,
+            overwritten: self.overwritten,
+            skipped: self.skipped,
+            copied: self.copied,
+        }
+    }
 }
 
 const CHUNK: usize = 1 << 20;
 const EXDEV: i32 = 18;
 
-/// Result of one entry operation. `Partial` = completed but something was skipped.
+/// Result of one entry operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Done,
-    Partial,
+    Skipped,
     Cancelled,
 }
 
@@ -62,11 +116,24 @@ fn validate_name(name: &str) -> io::Result<()> {
 
 /// Recursive file/byte count. Symlinks count as one file, zero bytes, and are not followed.
 pub fn measure(sources: &[PathBuf]) -> io::Result<Totals> {
-    fn walk(p: &Path, t: &mut Totals) -> io::Result<()> {
+    Ok(measure_cancellable(sources, &|| false)?.unwrap_or(Totals { files: 0, bytes: 0 }))
+}
+
+/// Like [`measure`] but polls `is_cancelled`; `Ok(None)` means cancelled.
+pub fn measure_cancellable(
+    sources: &[PathBuf],
+    is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<Option<Totals>> {
+    fn walk(p: &Path, t: &mut Totals, stop: &dyn Fn() -> bool) -> io::Result<bool> {
+        if stop() {
+            return Ok(false);
+        }
         let m = fs::symlink_metadata(p)?;
         if m.is_dir() {
             for e in fs::read_dir(p)? {
-                walk(&e?.path(), t)?;
+                if !walk(&e?.path(), t, stop)? {
+                    return Ok(false);
+                }
             }
         } else {
             t.files += 1;
@@ -74,13 +141,15 @@ pub fn measure(sources: &[PathBuf]) -> io::Result<Totals> {
                 t.bytes += m.len();
             }
         }
-        Ok(())
+        Ok(true)
     }
     let mut t = Totals { files: 0, bytes: 0 };
     for s in sources {
-        walk(s, &mut t)?;
+        if !walk(s, &mut t, is_cancelled)? {
+            return Ok(None);
+        }
     }
-    Ok(t)
+    Ok(Some(t))
 }
 
 /// Canonical path of an entry without following the entry itself if it is a symlink.
@@ -116,6 +185,20 @@ fn check_all(sources: &[PathBuf], dest_dir: &Path) -> io::Result<Vec<PathBuf>> {
     sources.iter().map(|s| check_target(s, dest_dir)).collect()
 }
 
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Unique sibling temp path (`.hdir-tmp-<pid>-<n>-<name>`), name capped to stay under NAME_MAX.
+fn temp_sibling(dest: &Path) -> PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = dest.file_name().map(|n| n.as_bytes()).unwrap_or_default();
+    let name = &name[..name.len().min(100)];
+    let mut tmp = OsString::from(format!(".hdir-tmp-{}-{n}-", std::process::id()));
+    tmp.push(OsString::from_vec(name.to_vec()));
+    dest.with_file_name(tmp)
+}
+
+/// Copy file data to a temp file next to `dest`, then atomically rename over `dest`.
+/// `dest` is never touched unless the new content is complete.
 fn copy_file(
     src: &Path,
     dest: &Path,
@@ -123,7 +206,11 @@ fn copy_file(
     ctl: &mut dyn OpControl,
 ) -> io::Result<Step> {
     let mut input = fs::File::open(src)?;
-    let mut out = fs::File::create(dest)?;
+    let tmp = temp_sibling(dest);
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
     let mut buf = vec![0u8; CHUNK];
     let res = (|| -> io::Result<bool> {
         loop {
@@ -132,31 +219,44 @@ fn copy_file(
             }
             let n = input.read(&mut buf)?;
             if n == 0 {
-                return Ok(true);
+                break;
             }
             out.write_all(&buf[..n])?;
             ctl.on_progress(n as u64, src);
         }
+        out.set_permissions(meta.permissions())?;
+        out.set_modified(meta.modified()?)?;
+        out.sync_all()?;
+        Ok(true)
     })();
+    drop(out);
     match res {
         Ok(true) => {
-            out.set_modified(meta.modified()?)?;
-            drop(out);
-            fs::set_permissions(dest, meta.permissions())?;
+            if let Err(e) = fs::rename(&tmp, dest) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
             ctl.on_file_done(dest);
             Ok(Step::Done)
         }
         Ok(false) => {
-            drop(out);
-            let _ = fs::remove_file(dest);
+            let _ = fs::remove_file(&tmp);
             Ok(Step::Cancelled)
         }
         Err(e) => {
-            drop(out);
-            let _ = fs::remove_file(dest);
+            let _ = fs::remove_file(&tmp);
             Err(e)
         }
     }
+}
+
+/// Create a symlink at `dest` atomically (temp link + rename).
+fn copy_symlink(src: &Path, dest: &Path) -> io::Result<()> {
+    let tmp = temp_sibling(dest);
+    std::os::unix::fs::symlink(fs::read_link(src)?, &tmp)?;
+    fs::rename(&tmp, dest).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
 }
 
 fn copy_dir(
@@ -164,45 +264,61 @@ fn copy_dir(
     dest: &Path,
     meta: &fs::Metadata,
     ctl: &mut dyn OpControl,
+    acc: &mut Acc,
 ) -> io::Result<Step> {
     let created = !is_real_dir(dest);
     if created {
         if exists(dest) {
             fs::remove_file(dest)?;
+            acc.overwritten += 1;
         }
         fs::create_dir(dest)?;
     }
-    let mut result = Step::Done;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
-        match copy_entry(&entry.path(), &dest.join(entry.file_name()), ctl, true)? {
-            Step::Cancelled => return Ok(Step::Cancelled),
-            Step::Partial => result = Step::Partial,
-            Step::Done => {}
+        if copy_entry(&entry.path(), &dest.join(entry.file_name()), ctl, true, acc)?
+            == Step::Cancelled
+        {
+            return Ok(Step::Cancelled);
         }
     }
     if created {
         fs::File::open(dest)?.set_modified(meta.modified()?)?;
         fs::set_permissions(dest, meta.permissions())?;
     }
-    Ok(result)
+    Ok(Step::Done)
 }
 
 /// Copy one entry. With `prompt`, an existing destination triggers `on_conflict`.
-fn copy_entry(src: &Path, dest: &Path, ctl: &mut dyn OpControl, prompt: bool) -> io::Result<Step> {
+/// FIFOs, sockets and device files are skipped (never opened).
+fn copy_entry(
+    src: &Path,
+    dest: &Path,
+    ctl: &mut dyn OpControl,
+    prompt: bool,
+    acc: &mut Acc,
+) -> io::Result<Step> {
     if ctl.is_cancelled() {
         return Ok(Step::Cancelled);
     }
     let meta = fs::symlink_metadata(src)?;
+    let ft = meta.file_type();
+    if !(ft.is_dir() || ft.is_file() || ft.is_symlink()) {
+        acc.skipped += 1;
+        return Ok(Step::Skipped);
+    }
     if prompt && exists(dest) {
         match ctl.on_conflict(dest) {
-            ConflictAction::Skip => return Ok(Step::Partial),
+            ConflictAction::Skip => {
+                acc.skipped += 1;
+                return Ok(Step::Skipped);
+            }
             ConflictAction::Cancel => return Ok(Step::Cancelled),
             ConflictAction::Overwrite => {}
         }
     }
-    if meta.is_dir() {
-        return copy_dir(src, dest, &meta, ctl);
+    if ft.is_dir() {
+        return copy_dir(src, dest, &meta, ctl, acc);
     }
     if is_real_dir(dest) {
         return Err(io::Error::new(
@@ -210,37 +326,48 @@ fn copy_entry(src: &Path, dest: &Path, ctl: &mut dyn OpControl, prompt: bool) ->
             "destination is a directory",
         ));
     }
-    if exists(dest) {
-        fs::remove_file(dest)?;
-    }
-    if meta.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(src)?, dest)?;
+    let replaced = exists(dest);
+    let step = if ft.is_symlink() {
+        copy_symlink(src, dest)?;
         ctl.on_file_done(dest);
-        Ok(Step::Done)
+        Step::Done
     } else {
-        copy_file(src, dest, &meta, ctl)
+        copy_file(src, dest, &meta, ctl)?
+    };
+    if step == Step::Done && replaced {
+        acc.overwritten += 1;
     }
+    Ok(step)
 }
 
-pub fn copy_items(
+pub fn copy_items(sources: &[PathBuf], dest_dir: &Path, ctl: &mut dyn OpControl) -> OpReport {
+    let mut acc = Acc::default();
+    let outcome = match copy_loop(sources, dest_dir, ctl, &mut acc) {
+        Ok(o) => o,
+        Err(e) => OpOutcome::Failed(e.to_string()),
+    };
+    acc.into_report(outcome)
+}
+
+fn copy_loop(
     sources: &[PathBuf],
     dest_dir: &Path,
     ctl: &mut dyn OpControl,
+    acc: &mut Acc,
 ) -> io::Result<OpOutcome> {
     let dests = check_all(sources, dest_dir)?;
     for (src, dest) in sources.iter().zip(&dests) {
-        if copy_entry(src, dest, ctl, true)? == Step::Cancelled {
-            return Ok(OpOutcome::Cancelled);
+        match copy_entry(src, dest, ctl, true, acc)? {
+            Step::Cancelled => return Ok(OpOutcome::Cancelled),
+            Step::Done => acc.copied += 1,
+            Step::Skipped => {}
         }
+        ctl.on_item_done(src);
     }
     Ok(OpOutcome::Done)
 }
 
-pub fn move_items(
-    sources: &[PathBuf],
-    dest_dir: &Path,
-    ctl: &mut dyn OpControl,
-) -> io::Result<OpOutcome> {
+pub fn move_items(sources: &[PathBuf], dest_dir: &Path, ctl: &mut dyn OpControl) -> OpReport {
     move_items_with(sources, dest_dir, ctl, &|a, b| fs::rename(a, b))
 }
 
@@ -258,46 +385,162 @@ fn move_items_with(
     dest_dir: &Path,
     ctl: &mut dyn OpControl,
     rename_fn: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> OpReport {
+    let mut acc = Acc::default();
+    let outcome = match move_loop(sources, dest_dir, ctl, rename_fn, &mut acc) {
+        Ok(o) => o,
+        Err(e) => OpOutcome::Failed(e.to_string()),
+    };
+    acc.into_report(outcome)
+}
+
+fn move_loop(
+    sources: &[PathBuf],
+    dest_dir: &Path,
+    ctl: &mut dyn OpControl,
+    rename_fn: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    acc: &mut Acc,
 ) -> io::Result<OpOutcome> {
     let dests = check_all(sources, dest_dir)?;
     for (src, dest) in sources.iter().zip(&dests) {
-        if ctl.is_cancelled() {
-            return Ok(OpOutcome::Cancelled);
+        match move_entry(src, dest, ctl, rename_fn, acc)? {
+            Step::Cancelled => return Ok(OpOutcome::Cancelled),
+            Step::Done => acc.copied += 1,
+            Step::Skipped => {}
         }
-        if exists(dest) {
-            match ctl.on_conflict(dest) {
-                ConflictAction::Skip => continue,
-                ConflictAction::Cancel => return Ok(OpOutcome::Cancelled),
-                ConflictAction::Overwrite => {}
-            }
-            if is_real_dir(src) && is_real_dir(dest) {
-                // Merge: cannot rename over a directory.
-                match copy_entry(src, dest, ctl, false)? {
-                    Step::Cancelled => return Ok(OpOutcome::Cancelled),
-                    Step::Done => remove_source(src)?,
-                    Step::Partial => {}
-                }
-                continue;
-            }
-            if is_real_dir(dest) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "destination is a directory",
-                ));
-            }
-            fs::remove_file(dest)?;
-        }
-        match rename_fn(src, dest) {
-            Ok(()) => {}
-            Err(e) if is_cross_device(&e) => match copy_entry(src, dest, ctl, false)? {
-                Step::Cancelled => return Ok(OpOutcome::Cancelled),
-                Step::Done => remove_source(src)?,
-                Step::Partial => {}
-            },
-            Err(e) => return Err(e),
-        }
+        ctl.on_item_done(src);
     }
     Ok(OpOutcome::Done)
+}
+
+fn move_entry(
+    src: &Path,
+    dest: &Path,
+    ctl: &mut dyn OpControl,
+    rename_fn: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    acc: &mut Acc,
+) -> io::Result<Step> {
+    if ctl.is_cancelled() {
+        return Ok(Step::Cancelled);
+    }
+    let mut replaced = false;
+    if exists(dest) {
+        match ctl.on_conflict(dest) {
+            ConflictAction::Skip => {
+                acc.skipped += 1;
+                return Ok(Step::Skipped);
+            }
+            ConflictAction::Cancel => return Ok(Step::Cancelled),
+            ConflictAction::Overwrite => {}
+        }
+        let src_dir = is_real_dir(src);
+        let dest_dir = is_real_dir(dest);
+        if src_dir && dest_dir {
+            // Merge: cannot rename over a directory. Move children one by one.
+            let mut children = Vec::new();
+            for e in fs::read_dir(src)? {
+                children.push(e?.file_name());
+            }
+            for name in children {
+                let (cs, cd) = (src.join(&name), dest.join(&name));
+                if move_entry(&cs, &cd, ctl, rename_fn, acc)? == Step::Cancelled {
+                    return Ok(Step::Cancelled);
+                }
+            }
+            // Only succeeds when empty; leftovers (skipped entries) stay in place.
+            let _ = fs::remove_dir(src);
+            return Ok(Step::Done);
+        }
+        if dest_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "destination is a directory",
+            ));
+        }
+        if src_dir {
+            // rename(dir, file) is not allowed; the user confirmed replacing the file.
+            fs::remove_file(dest)?;
+        }
+        // File onto file: rename replaces atomically, dest survives any failure.
+        replaced = true;
+    }
+    match rename_fn(src, dest) {
+        Ok(()) => {}
+        Err(e) if is_cross_device(&e) => {
+            let skipped_before = acc.skipped;
+            match copy_entry(src, dest, ctl, false, acc)? {
+                Step::Cancelled => return Ok(Step::Cancelled),
+                Step::Skipped => return Ok(Step::Skipped),
+                Step::Done => {
+                    if acc.skipped != skipped_before {
+                        // Something was not copied: keep the source intact.
+                        return Ok(Step::Done);
+                    }
+                    remove_source(src)?;
+                    // copy_entry already counted the replaced file.
+                    acc.moved.push((src.to_path_buf(), dest.to_path_buf()));
+                    return Ok(Step::Done);
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    if replaced {
+        acc.overwritten += 1;
+    }
+    acc.moved.push((src.to_path_buf(), dest.to_path_buf()));
+    Ok(Step::Done)
+}
+
+/// Move `src` to the exact path `dest`, refusing to overwrite anything.
+/// Falls back to copy + remove across devices.
+pub fn move_path_no_overwrite(src: &Path, dest: &Path) -> io::Result<()> {
+    move_path_with(src, dest, &|a, b| fs::rename(a, b))
+}
+
+struct Quiet;
+impl OpControl for Quiet {
+    fn on_progress(&mut self, _: u64, _: &Path) {}
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn on_conflict(&mut self, _: &Path) -> ConflictAction {
+        ConflictAction::Cancel
+    }
+}
+
+fn move_path_with(
+    src: &Path,
+    dest: &Path,
+    rename_fn: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    if exists(dest) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "target already exists",
+        ));
+    }
+    match rename_fn(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if is_cross_device(&e) => {
+            let mut acc = Acc::default();
+            let res = copy_entry(src, dest, &mut Quiet, false, &mut acc);
+            match res {
+                Ok(Step::Done) if acc.skipped == 0 => remove_source(src).inspect_err(|_| {
+                    let _ = remove_source(dest);
+                }),
+                other => {
+                    // We created `dest` (it did not exist): clean up the partial copy.
+                    let _ = remove_source(dest);
+                    match other {
+                        Err(e) => Err(e),
+                        _ => Err(io::Error::other("could not copy every entry")),
+                    }
+                }
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether a rename failure means "different filesystem" (EXDEV).
@@ -312,10 +555,29 @@ pub fn make_dir(parent: &Path, name: &str) -> io::Result<PathBuf> {
     Ok(p)
 }
 
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
 pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     validate_name(new_name)?;
     let target = path.with_file_name(new_name);
     if exists(&target) {
+        // Case-only change on a case-insensitive filesystem: target IS the source.
+        let old = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        let case_only = old.is_some_and(|o| o == new_name.to_lowercase());
+        if case_only && same_file(path, &target) {
+            let tmp = temp_sibling(path);
+            fs::rename(path, &tmp)?;
+            if let Err(e) = fs::rename(&tmp, &target) {
+                let _ = fs::rename(&tmp, path);
+                return Err(e);
+            }
+            return Ok(target);
+        }
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "target already exists",
@@ -384,6 +646,13 @@ mod tests {
         }
     }
 
+    fn failed(r: OpReport) -> String {
+        match r.outcome {
+            OpOutcome::Failed(m) => m,
+            o => panic!("expected Failed, got {o:?}"),
+        }
+    }
+
     fn ctl() -> Ctl {
         Ctl::new(ConflictAction::Cancel)
     }
@@ -396,7 +665,7 @@ mod tests {
         fs::create_dir(&dst).unwrap();
         let mut c = ctl();
         assert_eq!(
-            copy_items(std::slice::from_ref(&src), &dst, &mut c).unwrap(),
+            copy_items(std::slice::from_ref(&src), &dst, &mut c).outcome,
             OpOutcome::Done
         );
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
@@ -423,7 +692,7 @@ mod tests {
             .set_modified(mt)
             .unwrap();
         let mut c = ctl();
-        copy_items(&[src], &dst, &mut c).unwrap();
+        copy_items(&[src], &dst, &mut c);
         assert_eq!(fs::read(dst.join("src/sub/deep/f.bin")).unwrap(), [1, 2, 3]);
         let m = fs::metadata(dst.join("src/top.sh")).unwrap();
         assert_eq!(m.permissions().mode() & 0o777, 0o750);
@@ -438,7 +707,7 @@ mod tests {
         fs::write(t.path().join("target"), "t").unwrap();
         let link = t.path().join("lnk");
         std::os::unix::fs::symlink("target", &link).unwrap();
-        copy_items(&[link], &dst, &mut ctl()).unwrap();
+        copy_items(&[link], &dst, &mut ctl());
         let m = fs::symlink_metadata(dst.join("lnk")).unwrap();
         assert!(m.file_type().is_symlink());
         assert_eq!(
@@ -461,7 +730,7 @@ mod tests {
     fn conflict_overwrite() {
         let (_t, src, dst) = conflict_setup();
         let mut c = Ctl::new(ConflictAction::Overwrite);
-        assert_eq!(copy_items(&[src], &dst, &mut c).unwrap(), OpOutcome::Done);
+        assert_eq!(copy_items(&[src], &dst, &mut c).outcome, OpOutcome::Done);
         assert_eq!(fs::read_to_string(dst.join("f.txt")).unwrap(), "new");
         assert_eq!(c.conflicts, vec![dst.join("f.txt")]);
     }
@@ -470,7 +739,7 @@ mod tests {
     fn conflict_skip() {
         let (_t, src, dst) = conflict_setup();
         let mut c = Ctl::new(ConflictAction::Skip);
-        assert_eq!(copy_items(&[src], &dst, &mut c).unwrap(), OpOutcome::Done);
+        assert_eq!(copy_items(&[src], &dst, &mut c).outcome, OpOutcome::Done);
         assert_eq!(fs::read_to_string(dst.join("f.txt")).unwrap(), "old");
     }
 
@@ -479,7 +748,7 @@ mod tests {
         let (_t, src, dst) = conflict_setup();
         let mut c = Ctl::new(ConflictAction::Cancel);
         assert_eq!(
-            copy_items(&[src], &dst, &mut c).unwrap(),
+            copy_items(&[src], &dst, &mut c).outcome,
             OpOutcome::Cancelled
         );
         assert_eq!(fs::read_to_string(dst.join("f.txt")).unwrap(), "old");
@@ -497,7 +766,7 @@ mod tests {
         fs::write(dst.join("d/a"), "old-a").unwrap();
         fs::write(dst.join("d/keep"), "keep").unwrap();
         let mut c = Ctl::new(ConflictAction::Overwrite);
-        copy_items(&[src], &dst, &mut c).unwrap();
+        copy_items(&[src], &dst, &mut c);
         assert_eq!(fs::read_to_string(dst.join("d/a")).unwrap(), "new-a");
         assert_eq!(fs::read_to_string(dst.join("d/b")).unwrap(), "new-b");
         assert_eq!(fs::read_to_string(dst.join("d/keep")).unwrap(), "keep");
@@ -510,10 +779,10 @@ mod tests {
         let src = t.path().join("d");
         fs::create_dir_all(src.join("sub")).unwrap();
         for dest in [src.clone(), src.join("sub")] {
-            let e = copy_items(std::slice::from_ref(&src), &dest, &mut ctl()).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-            let e = move_items(std::slice::from_ref(&src), &dest, &mut ctl()).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            let e = failed(copy_items(std::slice::from_ref(&src), &dest, &mut ctl()));
+            assert!(e.contains("same") || e.contains("itself"), "{e}");
+            let e = failed(move_items(std::slice::from_ref(&src), &dest, &mut ctl()));
+            assert!(e.contains("same") || e.contains("itself"), "{e}");
         }
     }
 
@@ -522,10 +791,10 @@ mod tests {
         let t = tempdir().unwrap();
         let f = t.path().join("f");
         fs::write(&f, "x").unwrap();
-        let e = copy_items(std::slice::from_ref(&f), t.path(), &mut ctl()).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-        let e = move_items(std::slice::from_ref(&f), t.path(), &mut ctl()).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = failed(copy_items(std::slice::from_ref(&f), t.path(), &mut ctl()));
+        assert!(e.contains("same") || e.contains("itself"), "{e}");
+        let e = failed(move_items(std::slice::from_ref(&f), t.path(), &mut ctl()));
+        assert!(e.contains("same") || e.contains("itself"), "{e}");
         assert_eq!(fs::read_to_string(&f).unwrap(), "x");
     }
 
@@ -539,7 +808,7 @@ mod tests {
         let mut c = ctl();
         c.cancel_on_progress = true;
         assert_eq!(
-            copy_items(&[src], &dst, &mut c).unwrap(),
+            copy_items(&[src], &dst, &mut c).outcome,
             OpOutcome::Cancelled
         );
         assert!(!dst.join("big").exists());
@@ -566,7 +835,7 @@ mod tests {
             }
         );
         let mut c = ctl();
-        copy_items(&[src], &dst, &mut c).unwrap();
+        copy_items(&[src], &dst, &mut c);
         assert_eq!(c.progress, tot.bytes);
     }
 
@@ -579,7 +848,7 @@ mod tests {
         fs::create_dir(&dst).unwrap();
         fs::write(src.join("f"), "x").unwrap();
         assert_eq!(
-            move_items(std::slice::from_ref(&src), &dst, &mut ctl()).unwrap(),
+            move_items(std::slice::from_ref(&src), &dst, &mut ctl()).outcome,
             OpOutcome::Done
         );
         assert!(!src.exists());
@@ -590,7 +859,7 @@ mod tests {
     fn move_conflict_skip_keeps_source() {
         let (_t, src, dst) = conflict_setup();
         let mut c = Ctl::new(ConflictAction::Skip);
-        move_items(std::slice::from_ref(&src), &dst, &mut c).unwrap();
+        move_items(std::slice::from_ref(&src), &dst, &mut c);
         assert!(src.exists());
         assert_eq!(fs::read_to_string(dst.join("f.txt")).unwrap(), "old");
     }
@@ -599,7 +868,7 @@ mod tests {
     fn move_conflict_overwrite_replaces() {
         let (_t, src, dst) = conflict_setup();
         let mut c = Ctl::new(ConflictAction::Overwrite);
-        move_items(std::slice::from_ref(&src), &dst, &mut c).unwrap();
+        move_items(std::slice::from_ref(&src), &dst, &mut c);
         assert!(!src.exists());
         assert_eq!(fs::read_to_string(dst.join("f.txt")).unwrap(), "new");
     }
@@ -614,8 +883,8 @@ mod tests {
         fs::write(src.join("f"), "x").unwrap();
         let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
         let mut c = ctl();
-        let r = move_items_with(std::slice::from_ref(&src), &dst, &mut c, &exdev).unwrap();
-        assert_eq!(r, OpOutcome::Done);
+        let r = move_items_with(std::slice::from_ref(&src), &dst, &mut c, &exdev);
+        assert_eq!(r.outcome, OpOutcome::Done);
         assert!(!src.exists());
         assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "x");
         assert_eq!(c.progress, 1);
@@ -631,8 +900,8 @@ mod tests {
         let exdev = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::CrossesDevices));
         let mut c = ctl();
         c.cancel_on_progress = true;
-        let r = move_items_with(std::slice::from_ref(&src), &dst, &mut c, &exdev).unwrap();
-        assert_eq!(r, OpOutcome::Cancelled);
+        let r = move_items_with(std::slice::from_ref(&src), &dst, &mut c, &exdev);
+        assert_eq!(r.outcome, OpOutcome::Cancelled);
         assert!(src.exists());
         assert!(!dst.join("big").exists());
     }
@@ -645,8 +914,13 @@ mod tests {
         fs::create_dir(&dst).unwrap();
         fs::write(&src, "x").unwrap();
         let denied = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::PermissionDenied));
-        let e = move_items_with(std::slice::from_ref(&src), &dst, &mut ctl(), &denied).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let e = failed(move_items_with(
+            std::slice::from_ref(&src),
+            &dst,
+            &mut ctl(),
+            &denied,
+        ));
+        assert_eq!(e, "permission denied");
         assert!(src.exists());
     }
 
@@ -709,7 +983,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::create_dir(&dst).unwrap();
         fs::write(src.join("가 나.txt"), "한").unwrap();
-        copy_items(&[src], &dst, &mut ctl()).unwrap();
+        copy_items(&[src], &dst, &mut ctl());
         assert_eq!(
             fs::read_to_string(dst.join("내 문서 'q'/가 나.txt")).unwrap(),
             "한"
@@ -755,20 +1029,20 @@ mod tests {
         let (_t, s, d) = two_dirs();
         let e = s.join("empty");
         fs::create_dir(&e).unwrap();
-        copy_items(std::slice::from_ref(&e), &d, &mut ctl()).unwrap();
+        copy_items(std::slice::from_ref(&e), &d, &mut ctl());
         assert!(d.join("empty").is_dir());
         assert_eq!(fs::read_dir(d.join("empty")).unwrap().count(), 0);
         assert!(e.exists());
         let d2 = _t.path().join("d2");
         fs::create_dir(&d2).unwrap();
-        move_items(std::slice::from_ref(&e), &d2, &mut ctl()).unwrap();
+        move_items(std::slice::from_ref(&e), &d2, &mut ctl());
         assert!(d2.join("empty").is_dir());
         assert!(!e.exists());
         // EXDEV fallback path for an empty dir too.
         let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
         let e2 = s.join("empty2");
         fs::create_dir(&e2).unwrap();
-        move_items_with(std::slice::from_ref(&e2), &d2, &mut ctl(), &exdev).unwrap();
+        move_items_with(std::slice::from_ref(&e2), &d2, &mut ctl(), &exdev);
         assert!(d2.join("empty2").is_dir() && !e2.exists());
     }
 
@@ -778,7 +1052,7 @@ mod tests {
         let src = s.join("ro.txt");
         fs::write(&src, "v1").unwrap();
         fs::set_permissions(&src, fs::Permissions::from_mode(0o444)).unwrap();
-        copy_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap();
+        copy_items(std::slice::from_ref(&src), &d, &mut ctl());
         let dest = d.join("ro.txt");
         assert_eq!(
             fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
@@ -788,7 +1062,7 @@ mod tests {
         // Second run: dest is read-only and must still be replaced.
         let mut c = Ctl::new(ConflictAction::Overwrite);
         assert_eq!(
-            copy_items(std::slice::from_ref(&src), &d, &mut c).unwrap(),
+            copy_items(std::slice::from_ref(&src), &d, &mut c).outcome,
             OpOutcome::Done
         );
         assert_eq!(c.conflicts.len(), 1);
@@ -803,8 +1077,7 @@ mod tests {
             std::slice::from_ref(&src),
             &d,
             &mut Ctl::new(ConflictAction::Overwrite),
-        )
-        .unwrap();
+        );
         assert_eq!(fs::read_to_string(&dest).unwrap(), "v2");
     }
 
@@ -821,12 +1094,12 @@ mod tests {
         if fs::File::create(d.join("probe")).is_ok() {
             return; // running as root: permissions not enforced
         }
-        let e = copy_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-        let e = copy_items(std::slice::from_ref(&tree), &d, &mut ctl()).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-        let e = move_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let e = failed(copy_items(std::slice::from_ref(&src), &d, &mut ctl()));
+        assert!(e.contains("Permission denied"), "{e}");
+        let e = failed(copy_items(std::slice::from_ref(&tree), &d, &mut ctl()));
+        assert!(e.contains("Permission denied"), "{e}");
+        let e = failed(move_items(std::slice::from_ref(&src), &d, &mut ctl()));
+        assert!(e.contains("Permission denied"), "{e}");
         assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
         assert!(src.exists() && tree.exists());
     }
@@ -844,7 +1117,7 @@ mod tests {
         let tot = measure(std::slice::from_ref(&tree)).unwrap();
         assert_eq!(tot, Totals { files: 5, bytes: 1 });
         let mut c = ctl();
-        copy_items(std::slice::from_ref(&tree), &d, &mut c).unwrap();
+        copy_items(std::slice::from_ref(&tree), &d, &mut c);
         assert_eq!(c.progress, tot.bytes);
         for (l, t) in [("a/up", ".."), ("loop1", "loop2"), ("loop2", "loop1")] {
             let p = d.join("tree").join(l);
@@ -856,7 +1129,7 @@ mod tests {
         let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
         let d2 = _t.path().join("d2");
         fs::create_dir(&d2).unwrap();
-        move_items_with(std::slice::from_ref(&tree), &d2, &mut ctl(), &exdev).unwrap();
+        move_items_with(std::slice::from_ref(&tree), &d2, &mut ctl(), &exdev);
         assert!(!tree.exists());
         assert!(
             fs::symlink_metadata(d2.join("tree/a/up"))
@@ -873,7 +1146,7 @@ mod tests {
         fs::write(real.join("f"), "f").unwrap();
         let lnk = s.join("lnk");
         std::os::unix::fs::symlink(&real, &lnk).unwrap();
-        copy_items(std::slice::from_ref(&lnk), &d, &mut ctl()).unwrap();
+        copy_items(std::slice::from_ref(&lnk), &d, &mut ctl());
         assert!(fs::symlink_metadata(d.join("lnk")).unwrap().is_symlink());
     }
 
@@ -901,7 +1174,7 @@ mod tests {
         srcs.push(dir);
         let tot = measure(&srcs).unwrap();
         let mut c = ctl();
-        copy_items(&srcs, &d, &mut c).unwrap();
+        copy_items(&srcs, &d, &mut c);
         assert_eq!(c.progress, tot.bytes);
         for n in names {
             assert_eq!(fs::read_to_string(d.join(n)).unwrap(), n);
@@ -912,7 +1185,7 @@ mod tests {
         );
         let d2 = _t.path().join("d2");
         fs::create_dir(&d2).unwrap();
-        move_items(&srcs, &d2, &mut ctl()).unwrap();
+        move_items(&srcs, &d2, &mut ctl());
         assert_eq!(
             fs::read_to_string(d2.join("new\nline")).unwrap(),
             "new\nline"
@@ -945,7 +1218,7 @@ mod tests {
             }
         );
         let mut c = ctl();
-        copy_items(&[tree], &d, &mut c).unwrap();
+        copy_items(&[tree], &d, &mut c);
         assert_eq!(c.progress, tot.bytes);
         assert_eq!(c.done.len() as u64, tot.files);
     }
@@ -963,7 +1236,7 @@ mod tests {
         let tot = measure(std::slice::from_ref(&root)).unwrap();
         assert_eq!(tot, Totals { files: 1, bytes: 4 });
         let mut c = ctl();
-        copy_items(std::slice::from_ref(&root), &d, &mut c).unwrap();
+        copy_items(std::slice::from_ref(&root), &d, &mut c);
         let mut copied = d.join("root");
         for i in 0..50 {
             copied = copied.join(format!("l{i}"));
@@ -972,7 +1245,7 @@ mod tests {
         let d2 = _t.path().join("d2");
         fs::create_dir(&d2).unwrap();
         let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
-        move_items_with(std::slice::from_ref(&root), &d2, &mut ctl(), &exdev).unwrap();
+        move_items_with(std::slice::from_ref(&root), &d2, &mut ctl(), &exdev);
         assert!(!root.exists());
         assert!(d2.join("root/l0").is_dir());
     }
@@ -985,12 +1258,215 @@ mod tests {
         fs::write(src.join("f"), "x").unwrap();
         fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).unwrap();
         let _g = Unlock(src.clone());
-        copy_items(std::slice::from_ref(&src), &d, &mut ctl()).unwrap();
+        copy_items(std::slice::from_ref(&src), &d, &mut ctl());
         assert_eq!(fs::read_to_string(d.join("rod/f")).unwrap(), "x");
         assert_eq!(
             fs::metadata(d.join("rod")).unwrap().permissions().mode() & 0o777,
             0o555
         );
         let _g2 = Unlock(d.join("rod"));
+    }
+
+    // ---- review fixes (phase A: old API) ----
+
+    fn names(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn overwrite_then_cancel_keeps_original_and_no_temp() {
+        let (_t, s, d) = two_dirs();
+        fs::write(s.join("big"), vec![7u8; 3 * 1024 * 1024]).unwrap();
+        fs::write(d.join("big"), "ORIGINAL").unwrap();
+        let mut c = Ctl::new(ConflictAction::Overwrite);
+        c.cancel_on_progress = true;
+        assert_eq!(
+            copy_items(&[s.join("big")], &d, &mut c).outcome,
+            OpOutcome::Cancelled
+        );
+        assert_eq!(fs::read_to_string(d.join("big")).unwrap(), "ORIGINAL");
+        assert_eq!(names(&d), vec!["big"]);
+    }
+
+    #[test]
+    fn overwrite_with_unreadable_source_keeps_original() {
+        let (_t, s, d) = two_dirs();
+        let src = s.join("f");
+        fs::write(&src, "new").unwrap();
+        fs::write(d.join("f"), "ORIGINAL").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&src).is_ok() {
+            return; // root
+        }
+        let mut c = Ctl::new(ConflictAction::Overwrite);
+        assert!(copy_items(std::slice::from_ref(&src), &d, &mut c).outcome != OpOutcome::Done);
+        assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "ORIGINAL");
+        assert_eq!(names(&d), vec!["f"]);
+    }
+
+    #[test]
+    fn plain_copy_cancel_leaves_nothing_under_any_name() {
+        let (_t, s, d) = two_dirs();
+        fs::write(s.join("big"), vec![1u8; 3 * 1024 * 1024]).unwrap();
+        let mut c = ctl();
+        c.cancel_on_progress = true;
+        copy_items(&[s.join("big")], &d, &mut c);
+        assert!(names(&d).is_empty());
+    }
+
+    #[test]
+    fn move_overwrite_rename_failure_keeps_dest() {
+        let (_t, s, d) = two_dirs();
+        fs::write(s.join("f"), "new").unwrap();
+        fs::write(d.join("f"), "ORIGINAL").unwrap();
+        let denied = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        let mut c = Ctl::new(ConflictAction::Overwrite);
+        let _ = move_items_with(&[s.join("f")], &d, &mut c, &denied);
+        assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "ORIGINAL");
+        assert_eq!(fs::read_to_string(s.join("f")).unwrap(), "new");
+    }
+
+    #[test]
+    fn fifo_in_tree_is_skipped_not_opened() {
+        let (_t, s, d) = two_dirs();
+        let tree = s.join("tree");
+        fs::create_dir(&tree).unwrap();
+        fs::write(tree.join("reg"), "r").unwrap();
+        match std::process::Command::new("mkfifo")
+            .arg(tree.join("pipe"))
+            .status()
+        {
+            Ok(st) if st.success() => {}
+            _ => return,
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (t2, d2) = (tree.clone(), d.clone());
+        std::thread::spawn(move || {
+            let r = copy_items(&[t2], &d2, &mut ctl());
+            let _ = tx.send(r.outcome == OpOutcome::Done);
+        });
+        let ok = rx.recv_timeout(Duration::from_secs(5));
+        assert_eq!(ok, Ok(true), "copy hung on or failed with FIFO");
+        assert_eq!(fs::read_to_string(d.join("tree/reg")).unwrap(), "r");
+        assert!(!d.join("tree/pipe").exists());
+    }
+
+    #[test]
+    fn rename_case_only_change() {
+        let t = tempdir().unwrap();
+        let a = t.path().join("foo");
+        fs::write(&a, "x").unwrap();
+        let n = rename(&a, "Foo").unwrap();
+        assert_eq!(names(t.path()), vec!["Foo"]);
+        assert_eq!(fs::read_to_string(n).unwrap(), "x");
+    }
+
+    // ---- review fixes (phase B: OpReport API) ----
+
+    #[test]
+    fn report_move_records_pairs_and_overwrites() {
+        let (_t, s, d) = two_dirs();
+        fs::write(s.join("a"), "A").unwrap();
+        fs::write(s.join("b"), "B").unwrap();
+        fs::write(d.join("b"), "OLD").unwrap();
+        let mut c = Ctl::new(ConflictAction::Overwrite);
+        let r = move_items(&[s.join("a"), s.join("b")], &d, &mut c);
+        assert_eq!(r.outcome, OpOutcome::Done);
+        assert_eq!(
+            r.moved,
+            vec![(s.join("a"), d.join("a")), (s.join("b"), d.join("b"))]
+        );
+        assert_eq!((r.overwritten, r.skipped, r.copied), (1, 0, 2));
+    }
+
+    #[test]
+    fn report_merge_records_children_not_parent() {
+        let (_t, s, d) = two_dirs();
+        fs::create_dir_all(s.join("x/sub")).unwrap();
+        fs::create_dir_all(d.join("x")).unwrap();
+        fs::write(s.join("x/a"), "A").unwrap();
+        fs::write(s.join("x/sub/b"), "B").unwrap();
+        fs::write(d.join("x/keep"), "K").unwrap();
+        let mut c = Ctl::new(ConflictAction::Overwrite);
+        let r = move_items(&[s.join("x")], &d, &mut c);
+        assert_eq!(r.outcome, OpOutcome::Done);
+        let mut m = r.moved.clone();
+        m.sort();
+        assert_eq!(
+            m,
+            vec![
+                (s.join("x/a"), d.join("x/a")),
+                (s.join("x/sub"), d.join("x/sub"))
+            ]
+        );
+        assert!(!s.join("x").exists());
+        assert_eq!(fs::read_to_string(d.join("x/keep")).unwrap(), "K");
+    }
+
+    #[test]
+    fn report_failed_keeps_partial_progress_and_validation_is_failed() {
+        let (_t, s, d) = two_dirs();
+        fs::write(s.join("a"), "A").unwrap();
+        fs::write(s.join("b"), "B").unwrap();
+        let flaky = |a: &Path, b: &Path| {
+            if a.ends_with("b") {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                fs::rename(a, b)
+            }
+        };
+        let r = move_items_with(&[s.join("a"), s.join("b")], &d, &mut ctl(), &flaky);
+        assert!(matches!(r.outcome, OpOutcome::Failed(_)));
+        assert_eq!(r.moved, vec![(s.join("a"), d.join("a"))]);
+        assert_eq!(r.copied, 1);
+        let r = copy_items(&[s.join("missing")], &d, &mut ctl());
+        assert!(matches!(r.outcome, OpOutcome::Failed(_)));
+        assert!(r.moved.is_empty());
+    }
+
+    #[test]
+    fn report_counts_skips_and_special_files() {
+        let (_t, s, d) = two_dirs();
+        fs::write(s.join("a"), "A").unwrap();
+        fs::write(d.join("a"), "OLD").unwrap();
+        let r = copy_items(&[s.join("a")], &d, &mut Ctl::new(ConflictAction::Skip));
+        assert_eq!((r.skipped, r.copied, r.overwritten), (1, 0, 0));
+        let r = copy_items(&[s.join("a")], &d, &mut Ctl::new(ConflictAction::Overwrite));
+        assert_eq!((r.skipped, r.copied, r.overwritten), (0, 1, 1));
+    }
+
+    #[test]
+    fn measure_cancellable_stops_early() {
+        let (_t, s, _d) = two_dirs();
+        fs::write(s.join("a"), "A").unwrap();
+        assert_eq!(
+            measure_cancellable(std::slice::from_ref(&s), &|| true).unwrap(),
+            None
+        );
+        assert_eq!(
+            measure_cancellable(&[s], &|| false).unwrap(),
+            Some(Totals { files: 1, bytes: 1 })
+        );
+    }
+
+    #[test]
+    fn move_path_exdev_falls_back_and_never_overwrites() {
+        let (_t, s, d) = two_dirs();
+        fs::create_dir(s.join("dir")).unwrap();
+        fs::write(s.join("dir/f"), "x").unwrap();
+        let exdev = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(18));
+        move_path_with(&s.join("dir"), &d.join("dir"), &exdev).unwrap();
+        assert_eq!(fs::read_to_string(d.join("dir/f")).unwrap(), "x");
+        assert!(!s.join("dir").exists());
+        fs::write(s.join("f"), "n").unwrap();
+        fs::write(d.join("f"), "KEEP").unwrap();
+        assert!(move_path_with(&s.join("f"), &d.join("f"), &exdev).is_err());
+        assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "KEEP");
+        assert!(s.join("f").exists());
     }
 }

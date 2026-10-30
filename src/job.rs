@@ -1,6 +1,6 @@
 //! Background copy/move worker so the UI thread never blocks.
 
-use crate::fs_ops::{self, ConflictAction, OpControl, OpOutcome};
+use crate::fs_ops::{self, ConflictAction, OpControl, OpOutcome, OpReport};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,17 +39,13 @@ pub enum JobEvent {
     Conflict {
         dest: PathBuf,
     },
+    /// The report's `outcome` says how the job ended.
     Finished {
-        outcome: JobOutcome,
+        report: OpReport,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobOutcome {
-    Done,
-    Cancelled,
-    Failed(String),
-}
+pub type JobOutcome = OpOutcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictAnswer {
@@ -95,6 +91,8 @@ struct Worker {
     policy: ConflictPolicy,
     files_done: u64,
     bytes_done: u64,
+    /// Move jobs report progress per top-level item instead of per file.
+    by_items: bool,
     current: PathBuf,
     last_sent: Instant,
     /// Test hook: invoked after every copied chunk, on the worker thread.
@@ -131,9 +129,19 @@ impl OpControl for Worker {
     }
 
     fn on_file_done(&mut self, path: &Path) {
-        self.files_done += 1;
+        if !self.by_items {
+            self.files_done += 1;
+        }
         self.current = path.to_path_buf();
         self.send_progress();
+    }
+
+    fn on_item_done(&mut self, src: &Path) {
+        if self.by_items {
+            self.files_done += 1;
+            self.current = src.to_path_buf();
+            self.send_progress();
+        }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -161,30 +169,44 @@ impl OpControl for Worker {
     }
 }
 
-fn run(spec: &JobSpec, w: &mut Worker) -> JobOutcome {
-    let totals = match fs_ops::measure(&spec.sources) {
-        Ok(t) => t,
-        Err(e) => return JobOutcome::Failed(e.to_string()),
+fn run(spec: &JobSpec, w: &mut Worker) -> OpReport {
+    let totals = match spec.kind {
+        // Moves are renames: progress by top-level item, no deep walk.
+        JobKind::Move => fs_ops::Totals {
+            files: spec.sources.len() as u64,
+            bytes: 0,
+        },
+        JobKind::Copy => {
+            let cancel = Arc::clone(&w.cancel);
+            let stop = move || cancel.load(Ordering::Relaxed);
+            match fs_ops::measure_cancellable(&spec.sources, &stop) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return OpReport {
+                        outcome: OpOutcome::Cancelled,
+                        ..OpReport::failed("")
+                    };
+                }
+                Err(e) => return OpReport::failed(e.to_string()),
+            }
+        }
     };
     let _ = w.events.send(JobEvent::Started { totals });
-    let res = match spec.kind {
+    let report = match spec.kind {
         JobKind::Copy => fs_ops::copy_items(&spec.sources, &spec.dest_dir, w),
         JobKind::Move => fs_ops::move_items(&spec.sources, &spec.dest_dir, w),
     };
-    match res {
-        Ok(OpOutcome::Done) => {
+    match report.outcome {
+        OpOutcome::Done => {
             // Renames report no per-byte progress; show completion.
             w.files_done = w.files_done.max(totals.files);
             w.bytes_done = w.bytes_done.max(totals.bytes);
             w.send_progress();
-            JobOutcome::Done
         }
-        Ok(OpOutcome::Cancelled) => {
-            w.send_progress();
-            JobOutcome::Cancelled
-        }
-        Err(e) => JobOutcome::Failed(e.to_string()),
+        OpOutcome::Cancelled => w.send_progress(),
+        OpOutcome::Failed(_) => {}
     }
+    report
 }
 
 pub struct JobHandle {
@@ -211,14 +233,15 @@ impl JobHandle {
             policy: ConflictPolicy::default(),
             files_done: 0,
             bytes_done: 0,
+            by_items: spec.kind == JobKind::Move,
             current: PathBuf::new(),
             last_sent: Instant::now(),
             on_chunk,
         };
         let thread = std::thread::spawn(move || {
-            let outcome = catch_unwind(AssertUnwindSafe(|| run(&spec, &mut worker)))
-                .unwrap_or_else(|_| JobOutcome::Failed("worker panicked".into()));
-            let _ = etx.send(JobEvent::Finished { outcome });
+            let report = catch_unwind(AssertUnwindSafe(|| run(&spec, &mut worker)))
+                .unwrap_or_else(|_| OpReport::failed("worker panicked"));
+            let _ = etx.send(JobEvent::Finished { report });
         });
         JobHandle {
             events: erx,
@@ -353,7 +376,7 @@ mod tests {
     fn outcome(ev: &[JobEvent]) -> JobOutcome {
         ev.iter()
             .find_map(|e| match e {
-                JobEvent::Finished { outcome } => Some(outcome.clone()),
+                JobEvent::Finished { report } => Some(report.outcome.clone()),
                 _ => None,
             })
             .unwrap()
@@ -619,5 +642,37 @@ mod tests {
         });
         assert_eq!(v.percent(), 100);
         assert!(v.status_line().starts_with("이동 중 2/2 · 100%"));
+    }
+
+    #[test]
+    fn move_job_skips_deep_measure() {
+        let (_t, s, d) = dirs();
+        fs::create_dir_all(s.join("t/u")).unwrap();
+        fs::write(s.join("t/u/f"), "abc").unwrap();
+        fs::write(s.join("g"), "g").unwrap();
+        let h = JobHandle::spawn(spec(JobKind::Move, vec![s.join("t"), s.join("g")], &d));
+        let ev = wait_events(&h, finished);
+        assert!(
+            matches!(ev[0], JobEvent::Started { totals } if totals.files == 2 && totals.bytes == 0),
+            "{:?}",
+            ev[0]
+        );
+        assert_eq!(outcome(&ev), JobOutcome::Done);
+    }
+
+    #[test]
+    fn finished_event_carries_report() {
+        let (_t, s, d) = dirs();
+        fs::write(s.join("a"), "A").unwrap();
+        let h = JobHandle::spawn(spec(JobKind::Move, vec![s.join("a")], &d));
+        let ev = wait_events(&h, finished);
+        let report = ev
+            .iter()
+            .find_map(|e| match e {
+                JobEvent::Finished { report } => Some(report.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(report.moved, vec![(s.join("a"), d.join("a"))]);
     }
 }

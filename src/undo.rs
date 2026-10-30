@@ -54,8 +54,9 @@ impl UndoStack {
         self.ops.is_empty()
     }
 
-    /// Pop and reverse the latest op. The op is always consumed, even on
-    /// error (no retry), and existing files are never overwritten.
+    /// Pop and reverse the latest op. The op is consumed, even on error, except
+    /// that failed pairs of a move are pushed back for a retry. Existing files
+    /// are never overwritten.
     pub fn undo(&mut self) -> Result<String, String> {
         let op = self.ops.pop().ok_or("되돌릴 작업 없음")?;
         match op {
@@ -70,19 +71,24 @@ impl UndoStack {
             UndoOp::Move { pairs } => {
                 let total = pairs.len();
                 let mut errors = Vec::new();
-                for (orig, new) in &pairs {
-                    if let Err(e) = restore(new, orig) {
+                let mut failed = Vec::new();
+                for (orig, new) in pairs {
+                    if let Err(e) = restore(&new, &orig) {
                         errors.push(e);
+                        failed.push((orig, new));
                     }
                 }
                 if errors.is_empty() {
                     Ok(format!("되돌림: 이동 {total}개"))
                 } else {
-                    Err(format!(
+                    let msg = format!(
                         "되돌림 일부 실패 ({}/{total}): {}",
                         total - errors.len(),
                         errors[0]
-                    ))
+                    );
+                    // Keep only the failed pairs so the user can retry.
+                    self.push(UndoOp::Move { pairs: failed });
+                    Err(msg)
                 }
             }
             UndoOp::Trash { .. } => Err("휴지통 항목은 Finder/휴지통에서 복원하세요".into()),
@@ -104,7 +110,13 @@ fn restore(current: &Path, target: &Path) -> Result<(), String> {
             target.to_string_lossy()
         ));
     }
-    fs::rename(current, target).map_err(|e| format!("되돌릴 수 없음: {e}"))
+    // A merged-away source directory may be gone; recreate its parent chain.
+    if let Some(parent) = target.parent().filter(|p| !p.exists()) {
+        fs::create_dir_all(parent).map_err(|e| format!("되돌릴 수 없음: {e}"))?;
+    }
+    // Falls back to copy + remove across devices; never overwrites.
+    crate::fs_ops::move_path_no_overwrite(current, target)
+        .map_err(|e| format!("되돌릴 수 없음: {e}"))
 }
 
 #[cfg(test)]
@@ -202,6 +214,14 @@ mod tests {
         });
         let e = u.undo().unwrap_err();
         assert!(e.contains("1/2"), "{e}");
+        // Failed pair is kept on the stack so the user can retry.
+        assert_eq!(u.len(), 1);
+        assert_eq!(
+            u.ops[0],
+            UndoOp::Move {
+                pairs: vec![(o2.clone(), n2.clone())]
+            }
+        );
         assert!(o1.exists());
         assert_eq!(fs::read_to_string(&o2).unwrap(), "blocker");
         assert!(n2.exists());
