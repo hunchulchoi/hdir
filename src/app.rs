@@ -5580,6 +5580,7 @@ mod tests {
             }
         }
 
+        #[cfg_attr(windows, allow(dead_code))]
         struct Env {
             _t: TempDir,
             _cfg: TempDir,
@@ -5607,6 +5608,7 @@ mod tests {
 
         const CAT: &str = "[[assoc]]\next = [\"txt\"]\ncmd = \"cat {}\"\n";
 
+        #[cfg_attr(windows, allow(dead_code))]
         fn run_pending_logged(e: &mut Env) {
             let l = Arc::clone(&e.log);
             e.app.run_pending(move |f| {
