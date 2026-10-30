@@ -16,6 +16,7 @@ use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, Progress
 use crate::keymap::{Action, Context};
 use crate::loader::Loader;
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
+use crate::screen::{self, TextScreen};
 use crate::theme::{self, Theme};
 use crate::trash::{
     self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
@@ -197,6 +198,8 @@ pub struct App {
     pub settings: Settings,
     /// Terminal supports 24-bit color; otherwise themes are mapped to 256.
     truecolor: bool,
+    /// A full-screen text page (help, key settings, warnings) over the panels.
+    pub screen: Option<TextScreen>,
 }
 
 impl Default for App {
@@ -244,6 +247,7 @@ impl App {
             config_dir: None,
             settings: config::load_settings(None),
             truecolor: true,
+            screen: None,
         }
     }
 
@@ -264,6 +268,71 @@ impl App {
     fn reload_settings(&mut self) {
         self.settings = config::load_settings(self.config_dir.as_deref());
         self.apply_theme();
+    }
+
+    /// Re-read config, themes, keymap and assoc and apply them immediately.
+    pub fn reload_config(&mut self) {
+        self.reload_settings();
+        self.status = Some(
+            config::warning_summary(&self.settings.warnings)
+                .unwrap_or_else(|| "설정을 다시 읽었음".to_string()),
+        );
+    }
+
+    fn close_hint(&self) -> String {
+        let keys: Vec<String> = self
+            .settings
+            .keymap
+            .keys_for(Context::Viewer, Action::Quit)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        format!("{}: 닫기", keys.join("/"))
+    }
+
+    fn open_screen(&mut self, title: &str, lines: Vec<String>) {
+        self.status = None;
+        self.screen = Some(TextScreen::new(title, lines, self.close_hint()));
+    }
+
+    /// F1: every binding of the current keymap.
+    pub fn open_help(&mut self) {
+        let lines = screen::help_lines(&self.settings.keymap);
+        self.open_screen("도움말", lines);
+    }
+
+    /// Config file location plus the current bindings.
+    pub fn open_key_settings(&mut self) {
+        let path = self.config_dir.as_deref().map(config::config_file);
+        let exists = path.as_deref().is_some_and(std::path::Path::is_file);
+        let preset = self
+            .settings
+            .config
+            .keys
+            .preset
+            .clone()
+            .unwrap_or_else(|| "mdir".to_string());
+        let lines =
+            screen::key_settings_lines(path.as_deref(), exists, &preset, &self.settings.keymap);
+        self.open_screen("키 설정", lines);
+    }
+
+    pub fn open_warnings(&mut self) {
+        let lines = if self.settings.warnings.is_empty() {
+            vec!["경고 없음".to_string()]
+        } else {
+            self.settings.warnings.clone()
+        };
+        self.open_screen("설정 경고", lines);
+    }
+
+    fn handle_screen_key(&mut self, key: KeyEvent) {
+        let Some(action) = self.settings.keymap.lookup(Context::Viewer, &key) else {
+            return;
+        };
+        if self.screen.as_mut().is_some_and(|s| s.apply(action)) {
+            self.screen = None;
+        }
     }
 
     /// Switch layout mode; the theme follows the per-mode setting.
@@ -326,6 +395,10 @@ impl App {
         }
         if self.dialog.is_some() {
             self.handle_dialog_key(key);
+            return;
+        }
+        if self.screen.is_some() {
+            self.handle_screen_key(key);
             return;
         }
         if self.trash_views[self.active].is_some() {
@@ -420,7 +493,7 @@ impl App {
             Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
             Action::OpenWith => self.unsupported("연결 프로그램 선택"),
             Action::Menu => self.unsupported("메뉴"),
-            Action::Help => self.unsupported("도움말"),
+            Action::Help => self.open_help(),
             Action::Confirm | Action::Cancel => {}
         }
     }
@@ -1178,6 +1251,12 @@ impl App {
         for v in self.trash_views.iter_mut().flatten() {
             v.ensure_visible(rows);
         }
+        let bar_ctx = if self.trash_views[self.active].is_some() {
+            Context::Trash
+        } else {
+            Context::Panel
+        };
+        let fkeys = ui::fkey_bar(&self.settings.keymap, bar_ctx);
         let view = View {
             panels: [&self.panels[0], &self.panels[1]],
             active: self.active,
@@ -1186,8 +1265,13 @@ impl App {
             os: std::env::consts::OS,
             trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
             theme: &self.theme,
+            fkeys: &fkeys,
         };
-        ui::draw(frame, &view);
+        if let Some(scr) = self.screen.as_mut() {
+            screen::render(frame, scr, &self.theme);
+        } else {
+            ui::draw(frame, &view);
+        }
         if let Some((dlg, _)) = &self.dialog {
             dialog::render_themed(frame, frame.area(), dlg, &self.theme);
         }
@@ -1494,6 +1578,153 @@ mod tests {
         assert!(app.trash_views[0].is_some(), "Esc no longer closes");
         press(&mut app, KeyCode::Char('x'));
         assert!(app.trash_views[0].is_none());
+    }
+
+    // ---- HDIR-20: help, key settings, reload ----
+
+    fn draw_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| app.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < w {
+                    let sym = buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    // wide glyphs are followed by a filler cell
+                    x += if unicode_width::UnicodeWidthStr::width(sym) > 1 {
+                        2
+                    } else {
+                        1
+                    };
+                }
+                row
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn page_text(app: &App) -> String {
+        app.screen.as_ref().unwrap().lines.join("\n")
+    }
+
+    #[test]
+    fn f1_opens_the_help_screen_and_esc_closes_it() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(1));
+        assert!(app.screen.is_some());
+        let text = draw_text(&mut app, 80, 24);
+        assert!(text.contains("도움말"), "{text}");
+        assert!(text.contains("F5, Alt+5"), "{text}");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.screen.is_none());
+        assert!(app.running);
+    }
+
+    #[test]
+    fn help_screen_takes_all_keys_and_scrolls() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(1));
+        draw_text(&mut app, 80, 10);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.screen.as_ref().unwrap().scroll, 1);
+        assert_eq!(app.panels[0].cursor, 0, "panel must not move");
+        press(&mut app, KeyCode::F(5));
+        assert!(app.dialog.is_none(), "no copy dialog from help");
+        press(&mut app, KeyCode::End);
+        assert!(app.screen.as_ref().unwrap().scroll > 1);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.screen.is_none());
+        assert!(app.running, "q only closes the help");
+    }
+
+    #[test]
+    fn help_is_generated_from_the_current_keymap() {
+        let (_t, mut app) = configured("[keys.bind]\ncopy = [\"c\"]\n", Some("truecolor"));
+        press(&mut app, KeyCode::F(1));
+        let text = page_text(&app);
+        let copy = text.lines().find(|l| l.contains("복사")).unwrap();
+        assert!(copy.contains('c') && !copy.contains("F5"), "{copy}");
+    }
+
+    #[test]
+    fn key_settings_view_shows_path_and_bindings() {
+        let cfg = config_with("[keys.bind]\ncopy = [\"c\"]\n");
+        let (_t, mut app) = fixture();
+        app.configure(Some(cfg.path().to_path_buf()), Some("truecolor"));
+        app.open_key_settings();
+        let text = page_text(&app);
+        assert!(
+            text.contains(&cfg.path().join("config.toml").display().to_string()),
+            "{text}"
+        );
+        assert!(text.contains("키 프리셋: mdir"));
+        assert!(text.lines().any(|l| l.contains("복사") && l.contains('c')));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.screen.is_none());
+    }
+
+    #[test]
+    fn reload_applies_theme_keys_and_assoc_immediately() {
+        let cfg = config_with("");
+        let (_t, mut app) = fixture();
+        app.configure(Some(cfg.path().to_path_buf()), Some("truecolor"));
+        assert_eq!(app.theme.name, "mdir");
+        fs::write(
+            cfg.path().join("config.toml"),
+            "[theme]\nclassic = \"dark\"\n[keys.bind]\ncopy = [\"c\"]\n[[assoc]]\next = [\"md\"]\ncmd = \"cat {}\"\n",
+        )
+        .unwrap();
+        press(&mut app, KeyCode::Down);
+        app.reload_config();
+        assert_eq!(app.theme.name, "dark");
+        assert_eq!(app.status.as_deref(), Some("설정을 다시 읽었음"));
+        press(&mut app, KeyCode::F(5));
+        assert!(app.dialog.is_none());
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.dialog.is_some());
+        assert!(
+            app.settings
+                .assoc
+                .find(std::ffi::OsStr::new("a.md"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn reload_keeps_mode_and_reports_warnings() {
+        let cfg = config_with("");
+        let (_t, mut app) = fixture();
+        app.configure(Some(cfg.path().to_path_buf()), Some("truecolor"));
+        app.set_mode(Mode::Dev);
+        fs::write(
+            cfg.path().join("config.toml"),
+            "[theme]\ndev = \"light\"\nclassic = \"nope\"\n[keys.bind]\nfrob = \"F5\"\n",
+        )
+        .unwrap();
+        app.reload_config();
+        assert_eq!(app.mode, Mode::Dev);
+        assert_eq!(app.theme.name, "light");
+        let st = app.status.clone().unwrap();
+        assert!(
+            st.starts_with("설정 경고: ") && st.contains("(외 1개)"),
+            "{st}"
+        );
+    }
+
+    #[test]
+    fn warnings_view_lists_every_warning() {
+        let cfg = config_with("[theme]\nclassic = \"nope\"\n[keys.bind]\nfrob = \"F5\"\n");
+        let (_t, mut app) = fixture();
+        app.configure(Some(cfg.path().to_path_buf()), Some("truecolor"));
+        app.open_warnings();
+        let text = page_text(&app);
+        assert!(text.contains("nope") && text.contains("frob"), "{text}");
+        let (_t, mut app) = fixture();
+        app.open_warnings();
+        assert!(page_text(&app).contains("경고 없음"));
     }
 
     #[test]

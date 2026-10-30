@@ -12,6 +12,7 @@ pub mod panel;
 pub mod platform;
 pub mod preview;
 pub mod remote;
+pub mod screen;
 pub mod servers;
 pub mod term;
 pub mod theme;

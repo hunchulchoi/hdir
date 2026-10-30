@@ -1,12 +1,14 @@
 //! Layout rendering (pure: draws a `View` into a ratatui `Frame`, no IO).
 
 use ratatui::Frame;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::keymap::{Action, Context, Keymap};
 use crate::panel::{Entry, EntryKind, Panel};
 use crate::theme::Theme;
 use crate::trash::{TrashEntry, TrashView, format_local};
@@ -20,34 +22,78 @@ pub struct View<'a> {
     /// A panel showing the trash instead of its directory.
     pub trash: [Option<&'a TrashView>; 2],
     pub theme: &'a Theme,
+    /// F-key bar `(key, label)` slots, see [`fkey_bar`].
+    pub fkeys: &'a [(String, String)],
 }
 
-const FKEYS: [(&str, &str); 10] = [
-    ("1", "Help"),
-    ("2", "Rename"),
-    ("3", "View"),
-    ("4", "Edit"),
-    ("5", "Copy"),
-    ("6", "Move"),
-    ("7", "Mkdir"),
-    ("8", "Del"),
-    ("9", "Menu"),
-    ("10", "Quit"),
+/// F-key bar slots: the action each slot stands for and its label.
+const PANEL_BAR: [Option<(Action, &str)>; 10] = [
+    Some((Action::Help, "Help")),
+    Some((Action::Rename, "Rename")),
+    Some((Action::View, "View")),
+    Some((Action::Edit, "Edit")),
+    Some((Action::Copy, "Copy")),
+    Some((Action::Move, "Move")),
+    Some((Action::Mkdir, "Mkdir")),
+    Some((Action::Delete, "Del")),
+    Some((Action::Menu, "Menu")),
+    Some((Action::Quit, "Quit")),
 ];
 
-/// F-key bar while a panel shows the trash; unavailable keys stay blank.
-const TRASH_FKEYS: [(&str, &str); 10] = [
-    ("1", ""),
-    ("2", ""),
-    ("3", ""),
-    ("4", ""),
-    ("5", "Restore"),
-    ("6", ""),
-    ("7", ""),
-    ("8", "Purge"),
-    ("Esc", "Back"),
-    ("10", "Quit"),
+/// F-key bar while a panel shows the trash; unavailable slots stay blank.
+const TRASH_BAR: [Option<(Action, &str)>; 10] = [
+    None,
+    None,
+    None,
+    None,
+    Some((Action::Copy, "Restore")),
+    None,
+    None,
+    Some((Action::Delete, "Purge")),
+    Some((Action::Cancel, "Back")),
+    Some((Action::Quit, "Quit")),
 ];
+
+/// The key to show for `action`: a plain F-key if bound (shown as its number),
+/// else the shortest binding. `None` when the action has no key.
+fn key_label(km: &Keymap, ctx: Context, action: Action) -> Option<String> {
+    let keys = km.keys_for(ctx, action);
+    if let Some(n) = keys.iter().find_map(|k| match (k.code, k.mods.is_empty()) {
+        (KeyCode::F(n), true) => Some(n),
+        _ => None,
+    }) {
+        return Some(n.to_string());
+    }
+    keys.iter()
+        .map(ToString::to_string)
+        .min_by_key(|s| s.width())
+}
+
+/// `(key, label)` for the 10 bar slots of `ctx` (`Trash` or anything else = panel),
+/// generated from the keymap so remaps show immediately.
+pub fn fkey_bar(km: &Keymap, ctx: Context) -> Vec<(String, String)> {
+    let slots = if ctx == Context::Trash {
+        &TRASH_BAR
+    } else {
+        &PANEL_BAR
+    };
+    let ctx = if ctx == Context::Trash {
+        Context::Trash
+    } else {
+        Context::Panel
+    };
+    slots
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| match slot {
+            None => ((i + 1).to_string(), String::new()),
+            Some((action, label)) => match key_label(km, ctx, *action) {
+                Some(k) => (k, (*label).to_string()),
+                None => (String::new(), String::new()),
+            },
+        })
+        .collect()
+}
 
 /// Offset that keeps `cursor` within a window of `height` rows, starting from `scroll`.
 pub fn visible_offset(cursor: usize, scroll: usize, height: usize) -> usize {
@@ -369,12 +415,12 @@ fn default_status(panel: &Panel) -> String {
     format!("{files} files · {dirs} dirs")
 }
 
-fn fkey_line(width: usize, keys: &[(&str, &str); 10], theme: &Theme) -> Line<'static> {
+fn fkey_line(width: usize, keys: &[(String, String)], theme: &Theme) -> Line<'static> {
     let label_style = Style::default()
         .fg(theme.fkey_label_fg)
         .bg(theme.fkey_label_bg);
     let num_style = Style::default().fg(theme.fkey_num_fg).bg(theme.fkey_num_bg);
-    let slot = width / keys.len();
+    let slot = width / keys.len().max(1);
     let mut spans = Vec::new();
     for (i, (n, l)) in keys.iter().enumerate() {
         let w = if i == keys.len() - 1 {
@@ -382,11 +428,16 @@ fn fkey_line(width: usize, keys: &[(&str, &str); 10], theme: &Theme) -> Line<'st
         } else {
             slot
         };
-        spans.push(Span::styled((*n).to_string(), num_style));
+        let key_w = n.width().min(w);
         spans.push(Span::styled(
-            fit_width(l, w.saturating_sub(n.len())),
-            label_style,
+            if key_w == n.width() {
+                n.clone()
+            } else {
+                fit_width(n, key_w)
+            },
+            num_style,
         ));
+        spans.push(Span::styled(fit_width(l, w - key_w), label_style));
     }
     Line::from(spans)
 }
@@ -439,13 +490,8 @@ pub fn draw(frame: &mut Frame, view: &View) {
             .style(Style::default().fg(theme.status_fg).bg(theme.status_bg)),
         rows[2],
     );
-    let keys = if view.trash[active].is_some() {
-        &TRASH_FKEYS
-    } else {
-        &FKEYS
-    };
     frame.render_widget(
-        Paragraph::new(fkey_line(area.width as usize, keys, view.theme)),
+        Paragraph::new(fkey_line(area.width as usize, view.fkeys, view.theme)),
         rows[3],
     );
 }
@@ -453,6 +499,7 @@ pub fn draw(frame: &mut Frame, view: &View) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::{Context, Keymap};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -509,6 +556,7 @@ mod tests {
             os: "macos",
             trash: [None, None],
             theme: &th(),
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -662,6 +710,7 @@ mod tests {
             os: "macos",
             trash: [None, None],
             theme,
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -781,6 +830,91 @@ mod tests {
         assert_eq!(name_fg(&buf, 1), Color::Rgb(9, 9, 9));
     }
 
+    // ---- HDIR-20: F-key bar from the keymap ----
+
+    fn km_with(src: &str) -> Keymap {
+        let cfg: crate::keymap::KeysConfig = toml::from_str(src).unwrap();
+        crate::keymap::build(&cfg).0
+    }
+
+    fn bar(km: &Keymap, ctx: Context) -> Vec<(String, String)> {
+        fkey_bar(km, ctx)
+    }
+
+    fn pair(n: &str, l: &str) -> (String, String) {
+        (n.to_string(), l.to_string())
+    }
+
+    #[test]
+    fn default_panel_bar_matches_the_classic_f_keys() {
+        let got = bar(&Keymap::preset("mdir").unwrap(), Context::Panel);
+        let want = [
+            ("1", "Help"),
+            ("2", "Rename"),
+            ("3", "View"),
+            ("4", "Edit"),
+            ("5", "Copy"),
+            ("6", "Move"),
+            ("7", "Mkdir"),
+            ("8", "Del"),
+            ("9", "Menu"),
+            ("10", "Quit"),
+        ]
+        .map(|(n, l)| pair(n, l));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn trash_bar_labels_only_available_actions() {
+        let got = bar(&Keymap::preset("mdir").unwrap(), Context::Trash);
+        assert_eq!(got.len(), 10);
+        assert_eq!(got[0], pair("1", ""));
+        assert_eq!(got[4], pair("5", "Restore"));
+        assert_eq!(got[7], pair("8", "Purge"));
+        assert_eq!(got[8], pair("Esc", "Back"));
+        assert_eq!(got[9], pair("10", "Quit"));
+        assert!(got.iter().all(|(_, l)| l != "Copy" && l != "Mkdir"));
+    }
+
+    #[test]
+    fn remapped_keys_show_in_the_bar_f_key_preferred_else_shortest() {
+        let km = km_with(
+            "[bind]\ncopy = [\"c\"]\nmove = [\"Alt+6\", \"F6\"]\nmkdir = [\"Ctrl+Shift+x\", \"Alt+m\"]\nview = []\n",
+        );
+        let got = bar(&km, Context::Panel);
+        assert_eq!(got[4], pair("c", "Copy"));
+        assert_eq!(got[5], pair("6", "Move"), "F-key preferred over Alt+6");
+        assert_eq!(got[6], pair("Alt+M", "Mkdir"), "shortest of the rest");
+        assert_eq!(
+            got[2],
+            pair("", ""),
+            "disabled action leaves the slot blank"
+        );
+    }
+
+    #[test]
+    fn draw_shows_remapped_key_in_fkey_row() {
+        let km = km_with("[bind]\ncopy = [\"c\"]\n");
+        let pa = fixed_panel("/tmp/a", &[]);
+        let pb = fixed_panel("/tmp/b", &[]);
+        let fkeys = fkey_bar(&km, Context::Panel);
+        let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let view = View {
+            panels: [&pa, &pb],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            trash: [None, None],
+            theme: &th(),
+            fkeys: &fkeys,
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        let row11 = row(t.backend().buffer(), 11);
+        assert!(row11.contains("cCopy"), "{row11}");
+        assert!(!row11.contains("5Copy"));
+    }
+
     #[test]
     fn long_korean_name_stays_inside_border() {
         let (a, b) = setup();
@@ -878,6 +1012,7 @@ mod tests {
             os: "macos",
             trash: [Some(tv), None],
             theme: &th(),
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
