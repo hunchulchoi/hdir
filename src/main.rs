@@ -25,8 +25,9 @@ fn run(
             dirty = false;
         }
         if event::poll(Duration::from_millis(50))? {
-            dirty = app.handle_event(event::read()?);
+            dirty |= app.handle_event(event::read()?);
         }
+        dirty |= app.tick();
     }
     Ok(())
 }

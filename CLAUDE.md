@@ -51,7 +51,19 @@ Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 전체 계�
 - 판정(메인): Critical/High → 수정 후 재리뷰. Medium → 수정 또는 Plane 이슈 등록. 오탐 → PR 코멘트에 사유.
 - 리뷰 요약을 PR 본문과 Plane 이슈 코멘트에 기록.
 
-## 6. 코드 원칙
+## 6. Linux 테스트
+- 로컬은 macOS. Linux 동작(renameat2, non-UTF-8 파일명, FIFO, 대소문자 구분 FS, 원격 `find -printf` 등)은 Linux 서버에서 검증한다.
+- 서버: `ssh choi@stage.devfor.link`, 경로 `/home/choi/workspace/project/hdir` (origin = GitHub 리포 clone).
+- 절차: 브랜치를 push한 뒤 서버에서 같은 브랜치를 맞추고 게이트 실행.
+  ```sh
+  git push
+  ssh choi@stage.devfor.link 'cd /home/choi/workspace/project/hdir && git fetch -q origin && git checkout -q <branch> && git reset -q --hard origin/<branch> && source ~/.cargo/env && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test'
+  ```
+- 시점: PR 생성 전 필수, `#[cfg(target_os = "linux")]`·플랫폼 분기 코드를 바꾼 체크포인트마다 실행.
+- 결과(통과 수, 실패 원문)를 PR 본문과 Plane 이슈 코멘트에 `[linux]` 태그로 기록.
+- 서버 작업 디렉터리에서는 테스트만 한다. 서버에서 커밋·push 금지, 리포 밖 파일 수정 금지.
+
+## 7. 코드 원칙
 - 반응성 최우선: UI 스레드에서 블로킹 IO(원격 명령, 큰 복사) 금지 → 워커 스레드 + mpsc.
 - 외부 명령 인자는 셸 이스케이프 필수. 파일명은 공백·한글·따옴표·개행 포함을 가정.
 - 기본 테마는 `mdir` (DOS 16색 팔레트).

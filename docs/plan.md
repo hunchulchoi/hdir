@@ -168,6 +168,13 @@ shell/
    - 진행률: 선택 항목별 scp 실행 → `전송 중 3/12 · prod-web` 표시, 시작 전 원격 `du -sb`로 총 크기 계산해 바이트 진행률 근사.
    - 덮어쓰기 충돌: 대상 존재 여부 사전 확인 → 기존 충돌 dialog 재사용.
    - Esc로 전송 취소(scp 프로세스 kill, 부분 파일 남음을 알림).
+12-0. **휴지통 보기·복원**
+   - F8은 OS 휴지통으로 이동(macOS Finder 휴지통, Linux freedesktop). Alt+F8 또는 `:trash`로 활성 패널을 "휴지통" 가상 위치로 전환.
+   - 목록: 이름 · 원래 경로 · 삭제 시각 · 크기 (최근 삭제순). Enter/F5 = 원래 위치로 복원, F8 = 영구 삭제(빨간 경고), Backspace/Esc = 이전 위치 복귀.
+   - 원래 경로에 같은 이름이 있으면 덮어쓰지 않고 충돌 dialog(이름 바꿔 복원 / 건너뛰기).
+   - 백엔드 `TrashStore { list, restore, purge }`: Linux는 `trash::os_limited`, macOS는 `NSFileManager trashItemAtURL:resultingItemURL`로 실제 휴지통 경로를 받아 hdir 인덱스(`~/.local/share/hdir/trash-index.jsonl`)에 기록 후 인덱스 기반 복원. 인덱스에 없는 항목은 원래 경로 미상 → 복원 시 대상 폴더 입력.
+   - Ctrl+Z: 방금 F8로 보낸 항목 복원.
+   - 복원·영구 삭제는 워커 스레드에서 실행.
 12-1. **키 설정 (키맵 변경)**
    - 모든 조작은 `Action` enum(`cursor_up`, `enter`, `parent`, `switch_panel`, `toggle_select`, `view`, `edit`, `copy`, `move`, `mkdir`, `rename`, `delete`, `menu`, `quit`, `quit_no_cd`, `undo`, `command_line`, `toggle_mode`, `toggle_hidden`, `connect_left`, `connect_right`, `open_with` …)로 정의. 키 → Action은 테이블 조회만 → 하드코딩 금지.
    - 내장 프리셋: `mdir`(기본, 위 F키 표), `vim`(hjkl·`/`·`yy`→copy 등 단일키 위주). `keys.preset = "mdir"`.
