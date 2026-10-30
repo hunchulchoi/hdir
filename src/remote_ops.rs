@@ -1243,6 +1243,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&a).unwrap().ino(), ino);
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "edited shared");
         no_temp_left(&dir);
+        assert!(backups(&dir).is_empty(), "backup removed after success");
     }
 
     #[test]
@@ -1350,6 +1351,38 @@ mod tests {
         let out = local_session(&dir).exec(&cmd).unwrap();
         assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "other");
+    }
+
+    #[test]
+    fn real_replace_refuses_a_change_made_while_the_checksum_runs() {
+        // cksum reads the old content, then the file grows behind it
+        let (_t, dir, cmd) = replace_with_fakes(
+            &[(
+                "cksum",
+                "/usr/bin/cksum \"$@\"; r=$?; printf more >> \"$(dirname \"$0\")/../d/a\"; exit $r",
+            )],
+            false,
+        );
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a")).unwrap(),
+            "sharedmore"
+        );
+    }
+
+    #[test]
+    fn real_replace_of_a_changed_hard_linked_file_makes_no_backup() {
+        // a fake cp records any backup attempt
+        let (_t, dir, cmd) = hard_linked_with_fakes(&[(
+            "cp",
+            ": > \"$(dirname \"$0\")/cp-called\"; exec /bin/cp \"$@\"",
+        )]);
+        std::fs::write(dir.join("a"), "changed!").unwrap();
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
+        assert!(!dir.parent().unwrap().join("bin/cp-called").exists());
+        assert!(backups(&dir).is_empty());
     }
 
     /// Fake `stat` reporting group 999999 for `stat -c|-f %g`, so the group

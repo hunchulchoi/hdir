@@ -476,13 +476,21 @@ pub const REPLACE_CHANGED: i32 = 36;
 
 /// Shell that sets `s` (inode, mtime, size, following symlinks) and `k`
 /// (`cksum` of the content) for the file named by `$var`; fails without
-/// reading anything unless it is a regular file (a FIFO would block).
+/// reading anything unless it is a regular file (a FIFO would block), and
+/// when the `stat` fields changed while the checksum ran.
 fn stamp_vars(os: &RemoteOs, var: &str) -> String {
-    let st = match os {
+    let st = stat_stamp_args(os);
+    format!(
+        "[ -f \"${var}\" ] && s=$({st} \"${var}\") && k=$(cksum < \"${var}\") && [ \"$({st} \"${var}\")\" = \"$s\" ]"
+    )
+}
+
+/// `stat` fields `inode mtime size` (symlinks followed) of `os`.
+fn stat_stamp_args(os: &RemoteOs) -> &'static str {
+    match os {
         RemoteOs::Bsd => "stat -L -f '%i %m %z' --",
         RemoteOs::Linux | RemoteOs::Other(_) => "stat -L -c '%i %Y %s' --",
-    };
-    format!("[ -f \"${var}\" ] && s=$({st} \"${var}\") && k=$(cksum < \"${var}\")")
+    }
 }
 
 /// Prints a fingerprint of the file at `path` (inode, mtime, size and a
@@ -531,7 +539,8 @@ fn stat_meta_args(os: &RemoteOs) -> &'static str {
 ///   the verified temp content is written in place with `cat`. If that write
 ///   fails the backup is copied back ([`REPLACE_RESTORED`]); if restoring
 ///   fails too, the backup and the temp stay ([`REPLACE_BACKUP_KEPT`], the
-///   backup path printed NUL-terminated).
+///   backup path printed NUL-terminated). An original whose `stat` fields
+///   already differ from `expect` is refused before any backup is made.
 ///
 /// - before the `mv`, the temp gets the original's group (`chgrp`, then the
 ///   mode again, as `chgrp` may clear setgid); when that is not allowed
@@ -560,7 +569,11 @@ pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64, expect: &[
             "changed() {{ echo 'changed on the remote since it was downloaded' >&2; exit {REPLACE_CHANGED}; }}\n"
         )
         .as_bytes(),
+        format!("pre() {{ [ \"$({} \"$o\")\" = ", stat_stamp_args(os)).as_bytes(),
+        &sh_quote(&expect.split(|&b| b == b' ').take(3).collect::<Vec<_>>().join(&b' ')),
+        b" ]; }\n",
         b"if [ \"$2\" -gt 1 ]; then\n  \
+          pre || changed\n  \
           b=$(mktemp \"${o%/*}/.hdir-bak.XXXXXX\") || exit 1\n  \
           cp -- \"$o\" \"$b\" || { rm -f -- \"$b\"; exit 1; }\n  \
           same || { rm -f -- \"$b\"; changed; }\n  \
@@ -1214,7 +1227,7 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     fn stamp_cmd_prints_inode_mtime_size_and_checksum_following_links() {
         assert_eq!(
             s(stamp_cmd(&RemoteOs::Linux, b"/d/it's")),
-            "f='/d/it'\\''s'; [ -f \"$f\" ] && s=$(stat -L -c '%i %Y %s' -- \"$f\") && k=$(cksum < \"$f\") || { echo 'not a readable regular file' >&2; exit 1; }; printf '%s %s' \"$s\" \"$k\""
+            "f='/d/it'\\''s'; [ -f \"$f\" ] && s=$(stat -L -c '%i %Y %s' -- \"$f\") && k=$(cksum < \"$f\") && [ \"$(stat -L -c '%i %Y %s' -- \"$f\")\" = \"$s\" ] || { echo 'not a readable regular file' >&2; exit 1; }; printf '%s %s' \"$s\" \"$k\""
         );
         assert!(s(stamp_cmd(&RemoteOs::Bsd, b"/x")).contains("stat -L -f '%i %m %z' -- \"$f\""));
     }
@@ -1282,11 +1295,16 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         assert!(l.find("exit 31").unwrap() < l.find("cat --").unwrap());
         assert!(
             l.contains(
-                "same() { [ -f \"$o\" ] && s=$(stat -L -c '%i %Y %s' -- \"$o\") && k=$(cksum < \"$o\") && [ \"$s $k\" = '7 99 42 1234 42' ]; }\n"
+                "same() { [ -f \"$o\" ] && s=$(stat -L -c '%i %Y %s' -- \"$o\") && k=$(cksum < \"$o\") && [ \"$(stat -L -c '%i %Y %s' -- \"$o\")\" = \"$s\" ] && [ \"$s $k\" = '7 99 42 1234 42' ]; }\n"
             ),
             "{l}"
         );
         assert!(l.contains("exit 36; }\n"), "{l}");
+        assert!(
+            l.contains("pre() { [ \"$(stat -L -c '%i %Y %s' -- \"$o\")\" = '7 99 42' ]; }\n"),
+            "{l}"
+        );
+        assert!(l.find("pre || changed").unwrap() < l.find("b=$(mktemp").unwrap());
         // checked right before each write: after the backup, after chgrp/chmod
         let backup = l.find("cp -- \"$o\" \"$b\"").unwrap();
         let recheck_ln = l.find("same || { rm -f -- \"$b\"; changed; }").unwrap();
