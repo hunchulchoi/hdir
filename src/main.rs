@@ -36,6 +36,10 @@ fn run(
             app.run_edit(|f| term::suspend(terminal, f));
             dirty = true;
         }
+        if app.has_pending_run() {
+            app.run_pending(|f| term::suspend(terminal, f));
+            dirty = true;
+        }
         dirty |= app.tick();
     }
     Ok(())
