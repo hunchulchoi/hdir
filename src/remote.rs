@@ -275,6 +275,35 @@ pub fn head_cmd(path: &[u8], max: usize) -> Vec<u8> {
     cat(&[format!("head -c {max} -- ").as_bytes(), &sh_quote(path)])
 }
 
+/// Exit codes of [`preview_cmd`] for things that are not regular files.
+pub const PREVIEW_DIR: i32 = 20;
+pub const PREVIEW_SPECIAL: i32 = 21;
+pub const PREVIEW_MISSING: i32 = 22;
+pub const PREVIEW_BROKEN: i32 = 23;
+
+/// One round trip for a preview: a directory exits [`PREVIEW_DIR`], other
+/// non-regular files (fifo, device, socket: `head` could block) exit
+/// [`PREVIEW_SPECIAL`]; a regular file prints its size and a newline, then
+/// the first `max` bytes (`head -c`). Symlinks are followed.
+pub fn preview_cmd(path: &[u8], max: usize) -> Vec<u8> {
+    let q = sh_quote(path);
+    cat(&[
+        b"if [ -d ",
+        &q,
+        format!(" ]; then exit {PREVIEW_DIR}; elif [ -f ").as_bytes(),
+        &q,
+        b" ]; then n=$(wc -c < ",
+        &q,
+        b") || exit 1; printf '%s\\n' $n; ",
+        &head_cmd(path, max),
+        format!("; elif [ -e ").as_bytes(),
+        &q,
+        format!(" ]; then exit {PREVIEW_SPECIAL}; elif [ -L ").as_bytes(),
+        &q,
+        format!(" ]; then exit {PREVIEW_BROKEN}; else exit {PREVIEW_MISSING}; fi").as_bytes(),
+    ])
+}
+
 pub fn mkdir_cmd(path: &[u8]) -> Vec<u8> {
     cat(&[b"mkdir -- ", &sh_quote(path)])
 }
@@ -883,6 +912,28 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         let c = s(rename_cmd(b"/d/-a", b"/d/b\nc"));
         assert!(c.ends_with("mv -n -- '/d/-a' '/d/b\nc'"), "{c}");
         assert_eq!(RENAME_EXISTS, 17);
+    }
+
+    #[test]
+    fn preview_cmd_classifies_then_prints_size_and_head() {
+        assert_eq!(
+            s(preview_cmd(b"/d/it's -x", 65539)),
+            "if [ -d '/d/it'\\''s -x' ]; then exit 20; \
+             elif [ -f '/d/it'\\''s -x' ]; then n=$(wc -c < '/d/it'\\''s -x') || exit 1; \
+             printf '%s\\n' $n; head -c 65539 -- '/d/it'\\''s -x'; \
+             elif [ -e '/d/it'\\''s -x' ]; then exit 21; \
+             elif [ -L '/d/it'\\''s -x' ]; then exit 23; \
+             else exit 22; fi"
+        );
+        assert_eq!(
+            (
+                PREVIEW_DIR,
+                PREVIEW_SPECIAL,
+                PREVIEW_MISSING,
+                PREVIEW_BROKEN
+            ),
+            (20, 21, 22, 23)
+        );
     }
 
     #[test]

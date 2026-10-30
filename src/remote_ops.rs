@@ -7,8 +7,15 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::platform::os_bytes;
-use crate::remote::{RENAME_EXISTS, home_cmd, mkdir_cmd, rename_cmd, rm_cmd, rmdir_cmd};
+use crate::preview::{self, Limits, Preview};
+use crate::remote::{
+    PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING, PREVIEW_SPECIAL, RENAME_EXISTS, home_cmd,
+    mkdir_cmd, preview_cmd, rename_cmd, rm_cmd, rmdir_cmd,
+};
 use crate::session::{CmdOutput, RemoteSession, first_line};
+
+/// Text shown for a FIFO, socket or device (same as the local Enter message).
+pub const SPECIAL_FILE: &str = "특수 파일은 열 수 없음";
 
 /// A name that is safe to join onto a remote directory.
 pub fn validate_name(name: &str) -> Result<(), String> {
@@ -117,6 +124,74 @@ pub fn delete(s: &RemoteSession, cwd: &Path, names: &[OsString]) -> Result<(), S
     }
     let refs: Vec<&[u8]> = paths.iter().map(Vec::as_slice).collect();
     run_ok(s, &rm_cmd(&refs)).map(|_| ())
+}
+
+/// Read the head of a remote file (or summarize a directory) like the local
+/// preview does: at most `limits.max_bytes` (+3 so a split character can be
+/// completed) cross the wire, then [`preview::classify_with`] decides.
+pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
+    let bytes = os_bytes(path.as_os_str());
+    let out = match s.exec(&preview_cmd(&bytes, limits.max_bytes + 3)) {
+        Ok(o) => o,
+        Err(e) => return Preview::Error(e.message()),
+    };
+    match out.code {
+        Some(0) => {}
+        Some(PREVIEW_DIR) => return remote_dir_info(s, path),
+        Some(PREVIEW_SPECIAL) => {
+            return Preview::Binary {
+                size: 0,
+                kind: "특수 파일",
+            };
+        }
+        Some(PREVIEW_MISSING) => return Preview::Error("파일 없음".into()),
+        Some(PREVIEW_BROKEN) => return Preview::Error("깨진 링크".into()),
+        c => {
+            return Preview::Error(first_line(
+                &out.stderr,
+                &format!("종료 코드 {}", c.unwrap_or(-1)),
+            ));
+        }
+    }
+    let nl = out.stdout.iter().position(|&b| b == b'\n');
+    let size = nl
+        .and_then(|i| std::str::from_utf8(&out.stdout[..i]).ok())
+        .and_then(|t| t.trim().parse::<u64>().ok());
+    let (Some(nl), Some(size)) = (nl, size) else {
+        return Preview::Error("원격 응답을 해석할 수 없음".into());
+    };
+    preview::classify_with(&out.stdout[nl + 1..], size, limits)
+}
+
+fn remote_dir_info(s: &RemoteSession, path: &Path) -> Preview {
+    match s.list(path, true) {
+        // The listing starts with "..", which is not an entry of the directory.
+        Ok((entries, _)) => {
+            let n = entries.iter().filter(|e| e.name != "..").count();
+            Preview::Info(format!("원격 디렉터리 · 항목 {n}개"))
+        }
+        Err(e) => Preview::Error(e),
+    }
+}
+
+/// Is the remote file text (first 8 KiB)? Mirrors the local probe: special
+/// files and errors are `Err`.
+pub fn probe_text(s: &RemoteSession, path: &Path) -> Result<bool, String> {
+    let limits = Limits {
+        max_bytes: 8 * 1024,
+        ..Limits::PREVIEW
+    };
+    match preview(s, path, limits) {
+        Preview::Text { .. } | Preview::Empty => Ok(true),
+        Preview::Binary {
+            kind: "특수 파일",
+        ..
+        } => Err(SPECIAL_FILE.into()),
+        Preview::Binary { .. } => Ok(false),
+        Preview::Info(_) => Err("디렉터리".into()),
+        Preview::Dir { .. } => Err("디렉터리".into()),
+        Preview::Error(e) => Err(e),
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -300,6 +375,126 @@ mod tests {
             assert!(delete(&s, &p("/srv"), &[OsString::from("a")]).is_err());
             assert!(only_rm(&f).is_empty());
         }
+    }
+
+    // ---- HDIR-39: preview / probe ----
+
+    use crate::preview::{Limits, Preview};
+
+    /// Answers a preview command with `size\nbody`.
+    fn serving(size: u64, body: &'static [u8]) -> Arc<FakeCmd> {
+        FakeCmd::new(move |_| {
+            let mut o = crate::session::CmdOutput {
+                code: Some(0),
+                ..Default::default()
+            };
+            o.stdout = format!("{size}\n").into_bytes();
+            o.stdout.extend_from_slice(body);
+            o
+        })
+    }
+
+    #[test]
+    fn preview_reads_head_and_classifies_text() {
+        let f = serving(12, b"hello\nworld\n");
+        let s = session(Arc::clone(&f));
+        let got = preview(&s, &p("/srv/a b.txt"), Limits::PREVIEW);
+        assert_eq!(
+            got,
+            Preview::Text {
+                lines: vec!["hello".into(), "world".into()],
+                truncated: false
+            }
+        );
+        let want = crate::remote::preview_cmd(b"/srv/a b.txt", Limits::PREVIEW.max_bytes + 3);
+        assert_eq!(f.remote_cmds(), vec![String::from_utf8(want).unwrap()]);
+    }
+
+    #[test]
+    fn preview_of_a_bigger_file_is_marked_truncated_and_viewer_reads_4_mib() {
+        let f = serving(9_000_000, b"line\n");
+        let s = session(Arc::clone(&f));
+        match preview(&s, &p("/srv/big"), Limits::VIEWER) {
+            Preview::Text { truncated, .. } => assert!(truncated),
+            other => panic!("{other:?}"),
+        }
+        assert!(f.remote_cmds()[0].contains("head -c 4194307 -- '/srv/big'"));
+    }
+
+    #[test]
+    fn preview_binary_and_empty() {
+        let f = serving(4, b"\x00\x01\x02\x03");
+        assert!(matches!(
+            preview(&session(f), &p("/b"), Limits::PREVIEW),
+            Preview::Binary { size: 4, .. }
+        ));
+        let f = serving(0, b"");
+        assert_eq!(
+            preview(&session(f), &p("/e"), Limits::PREVIEW),
+            Preview::Empty
+        );
+    }
+
+    #[test]
+    fn preview_special_missing_broken_and_failures() {
+        let by = |c: i32, err: &'static str| {
+            let f = FakeCmd::new(move |_| fail(c, err));
+            preview(&session(f), &p("/x"), Limits::PREVIEW)
+        };
+        assert_eq!(
+            by(21, ""),
+            Preview::Binary {
+                size: 0,
+                kind: "특수 파일"
+            }
+        );
+        assert_eq!(by(22, ""), Preview::Error("파일 없음".into()));
+        assert_eq!(by(23, ""), Preview::Error("깨진 링크".into()));
+        assert_eq!(
+            by(1, "wc: /x: Permission denied\n"),
+            Preview::Error("wc: /x: Permission denied".into())
+        );
+        assert_eq!(
+            by(255, ""),
+            Preview::Error(crate::session::DISCONNECTED_MSG.into())
+        );
+    }
+
+    #[test]
+    fn preview_of_a_remote_dir_counts_entries() {
+        let f = FakeCmd::new(|a| {
+            let c = crate::testutil::remote_cmd(a).unwrap_or("");
+            if c.starts_with("if [ -d") {
+                code(20)
+            } else {
+                ok("f\t5\t1700000000.0\t644\t\ta\0d\t5\t1700000000.0\t755\t\tb\0")
+            }
+        });
+        assert_eq!(
+            preview(&session(f), &p("/srv/d"), Limits::PREVIEW),
+            Preview::Info("원격 디렉터리 · 항목 2개".into())
+        );
+    }
+
+    #[test]
+    fn probe_text_follows_the_first_chunk() {
+        assert_eq!(probe_text(&session(serving(3, b"abc")), &p("/t")), Ok(true));
+        assert_eq!(probe_text(&session(serving(0, b"")), &p("/t")), Ok(true));
+        assert_eq!(
+            probe_text(&session(serving(2, b"\x00\x00")), &p("/t")),
+            Ok(false)
+        );
+        let sp = FakeCmd::new(|_| code(21));
+        assert_eq!(
+            probe_text(&session(sp), &p("/t")),
+            Err("특수 파일은 열 수 없음".into())
+        );
+        let missing = FakeCmd::new(|_| code(22));
+        assert!(probe_text(&session(missing), &p("/t")).is_err());
+        let f = serving(3, b"abc");
+        let s = session(Arc::clone(&f));
+        let _ = probe_text(&s, &p("/t"));
+        assert!(f.remote_cmds()[0].contains("head -c 8195 -- '/t'"));
     }
 
     #[test]

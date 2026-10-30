@@ -682,6 +682,7 @@ fn preview_lines(p: &Preview) -> Vec<String> {
         }
         Preview::Empty => vec!["빈 파일".to_string()],
         Preview::Error(e) => vec![format!("오류: {e}")],
+        Preview::Info(m) => vec![m.clone()],
         Preview::Dir {
             files,
             dirs,
@@ -1734,6 +1735,10 @@ mod tests {
     fn preview_lines_cover_every_kind() {
         let l = |p: &Preview| preview_lines(p);
         assert_eq!(l(&Preview::Empty), ["빈 파일"]);
+        assert_eq!(
+            l(&Preview::Info("원격 디렉터리 · 항목 3개".into())),
+            ["원격 디렉터리 · 항목 3개"]
+        );
         assert_eq!(
             l(&Preview::Binary {
                 size: 2048,

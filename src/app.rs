@@ -155,7 +155,7 @@ const MENU_OPEN_WITH: usize = 5;
 pub type TextProbe = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
 /// Status shown when Enter lands on a FIFO, socket or device.
-const SPECIAL_FILE: &str = "특수 파일은 열 수 없음";
+const SPECIAL_FILE: &str = remote_ops::SPECIAL_FILE;
 
 /// Reads the first 8 KiB of `path` and classifies it like the preview does.
 /// Errors (vanished, unreadable, dangling symlink, special file) carry the
@@ -224,10 +224,29 @@ pub type PreviewRunner = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
 /// Reads the F3 viewer's file off the UI thread; tests may swap in a gated fake.
 pub type ViewerLoader = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
 
+/// What the Dev preview shows: a path and, for remote panels, the session
+/// that can read it (the same path on another host is a different target).
+#[derive(Debug, Clone)]
+pub struct PreviewTarget {
+    pub path: PathBuf,
+    pub session: Option<Arc<RemoteSession>>,
+}
+
+impl PartialEq for PreviewTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && match (&self.session, &other.session) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
 /// Dev-mode preview bookkeeping: debounce, latest-wins ids, last result.
 pub struct PreviewState {
-    /// Path under the cursor that the preview should show.
-    wanted: Option<PathBuf>,
+    /// Target under the cursor that the preview should show.
+    wanted: Option<PreviewTarget>,
     wanted_at: Instant,
     /// A request for `wanted` has been started (or is done).
     requested: bool,
@@ -236,9 +255,9 @@ pub struct PreviewState {
     in_flight: bool,
     /// Results with another id are stale and dropped.
     latest_id: u64,
-    shown: Option<(PathBuf, Preview)>,
-    tx: Sender<(u64, PathBuf, Preview)>,
-    rx: Receiver<(u64, PathBuf, Preview)>,
+    shown: Option<(PreviewTarget, Preview)>,
+    tx: Sender<(u64, PreviewTarget, Preview)>,
+    rx: Receiver<(u64, PreviewTarget, Preview)>,
 }
 
 impl PreviewState {
@@ -474,6 +493,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub viewer_loader: ViewerLoader,
     viewer_load: Option<ViewerLoad>,
+    /// The session the open viewer's file lives on (`None`: a local file).
+    viewer_session: Option<Arc<RemoteSession>>,
     /// The F9 popup menu (or theme picker).
     pub menu: Option<OpenMenu>,
     /// Starts association programs; tests inject a fake.
@@ -577,6 +598,7 @@ impl App {
             viewer: None,
             viewer_loader: Arc::new(|p| preview::preview_path_with(p, preview::Limits::VIEWER)),
             viewer_load: None,
+            viewer_session: None,
             menu: None,
             launcher: launcher::system_launcher(),
             text_probe: Arc::new(probe_text),
@@ -1381,7 +1403,7 @@ impl App {
         }
         let blocked = match action {
             Action::Copy | Action::Move => remote_any,
-            Action::View | Action::Edit | Action::OpenWith => remote_here,
+            Action::Edit | Action::OpenWith => remote_here,
             _ => false,
         };
         if blocked {
@@ -1541,11 +1563,10 @@ impl App {
     }
 
     /// Path the Dev preview should show: the active panel's cursor entry.
-    fn preview_target(&self) -> Option<PathBuf> {
+    fn preview_target(&self) -> Option<PreviewTarget> {
         if self.mode != Mode::Dev
             || self.viewer.is_some()
             || self.trash_views[self.active].is_some()
-            || self.active_panel().location.is_remote()
         {
             return None;
         }
@@ -1555,7 +1576,10 @@ impl App {
             return self.preview.wanted.clone();
         }
         match panel.current() {
-            Some(e) if e.kind != EntryKind::Parent => Some(panel.cwd.join(&e.os_name)),
+            Some(e) if e.kind != EntryKind::Parent => Some(PreviewTarget {
+                path: panel.cwd.join(&e.os_name),
+                session: panel.location.session().cloned(),
+            }),
             _ => None,
         }
     }
@@ -1590,7 +1614,7 @@ impl App {
                 changed = true;
             }
         }
-        if let Some(path) = st.wanted.clone()
+        if let Some(target) = st.wanted.clone()
             && !st.requested
             && !st.in_flight
             && st.wanted_at.elapsed() >= self.preview_debounce
@@ -1603,9 +1627,16 @@ impl App {
                 // A panicking runner must still report back or the single
                 // slot would stay occupied forever.
                 let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner(&path)))
-                        .unwrap_or_else(|_| Preview::Error("미리보기 실패".into()));
-                let _ = tx.send((id, path, result));
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match &target.session {
+                            Some(sess) => {
+                                remote_ops::preview(sess, &target.path, preview::Limits::PREVIEW)
+                            }
+                            None => runner(&target.path),
+                        }
+                    }))
+                    .unwrap_or_else(|_| Preview::Error("미리보기 실패".into()));
+                let _ = tx.send((id, target, result));
             });
         }
         changed
@@ -1647,7 +1678,10 @@ impl App {
     /// F3: view the current file (directories and `..` do nothing).
     fn open_viewer(&mut self) {
         if let Some(path) = self.current_file() {
-            self.view_path(path);
+            match self.active_panel().location.session().cloned() {
+                Some(session) => self.view_remote(session, path),
+                None => self.view_path(path),
+            }
         }
     }
 
@@ -1665,6 +1699,15 @@ impl App {
 
     fn view_path(&mut self, path: PathBuf) {
         self.status = None;
+        self.viewer_session = None;
+        self.viewer = Some(Viewer::loading(path.clone()));
+        self.start_viewer_load(path);
+    }
+
+    /// F3 on a remote file: read its head over ssh.
+    fn view_remote(&mut self, session: Arc<RemoteSession>, path: PathBuf) {
+        self.status = None;
+        self.viewer_session = Some(session);
         self.viewer = Some(Viewer::loading(path.clone()));
         self.start_viewer_load(path);
     }
@@ -1674,14 +1717,20 @@ impl App {
     fn start_viewer_load(&mut self, path: PathBuf) {
         let (tx, rx) = mpsc::channel();
         let loader = Arc::clone(&self.viewer_loader);
+        let session = self.viewer_session.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(loader(&path));
+            let preview = match session {
+                Some(s) => remote_ops::preview(&s, &path, preview::Limits::VIEWER),
+                None => loader(&path),
+            };
+            let _ = tx.send(preview);
         });
         self.viewer_load = Some(ViewerLoad { rx });
     }
 
     fn close_viewer(&mut self) {
         self.viewer = None;
+        self.viewer_session = None;
         self.viewer_load = None; // abandon: the worker's send just fails
     }
 
@@ -1960,6 +2009,9 @@ impl App {
             return;
         };
         match action {
+            Action::Edit if self.viewer_session.is_some() => {
+                self.status = Some(REMOTE_UNSUPPORTED.into());
+            }
             Action::Edit => {
                 let path = v.path.clone();
                 self.queue_edit(&path);
@@ -2898,7 +2950,7 @@ impl App {
                 .preview
                 .wanted
                 .as_ref()
-                .and_then(|p| p.file_name())
+                .and_then(|t| t.path.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let body = match (&self.preview.wanted, self.preview.shown_for_wanted()) {
@@ -8005,11 +8057,161 @@ mod tests {
             assert!(!app.panels[1].location.session().unwrap().is_alive());
         }
 
+        // ---- HDIR-39: remote preview and F3 ----
+
+        /// Serve `size\nbody` for preview commands.
+        fn serve_files(f: &FakeSsh, body: &'static str) {
+            script(f, move |a| {
+                let c = crate::testutil::remote_cmd(a)?;
+                if c.starts_with("if [ -d ") {
+                    return Some(out(0, &format!("{}\n{body}", body.len())));
+                }
+                None
+            });
+        }
+
+        fn wait_preview(app: &mut App) {
+            let start = Instant::now();
+            while app.preview_shown().is_none() {
+                assert!(start.elapsed() < Duration::from_secs(5), "preview timeout");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[test]
+        fn dev_preview_of_a_remote_file_reads_the_head_over_ssh() {
+            let (_t, mut app, f) = env();
+            serve_files(&f, "hello 한글\nline2\n");
+            app.preview_debounce = Duration::ZERO;
+            app.set_mode(Mode::Dev);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // a.txt
+            wait_preview(&mut app);
+            assert_eq!(
+                app.preview_shown(),
+                Some(&Preview::Text {
+                    lines: vec!["hello 한글".into(), "line2".into()],
+                    truncated: false
+                })
+            );
+            let want = crate::remote::preview_cmd(b"/srv/data/a.txt", 65536 + 3);
+            assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
+        }
+
+        #[test]
+        fn dev_preview_of_a_remote_dir_shows_an_entry_count() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(crate::remote::PREVIEW_DIR, ""))
+            });
+            app.preview_debounce = Duration::ZERO;
+            app.set_mode(Mode::Dev);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down); // sub (1 entry)
+            wait_preview(&mut app);
+            assert_eq!(
+                app.preview_shown(),
+                Some(&Preview::Info("원격 디렉터리 · 항목 1개".into()))
+            );
+        }
+
+        #[test]
+        fn remote_preview_is_not_confused_with_a_local_file_of_the_same_path() {
+            let (_t, mut app, f) = env();
+            serve_files(&f, "remote text\n");
+            app.preview_debounce = Duration::ZERO;
+            app.set_mode(Mode::Dev);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            wait_preview(&mut app);
+            assert!(
+                matches!(app.preview_shown(), Some(Preview::Text { lines, .. }) if lines[0] == "remote text")
+            );
+        }
+
+        fn wait_viewer(app: &mut App) {
+            let start = Instant::now();
+            while matches!(
+                app.viewer.as_ref().map(|v| &v.content),
+                Some(viewer::Content::Loading)
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(5), "viewer timeout");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[test]
+        fn remote_f3_views_the_head_with_the_4_mib_cap() {
+            let (_t, mut app, f) = env();
+            serve_files(&f, "first\nsecond\n");
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // a.txt
+            press(&mut app, KeyCode::F(3));
+            assert!(app.viewer.is_some());
+            wait_viewer(&mut app);
+            let v = app.viewer.as_ref().unwrap();
+            assert_eq!(v.path, PathBuf::from("/srv/data/a.txt"));
+            assert!(
+                matches!(&v.content, viewer::Content::Text { lines, .. } if lines == &["first", "second"])
+            );
+            let want = crate::remote::preview_cmd(b"/srv/data/a.txt", 4 * 1024 * 1024 + 3);
+            assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
+            press(&mut app, KeyCode::Esc);
+            assert!(app.viewer.is_none());
+        }
+
+        #[test]
+        fn remote_f3_on_a_special_file_says_so_and_on_a_dir_does_nothing() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(crate::remote::PREVIEW_SPECIAL, ""))
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down); // sub (dir)
+            press(&mut app, KeyCode::F(3));
+            assert!(app.viewer.is_none());
+            press(&mut app, KeyCode::Down); // a.txt, reported special
+            press(&mut app, KeyCode::F(3));
+            wait_viewer(&mut app);
+            assert!(matches!(&app.viewer.as_ref().unwrap().content,
+                viewer::Content::Message(m) if m.contains("특수 파일")));
+        }
+
+        #[test]
+        fn remote_f3_error_is_shown_in_the_viewer() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| CmdOutput {
+                        code: Some(1),
+                        stdout: Vec::new(),
+                        stderr: b"wc: x: Permission denied\n".to_vec(),
+                    })
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::F(3));
+            wait_viewer(&mut app);
+            assert!(matches!(&app.viewer.as_ref().unwrap().content,
+                viewer::Content::Message(m) if m.contains("Permission denied")));
+        }
+
         #[test]
         fn file_operations_on_remote_panels_are_not_supported_yet() {
             let (_t, mut app, _f) = env();
             connect_prod(&mut app);
-            for f in [3u8, 4, 5, 6] {
+            for f in [4u8, 5, 6] {
                 app.status = None;
                 press(&mut app, KeyCode::F(f));
                 assert_eq!(app.status.as_deref(), Some(UNSUPPORTED), "F{f}");
@@ -8068,7 +8270,7 @@ mod tests {
         }
 
         #[test]
-        fn exit_cwd_and_preview_ignore_remote_panels() {
+        fn exit_cwd_ignores_remote_panels() {
             let (_t, mut app, _f) = env();
             let local = app.panels[1].cwd.clone();
             app.set_mode(Mode::Dev);

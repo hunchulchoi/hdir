@@ -125,6 +125,7 @@ impl Viewer {
             Preview::Empty => Content::Message("빈 파일".to_string()),
             Preview::Dir { .. } => Content::Message("디렉터리는 볼 수 없음".to_string()),
             Preview::Error(e) => Content::Message(format!("오류: {e}")),
+            Preview::Info(m) => Content::Message(m),
         };
     }
 
@@ -658,6 +659,11 @@ mod tests {
         );
         let rows = draw(&mut v, 50, 6);
         assert!(rows.join("").contains("바이너리 파일 (PNG 이미지, 2.0K)"));
+        v.set_preview(Preview::Info("원격 디렉터리 · 항목 2개".into()));
+        assert_eq!(
+            v.content,
+            Content::Message("원격 디렉터리 · 항목 2개".into())
+        );
         v.set_preview(Preview::Empty);
         assert!(matches!(&v.content, Content::Message(m) if m.contains("빈 파일")));
         v.set_preview(Preview::Error("권한 없음".into()));
