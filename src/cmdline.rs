@@ -119,6 +119,20 @@ pub fn parse_cd(cmd: &str, home: Option<&Path>) -> Option<CdTarget> {
     }
 }
 
+/// `cwd/p` without std's lexical folding: `Path::join` onto a Windows
+/// verbatim path resolves `..` textually, which would hide `missing/..`.
+fn join_raw(cwd: &Path, p: &Path) -> PathBuf {
+    if p.has_root() || p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let mut s = cwd.as_os_str().to_owned();
+    if !s.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR) {
+        s.push(std::path::MAIN_SEPARATOR_STR);
+    }
+    s.push(p.as_os_str());
+    PathBuf::from(s)
+}
+
 /// The physical, existing directory `p` points to (every component is
 /// resolved through the filesystem, symlinks first, like `cd -P`).
 /// Errors if it does not exist or is not a directory.
@@ -195,7 +209,7 @@ pub fn resolve_cd(
             .map(Path::to_path_buf)
             .ok_or_else(|| "이전 디렉터리 없음".to_string()),
         CdTarget::Path(p) => {
-            let full = cwd.join(p);
+            let full = join_raw(cwd, p);
             canonical_dir(&full).map_err(|e| format!("{}: {e}", p.display()))
         }
     }
