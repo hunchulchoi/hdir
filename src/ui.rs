@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::assoc::AssocTable;
 use crate::config::Mode;
@@ -48,6 +48,8 @@ pub struct View<'a> {
     pub theme: &'a Theme,
     /// F-key bar `(key, label)` slots, see [`fkey_bar`].
     pub fkeys: &'a [(String, String)],
+    /// The open `:` line as (text, cursor char index).
+    pub cmdline: Option<(&'a str, usize)>,
 }
 
 /// F-key bar slots: the action each slot stands for and its label.
@@ -603,9 +605,26 @@ pub fn draw(frame: &mut Frame, view: &View) {
     if let Some(r) = areas.preview {
         draw_preview(frame, r, view.preview.as_ref(), theme);
     }
+    // Dev mode edits in its `>` row, Classic borrows the status row.
+    let input_row = areas.command.unwrap_or(areas.status);
+    let prompt = if areas.command.is_some() { "> " } else { ": " };
+    // Scroll the input horizontally so the cursor cell stays on screen.
+    // The status row is drawn with one leading space.
+    let lead = if areas.command.is_some() { 0 } else { 1 };
+    let avail = (input_row.width as usize).saturating_sub(lead + UnicodeWidthStr::width(prompt));
+    let (line, cursor_col) = view.cmdline.map_or((String::new(), 0), |(v, c)| {
+        let start = crate::dialog::input_window_start(v, c, avail);
+        let before: usize = v
+            .chars()
+            .skip(start)
+            .take(c.saturating_sub(start))
+            .map(|ch| ch.width().unwrap_or(0))
+            .sum();
+        (v.chars().skip(start).collect(), before)
+    });
     if let Some(r) = areas.command {
         frame.render_widget(
-            Paragraph::new(fit_width("> ", r.width as usize))
+            Paragraph::new(fit_width(&format!("{prompt}{line}"), r.width as usize))
                 .style(Style::default().fg(theme.fg).bg(theme.bg)),
             r,
         );
@@ -613,6 +632,7 @@ pub fn draw(frame: &mut Frame, view: &View) {
 
     let active = view.active.min(1);
     let status = match (view.status, view.trash[active]) {
+        _ if view.cmdline.is_some() && areas.command.is_none() => format!("{prompt}{line}"),
         (Some(s), _) => s.to_string(),
         (None, Some(tv)) => trash_status(tv),
         (None, None) => default_status(view.panels[active]),
@@ -626,6 +646,11 @@ pub fn draw(frame: &mut Frame, view: &View) {
         Paragraph::new(fkey_line(area.width as usize, view.fkeys, view.theme)),
         areas.fkeys,
     );
+    if view.cmdline.is_some() {
+        let x = UnicodeWidthStr::width(prompt) + cursor_col + lead;
+        let x = input_row.x + (x as u16).min(input_row.width.saturating_sub(1));
+        frame.set_cursor_position((x, input_row.y));
+    }
 }
 
 /// The Dev-mode preview area.
@@ -799,9 +824,74 @@ mod tests {
             trash: [None, None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+            cmdline: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
+    }
+
+    fn render_cmdline(mode: Mode, text: &str, cursor: usize, w: u16) -> (Buffer, (u16, u16)) {
+        let (a, b) = setup();
+        let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
+        let mut t = Terminal::new(TestBackend::new(w, 24)).unwrap();
+        let view = View {
+            panels: [&pa, &pb],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            assoc: &AssocTable::default(),
+            os: "macos",
+            mode,
+            preview: None,
+            trash: [None, None],
+            theme: &th(),
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+            cmdline: Some((text, cursor)),
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        let pos = t.get_cursor_position().unwrap();
+        (t.backend().buffer().clone(), (pos.x, pos.y))
+    }
+
+    #[test]
+    fn cmdline_long_input_scrolls_to_keep_cursor_visible_both_modes() {
+        let text = "0123456789".repeat(8); // 80 cols, window is narrower
+        for mode in [Mode::Classic, Mode::Dev] {
+            let (buf, (cx, cy)) = render_cmdline(mode, &text, text.len(), 40);
+            assert!(cx < 40, "{mode:?}: cursor on screen, x={cx}");
+            let r = row(&buf, cy);
+            assert!(r.contains("789"), "{mode:?}: tail visible: {r:?}");
+            assert!(!r.contains("0123456789 0123"), "{mode:?}");
+            assert!(
+                r.contains("> ") || r.contains(": "),
+                "{mode:?}: prompt kept: {r:?}"
+            );
+            // cursor sits right after the last shown char
+            let shown = r.trim_end();
+            assert_eq!(
+                cx as usize,
+                UnicodeWidthStr::width(shown),
+                "{mode:?}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmdline_korean_cursor_positions_with_scrolling() {
+        let text = "가나다라마바사아자차카타파하".repeat(2); // 28 chars, 56 cols
+        let n = text.chars().count();
+        for mode in [Mode::Classic, Mode::Dev] {
+            for cursor in [0, 3, 10, n - 1, n] {
+                let (buf, (cx, cy)) = render_cmdline(mode, &text, cursor, 30);
+                assert!(cx < 30, "{mode:?} c={cursor}: x={cx}");
+                let r = row(&buf, cy);
+                // the char under the cursor is exactly at cx
+                if cursor < n {
+                    let c = text.chars().nth(cursor).unwrap().to_string();
+                    assert_eq!(buf[(cx, cy)].symbol(), c, "{mode:?} c={cursor}: {r:?}");
+                }
+            }
+        }
     }
 
     fn row(buf: &Buffer, y: u16) -> String {
@@ -960,6 +1050,7 @@ mod tests {
             trash: [None, None],
             theme,
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+            cmdline: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -1218,6 +1309,7 @@ mod tests {
             trash: [None, None],
             theme: &th(),
             fkeys: &fkeys,
+            cmdline: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         let row11 = row(t.backend().buffer(), 11);
@@ -1326,6 +1418,7 @@ mod tests {
             trash: [Some(tv), None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
+            cmdline: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -1463,6 +1556,7 @@ mod tests {
             trash: [None, None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+            cmdline: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         rows_of(t.backend().buffer())
@@ -1604,6 +1698,7 @@ mod tests {
             trash: [None, None],
             theme,
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+            cmdline: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()

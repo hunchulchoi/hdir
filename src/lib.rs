@@ -2,6 +2,8 @@
 
 pub mod app;
 pub mod assoc;
+pub mod cli;
+pub mod cmdline;
 pub mod config;
 pub mod dialog;
 pub mod editor;

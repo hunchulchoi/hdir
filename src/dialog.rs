@@ -163,7 +163,7 @@ fn byte_index(s: &str, chars: usize) -> usize {
     s.char_indices().nth(chars).map_or(s.len(), |(i, _)| i)
 }
 
-fn input_key(value: &mut String, cursor: &mut usize, key: KeyEvent) -> DialogResult {
+pub fn input_key(value: &mut String, cursor: &mut usize, key: KeyEvent) -> DialogResult {
     let len = value.chars().count();
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -212,7 +212,7 @@ fn cw(c: char) -> usize {
 
 /// First char index to display so that the cursor cell fits in `width` columns.
 /// Stays at 0 while the cursor fits; otherwise the cursor sits at the right edge.
-fn input_window_start(value: &str, cursor: usize, width: usize) -> usize {
+pub(crate) fn input_window_start(value: &str, cursor: usize, width: usize) -> usize {
     let chars: Vec<char> = value.chars().collect();
     let cell = chars.get(cursor).map_or(1, |&c| cw(c).max(1));
     let before: usize = chars.iter().take(cursor).map(|&c| cw(c)).sum();
