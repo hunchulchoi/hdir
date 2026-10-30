@@ -10,6 +10,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::assoc::{self, AssocRule, DefaultAction, RunMode};
+use crate::cmdline::{self, CdTarget, CmdEvent, CmdLine, History};
 use crate::config::{self, Mode, Settings};
 use crate::dialog::{self, Dialog, DialogResult};
 use crate::editor::{self, EditResult, EditorRunner};
@@ -139,6 +140,12 @@ struct RunJob {
     name: OsString,
     /// What the user configured, for error messages.
     label: String,
+}
+
+/// A command line command waiting for the main loop to suspend the TUI.
+struct ShellJob {
+    cmd: String,
+    cwd: PathBuf,
 }
 
 /// An in-flight text-or-not decision for a file without a rule.
@@ -388,6 +395,18 @@ pub struct App {
     /// Text detection for Enter on a file without a rule; tests inject fakes.
     pub text_probe: TextProbe,
     pending_run: Option<RunJob>,
+    /// The open `:` command line.
+    pub cmdline: Option<CmdLine>,
+    pub cmd_history: History,
+    pending_shell: Option<ShellJob>,
+    /// Shell used for `-c` commands (`$SHELL`, else `/bin/sh`).
+    pub shell_path: OsString,
+    /// Target of a bare `cd` / `cd ~`.
+    pub home_dir: Option<PathBuf>,
+    /// Per panel: where it was before its last directory change (`cd -`).
+    prev_dirs: [Option<PathBuf>; 2],
+    /// Whether leaving now should sync the shell's cwd (false: quit without cd).
+    pub cd_on_exit: bool,
     /// The single probe worker in flight, if any.
     probe: Option<ProbeLoad>,
     /// A newer request waiting for the running probe to finish.
@@ -458,6 +477,15 @@ impl App {
             launcher: launcher::system_launcher(),
             text_probe: Arc::new(probe_text),
             pending_run: None,
+            cmdline: None,
+            cmd_history: History::default(),
+            pending_shell: None,
+            shell_path: std::env::var_os("SHELL")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| OsString::from("/bin/sh")),
+            home_dir: dirs::home_dir(),
+            prev_dirs: [None, None],
+            cd_on_exit: true,
             probe: None,
             probe_next: None,
             probe_gen: 0,
@@ -773,6 +801,10 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if self.cmdline.is_some() {
+            self.handle_cmdline_key(key);
+            return;
+        }
         if self.dialog.is_some() {
             self.handle_dialog_key(key);
             return;
@@ -799,6 +831,105 @@ impl App {
         self.panel_action(action);
     }
 
+    /// Stop the app; `cd` = the shell should follow the active panel.
+    fn quit(&mut self, cd: bool) {
+        self.cd_on_exit = cd;
+        self.running = false;
+    }
+
+    /// Directory the shell should `cd` to on exit, or `None` (quit without cd).
+    pub fn exit_cwd(&self) -> Option<&Path> {
+        self.cd_on_exit.then(|| self.active_panel().cwd.as_path())
+    }
+
+    fn handle_cmdline_key(&mut self, key: KeyEvent) {
+        let Some(line) = self.cmdline.as_mut() else {
+            return;
+        };
+        match line.key(key, &self.cmd_history) {
+            CmdEvent::Pending => {}
+            CmdEvent::Cancel => self.cmdline = None,
+            CmdEvent::Run(cmd) => {
+                self.cmdline = None;
+                self.run_command_line(cmd.trim());
+            }
+        }
+    }
+
+    fn run_command_line(&mut self, cmd: &str) {
+        if cmd.is_empty() {
+            return;
+        }
+        self.cmd_history.push(cmd);
+        self.status = None;
+        let cwd = self.active_panel().cwd.clone();
+        if let Some(target) = cmdline::parse_cd(cmd, self.home_dir.as_deref()) {
+            self.change_dir_to(&cwd, &target);
+            return;
+        }
+        if cfg!(windows) {
+            self.status = Some("셸 명령: Windows 지원 예정".into());
+            return;
+        }
+        self.pending_shell = Some(ShellJob {
+            cmd: cmd.to_string(),
+            cwd,
+        });
+    }
+
+    fn change_dir_to(&mut self, cwd: &Path, target: &CdTarget) {
+        let prev = self.prev_dirs[self.active].as_deref();
+        match cmdline::resolve_cd(cwd, target, self.home_dir.as_deref(), prev) {
+            Ok(dir) => {
+                self.invalidate_probe();
+                let id = self.next_id();
+                let req = self
+                    .active_panel_mut()
+                    .begin_change_dir(id, dir, None, LoadKind::Enter);
+                self.dispatch(self.active, req);
+            }
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    pub fn has_pending_shell(&self) -> bool {
+        self.pending_shell.is_some()
+    }
+
+    /// Run the queued command line command: `suspend` leaves the TUI, calls
+    /// the closure (shell, then the exit code and a key prompt) and re-enters;
+    /// then both panels reload and the exit code goes to the status line.
+    pub fn run_shell(
+        &mut self,
+        suspend: impl FnOnce(&mut dyn FnMut() -> EditResult) -> std::io::Result<EditResult>,
+    ) {
+        let Some(job) = self.pending_shell.take() else {
+            return;
+        };
+        let launcher = Arc::clone(&self.launcher);
+        let argv = [
+            self.shell_path.clone(),
+            OsString::from("-c"),
+            OsString::from(&job.cmd),
+        ];
+        let mut result: Result<i32, String> = Err("실행되지 않음".into());
+        let outcome = suspend(&mut || {
+            let r = launcher.run_shell(&argv, &job.cwd);
+            if let Ok(code) = &r {
+                launcher.wait_key_after(*code);
+            }
+            let out = r.as_ref().map(|_| ()).map_err(Clone::clone);
+            result = r;
+            out
+        });
+        self.reload_both();
+        self.status = Some(match (outcome, result) {
+            (Err(e), _) => format!("터미널 복귀 실패: {e}"),
+            (Ok(_), Ok(code)) => format!("종료 코드 {code}: {}", job.cmd),
+            (Ok(_), Err(e)) => format!("오류: {}: {e}", job.cmd),
+        });
+    }
+
     fn unsupported(&mut self, what: &str) {
         self.status = Some(format!("{what}: 아직 지원하지 않음"));
     }
@@ -821,8 +952,7 @@ impl App {
             Action::Rename => self.open_rename(),
             Action::TrashView => self.open_trash_view(),
             Action::Delete => self.open_trash(),
-            // No cwd file is written yet, so both quit the same way.
-            Action::Quit | Action::QuitNoCd => self.running = false,
+            Action::Quit | Action::QuitNoCd => self.quit(action == Action::Quit),
             Action::SwitchPanel => {
                 self.invalidate_probe();
                 self.active = 1 - self.active;
@@ -878,7 +1008,10 @@ impl App {
             }
             Action::View => self.open_viewer(),
             Action::Edit => self.open_editor(),
-            Action::CommandLine => self.unsupported("명령줄"),
+            Action::CommandLine => {
+                self.status = None;
+                self.cmdline = Some(CmdLine::default());
+            }
             Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
             Action::OpenWith => self.open_with_menu(),
             Action::Menu => self.open_main_menu(),
@@ -1460,8 +1593,12 @@ impl App {
                 continue; // superseded
             };
             let kind = self.panels[idx].loading.as_ref().map(|r| r.kind);
+            let before = self.panels[idx].cwd.clone();
             if self.panels[idx].finish_load(res) {
                 changed = true;
+                if self.panels[idx].cwd != before {
+                    self.prev_dirs[idx] = Some(before);
+                }
                 self.preview_refresh();
                 if idx == self.active
                     && kind != Some(LoadKind::Reload)
@@ -1844,7 +1981,7 @@ impl App {
         match action {
             Action::Cancel | Action::Parent => self.close_trash_view(idx),
             Action::SwitchPanel => self.active = 1 - self.active,
-            Action::Quit | Action::QuitNoCd => self.running = false,
+            Action::Quit | Action::QuitNoCd => self.quit(action == Action::Quit),
             // Already in the trash view.
             Action::TrashView => {}
             Action::Delete => self.open_trash_purge(),
@@ -2186,6 +2323,7 @@ impl App {
             trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
             theme: &self.theme,
             fkeys: &fkeys,
+            cmdline: self.cmdline.as_ref().map(|c| (c.value.as_str(), c.cursor)),
         };
         let viewer_hint = format!("{} · /: 검색 · n: 다음", self.close_hint());
         if let Some(scr) = self.screen.as_mut() {
@@ -6236,6 +6374,310 @@ mod tests {
             e.app.open_main_menu();
             pick(&mut e.app, "연결 프로그램 선택");
             assert_eq!(e.app.menu.as_ref().unwrap().menu.items.len(), 4);
+        }
+    }
+    // ---- HDIR-31/32: command line, cwd on exit ----
+
+    mod cmdline_run {
+        use super::*;
+        use crate::launcher::Launcher;
+        use std::sync::Mutex;
+
+        struct ShellFake {
+            log: Mutex<Vec<String>>,
+            result: Mutex<Result<i32, String>>,
+        }
+
+        impl Launcher for ShellFake {
+            fn run(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                unreachable!("command line uses run_shell")
+            }
+            fn spawn_detached(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait_key(&self) {
+                self.log.lock().unwrap().push("wait_key".into());
+            }
+            fn run_shell(&self, argv: &[OsString], cwd: &Path) -> Result<i32, String> {
+                let a: Vec<_> = argv.iter().map(|a| a.to_string_lossy()).collect();
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("shell {} @{}", a.join("|"), cwd.display()));
+                self.result.lock().unwrap().clone()
+            }
+            fn wait_key_after(&self, code: i32) {
+                self.log.lock().unwrap().push(format!("wait_key {code}"));
+            }
+        }
+
+        fn env() -> (TempDir, App, Arc<ShellFake>) {
+            let (t, mut app) = fixture();
+            fs::create_dir(t.path().join("한글 dir")).unwrap();
+            fs::create_dir(t.path().join("adir/sub")).unwrap();
+            let fake = Arc::new(ShellFake {
+                log: Mutex::new(Vec::new()),
+                result: Mutex::new(Ok(0)),
+            });
+            app.launcher = fake.clone();
+            app.shell_path = OsString::from("/bin/zsh");
+            app.home_dir = Some(app.panels[0].cwd.join("bdir"));
+            (t, app, fake)
+        }
+
+        fn submit(app: &mut App, cmd: &str) {
+            press(app, KeyCode::Char(':'));
+            type_str(app, cmd);
+            press(app, KeyCode::Enter);
+        }
+
+        fn log(f: &ShellFake) -> Vec<String> {
+            f.log.lock().unwrap().clone()
+        }
+
+        fn run_logged(app: &mut App, f: &Arc<ShellFake>) {
+            let f = Arc::clone(f);
+            app.run_shell(move |run| {
+                f.log.lock().unwrap().push("suspend".into());
+                let r = run();
+                f.log.lock().unwrap().push("resume".into());
+                Ok(r)
+            });
+        }
+
+        #[test]
+        fn colon_opens_and_esc_closes_without_side_effects() {
+            let (_t, mut app, _f) = env();
+            press(&mut app, KeyCode::Char(':'));
+            assert!(app.cmdline.is_some());
+            type_str(&mut app, "q");
+            assert!(app.running, "keys are text while the line is open");
+            assert_eq!(app.cmdline.as_ref().unwrap().value, "q");
+            press(&mut app, KeyCode::Esc);
+            assert!(app.cmdline.is_none() && !app.has_pending_shell());
+            assert!(app.running);
+        }
+
+        #[test]
+        fn cd_relative_is_internal_and_async() {
+            let (_t, mut app, f) = env();
+            let root = app.panels[0].cwd.clone();
+            submit(&mut app, "cd adir");
+            assert!(app.cmdline.is_none() && !app.has_pending_shell());
+            assert!(app.panels[0].loading.is_some());
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.join("adir"));
+            assert!(log(&f).is_empty());
+        }
+
+        #[test]
+        fn cd_dash_goes_back_and_dotdot_works() {
+            let (_t, mut app, _f) = env();
+            let root = app.panels[0].cwd.clone();
+            submit(&mut app, "cd adir/sub");
+            settle(&mut app);
+            submit(&mut app, "cd ../..");
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.as_path());
+            submit(&mut app, "cd -");
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.join("adir/sub"));
+            submit(&mut app, "cd -");
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.as_path(), "toggles");
+        }
+
+        #[test]
+        fn cd_dash_without_previous_reports() {
+            let (_t, mut app, _f) = env();
+            let root = app.panels[0].cwd.clone();
+            submit(&mut app, "cd -");
+            assert_eq!(app.status.as_deref(), Some("이전 디렉터리 없음"));
+            assert_eq!(app.panels[0].cwd, root.as_path());
+        }
+
+        #[test]
+        fn cd_home_and_tilde_use_home_dir() {
+            let (_t, mut app, _f) = env();
+            let root = app.panels[0].cwd.clone();
+            submit(&mut app, "cd");
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.join("bdir"));
+            submit(&mut app, "cd ~/../adir");
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.join("adir"));
+            app.home_dir = None;
+            submit(&mut app, "cd");
+            assert_eq!(app.status.as_deref(), Some("홈 디렉터리를 알 수 없음"));
+        }
+
+        #[test]
+        fn cd_quoted_korean_name_with_space() {
+            let (_t, mut app, _f) = env();
+            let root = app.panels[0].cwd.clone();
+            submit(&mut app, "cd \"한글 dir\"");
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.join("한글 dir"));
+        }
+
+        #[test]
+        fn cd_to_missing_dir_shows_error_and_stays() {
+            let (_t, mut app, _f) = env();
+            let root = app.panels[0].cwd.clone();
+            submit(&mut app, "cd nope");
+            settle(&mut app);
+            assert_eq!(app.panels[0].cwd, root.as_path());
+            assert!(app.status.is_some(), "error surfaced");
+        }
+
+        #[test]
+        fn cd_acts_on_the_active_panel_only() {
+            let (_t, mut app, _f) = env();
+            let root = app.panels[0].cwd.clone();
+            press(&mut app, KeyCode::Tab);
+            submit(&mut app, "cd adir");
+            settle(&mut app);
+            assert_eq!(app.panels[1].cwd, root.join("adir"));
+            assert_eq!(app.panels[0].cwd, root.as_path());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn other_commands_suspend_run_in_the_shell_and_reload() {
+            let (_t, mut app, f) = env();
+            let root = app.panels[0].cwd.clone();
+            submit(&mut app, "ls -la && echo 한글");
+            assert!(app.has_pending_shell());
+            assert!(log(&f).is_empty(), "nothing runs before the suspend");
+            run_logged(&mut app, &f);
+            let cwd = root.display();
+            assert_eq!(
+                log(&f),
+                [
+                    "suspend".to_string(),
+                    format!("shell /bin/zsh|-c|ls -la && echo 한글 @{cwd}"),
+                    "wait_key 0".to_string(),
+                    "resume".to_string(),
+                ]
+            );
+            assert!(!app.has_pending_shell());
+            assert!(app.panels.iter().all(|p| p.loading.is_some()), "reloaded");
+            assert_eq!(
+                app.status.as_deref(),
+                Some("종료 코드 0: ls -la && echo 한글")
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn exit_code_and_launch_failure_show_in_status() {
+            let (_t, mut app, f) = env();
+            *f.result.lock().unwrap() = Ok(3);
+            submit(&mut app, "false");
+            run_logged(&mut app, &f);
+            assert_eq!(app.status.as_deref(), Some("종료 코드 3: false"));
+            *f.result.lock().unwrap() = Err("no such shell".into());
+            submit(&mut app, "x");
+            run_logged(&mut app, &f);
+            assert_eq!(app.status.as_deref(), Some("오류: x: no such shell"));
+            assert!(!log(&f).iter().any(|l| l == "wait_key -1"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn command_runs_in_the_active_panels_cwd() {
+            let (_t, mut app, f) = env();
+            let root = app.panels[0].cwd.clone();
+            press(&mut app, KeyCode::Tab);
+            submit(&mut app, "cd adir");
+            settle(&mut app);
+            submit(&mut app, "pwd");
+            run_logged(&mut app, &f);
+            let want = format!("shell /bin/zsh|-c|pwd @{}", root.join("adir").display());
+            assert!(log(&f).contains(&want), "{:?}", log(&f));
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn shell_commands_are_not_supported_on_windows_yet() {
+            let (_t, mut app, _f) = env();
+            submit(&mut app, "dir");
+            assert!(!app.has_pending_shell());
+            assert_eq!(app.status.as_deref(), Some("셸 명령: Windows 지원 예정"));
+        }
+
+        #[test]
+        fn history_up_down_dedup() {
+            let (_t, mut app, _f) = env();
+            submit(&mut app, "cd adir");
+            settle(&mut app);
+            submit(&mut app, "cd adir");
+            settle(&mut app);
+            submit(&mut app, "cd -");
+            settle(&mut app);
+            press(&mut app, KeyCode::Char(':'));
+            press(&mut app, KeyCode::Up);
+            assert_eq!(app.cmdline.as_ref().unwrap().value, "cd -");
+            press(&mut app, KeyCode::Up);
+            assert_eq!(app.cmdline.as_ref().unwrap().value, "cd adir");
+            press(&mut app, KeyCode::Up);
+            assert_eq!(app.cmdline.as_ref().unwrap().value, "cd adir");
+            press(&mut app, KeyCode::Down);
+            assert_eq!(app.cmdline.as_ref().unwrap().value, "cd -");
+        }
+
+        #[test]
+        fn blank_line_just_closes() {
+            let (_t, mut app, _f) = env();
+            submit(&mut app, "   ");
+            assert!(app.cmdline.is_none() && !app.has_pending_shell());
+            assert!(app.panels[0].loading.is_none());
+        }
+
+        #[test]
+        fn dev_mode_shows_the_line_in_the_command_row() {
+            let (_t, mut app, _f) = env();
+            app.set_mode(Mode::Dev);
+            press(&mut app, KeyCode::Char(':'));
+            type_str(&mut app, "ls 한");
+            let rows = draw_app(&mut app, 100, 30);
+            assert!(rows[27].starts_with("> ls 한"), "{:?}", rows[27]);
+            let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            t.draw(|f| app.draw(f)).unwrap();
+            let pos = t.get_cursor_position().unwrap();
+            assert_eq!((pos.x, pos.y), (2 + 3 + 2, 27), "wide char counts 2 cells");
+        }
+
+        #[test]
+        fn classic_mode_shows_the_line_on_the_status_row() {
+            let (_t, mut app, _f) = env();
+            press(&mut app, KeyCode::Char(':'));
+            type_str(&mut app, "ls");
+            let rows = draw_app(&mut app, 100, 30);
+            assert!(rows[28].trim_start().starts_with(": ls"), "{:?}", rows[28]);
+        }
+
+        #[test]
+        fn quit_keys_decide_whether_the_cwd_is_written() {
+            for (code, mods, cd) in [
+                (KeyCode::F(10), KeyModifiers::NONE, true),
+                (KeyCode::Char('q'), KeyModifiers::NONE, true),
+                (KeyCode::F(10), KeyModifiers::SHIFT, false),
+                (KeyCode::Char('x'), KeyModifiers::CONTROL, false),
+            ] {
+                let (_t, mut app, _f) = env();
+                press_mods(&mut app, code, mods);
+                assert!(!app.running, "{code:?}");
+                assert_eq!(app.cd_on_exit, cd, "{code:?} {mods:?}");
+            }
+        }
+
+        #[test]
+        fn quit_from_the_trash_view_keeps_the_same_rules() {
+            let (_t, mut app, _f) = env();
+            app.trash_views[0] = Some(TrashView::new(app.panels[0].cwd.clone()));
+            press_mods(&mut app, KeyCode::F(10), KeyModifiers::SHIFT);
+            assert!(!app.running && !app.cd_on_exit);
         }
     }
 }

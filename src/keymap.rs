@@ -265,7 +265,7 @@ const MDIR_PANEL: &[(Action, &[&str])] = &[
     (A::Menu, &["F9", "Alt+9"]),
     (A::Help, &["F1", "Alt+1"]),
     (A::Quit, &["F10", "q", "Alt+0"]),
-    (A::QuitNoCd, &["Shift+F10"]),
+    (A::QuitNoCd, &["Shift+F10", "Ctrl+X"]),
     (A::Undo, &["Ctrl+Z"]),
     (A::CommandLine, &[":"]),
     (A::ToggleMode, &["Ctrl+T"]),
@@ -316,6 +316,7 @@ const MDIR_TRASH: &[(Action, &[&str])] = &[
     (A::ToggleSelect, &["Space", "Insert"]),
     (A::TrashView, &["Alt+F8"]),
     (A::Quit, &["F10", "q"]),
+    (A::QuitNoCd, &["Shift+F10", "Ctrl+X"]),
 ];
 
 /// Extra single-key bindings layered on top of mdir for the vim preset.
@@ -793,6 +794,7 @@ mod tests {
         assert_eq!(p(KeyCode::Char(':'), NONE), Some(Action::CommandLine));
         assert_eq!(p(KeyCode::Char('t'), CTRL), Some(Action::ToggleMode));
         assert_eq!(p(KeyCode::F(10), SHIFT), Some(Action::QuitNoCd));
+        assert_eq!(p(KeyCode::Char('x'), CTRL), Some(Action::QuitNoCd));
         assert_eq!(p(KeyCode::F(1), ALT), Some(Action::ConnectLeft));
         assert_eq!(p(KeyCode::F(2), ALT), Some(Action::ConnectRight));
         assert_eq!(p(KeyCode::Char('o'), CTRL), Some(Action::OpenWith));

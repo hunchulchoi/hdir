@@ -163,7 +163,7 @@ fn byte_index(s: &str, chars: usize) -> usize {
     s.char_indices().nth(chars).map_or(s.len(), |(i, _)| i)
 }
 
-fn input_key(value: &mut String, cursor: &mut usize, key: KeyEvent) -> DialogResult {
+pub fn input_key(value: &mut String, cursor: &mut usize, key: KeyEvent) -> DialogResult {
     let len = value.chars().count();
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {

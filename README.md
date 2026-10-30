@@ -16,6 +16,20 @@ DOS 시절 Mdir의 키보드 조작감과 현대 Bash/Zsh 기능을 합친 개�
 - macOS, Linux: 지원
 - Windows: 빌드는 되지만 기능은 **지원 예정** (휴지통 보기, PowerShell 셸 통합, 확장자 실행, SSH 등)
 
+## 셸 통합
+`h`로 hdir를 실행하고, 종료할 때 활성 패널의 디렉터리로 셸이 `cd`한다. 종료 키는 F10/`q`(cd 함), Shift+F10/Ctrl+X(cd 없이 종료).
+
+```sh
+# ~/.zshrc
+source /path/to/hdir/shell/hdir.zsh
+# ~/.bashrc
+source /path/to/hdir/shell/hdir.bash
+# ~/.config/fish/config.fish
+source /path/to/hdir/shell/hdir.fish
+```
+
+직접 쓰려면 `hdir --cwd-file PATH [START_DIR]`: 종료 시 PATH에 디렉터리를 기록한다 (cd 없이 종료하면 빈 파일). `:` 명령줄에서 `cd <경로>`/`cd -`/`cd`는 내부 처리, 그 외는 `$SHELL -c`로 실행한다. Windows는 지원 예정.
+
 ## 문서
 - [구현 계획](docs/plan.md)
 - [초기 구상](docs/mvp계획.md)

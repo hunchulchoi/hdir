@@ -19,6 +19,28 @@ pub trait Launcher: Send + Sync {
     fn spawn_detached(&self, argv: &[OsString], cwd: &Path) -> Result<(), String>;
     /// Print [`PRESS_ANY_KEY`] and block until a key is pressed.
     fn wait_key(&self);
+
+    /// Like [`run`](Self::run) but reports the exit code instead of turning a
+    /// non-zero code into an error. `Err` only when the program did not run.
+    fn run_shell(&self, argv: &[OsString], cwd: &Path) -> Result<i32, String> {
+        match self.run(argv, cwd) {
+            Ok(()) => Ok(0),
+            Err(e) => match e.strip_prefix("종료 코드 ").and_then(|c| c.parse().ok()) {
+                Some(code) => Ok(code),
+                None => Err(e),
+            },
+        }
+    }
+
+    /// Show `[종료 코드 N]` plus the key prompt and wait for a key.
+    fn wait_key_after(&self, _code: i32) {
+        self.wait_key();
+    }
+}
+
+/// Text printed before waiting for a key after a command line command.
+pub fn exit_prompt(code: i32) -> String {
+    format!("\r\n[종료 코드 {code}] {PRESS_ANY_KEY}")
 }
 
 pub type SharedLauncher = Arc<dyn Launcher>;
@@ -64,22 +86,35 @@ impl Launcher for SystemLauncher {
         Ok(())
     }
 
-    fn wait_key(&self) {
-        use ratatui::crossterm::event::{self, Event, KeyEventKind};
-        use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-        print!("\r\n{PRESS_ANY_KEY}");
-        let _ = std::io::stdout().flush();
-        if enable_raw_mode().is_err() {
-            return;
-        }
-        while let Ok(ev) = event::read() {
-            if matches!(&ev, Event::Key(k) if k.kind != KeyEventKind::Release) {
-                break;
-            }
-        }
-        let _ = disable_raw_mode();
-        println!();
+    fn run_shell(&self, argv: &[OsString], cwd: &Path) -> Result<i32, String> {
+        let status = command(argv, cwd)?.status().map_err(|e| e.to_string())?;
+        Ok(status.code().unwrap_or(-1))
     }
+
+    fn wait_key(&self) {
+        wait_for_key(&format!("\r\n{PRESS_ANY_KEY}"));
+    }
+
+    fn wait_key_after(&self, code: i32) {
+        wait_for_key(&exit_prompt(code));
+    }
+}
+
+fn wait_for_key(prompt: &str) {
+    use ratatui::crossterm::event::{self, Event, KeyEventKind};
+    use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    if enable_raw_mode().is_err() {
+        return;
+    }
+    while let Ok(ev) = event::read() {
+        if matches!(&ev, Event::Key(k) if k.kind != KeyEventKind::Release) {
+            break;
+        }
+    }
+    let _ = disable_raw_mode();
+    println!();
 }
 
 #[cfg(all(test, unix))]
@@ -104,6 +139,44 @@ mod tests {
         assert_eq!(
             SystemLauncher.run(&sh("exit 3"), t.path()),
             Err("종료 코드 3".to_string())
+        );
+    }
+
+    #[test]
+    fn run_shell_returns_the_exit_code() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(SystemLauncher.run_shell(&sh("exit 0"), t.path()), Ok(0));
+        assert_eq!(SystemLauncher.run_shell(&sh("exit 7"), t.path()), Ok(7));
+        let bad = [OsString::from("/nonexistent/prog-hdir")];
+        assert!(SystemLauncher.run_shell(&bad, t.path()).is_err());
+    }
+
+    #[test]
+    fn default_run_shell_maps_run_results() {
+        struct R(Result<(), String>);
+        impl Launcher for R {
+            fn run(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                self.0.clone()
+            }
+            fn spawn_detached(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait_key(&self) {}
+        }
+        let p = Path::new("/");
+        assert_eq!(R(Ok(())).run_shell(&[], p), Ok(0));
+        assert_eq!(R(Err("종료 코드 3".into())).run_shell(&[], p), Ok(3));
+        assert_eq!(
+            R(Err("No such file".into())).run_shell(&[], p),
+            Err("No such file".to_string())
+        );
+    }
+
+    #[test]
+    fn exit_prompt_text_names_the_code() {
+        assert_eq!(
+            exit_prompt(2),
+            "\r\n[종료 코드 2] 계속하려면 아무 키나 누르세요"
         );
     }
 
