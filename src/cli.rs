@@ -280,6 +280,8 @@ mod tests {
     fn start_dir_resolves_symlink_before_dotdot_and_validates_the_result() {
         let d = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(d.path()).unwrap();
+        // Path::join folds `..` textually on Windows verbatim paths: append raw.
+        let raw = |b: &Path, rel: &str| PathBuf::from(format!("{}/{rel}", b.display()));
         fs::create_dir_all(base.join("real/inner")).unwrap();
         fs::create_dir(base.join("other")).unwrap();
         fs::write(base.join("real/file"), "").unwrap();
@@ -288,15 +290,15 @@ mod tests {
             std::os::unix::fs::symlink(base.join("real/inner"), base.join("link")).unwrap();
             // physical: link -> real/inner, so link/.. is real
             assert_eq!(
-                start_dir(Some(&base.join("link/.."))),
+                start_dir(Some(&raw(&base, "link/.."))),
                 Ok(base.join("real"))
             );
         }
         assert_eq!(
-            start_dir(Some(&base.join("real/../other"))),
+            start_dir(Some(&raw(&base, "real/../other"))),
             Ok(base.join("other"))
         );
-        assert!(start_dir(Some(&base.join("missing/.."))).is_err());
+        assert!(start_dir(Some(&raw(&base, "missing/.."))).is_err());
         assert!(start_dir(Some(&base.join("real/file"))).is_err());
     }
 }
