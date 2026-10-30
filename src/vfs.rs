@@ -16,6 +16,12 @@ pub trait Vfs: Send + Sync {
     fn list(&self, dir: &Path, show_hidden: bool) -> Listing;
     /// Human-readable location of `dir` (panel title).
     fn display_path(&self, dir: &Path) -> String;
+    /// Identity of the backing store: 0 is the local filesystem, anything else
+    /// a remote session. The loader abandons a slow read when a panel moves to
+    /// a different source.
+    fn source_key(&self) -> usize {
+        0
+    }
 }
 
 /// The local filesystem.

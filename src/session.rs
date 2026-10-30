@@ -11,10 +11,12 @@
 //!   terminal; everything else is `BatchMode=yes`.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::loader::Listing;
 use crate::panel::finish_listing;
@@ -45,22 +47,70 @@ pub trait Cmd: Send + Sync {
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput;
 }
 
+/// Stderr text of a command that was killed for running too long.
+pub const TIMEOUT_MSG: &str = "시간 초과";
+
+/// Hard limit for any non-interactive command run through [`SystemCmd`].
+pub const CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The real process runner.
 pub struct SystemCmd;
 
+/// Run `argv` to completion with captured output, killing it after `limit`
+/// (then `code` is `None` and stderr is [`TIMEOUT_MSG`]).
+pub fn run_limited(argv: &[OsString], limit: Duration) -> CmdOutput {
+    let Some((prog, args)) = argv.split_first() else {
+        return spawn_failed("empty command");
+    };
+    let mut child = match Command::new(prog)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return spawn_failed(&format!("{}: {e}", prog.to_string_lossy())),
+    };
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => break None,
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    match status {
+        Some(st) => CmdOutput {
+            code: st.code(),
+            stdout,
+            stderr,
+        },
+        None => spawn_failed(TIMEOUT_MSG),
+    }
+}
+
 impl Cmd for SystemCmd {
     fn run(&self, argv: &[OsString]) -> CmdOutput {
-        let Some((prog, args)) = argv.split_first() else {
-            return spawn_failed("empty command");
-        };
-        match Command::new(prog).args(args).stdin(Stdio::null()).output() {
-            Ok(o) => CmdOutput {
-                code: o.status.code(),
-                stdout: o.stdout,
-                stderr: o.stderr,
-            },
-            Err(e) => spawn_failed(&format!("{}: {e}", prog.to_string_lossy())),
-        }
+        run_limited(argv, CMD_TIMEOUT)
     }
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
         let Some((prog, args)) = argv.split_first() else {
@@ -211,6 +261,9 @@ impl Vfs for SshVfs {
     fn list(&self, dir: &Path, show_hidden: bool) -> Listing {
         self.session.list(dir, show_hidden)
     }
+    fn source_key(&self) -> usize {
+        Arc::as_ptr(&self.session) as usize
+    }
     fn display_path(&self, dir: &Path) -> String {
         format!("{}:{}", self.session.name, dir.to_string_lossy())
     }
@@ -233,16 +286,53 @@ pub fn control_path(cache_dir: Option<&Path>, uid: u32) -> PathBuf {
     PathBuf::from(format!("/tmp/hdir-{uid}")).join("cm-%C")
 }
 
-/// Create the control socket directory with mode 0700.
+/// Create the control socket directory with mode 0700. An existing directory
+/// is only accepted when it is a real directory (never a symlink) owned by the
+/// current user without group/other access; it is never chmod-ed.
 pub fn ensure_control_dir(path: &Path) -> std::io::Result<()> {
     let Some(dir) = path.parent() else {
         return Ok(());
     };
-    std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::DirBuilderExt;
+        match std::fs::symlink_metadata(dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)?;
+            }
+            Err(e) => return Err(e),
+        }
+        // Checked after creation too, so a racing symlink is caught.
+        check_private_dir(&std::fs::symlink_metadata(dir)?, dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+#[cfg(unix)]
+fn check_private_dir(m: &std::fs::Metadata, dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let deny = |why: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{}: {why}", dir.display()),
+        ))
+    };
+    if !m.is_dir() {
+        return deny("실제 디렉터리가 아님");
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    if m.uid() != unsafe { libc::getuid() } {
+        return deny("소유자가 다름");
+    }
+    if m.permissions().mode() & 0o077 != 0 {
+        return deny("권한이 너무 넓음 (0700 필요)");
     }
     Ok(())
 }
@@ -262,7 +352,7 @@ pub fn start_master(cmd: &dyn Cmd, t: &SshTarget) -> Result<(), String> {
     }
 }
 
-/// Remote shell command that prints the absolute form of `path` (`~` and
+/// Remote shell command that prints the absolute form (NUL-terminated) of `path` (`~` and
 /// `~/x` mean the remote home; empty/`.` the login directory).
 pub fn start_path_cmd(path: &str) -> Vec<u8> {
     let target: Vec<u8> = match path {
@@ -277,7 +367,13 @@ pub fn start_path_cmd(path: &str) -> Vec<u8> {
             None => sh_quote(p.as_bytes()),
         },
     };
-    [b"cd -- ".as_slice(), &target, b" && pwd"].concat()
+    // NUL-terminated so newlines and non-UTF-8 bytes in the path survive.
+    [
+        b"cd -- ".as_slice(),
+        &target,
+        b" && printf '%s\\0' \"$PWD\"",
+    ]
+    .concat()
 }
 
 /// A freshly established session plus the directory to show first.
@@ -328,12 +424,13 @@ pub fn establish(
     if out.code != Some(0) {
         return Err(first_line(&out.stderr, "시작 경로를 열 수 없음"));
     }
-    let pwd = String::from_utf8_lossy(&out.stdout);
-    let line = pwd.lines().next().unwrap_or("").trim_end_matches('\r');
-    if line.is_empty() {
+    let Some(end) = out.stdout.iter().position(|&b| b == 0) else {
+        return Err("시작 경로를 알 수 없음".to_string());
+    };
+    if end == 0 {
         return Err("시작 경로를 알 수 없음".to_string());
     }
-    let start = PathBuf::from(os_from_bytes(line.as_bytes().to_vec()));
+    let start = PathBuf::from(os_from_bytes(out.stdout[..end].to_vec()));
     Ok(Established { session, start })
 }
 
@@ -445,6 +542,73 @@ mod tests {
         ensure_control_dir(&sock).unwrap(); // idempotent
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_control_dir_refuses_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(ensure_control_dir(&link.join("cm-%C")).is_err());
+        let mode = real.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "never touched through the link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_control_dir_refuses_loose_permissions_without_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("loose");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_control_dir(&dir.join("cm-%C")).is_err());
+        assert_eq!(dir.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(ensure_control_dir(&dir.join("cm-%C")).is_err());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            ensure_control_dir(&dir.join("cm-%C")).is_ok(),
+            "stricter is fine"
+        );
+    }
+
+    // ---- timeouts ----
+
+    #[cfg(unix)]
+    #[test]
+    fn run_limited_kills_a_hanging_child() {
+        let start = std::time::Instant::now();
+        let argv: Vec<OsString> = vec!["sleep".into(), "30".into()];
+        let o = run_limited(&argv, std::time::Duration::from_millis(200));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(o.code, None);
+        assert_eq!(first_line(&o.stderr, ""), TIMEOUT_MSG);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_limited_returns_output_of_a_quick_child() {
+        let argv: Vec<OsString> = vec!["sh".into(), "-c".into(), "printf hi; exit 3".into()];
+        let o = run_limited(&argv, std::time::Duration::from_secs(5));
+        assert_eq!((o.code, o.stdout.as_slice()), (Some(3), &b"hi"[..]));
+    }
+
+    #[test]
+    fn a_timed_out_listing_is_an_error_but_keeps_the_session_alive() {
+        let f = Fake::new(|_| CmdOutput {
+            code: None,
+            stdout: Vec::new(),
+            stderr: TIMEOUT_MSG.as_bytes().to_vec(),
+        });
+        let s = session_with(f, RemoteOs::Linux);
+        assert_eq!(s.list(Path::new("/x"), false).unwrap_err(), "시간 초과");
+        assert!(s.is_alive());
+    }
+
     // ---- master / establish ----
 
     #[test]
@@ -472,14 +636,18 @@ mod tests {
     #[test]
     fn start_path_cmd_quotes_and_expands_home() {
         let s = |p: &str| String::from_utf8(start_path_cmd(p)).unwrap();
-        assert_eq!(s(""), "cd -- . && pwd");
-        assert_eq!(s("."), "cd -- . && pwd");
-        assert_eq!(s("/var/it's here"), "cd -- '/var/it'\\''s here' && pwd");
-        assert_eq!(s("~"), "cd -- \"$HOME\" && pwd");
-        assert_eq!(s("~/my dir"), "cd -- \"$HOME\"'/my dir' && pwd");
+        let tail = r#" && printf '%s\0' "$PWD""#;
+        assert_eq!(s(""), format!("cd -- .{tail}"));
+        assert_eq!(s("."), format!("cd -- .{tail}"));
+        assert_eq!(
+            s("/var/it's here"),
+            format!("cd -- '/var/it'\\''s here'{tail}")
+        );
+        assert_eq!(s("~"), format!("cd -- \"$HOME\"{tail}"));
+        assert_eq!(s("~/my dir"), format!("cd -- \"$HOME\"'/my dir'{tail}"));
     }
 
-    fn establish_fake(ssh_v: &'static str, uname: &'static str, pwd: &'static str) -> Arc<Fake> {
+    fn establish_fake(ssh_v: &'static str, uname: &'static str, pwd: &'static [u8]) -> Arc<Fake> {
         Fake::new(move |a| {
             if a == ["ssh", "-V"] {
                 return CmdOutput {
@@ -490,7 +658,11 @@ mod tests {
             }
             match remote_cmd_of(a) {
                 Some("uname -s") => out(0, uname),
-                Some(c) if c.ends_with("&& pwd") => out(0, pwd),
+                Some(c) if c.contains("$PWD") => CmdOutput {
+                    code: Some(0),
+                    stdout: pwd.to_vec(),
+                    stderr: Vec::new(),
+                },
                 _ => out(0, ""),
             }
         })
@@ -498,7 +670,7 @@ mod tests {
 
     #[test]
     fn establish_detects_os_scp_mode_and_start_dir() {
-        let f = establish_fake("OpenSSH_8.4p1, OpenSSL\n", "Linux\n", "/home/choi\n");
+        let f = establish_fake("OpenSSH_8.4p1, OpenSSL\n", "Linux\n", b"/home/choi\0");
         let cmd: Arc<dyn Cmd> = f.clone();
         let e = establish(&cmd, "web", target(), None).unwrap();
         assert_eq!(e.session.os, RemoteOs::Linux);
@@ -511,8 +683,35 @@ mod tests {
     }
 
     #[test]
+    fn establish_start_dir_keeps_newlines() {
+        let f = establish_fake("OpenSSH_9.6p1\n", "Linux\n", b"/srv/a\nb \xed\x95\x9c\0");
+        let cmd: Arc<dyn Cmd> = f;
+        let e = establish(&cmd, "web", target(), None).unwrap();
+        assert_eq!(e.start, PathBuf::from("/srv/a\nb 한"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn establish_start_dir_keeps_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let f = establish_fake("OpenSSH_9.6p1\n", "Linux\n", b"/srv/\xff\xfe\0trailing");
+        let cmd: Arc<dyn Cmd> = f;
+        let e = establish(&cmd, "web", target(), None).unwrap();
+        assert_eq!(e.start.as_os_str().as_bytes(), b"/srv/\xff\xfe");
+    }
+
+    #[test]
+    fn establish_rejects_unterminated_or_empty_start_dir() {
+        for pwd in [&b"/no/nul"[..], b"\0", b""] {
+            let f = establish_fake("OpenSSH_9.6p1\n", "Linux\n", pwd);
+            let cmd: Arc<dyn Cmd> = f;
+            assert!(establish(&cmd, "web", target(), None).is_err(), "{pwd:?}");
+        }
+    }
+
+    #[test]
     fn establish_darwin_is_bsd_and_sftp() {
-        let f = establish_fake("OpenSSH_9.6p1\n", "Darwin\n", "/Users/x\n");
+        let f = establish_fake("OpenSSH_9.6p1\n", "Darwin\n", b"/Users/x\0");
         let cmd: Arc<dyn Cmd> = f;
         let e = establish(&cmd, "mac", target(), Some("~/src")).unwrap();
         assert_eq!(e.session.os, RemoteOs::Bsd);

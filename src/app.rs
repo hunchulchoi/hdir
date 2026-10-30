@@ -1,5 +1,6 @@
 //! Application state and key handling (no terminal IO).
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -487,8 +488,8 @@ pub struct App {
     connect_gen: u64,
     connect_tx: Sender<ConnectMsg>,
     connect_rx: Receiver<ConnectMsg>,
-    /// A connect that needs the terminal for ssh's prompts.
-    pending_master: Option<ConnectJob>,
+    /// Connects that need the terminal for ssh's prompts, in request order.
+    pending_master: VecDeque<ConnectJob>,
 }
 
 impl Default for App {
@@ -575,7 +576,7 @@ impl App {
             connect_gen: 0,
             connect_tx,
             connect_rx,
-            pending_master: None,
+            pending_master: VecDeque::new(),
         }
     }
 
@@ -1102,7 +1103,7 @@ impl App {
             target,
         };
         self.connecting[idx] = Some(job.attempt);
-        self.pending_master = self.pending_master.take().filter(|j| j.idx != idx);
+        self.pending_master.retain(|j| j.idx != idx);
         self.status = Some(format!("연결 중… {}", job.target.host));
         self.spawn_connect(job, false);
     }
@@ -1156,7 +1157,7 @@ impl App {
     }
 
     pub fn has_pending_master(&self) -> bool {
-        self.pending_master.is_some()
+        !self.pending_master.is_empty()
     }
 
     /// Run the queued `ssh -fN` on the real terminal (password / host key
@@ -1165,12 +1166,14 @@ impl App {
         &mut self,
         suspend: impl FnOnce(&mut dyn FnMut() -> EditResult) -> std::io::Result<EditResult>,
     ) {
-        let Some(job) = self.pending_master.take() else {
-            return;
+        let job = loop {
+            let Some(job) = self.pending_master.pop_front() else {
+                return;
+            };
+            if self.connecting[job.idx] == Some(job.attempt) {
+                break job;
+            } // else superseded
         };
-        if self.connecting[job.idx] != Some(job.attempt) {
-            return; // superseded
-        }
         let cmd = Arc::clone(&self.cmd);
         let mut result: EditResult = Err("실행되지 않음".into());
         let outcome = suspend(&mut || {
@@ -1201,7 +1204,14 @@ impl App {
                 ConnectMsg::NeedAuth(job) => {
                     if self.connecting[job.idx] == Some(job.attempt) {
                         self.status = Some(format!("인증 필요: {}", job.target.host));
-                        self.pending_master = Some(job);
+                        self.pending_master.retain(|j| j.idx != job.idx);
+                        // Workers answer in any order; ask in request order.
+                        let at = self
+                            .pending_master
+                            .iter()
+                            .position(|j| j.attempt > job.attempt)
+                            .unwrap_or(self.pending_master.len());
+                        self.pending_master.insert(at, job);
                         changed = true;
                     }
                 }
@@ -1254,7 +1264,7 @@ impl App {
     /// `:local` / picking "로컬": back to the last local directory.
     fn switch_local(&mut self, idx: usize) {
         self.connecting[idx] = None;
-        self.pending_master = self.pending_master.take().filter(|j| j.idx != idx);
+        self.pending_master.retain(|j| j.idx != idx);
         if !self.panels[idx].location.is_remote() {
             self.status = Some("이미 로컬 패널".into());
             return;
@@ -7146,6 +7156,8 @@ mod tests {
             down: AtomicBool,
             interactive: Mutex<Vec<Vec<String>>>,
             checks: Mutex<usize>,
+            /// Held by a test to make every remote listing hang.
+            list_gate: Mutex<()>,
             tree: HashMap<&'static str, Vec<(&'static str, &'static str)>>,
         }
 
@@ -7164,6 +7176,7 @@ mod tests {
                     down: AtomicBool::new(false),
                     interactive: Mutex::new(Vec::new()),
                     checks: Mutex::new(0),
+                    list_gate: Mutex::new(()),
                     tree,
                 })
             }
@@ -7216,14 +7229,15 @@ mod tests {
                     .strip_prefix("cd -- ")
                     .map(|r| r.split(" && ").next().unwrap().trim_matches('\''))
                     .unwrap();
-                if cmd.ends_with("&& pwd") {
+                if cmd.contains("$PWD") {
                     let dir = if dir == "." || dir == "\"$HOME\"" {
                         "/home/choi"
                     } else {
                         dir
                     };
-                    return out(0, &format!("{dir}\n"));
+                    return out(0, &format!("{dir}\0"));
                 }
+                drop(self.list_gate.lock().unwrap()); // tests hold it to hang listings
                 match self.tree.get(dir) {
                     Some(items) => {
                         let recs: String = items
@@ -7388,6 +7402,69 @@ mod tests {
             assert_eq!(strs(&check_argv(&t))[..3], ["ssh", "-O", "check"]);
             assert!(app.panels[1].location.is_remote());
             assert_eq!(names(&app, 1)[1], "sub");
+        }
+
+        #[test]
+        fn two_panels_needing_auth_both_get_the_terminal_in_order() {
+            let (_t, mut app, f) = env_with(false);
+            alt(&mut app, 2); // right panel -> prod
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            alt(&mut app, 1); // left panel -> web
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let start = Instant::now();
+            while app.pending_master.len() < 2 {
+                assert!(start.elapsed() < Duration::from_secs(5), "auth requests");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            run_master_ok(&mut app);
+            assert!(
+                app.has_pending_master(),
+                "the second request is still queued"
+            );
+            run_master_ok(&mut app);
+            assert!(!app.has_pending_master());
+            wait_remote(&mut app);
+            let hosts: Vec<String> = f
+                .interactive
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|a| a[a.len() - 1].clone())
+                .collect();
+            assert_eq!(hosts, vec!["prod-web", "web"], "in request order");
+            assert!(app.panels[0].location.is_remote());
+            assert!(app.panels[1].location.is_remote());
+            assert!(!app.is_connecting());
+        }
+
+        #[test]
+        fn leaving_a_hung_remote_listing_does_not_block_the_local_one() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            let gate = f.list_gate.lock().unwrap();
+            app.reload_panel(1, None); // hangs on the gate
+            std::thread::sleep(Duration::from_millis(50));
+            submit(&mut app, "local");
+            let start = Instant::now();
+            while app.panels[1].loading.is_some() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "local listing stuck behind the hung remote one"
+                );
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!app.panels[1].location.is_remote());
+            assert!(!app.panels[1].entries.is_empty());
+            drop(gate);
+            std::thread::sleep(Duration::from_millis(100));
+            app.tick();
+            assert!(!app.panels[1].location.is_remote(), "old result is dropped");
+            assert!(app.panels[1].error.is_none());
         }
 
         #[test]
