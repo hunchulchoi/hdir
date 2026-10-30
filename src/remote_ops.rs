@@ -1374,7 +1374,7 @@ mod tests {
     #[test]
     fn real_replace_refuses_a_same_length_rewrite_with_the_mtime_restored() {
         // during the checksum: same-length rewrite, mtime put back (ctime
-        // cannot be put back; wait so it lands in another second)
+        // cannot be put back), all within the same second
         let (_t, dir, cmd) = replace_with_fakes(
             &[(
                 "cksum",
@@ -1384,7 +1384,6 @@ mod tests {
             )],
             false,
         );
-        std::thread::sleep(std::time::Duration::from_millis(1100));
         let out = local_session(&dir).exec(&cmd).unwrap();
         assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "SHARED");
@@ -1402,6 +1401,18 @@ mod tests {
         assert!(e.contains("원격 파일이 바뀌어"), "{e}");
         assert_eq!(mode_of(&dir.join("a")), 0o600);
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "shared");
+    }
+
+    #[test]
+    fn real_replace_of_a_changed_file_skips_the_checksum() {
+        let (_t, dir, cmd) = replace_with_fakes(
+            &[("cksum", ": > \"$(dirname \"$0\")/cksum-called\"; exit 1")],
+            false,
+        );
+        std::fs::write(dir.join("a"), "changed!").unwrap();
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
+        assert!(!dir.parent().unwrap().join("bin/cksum-called").exists());
     }
 
     #[test]
@@ -1517,19 +1528,18 @@ mod tests {
     #[test]
     fn real_replace_keeps_the_temp_private_until_the_check_passes() {
         // the fake cksum records the temp's mode while the check runs
-        let (_t, dir, cmd) = replace_with_fakes(
+        let (_t, dir, cmd) = replace_with_fakes_prep(
             &[(
                 "cksum",
                 "ls -l \"$(dirname \"$0\")/../d/.hdir-edit.Hl1\" > \"$(dirname \"$0\")/seen\"; exec /usr/bin/cksum \"$@\"",
             )],
             false,
+            |d| {
+                let mode = |m| std::fs::Permissions::from_mode(m);
+                std::fs::set_permissions(d.join("a"), mode(0o644)).unwrap();
+                std::fs::set_permissions(d.join(".hdir-edit.Hl1"), mode(0o600)).unwrap();
+            },
         );
-        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o644)).unwrap();
-        std::fs::set_permissions(
-            dir.join(".hdir-edit.Hl1"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
         let out = local_session(&dir).exec(&cmd).unwrap();
         assert_eq!(
             out.code,
@@ -1591,6 +1601,16 @@ mod tests {
         fakes: &[(&str, &str)],
         link: bool,
     ) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+        replace_with_fakes_prep(fakes, link, |_| {})
+    }
+
+    /// Like [`replace_with_fakes`]; `prep(dir)` runs before the original is
+    /// stamped (changes made after the stamp count as remote changes).
+    fn replace_with_fakes_prep(
+        fakes: &[(&str, &str)],
+        link: bool,
+        prep: impl FnOnce(&Path),
+    ) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
         let dir = root.join("d");
@@ -1600,6 +1620,7 @@ mod tests {
             std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
         }
         std::fs::write(dir.join(".hdir-edit.Hl1"), "edited!").unwrap();
+        prep(&dir);
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         for (name, body) in fakes {
@@ -1746,18 +1767,23 @@ mod tests {
     fn real_replace_refuses_when_the_group_cannot_be_kept() {
         use std::os::unix::fs::MetadataExt;
         // the fake chgrp fails as for a group the user is not in
-        let (_t, dir, cmd) = replace_with_fakes(&[("chgrp", "exit 1")], false);
-        let gid = std::fs::metadata(dir.join("a")).unwrap().gid();
-        let Some(g) = other_group(gid) else {
+        let other = std::cell::Cell::new(None);
+        let (_t, dir, cmd) = replace_with_fakes_prep(&[("chgrp", "exit 1")], false, |d| {
+            let gid = std::fs::metadata(d.join("a")).unwrap().gid();
+            if let Some(g) = other_group(gid) {
+                let st = std::process::Command::new("chgrp")
+                    .arg(g.to_string())
+                    .arg(d.join("a"))
+                    .status()
+                    .unwrap();
+                assert!(st.success());
+                other.set(Some(g));
+            }
+        });
+        let Some(g) = other.get() else {
             eprintln!("skipped: the user belongs to a single group");
             return;
         };
-        let st = std::process::Command::new("chgrp")
-            .arg(g.to_string())
-            .arg(dir.join("a"))
-            .status()
-            .unwrap();
-        assert!(st.success());
         let out = local_session(&dir).exec(&cmd).unwrap();
         assert_eq!(out.code, Some(crate::remote::REPLACE_GROUP));
         assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "shared");
