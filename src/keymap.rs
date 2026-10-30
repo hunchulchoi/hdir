@@ -271,7 +271,7 @@ const MDIR_PANEL: &[(Action, &[&str])] = &[
     (A::ToggleMode, &["Ctrl+T"]),
     (A::ConnectLeft, &["Alt+F1"]),
     (A::ConnectRight, &["Alt+F2"]),
-    (A::OpenWith, &["Ctrl+O"]),
+    (A::OpenWith, &["Shift+Enter", "Ctrl+O"]),
     (A::CancelJob, &["Esc"]),
 ];
 
@@ -796,6 +796,8 @@ mod tests {
         assert_eq!(p(KeyCode::F(1), ALT), Some(Action::ConnectLeft));
         assert_eq!(p(KeyCode::F(2), ALT), Some(Action::ConnectRight));
         assert_eq!(p(KeyCode::Char('o'), CTRL), Some(Action::OpenWith));
+        assert_eq!(p(KeyCode::Enter, SHIFT), Some(Action::OpenWith));
+        assert_eq!(p(KeyCode::Enter, NONE), Some(Action::Enter));
         assert_eq!(p(KeyCode::Char('x'), NONE), None);
     }
 

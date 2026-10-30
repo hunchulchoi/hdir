@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::assoc::AssocTable;
 use crate::config::Mode;
 use crate::keymap::{Action, Context, Keymap};
 use crate::panel::{Entry, EntryKind, Panel};
@@ -39,6 +40,8 @@ pub struct View<'a> {
     pub active: usize,
     pub status: Option<&'a str>,
     pub shell: &'a str,
+    /// Extension rules; files matching one get the `assoc_file` color.
+    pub assoc: &'a AssocTable,
     pub os: &'a str,
     /// A panel showing the trash instead of its directory.
     pub trash: [Option<&'a TrashView>; 2],
@@ -231,7 +234,7 @@ fn is_dirlike(e: &Entry) -> bool {
     )
 }
 
-fn entry_style(e: &Entry, selected: bool, theme: &Theme) -> Style {
+fn entry_style(e: &Entry, selected: bool, has_rule: bool, theme: &Theme) -> Style {
     let base = Style::default().bg(theme.bg);
     if selected {
         return base.fg(theme.selected);
@@ -253,7 +256,14 @@ fn entry_style(e: &Entry, selected: bool, theme: &Theme) -> Style {
     if e.kind == EntryKind::File && e.mode & 0o111 != 0 {
         return base.fg(theme.exec);
     }
-    base.fg(theme.color_for_ext(&e.name).unwrap_or(theme.file))
+    // Precedence: selected > dir > symlink > hidden > exec > ext group >
+    // assoc_file (any rule matches) > file.
+    let plain = if has_rule {
+        theme.assoc_file
+    } else {
+        theme.file
+    };
+    base.fg(theme.color_for_ext(&e.name).unwrap_or(plain))
 }
 
 fn row_text(e: &Entry, selected: bool, width: usize) -> String {
@@ -271,7 +281,14 @@ fn row_text(e: &Entry, selected: bool, width: usize) -> String {
     format!("{} {:>8}", fit_width(&name, width - 9), right)
 }
 
-fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool, theme: &Theme) {
+fn draw_panel(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &Panel,
+    active: bool,
+    assoc: &AssocTable,
+    theme: &Theme,
+) {
     let border = if active {
         theme.border_active
     } else {
@@ -300,7 +317,8 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool, theme:
         .take(rows)
         .map(|(i, e)| {
             let sel = panel.selected.contains(&e.os_name);
-            let mut style = entry_style(e, sel, theme);
+            let has_rule = e.kind == EntryKind::File && assoc.find(&e.os_name).is_some();
+            let mut style = entry_style(e, sel, has_rule, theme);
             if active && i == panel.cursor {
                 style = style.bg(theme.cursor_bg).fg(theme.cursor_fg);
             }
@@ -571,7 +589,14 @@ pub fn draw(frame: &mut Frame, view: &View) {
     for i in 0..2 {
         match view.trash[i] {
             Some(tv) => draw_trash_panel(frame, cols[i], tv, view.active == i, view.theme),
-            None => draw_panel(frame, cols[i], view.panels[i], view.active == i, view.theme),
+            None => draw_panel(
+                frame,
+                cols[i],
+                view.panels[i],
+                view.active == i,
+                view.assoc,
+                view.theme,
+            ),
         }
     }
 
@@ -767,6 +792,7 @@ mod tests {
             active,
             status,
             shell: "zsh",
+            assoc: &AssocTable::default(),
             os: "macos",
             mode: Mode::Classic,
             preview: None,
@@ -917,12 +943,17 @@ mod tests {
     // ---- HDIR-21/22/23: theme-driven colors ----
 
     fn render_themed(a: &Panel, b: &Panel, theme: &Theme) -> Buffer {
+        render_assoc(a, b, theme, &AssocTable::default())
+    }
+
+    fn render_assoc(a: &Panel, b: &Panel, theme: &Theme, assoc: &AssocTable) -> Buffer {
         let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let view = View {
             panels: [a, b],
             active: 0,
             status: None,
             shell: "zsh",
+            assoc,
             os: "macos",
             mode: Mode::Classic,
             preview: None,
@@ -1010,6 +1041,64 @@ mod tests {
         assert_eq!(name_fg(&buf, 3), theme.hidden, "hidden beats exec");
         assert_eq!(name_fg(&buf, 4), theme.exec, "exec beats ext");
         assert_eq!(name_fg(&buf, 5), theme.selected, "selected beats ext");
+    }
+
+    fn assoc_table(exts: &[&str]) -> AssocTable {
+        let rule = crate::assoc::AssocRule {
+            ext: Some(exts.iter().map(|e| e.to_string()).collect()),
+            glob: None,
+            cmd: "true".into(),
+            wait: false,
+            background: false,
+            name: None,
+        };
+        AssocTable::from_rules(vec![rule]).0
+    }
+
+    #[test]
+    fn assoc_files_use_the_assoc_file_color() {
+        let mut theme = th();
+        theme.assoc_file = Color::Rgb(7, 7, 7);
+        let pa = fixed_panel(
+            "/tmp/a",
+            &[
+                ("a.xyz", EntryKind::File, 1),
+                ("b.other", EntryKind::File, 1),
+                ("dir.xyz", EntryKind::Dir, 0),
+            ],
+        );
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_assoc(&pa, &pb, &theme, &assoc_table(&["xyz"]));
+        assert_eq!(name_fg(&buf, 1), Color::Rgb(7, 7, 7));
+        assert_eq!(name_fg(&buf, 2), theme.file, "no rule: plain file color");
+        assert_eq!(name_fg(&buf, 3), theme.dir, "dirs ignore rules");
+    }
+
+    #[test]
+    fn assoc_color_sits_below_ext_group_exec_and_hidden() {
+        let mut theme = th();
+        theme.assoc_file = Color::Rgb(7, 7, 7);
+        theme.ext_colors = vec![crate::theme::ExtGroup {
+            name: "mine".into(),
+            exts: vec!["rs".into()],
+            color: Color::Rgb(9, 9, 9),
+        }];
+        let mut pa = fixed_panel(
+            "/tmp/a",
+            &[
+                ("m.rs", EntryKind::File, 1),
+                ("x.sh", EntryKind::File, 1),
+                (".h.sh", EntryKind::File, 1),
+            ],
+        );
+        pa.entries[2].mode = 0o755;
+        pa.entries[3].mode = 0o755;
+        pa.entries[3].hidden = true;
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_assoc(&pa, &pb, &theme, &assoc_table(&["rs", "sh"]));
+        assert_eq!(name_fg(&buf, 1), Color::Rgb(9, 9, 9), "ext group wins");
+        assert_eq!(name_fg(&buf, 2), theme.exec, "exec wins");
+        assert_eq!(name_fg(&buf, 3), theme.hidden, "hidden wins");
     }
 
     #[test]
@@ -1122,6 +1211,7 @@ mod tests {
             active: 0,
             status: None,
             shell: "zsh",
+            assoc: &AssocTable::default(),
             os: "macos",
             mode: Mode::Classic,
             preview: None,
@@ -1229,6 +1319,7 @@ mod tests {
             active,
             status: None,
             shell: "zsh",
+            assoc: &AssocTable::default(),
             os: "macos",
             mode: Mode::Classic,
             preview: None,
@@ -1365,6 +1456,7 @@ mod tests {
             active: 0,
             status: None,
             shell: "zsh",
+            assoc: &AssocTable::default(),
             os: "macos",
             mode,
             preview: None,
@@ -1506,6 +1598,7 @@ mod tests {
             active: 0,
             status: None,
             shell: "zsh",
+            assoc: &AssocTable::default(),
             os: "macos",
             mode: Mode::Dev,
             trash: [None, None],

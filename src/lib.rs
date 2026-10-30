@@ -8,6 +8,7 @@ pub mod editor;
 pub mod fs_ops;
 pub mod job;
 pub mod keymap;
+pub mod launcher;
 pub mod loader;
 pub mod menu;
 pub mod panel;

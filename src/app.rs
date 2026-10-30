@@ -1,7 +1,7 @@
 //! Application state and key handling (no terminal IO).
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::assoc::{self, AssocRule, DefaultAction, RunMode};
 use crate::config::{self, Mode, Settings};
 use crate::dialog::{self, Dialog, DialogResult};
 use crate::editor::{self, EditResult, EditorRunner};
@@ -16,6 +17,7 @@ use crate::fs_ops::{self};
 use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
 use crate::keymap::{Action, Context};
+use crate::launcher::{self, SharedLauncher};
 use crate::loader::Loader;
 use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
@@ -63,6 +65,19 @@ enum MenuKind {
     Main,
     /// Theme names, parallel to the menu items.
     Theme(Vec<String>),
+    /// Open-with choices for `path`, parallel to the menu items.
+    OpenWith {
+        path: PathBuf,
+        choices: Vec<OpenChoice>,
+    },
+}
+
+/// One entry of the open-with menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenChoice {
+    Rule(AssocRule),
+    System,
+    Viewer,
 }
 
 /// The open popup menu.
@@ -78,6 +93,44 @@ const MENU_HIDDEN: usize = 1;
 const MENU_KEYS: usize = 2;
 const MENU_RELOAD: usize = 3;
 const MENU_WARNINGS: usize = 4;
+const MENU_OPEN_WITH: usize = 5;
+
+/// Decides off the UI thread whether a file is text (first chunk only).
+pub type TextProbe = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+/// Reads the first 8 KiB of `path` and classifies it like the preview does.
+pub fn probe_text(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let size = file.metadata().map_or(0, |m| m.len());
+    let mut buf = Vec::new();
+    if file.take(8 * 1024).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    matches!(
+        preview::classify(&buf, size),
+        Preview::Text { .. } | Preview::Empty
+    )
+}
+
+/// An association run waiting for the main loop to suspend the TUI.
+struct RunJob {
+    argv: Vec<OsString>,
+    cwd: PathBuf,
+    mode: RunMode,
+    panel: usize,
+    name: OsString,
+    /// What the user configured, for error messages.
+    label: String,
+}
+
+/// An in-flight text-or-not decision for a file without a rule.
+struct ProbeLoad {
+    rx: Receiver<bool>,
+    path: PathBuf,
+}
 
 /// Computes one preview off the UI thread; tests may swap in a gated fake.
 pub type PreviewRunner = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
@@ -306,6 +359,12 @@ pub struct App {
     viewer_load: Option<ViewerLoad>,
     /// The F9 popup menu (or theme picker).
     pub menu: Option<OpenMenu>,
+    /// Starts association programs; tests inject a fake.
+    pub launcher: SharedLauncher,
+    /// Text detection for Enter on a file without a rule; tests inject fakes.
+    pub text_probe: TextProbe,
+    pending_run: Option<RunJob>,
+    probe: Option<ProbeLoad>,
 }
 
 impl Default for App {
@@ -364,6 +423,10 @@ impl App {
             viewer_loader: Arc::new(|p| preview::preview_path_with(p, preview::Limits::VIEWER)),
             viewer_load: None,
             menu: None,
+            launcher: launcher::system_launcher(),
+            text_probe: Arc::new(probe_text),
+            pending_run: None,
+            probe: None,
         }
     }
 
@@ -463,6 +526,7 @@ impl App {
         .map(String::from)
         .to_vec();
         items.push(warnings);
+        items.push("연결 프로그램 선택".to_string());
         self.status = None;
         self.menu = Some(OpenMenu {
             menu: Menu::new("메뉴", items, 0),
@@ -543,6 +607,20 @@ impl App {
         let theme_names = match &open.kind {
             MenuKind::Theme(names) => Some(names.clone()),
             MenuKind::Main => None,
+            MenuKind::OpenWith { path, choices } => {
+                let (path, choices) = (path.clone(), choices.clone());
+                match event {
+                    MenuEvent::Chosen(i) => {
+                        self.menu = None;
+                        if let Some(c) = choices.get(i) {
+                            self.run_choice(c, path);
+                        }
+                    }
+                    MenuEvent::Cancelled => self.menu = None,
+                    _ => {}
+                }
+                return;
+            }
         };
         match (event, theme_names) {
             (MenuEvent::Moved, Some(names)) => {
@@ -571,6 +649,7 @@ impl App {
                     MENU_KEYS => self.open_key_settings(),
                     MENU_RELOAD => self.reload_config(),
                     MENU_WARNINGS => self.open_warnings(),
+                    MENU_OPEN_WITH => self.open_with_menu(),
                     _ => {}
                 }
             }
@@ -719,13 +798,7 @@ impl App {
                 self.status = None;
                 let id = self.next_id();
                 match self.active_panel_mut().begin_enter(id) {
-                    AsyncEnter::Opened(path) => {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        self.status = Some(format!("열기: {name}"));
-                    }
+                    AsyncEnter::Opened(path) => self.activate_file(path),
                     AsyncEnter::Load(req) => self.dispatch(self.active, req),
                     AsyncEnter::Nothing => self.show_panel_error(),
                 }
@@ -751,7 +824,7 @@ impl App {
             Action::Edit => self.open_editor(),
             Action::CommandLine => self.unsupported("명령줄"),
             Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
-            Action::OpenWith => self.unsupported("연결 프로그램 선택"),
+            Action::OpenWith => self.open_with_menu(),
             Action::Menu => self.open_main_menu(),
             Action::Help => self.open_help(),
             Action::Confirm
@@ -920,19 +993,24 @@ impl App {
 
     /// F3: view the current file (directories and `..` do nothing).
     fn open_viewer(&mut self) {
+        if let Some(path) = self.current_file() {
+            self.view_path(path);
+        }
+    }
+
+    /// The active panel's cursor entry when it is a file (not `..`/a dir).
+    fn current_file(&self) -> Option<PathBuf> {
         let panel = self.active_panel();
-        let Some(e) = panel.current() else {
-            return;
-        };
+        let e = panel.current()?;
         let is_dir = match e.kind {
             EntryKind::Parent | EntryKind::Dir => true,
             EntryKind::Symlink { target_is_dir } => target_is_dir,
             EntryKind::File => false,
         };
-        if is_dir {
-            return;
-        }
-        let path = panel.cwd.join(&e.os_name);
+        (!is_dir).then(|| panel.cwd.join(&e.os_name))
+    }
+
+    fn view_path(&mut self, path: PathBuf) {
         self.status = None;
         self.viewer = Some(Viewer::loading(path.clone()));
         self.start_viewer_load(path);
@@ -972,6 +1050,174 @@ impl App {
             }
             None => false,
         }
+    }
+
+    // ---- extension associations (HDIR-28/29) ----
+
+    /// Enter on a file: its rule, else text -> viewer / other -> system opener.
+    fn activate_file(&mut self, path: PathBuf) {
+        let Some(name) = path.file_name() else {
+            return;
+        };
+        if let Some(rule) = self.settings.assoc.find(name).cloned() {
+            self.run_rule(&rule, path);
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let probe = Arc::clone(&self.text_probe);
+        let target = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe(&target));
+        });
+        self.probe = Some(ProbeLoad { rx, path });
+    }
+
+    /// Apply a finished text probe; true when the screen changed.
+    fn tick_probe(&mut self) -> bool {
+        let Some(load) = self.probe.as_ref() else {
+            return false;
+        };
+        let is_text = match load.rx.try_recv() {
+            Ok(t) => t,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                self.probe = None;
+                self.status = Some("오류: 파일 형식 확인 실패".into());
+                return true;
+            }
+        };
+        let path = self.probe.take().map(|l| l.path).unwrap_or_default();
+        match assoc::default_action(is_text) {
+            DefaultAction::View => self.view_path(path),
+            DefaultAction::OpenWithSystem => self.run_system(path),
+        }
+        true
+    }
+
+    fn run_rule(&mut self, rule: &AssocRule, path: PathBuf) {
+        let cwd = self.run_cwd(&path);
+        match assoc::plan_run(rule, &path, &cwd, &self.shell) {
+            Ok((argv, mode)) => self.launch(argv, mode, rule.cmd.clone(), &path, cwd),
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    fn run_system(&mut self, path: PathBuf) {
+        let cwd = self.run_cwd(&path);
+        match assoc::system_opener_argv(&path) {
+            Ok(argv) => self.launch(
+                argv,
+                RunMode::Background,
+                assoc::system_opener().into(),
+                &path,
+                cwd,
+            ),
+            Err(e) => self.status = Some(e),
+        }
+    }
+
+    /// Programs run in the directory holding the file (the active panel's cwd).
+    fn run_cwd(&self, path: &Path) -> PathBuf {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| self.active_panel().cwd.clone(), Path::to_path_buf)
+    }
+
+    fn launch(
+        &mut self,
+        argv: Vec<OsString>,
+        mode: RunMode,
+        label: String,
+        path: &Path,
+        cwd: PathBuf,
+    ) {
+        let name = path.file_name().map(OsString::from).unwrap_or_default();
+        if mode == RunMode::Background {
+            self.status = Some(match self.launcher.spawn_detached(&argv, &cwd) {
+                Ok(()) => format!("실행: {}", name.to_string_lossy()),
+                Err(e) => format!("오류: {label}: {e}"),
+            });
+            return;
+        }
+        self.status = None;
+        self.pending_run = Some(RunJob {
+            argv,
+            cwd,
+            mode,
+            panel: self.active,
+            name,
+            label,
+        });
+    }
+
+    fn run_choice(&mut self, choice: &OpenChoice, path: PathBuf) {
+        match choice {
+            OpenChoice::Rule(rule) => self.run_rule(rule, path),
+            OpenChoice::System => self.run_system(path),
+            OpenChoice::Viewer => self.view_path(path),
+        }
+    }
+
+    /// Shift+Enter / Ctrl+O / F9 item: choose how to open the current file.
+    fn open_with_menu(&mut self) {
+        self.status = None;
+        let Some(path) = self.current_file() else {
+            self.status = Some("파일을 선택하세요".into());
+            return;
+        };
+        let mut items = Vec::new();
+        let mut choices = Vec::new();
+        if let Some(name) = path.file_name() {
+            for rule in self.settings.assoc.candidates(name) {
+                items.push(rule.name.clone().unwrap_or_else(|| rule.cmd.clone()));
+                choices.push(OpenChoice::Rule(rule.clone()));
+            }
+        }
+        items.push("시스템 기본 프로그램".into());
+        choices.push(OpenChoice::System);
+        items.push("뷰어(F3)".into());
+        choices.push(OpenChoice::Viewer);
+        self.menu = Some(OpenMenu {
+            menu: Menu::new("연결 프로그램 선택", items, 0),
+            kind: MenuKind::OpenWith { path, choices },
+        });
+    }
+
+    pub fn has_pending_run(&self) -> bool {
+        self.pending_run.is_some()
+    }
+
+    /// Run the queued association program: `suspend` leaves the TUI, calls the
+    /// closure (which runs the program, and for `wait` rules reads a key) and
+    /// re-enters; then the panels showing that directory reload.
+    pub fn run_pending(
+        &mut self,
+        suspend: impl FnOnce(&mut dyn FnMut() -> EditResult) -> std::io::Result<EditResult>,
+    ) {
+        let Some(job) = self.pending_run.take() else {
+            return;
+        };
+        let launcher = Arc::clone(&self.launcher);
+        let wait = job.mode == RunMode::Wait;
+        let outcome = suspend(&mut || {
+            let r = launcher.run(&job.argv, &job.cwd);
+            if wait {
+                launcher.wait_key();
+            }
+            r
+        });
+        for i in 0..2 {
+            if self.panels[i].cwd == job.cwd {
+                let focus = (i == job.panel).then(|| job.name.clone());
+                self.reload_after_op(i, focus);
+            }
+        }
+        let name = job.name.to_string_lossy();
+        self.status = Some(match outcome {
+            Ok(Ok(())) => format!("실행 완료: {name}"),
+            Ok(Err(e)) => format!("오류: {}: {e}", job.label),
+            Err(e) => format!("터미널 복귀 실패: {e}"),
+        });
     }
 
     /// F1 inside the viewer: help for the viewer keys only.
@@ -1109,7 +1355,7 @@ impl App {
     /// Poll background loads and the job; returns true when the screen needs a redraw.
     pub fn tick(&mut self) -> bool {
         let loaded = self.drain_loads();
-        let task = self.tick_task() | self.tick_viewer_load();
+        let task = self.tick_task() | self.tick_viewer_load() | self.tick_probe();
         let preview = self.tick_preview();
         self.tick_job() || loaded || task || preview
     }
@@ -1797,6 +2043,7 @@ impl App {
             active: self.active,
             status: self.status.as_deref(),
             shell: &self.shell,
+            assoc: &self.settings.assoc,
             os: std::env::consts::OS,
             mode: self.mode,
             preview: preview_view,
@@ -2320,7 +2567,8 @@ mod tests {
                 "숨김 파일 보기 토글",
                 "키 설정 보기",
                 "설정 다시 읽기",
-                "설정 경고 보기"
+                "설정 경고 보기",
+                "연결 프로그램 선택"
             ]
         );
         let text = draw_text(&mut app, 80, 24);
@@ -2692,14 +2940,6 @@ mod tests {
         settle(&mut app);
         assert_eq!(app.panels[0].cwd, root);
         assert_eq!(name_at(&app, 0), "adir");
-    }
-
-    #[test]
-    fn enter_file_sets_status_with_name() {
-        let (_t, mut app) = fixture();
-        press(&mut app, KeyCode::End);
-        press(&mut app, KeyCode::Enter);
-        assert!(app.status.as_deref().unwrap().contains("f.txt"));
     }
 
     #[test]
@@ -5304,6 +5544,353 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "{rows:?}");
             app.tick();
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // ---- HDIR-26/27/28/29: extension associations ----
+
+    mod assoc_run {
+        use super::*;
+        use crate::launcher::Launcher;
+        use std::path::Path;
+
+        #[derive(Default)]
+        struct Fake {
+            log: Arc<Mutex<Vec<String>>>,
+            fail_run: Mutex<Option<String>>,
+            fail_spawn: Mutex<Option<String>>,
+        }
+
+        fn line(kind: &str, argv: &[OsString], cwd: &Path) -> String {
+            let a: Vec<_> = argv.iter().map(|a| a.to_string_lossy()).collect();
+            format!("{kind} {} @{}", a.join("|"), cwd.display())
+        }
+
+        impl Launcher for Fake {
+            fn run(&self, argv: &[OsString], cwd: &Path) -> Result<(), String> {
+                self.log.lock().unwrap().push(line("run", argv, cwd));
+                self.fail_run.lock().unwrap().clone().map_or(Ok(()), Err)
+            }
+            fn spawn_detached(&self, argv: &[OsString], cwd: &Path) -> Result<(), String> {
+                self.log.lock().unwrap().push(line("spawn", argv, cwd));
+                self.fail_spawn.lock().unwrap().clone().map_or(Ok(()), Err)
+            }
+            fn wait_key(&self) {
+                self.log.lock().unwrap().push("wait_key".into());
+            }
+        }
+
+        struct Env {
+            _t: TempDir,
+            _cfg: TempDir,
+            app: App,
+            log: Arc<Mutex<Vec<String>>>,
+            fake: Arc<Fake>,
+        }
+
+        fn env(rules: &str) -> Env {
+            let (t, mut app) = fixture();
+            let cfg = config_with(rules);
+            app.configure(Some(cfg.path().to_path_buf()), Some("truecolor"));
+            let fake = Arc::new(Fake::default());
+            let log = Arc::clone(&fake.log);
+            app.launcher = fake.clone();
+            cursor_to(&mut app, "f.txt");
+            Env {
+                _t: t,
+                _cfg: cfg,
+                app,
+                log,
+                fake,
+            }
+        }
+
+        const CAT: &str = "[[assoc]]\next = [\"txt\"]\ncmd = \"cat {}\"\n";
+
+        fn run_pending_logged(e: &mut Env) {
+            let l = Arc::clone(&e.log);
+            e.app.run_pending(move |f| {
+                l.lock().unwrap().push("suspend".into());
+                let r = f();
+                l.lock().unwrap().push("resume".into());
+                Ok(r)
+            });
+        }
+
+        fn log(e: &Env) -> Vec<String> {
+            e.log.lock().unwrap().clone()
+        }
+
+        fn tick_until(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+            let start = Instant::now();
+            while !done(app) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "timed out: {what}"
+                );
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn enter_runs_a_foreground_rule_suspended_in_the_panel_cwd() {
+            let mut e = env(CAT);
+            press(&mut e.app, KeyCode::Enter);
+            assert!(e.app.has_pending_run(), "queued for the main loop");
+            assert!(log(&e).is_empty(), "nothing runs before the suspend");
+            run_pending_logged(&mut e);
+            let got = log(&e);
+            assert_eq!(got.len(), 3, "{got:?}");
+            assert_eq!(got[0], "suspend");
+            let cwd = e.app.panels[0].cwd.display().to_string();
+            assert!(
+                got[1].starts_with("run ")
+                    && got[1].contains("|-c|cat \"$1\"|hdir|")
+                    && got[1].contains(&format!("{cwd}/f.txt|{cwd}|f @{cwd}")),
+                "{got:?}"
+            );
+            assert_eq!(got[2], "resume");
+            assert!(!e.app.has_pending_run());
+            assert_eq!(e.app.status.as_deref(), Some("실행 완료: f.txt"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn wait_rule_reads_a_key_inside_the_suspension() {
+            let mut e = env(&format!("{CAT}wait = true\n"));
+            press(&mut e.app, KeyCode::Enter);
+            run_pending_logged(&mut e);
+            let got = log(&e);
+            assert_eq!(got.len(), 4, "{got:?}");
+            assert_eq!(got[0], "suspend");
+            assert!(got[1].starts_with("run "));
+            assert_eq!(got[2], "wait_key");
+            assert_eq!(got[3], "resume");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn background_rule_spawns_at_once_and_never_suspends() {
+            let mut e = env(&format!("{CAT}background = true\n"));
+            press(&mut e.app, KeyCode::Enter);
+            assert!(!e.app.has_pending_run());
+            let got = log(&e);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert!(got[0].starts_with("spawn ") && got[0].contains("cat \"$1\""));
+            assert_eq!(e.app.status.as_deref(), Some("실행: f.txt"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn foreground_failure_and_spawn_failure_report_cmd_and_reason() {
+            let mut e = env(CAT);
+            *e.fake.fail_run.lock().unwrap() = Some("종료 코드 1".into());
+            press(&mut e.app, KeyCode::Enter);
+            run_pending_logged(&mut e);
+            assert_eq!(e.app.status.as_deref(), Some("오류: cat {}: 종료 코드 1"));
+            let mut e = env(&format!("{CAT}background = true\n"));
+            *e.fake.fail_spawn.lock().unwrap() = Some("boom".into());
+            press(&mut e.app, KeyCode::Enter);
+            assert_eq!(e.app.status.as_deref(), Some("오류: cat {}: boom"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn terminal_failure_on_resume_is_reported() {
+            let mut e = env(CAT);
+            press(&mut e.app, KeyCode::Enter);
+            e.app
+                .run_pending(|_| Err(std::io::Error::other("tty gone")));
+            assert!(e.app.status.as_deref().unwrap().contains("tty gone"));
+        }
+
+        #[test]
+        fn no_rule_text_opens_the_viewer_without_launching() {
+            let mut e = env("");
+            e.app.text_probe = Arc::new(|_| true);
+            press(&mut e.app, KeyCode::Enter);
+            tick_until(&mut e.app, "viewer", |a| a.viewer.is_some());
+            assert!(log(&e).is_empty() && !e.app.has_pending_run());
+        }
+
+        #[test]
+        fn real_probe_treats_utf8_as_text_and_nul_bytes_as_binary() {
+            let mut e = env("");
+            press(&mut e.app, KeyCode::Enter); // f.txt = "x"
+            tick_until(&mut e.app, "viewer", |a| a.viewer.is_some());
+
+            let mut e = env("");
+            let root = e.app.panels[0].cwd.clone();
+            fs::write(root.join("blob.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+            e.app.reload_panel(0, None);
+            settle(&mut e.app);
+            cursor_to(&mut e.app, "blob.bin");
+            press(&mut e.app, KeyCode::Enter);
+            let l = Arc::clone(&e.log);
+            tick_until(&mut e.app, "spawn", move |_| !l.lock().unwrap().is_empty());
+            assert!(e.app.viewer.is_none());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn no_rule_binary_goes_to_the_system_opener_in_the_background() {
+            let mut e = env("");
+            e.app.text_probe = Arc::new(|_| false);
+            press(&mut e.app, KeyCode::Enter);
+            let l = Arc::clone(&e.log);
+            tick_until(&mut e.app, "spawn", move |_| !l.lock().unwrap().is_empty());
+            let got = log(&e);
+            let cwd = e.app.panels[0].cwd.display().to_string();
+            assert_eq!(
+                got,
+                vec![format!(
+                    "spawn {}|{cwd}/f.txt @{cwd}",
+                    crate::assoc::system_opener()
+                )]
+            );
+            assert!(e.app.viewer.is_none() && !e.app.has_pending_run());
+            assert_eq!(e.app.status.as_deref(), Some("실행: f.txt"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn system_opener_spawn_failure_reports_error() {
+            let mut e = env("");
+            e.app.text_probe = Arc::new(|_| false);
+            *e.fake.fail_spawn.lock().unwrap() = Some("no such file".into());
+            press(&mut e.app, KeyCode::Enter);
+            let want = format!("오류: {}: no such file", crate::assoc::system_opener());
+            tick_until(&mut e.app, "error", |a| a.status.as_deref() == Some(&want));
+        }
+
+        #[test]
+        fn text_probe_does_not_block_the_ui_thread() {
+            let mut e = env("");
+            let (tx, rx) = mpsc::channel::<()>();
+            let rx = Mutex::new(rx);
+            e.app.text_probe = Arc::new(move |_| {
+                let _ = rx.lock().unwrap().recv();
+                true
+            });
+            press(&mut e.app, KeyCode::Enter); // returns while the probe waits
+            assert!(e.app.viewer.is_none());
+            tx.send(()).unwrap();
+            tick_until(&mut e.app, "viewer", |a| a.viewer.is_some());
+        }
+
+        #[test]
+        fn enter_on_directories_never_launches() {
+            let mut e = env(CAT);
+            cursor_to(&mut e.app, "adir");
+            press(&mut e.app, KeyCode::Enter);
+            settle(&mut e.app);
+            assert!(log(&e).is_empty() && !e.app.has_pending_run());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_rule_run_shows_the_planned_message() {
+            let mut e = env(CAT);
+            press(&mut e.app, KeyCode::Enter);
+            assert_eq!(e.app.status.as_deref(), Some("Windows 지원 예정"));
+            assert!(!e.app.has_pending_run());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_system_opener_shows_the_planned_message() {
+            let mut e = env("");
+            e.app.text_probe = Arc::new(|_| false);
+            press(&mut e.app, KeyCode::Enter);
+            tick_until(&mut e.app, "msg", |a| {
+                a.status.as_deref() == Some("Windows 지원 예정")
+            });
+        }
+
+        // ---- open-with menu ----
+
+        const TWO: &str = "[[assoc]]\next = [\"txt\"]\ncmd = \"cat {}\"\nname = \"Cat\"\n[[assoc]]\nglob = \"f.*\"\ncmd = \"less {}\"\n";
+
+        #[test]
+        fn ctrl_o_and_shift_enter_open_the_open_with_menu() {
+            for (code, mods) in [
+                (KeyCode::Char('o'), KeyModifiers::CONTROL),
+                (KeyCode::Enter, KeyModifiers::SHIFT),
+            ] {
+                let mut e = env(TWO);
+                press_mods(&mut e.app, code, mods);
+                let open = e.app.menu.as_ref().expect("menu open");
+                assert_eq!(
+                    open.menu.items,
+                    ["less {}", "Cat", "시스템 기본 프로그램", "뷰어(F3)"]
+                );
+            }
+        }
+
+        #[test]
+        fn open_with_without_rules_lists_system_and_viewer_only() {
+            let mut e = env("");
+            press_mods(&mut e.app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            assert_eq!(
+                e.app.menu.as_ref().unwrap().menu.items,
+                ["시스템 기본 프로그램", "뷰어(F3)"]
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn open_with_runs_the_chosen_rule() {
+            let mut e = env(TWO);
+            press_mods(&mut e.app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            press(&mut e.app, KeyCode::Down); // "Cat"
+            press(&mut e.app, KeyCode::Enter);
+            assert!(e.app.menu.is_none());
+            run_pending_logged(&mut e);
+            let got = log(&e);
+            assert!(got[1].contains("|-c|cat \"$1\"|"), "{got:?}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn open_with_system_and_viewer_choices() {
+            let mut e = env(TWO);
+            press_mods(&mut e.app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            press(&mut e.app, KeyCode::Down);
+            press(&mut e.app, KeyCode::Down); // system
+            press(&mut e.app, KeyCode::Enter);
+            let got = log(&e);
+            assert_eq!(got.len(), 1, "{got:?}");
+            assert!(got[0].starts_with(&format!("spawn {}|", crate::assoc::system_opener())));
+
+            let mut e = env(TWO);
+            press_mods(&mut e.app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            for _ in 0..3 {
+                press(&mut e.app, KeyCode::Down); // viewer
+            }
+            press(&mut e.app, KeyCode::Enter);
+            assert!(e.app.viewer.is_some() && log(&e).is_empty());
+        }
+
+        #[test]
+        fn open_with_esc_cancels_and_dirs_are_refused() {
+            let mut e = env(TWO);
+            press_mods(&mut e.app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            press(&mut e.app, KeyCode::Esc);
+            assert!(e.app.menu.is_none() && !e.app.has_pending_run());
+            cursor_to(&mut e.app, "adir");
+            press_mods(&mut e.app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+            assert!(e.app.menu.is_none());
+            assert_eq!(e.app.status.as_deref(), Some("파일을 선택하세요"));
+        }
+
+        #[test]
+        fn f9_menu_has_the_open_with_item() {
+            let mut e = env(TWO);
+            e.app.open_main_menu();
+            pick(&mut e.app, "연결 프로그램 선택");
+            assert_eq!(e.app.menu.as_ref().unwrap().menu.items.len(), 4);
         }
     }
 }
