@@ -296,7 +296,7 @@ pub fn preview_cmd(path: &[u8], max: usize) -> Vec<u8> {
         &q,
         b") || exit 1; printf '%s\\n' $n; ",
         &head_cmd(path, max),
-        format!("; elif [ -e ").as_bytes(),
+        b"; elif [ -e ",
         &q,
         format!(" ]; then exit {PREVIEW_SPECIAL}; elif [ -L ").as_bytes(),
         &q,
