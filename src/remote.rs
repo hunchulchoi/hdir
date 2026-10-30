@@ -390,7 +390,9 @@ pub const DELETE_PROTECTED: i32 = 42;
 /// caught; a target that is itself a symlink is removed as a link, so its
 /// parent (the physical cwd) is what gets resolved. Nothing is removed when
 /// the home or cwd cannot be resolved ([`DELETE_NO_HOME`], [`DELETE_NO_CWD`])
-/// or a target is protected ([`DELETE_PROTECTED`]).
+/// or a target is protected ([`DELETE_PROTECTED`]). Every `$(pwd -P)` is
+/// followed by a sentinel (`echo x`, stripped with `${v%?x}`) so a path
+/// ending in a newline keeps it.
 pub fn delete_cmd(cwd: &[u8], names: &[&[u8]]) -> Vec<u8> {
     let list = names
         .iter()
@@ -399,10 +401,10 @@ pub fn delete_cmd(cwd: &[u8], names: &[&[u8]]) -> Vec<u8> {
         .join(&b' ');
     cat(&[
         b"[ -n \"$HOME\" ] || exit 40\n",
-        b"h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P) || exit 40\n",
+        b"h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P && echo x) || exit 40; h=${h%?x}\n",
         b"c=$(cd -- ",
         &sh_quote(cwd),
-        b" && pwd -P) || exit 41\n",
+        b" && pwd -P && echo x) || exit 41; c=${c%?x}\n",
         b"for n in ",
         &list,
         b"; do\n",
@@ -417,7 +419,8 @@ pub fn delete_cmd(cwd: &[u8], names: &[&[u8]]) -> Vec<u8> {
 
 /// Prints the physical path of `path` with its final symlinks followed
 /// (portable `readlink -f`: a manual loop, 40 levels at most), NUL-terminated;
-/// fails unless it names a regular file.
+/// fails unless it names a regular file. Like [`delete_cmd`], command
+/// substitutions carry a sentinel so trailing newlines survive.
 pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
     cat(&[
         b"p=",
@@ -429,7 +432,7 @@ pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
           case $l in /*) p=$l;; *) p=${p%/*}/$l;; esac\n\
           done\n\
           d=${p%/*}; [ -n \"$d\" ] || d=/; b=${p##*/}\n\
-          d=$(cd -- \"$d\" && pwd -P) || exit 1\n\
+          d=$(cd -- \"$d\" && pwd -P && echo x) || exit 1; d=${d%?x}\n\
           if [ \"$d\" = / ]; then p=/$b; else p=$d/$b; fi\n\
           [ -f \"$p\" ] || { echo 'not a regular file' >&2; exit 1; }\n\
           printf '%s\\0' \"$p\"",
@@ -1104,11 +1107,13 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     fn delete_cmd_resolves_physical_paths_and_checks_before_rm() {
         let c = s(delete_cmd(b"/srv/it's", &[b"a b", b"-r", b"x\ny"]));
         assert!(
-            c.contains("h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P) || exit 40"),
+            c.contains(
+                "h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P && echo x) || exit 40; h=${h%?x}"
+            ),
             "{c}"
         );
         assert!(
-            c.contains("c=$(cd -- '/srv/it'\\''s' && pwd -P) || exit 41"),
+            c.contains("c=$(cd -- '/srv/it'\\''s' && pwd -P && echo x) || exit 41; c=${c%?x}"),
             "{c}"
         );
         assert!(c.contains("for n in 'a b' '-r' 'x\ny'; do"), "{c}");
@@ -1132,7 +1137,10 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         assert!(c.starts_with("p='/d/it'\\''s'; n=0\n"), "{c}");
         assert!(c.contains("while [ -L \"$p\" ]"), "{c}");
         assert!(c.contains("readlink -- \"$p\""), "{c}");
-        assert!(c.contains("pwd -P"), "{c}");
+        assert!(
+            c.contains("d=$(cd -- \"$d\" && pwd -P && echo x) || exit 1; d=${d%?x}"),
+            "{c}"
+        );
         assert!(c.ends_with("printf '%s\\0' \"$p\""), "{c}");
         assert_eq!(
             s(mktemp_cmd(b"/srv/it's")),

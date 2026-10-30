@@ -596,6 +596,42 @@ mod tests {
         assert!(e.is_ok(), "{e:?}");
     }
 
+    /// work/a and work/"a\n", each holding `f` (the trailing newline must not
+    /// be lost by `$(pwd -P)`).
+    fn newline_twins() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let work = std::fs::canonicalize(t.path()).unwrap().join("work");
+        for d in ["a", "a\n"] {
+            std::fs::create_dir_all(work.join(d)).unwrap();
+            std::fs::write(work.join(d).join("f"), "keep").unwrap();
+        }
+        (t, work)
+    }
+
+    #[test]
+    fn delete_script_keeps_a_trailing_newline_of_the_cwd() {
+        let (_t, work) = newline_twins();
+        let s = local_session(&work);
+        delete(&s, &work.join("a\n"), &[OsString::from("f")]).unwrap();
+        assert!(!work.join("a\n/f").exists(), "the named file is removed");
+        assert!(
+            work.join("a/f").exists(),
+            "its twin without newline is kept"
+        );
+    }
+
+    #[test]
+    fn delete_script_refuses_a_home_reached_by_a_name_ending_in_newline() {
+        let (_t, work) = newline_twins();
+        // $HOME = work/"a\n": deleting work/"a\n" is refused, work/a is not
+        // the home and may go
+        let s = local_session(&work.join("a\n"));
+        assert!(delete(&s, &work, &[OsString::from("a\n")]).is_err());
+        assert!(work.join("a\n/f").exists());
+        delete(&s, &work, &[OsString::from("a")]).unwrap();
+        assert!(!work.join("a").exists());
+    }
+
     // ---- HDIR-39: preview / probe ----
 
     use crate::preview::{Limits, Preview};
@@ -1117,6 +1153,21 @@ mod tests {
         assert_eq!(std::fs::metadata(&a).unwrap().ino(), ino);
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "edited shared");
         no_temp_left(&dir);
+    }
+
+    #[test]
+    fn real_upload_into_a_directory_ending_in_newline_writes_only_that_file() {
+        let (_t, work) = newline_twins();
+        let local = edited(work.parent().unwrap(), "edited");
+        let s = local_session(&work);
+        upload_replace(&s, &local, &work.join("a\n/f")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(work.join("a\n/f")).unwrap(),
+            "edited"
+        );
+        assert_eq!(std::fs::read_to_string(work.join("a/f")).unwrap(), "keep");
+        no_temp_left(&work.join("a"));
+        no_temp_left(&work.join("a\n"));
     }
 
     #[test]
