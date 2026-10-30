@@ -332,9 +332,10 @@ pub fn merge(ssh: &[SshHost], cfg: &[ServerConfig]) -> (Vec<Server>, Vec<String>
             warnings.push(format!("[[servers]] #{}: duplicate name '{name}'", i + 1));
             continue;
         }
-        let is_alias = aliases.contains(&name.as_str());
+        // an explicit host that differs from the alias name wins over the ssh alias
+        let is_alias = aliases.contains(&name.as_str()) && host == name;
         servers.push(Server {
-            host: if is_alias { name.clone() } else { host },
+            host,
             name,
             port: c.port,
             start_path: c.path.clone(),
@@ -620,6 +621,18 @@ mod tests {
         assert_eq!(s[0].start_path.as_deref(), Some("/var/www"));
         assert_eq!(s[0].theme.as_deref(), Some("red"));
         assert!(s[0].from_ssh_config);
+    }
+
+    #[test]
+    fn merge_explicit_host_beats_same_named_alias() {
+        let (s, _) = merge(
+            &[ssh("alpha")],
+            &[entry(Some("alpha"), Some("me@9.9.9.9"), None, None)],
+        );
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].name, "alpha");
+        assert_eq!(s[0].host, "me@9.9.9.9");
+        assert!(!s[0].from_ssh_config);
     }
 
     #[test]
