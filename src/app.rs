@@ -6431,10 +6431,13 @@ mod tests {
             press(app, KeyCode::Enter);
         }
 
+        #[cfg(unix)]
+
         fn log(f: &ShellFake) -> Vec<String> {
             f.log.lock().unwrap().clone()
         }
 
+        #[cfg(unix)]
         fn run_logged(app: &mut App, f: &Arc<ShellFake>) {
             let f = Arc::clone(f);
             app.run_shell(move |run| {
