@@ -527,6 +527,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "trash",
+ "unicode-segmentation",
  "unicode-width",
  "windows-sys",
 ]

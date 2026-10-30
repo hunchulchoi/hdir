@@ -6,7 +6,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::keymap::{Action, Context, Keymap};
 use crate::panel::{Entry, EntryKind, Panel};
@@ -109,7 +110,14 @@ pub fn visible_offset(cursor: usize, scroll: usize, height: usize) -> usize {
     }
 }
 
+/// Display width of one grapheme cluster (ZWJ sequences, VS16 and combining
+/// marks measured as a unit).
+fn cluster_width(g: &str) -> usize {
+    g.width()
+}
+
 /// Truncate (with `…`) or right-pad `s` to exactly `width` display columns.
+/// Never splits a grapheme cluster.
 pub fn fit_width(s: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -117,12 +125,12 @@ pub fn fit_width(s: &str, width: usize) -> String {
         out.push_str(s);
         used = s.width();
     } else if width > 0 {
-        for c in s.chars() {
-            let w = c.width().unwrap_or(0);
+        for g in s.graphemes(true) {
+            let w = cluster_width(g);
             if used + w > width - 1 {
                 break;
             }
-            out.push(c);
+            out.push_str(g);
             used += w;
         }
         out.push('…');
@@ -133,6 +141,7 @@ pub fn fit_width(s: &str, width: usize) -> String {
 }
 
 /// Keep the tail of `s` within `width` columns, prefixed with `…` when cut.
+/// Never splits a grapheme cluster.
 fn tail_width(s: &str, width: usize) -> String {
     if s.width() <= width {
         return s.to_string();
@@ -140,19 +149,19 @@ fn tail_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let mut tail: Vec<char> = Vec::new();
+    let mut tail: Vec<&str> = Vec::new();
     let mut used = 1;
-    for c in s.chars().rev() {
-        let w = c.width().unwrap_or(0);
+    for g in s.graphemes(true).rev() {
+        let w = cluster_width(g);
         if used + w > width {
             break;
         }
-        tail.push(c);
+        tail.push(g);
         used += w;
     }
-    tail.push('…');
+    tail.push("…");
     tail.reverse();
-    tail.into_iter().collect()
+    tail.concat()
 }
 
 fn human_size(size: u64) -> String {
@@ -509,6 +518,35 @@ mod tests {
 
     fn th() -> Theme {
         crate::theme::builtin("mdir").unwrap()
+    }
+
+    #[test]
+    fn fit_width_never_splits_grapheme_clusters() {
+        // ZWJ emoji (2 cols), VS16 heart (2 cols), e + combining acute (1 col)
+        let zwj = "👩\u{200d}💻";
+        assert_eq!(fit_width(&format!("{zwj}ab"), 3), format!("{zwj}…"));
+        assert_eq!(fit_width(zwj, 3), format!("{zwj} "));
+        // width 2 for "a" + 2-wide cluster does not fit in 2 columns: cut before it
+        assert_eq!(fit_width(&format!("a{zwj}"), 2), "a…");
+        let heart = "❤\u{fe0f}";
+        assert_eq!(
+            fit_width(&format!("{heart}{heart}{heart}"), 5),
+            format!("{heart}{heart}…")
+        );
+        let e = "e\u{301}";
+        assert_eq!(fit_width(&format!("{e}{e}{e}{e}"), 3), format!("{e}{e}…"));
+        assert_eq!(fit_width(&format!("{e}{e}"), 4), format!("{e}{e}  "));
+        assert_eq!(fit_width("한글한글", 5), "한글…");
+    }
+
+    #[test]
+    fn tail_width_never_splits_grapheme_clusters() {
+        let zwj = "👩\u{200d}💻";
+        assert_eq!(tail_width(&format!("ab{zwj}"), 3), format!("…{zwj}"));
+        assert_eq!(tail_width(zwj, 1), "…");
+        let e = "e\u{301}";
+        assert_eq!(tail_width(&format!("{e}{e}{e}{e}"), 3), format!("…{e}{e}"));
+        assert_eq!(tail_width("가나다라", 5), "…다라");
     }
 
     #[test]
