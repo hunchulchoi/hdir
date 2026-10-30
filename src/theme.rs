@@ -398,7 +398,10 @@ pub fn load_user_themes(dir: &Path) -> (Vec<Theme>, Vec<String>) {
         if parent == Some(name) {
             return builtin(name);
         }
-        let (_, src) = sources.iter().find(|(n, _)| n == name)?;
+        // Not a user theme: fall through to the built-in of that name.
+        let Some((_, src)) = sources.iter().find(|(n, _)| n == name) else {
+            return builtin(name);
+        };
         if cyclic.iter().any(|c| c == name) {
             let mut t = builtin("mdir")?;
             t.name = name.to_string();
@@ -739,6 +742,21 @@ mod tests {
         assert_eq!(t.bg, rgb(0xFF, 0, 0)); // user overrides built-in
         let (t, _) = resolve("light", &themes);
         assert_eq!(t, builtin("light").unwrap());
+    }
+
+    #[test]
+    fn user_theme_can_extend_a_builtin_it_does_not_override() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("mine.toml"),
+            "base = \"dark\"\n[colors]\nbg = \"#010203\"\n",
+        )
+        .unwrap();
+        let (themes, warnings) = load_user_themes(d.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mine = &themes[0];
+        assert_eq!(mine.bg, rgb(1, 2, 3));
+        assert_eq!(mine.fg, builtin("dark").unwrap().fg);
     }
 
     #[test]

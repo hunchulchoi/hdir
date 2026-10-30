@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod assoc;
+pub mod config;
 pub mod dialog;
 pub mod fs_ops;
 pub mod job;
