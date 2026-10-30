@@ -390,7 +390,9 @@ pub const DELETE_PROTECTED: i32 = 42;
 /// caught; a target that is itself a symlink is removed as a link, so its
 /// parent (the physical cwd) is what gets resolved. Nothing is removed when
 /// the home or cwd cannot be resolved ([`DELETE_NO_HOME`], [`DELETE_NO_CWD`])
-/// or a target is protected ([`DELETE_PROTECTED`]).
+/// or a target is protected ([`DELETE_PROTECTED`]). Every `$(pwd -P)` is
+/// followed by a sentinel (`echo x`, stripped with `${v%?x}`) so a path
+/// ending in a newline keeps it.
 pub fn delete_cmd(cwd: &[u8], names: &[&[u8]]) -> Vec<u8> {
     let list = names
         .iter()
@@ -399,10 +401,10 @@ pub fn delete_cmd(cwd: &[u8], names: &[&[u8]]) -> Vec<u8> {
         .join(&b' ');
     cat(&[
         b"[ -n \"$HOME\" ] || exit 40\n",
-        b"h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P) || exit 40\n",
+        b"h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P && echo x) || exit 40; h=${h%?x}\n",
         b"c=$(cd -- ",
         &sh_quote(cwd),
-        b" && pwd -P) || exit 41\n",
+        b" && pwd -P && echo x) || exit 41; c=${c%?x}\n",
         b"for n in ",
         &list,
         b"; do\n",
@@ -417,7 +419,8 @@ pub fn delete_cmd(cwd: &[u8], names: &[&[u8]]) -> Vec<u8> {
 
 /// Prints the physical path of `path` with its final symlinks followed
 /// (portable `readlink -f`: a manual loop, 40 levels at most), NUL-terminated;
-/// fails unless it names a regular file.
+/// fails unless it names a regular file. Like [`delete_cmd`], command
+/// substitutions carry a sentinel so trailing newlines survive.
 pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
     cat(&[
         b"p=",
@@ -429,7 +432,7 @@ pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
           case $l in /*) p=$l;; *) p=${p%/*}/$l;; esac\n\
           done\n\
           d=${p%/*}; [ -n \"$d\" ] || d=/; b=${p##*/}\n\
-          d=$(cd -- \"$d\" && pwd -P) || exit 1\n\
+          d=$(cd -- \"$d\" && pwd -P && echo x) || exit 1; d=${d%?x}\n\
           if [ \"$d\" = / ]; then p=/$b; else p=$d/$b; fi\n\
           [ -f \"$p\" ] || { echo 'not a regular file' >&2; exit 1; }\n\
           printf '%s\\0' \"$p\"",
@@ -458,6 +461,69 @@ pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
 /// left in place.
 pub const REPLACE_SIZE: i32 = 31;
 pub const REPLACE_NOT_OWNER: i32 = 32;
+/// The in-place write of a hard-linked file failed and the original content
+/// was copied back from the backup.
+pub const REPLACE_RESTORED: i32 = 33;
+/// The in-place write failed and so did restoring: the backup (path printed,
+/// NUL-terminated) and the temp file are kept.
+pub const REPLACE_BACKUP_KEPT: i32 = 34;
+/// The original's group could not be given to the temp file (not a member
+/// of it): nothing is replaced.
+pub const REPLACE_GROUP: i32 = 35;
+/// The original changed on the remote since it was stamped (see
+/// [`stamp_cmd`]): nothing is replaced.
+pub const REPLACE_CHANGED: i32 = 36;
+
+/// Shell that sets `s` (the [`stat_stamp`] fields) and `k` (`cksum` of
+/// the content) for the file named by `$var`; fails without reading
+/// anything unless it is a regular file (a FIFO would block), and when the
+/// `stat` fields changed while the checksum ran.
+fn stamp_vars(os: &RemoteOs, var: &str) -> String {
+    let st = stat_stamp(os, var);
+    format!("[ -f \"${var}\" ] && s=$({st}) && k=$(cksum < \"${var}\") && [ \"$({st})\" = \"$s\" ]")
+}
+
+/// `stat` of the file named by `$var` printing `inode mtime ctime size mode
+/// uid gid` (symlinks followed), times with nanoseconds where `stat` can
+/// (else whole seconds). ctime cannot be set back by a user, so a rewrite
+/// that restores the mtime still shows; mode and owner changes count too.
+fn stat_stamp(os: &RemoteOs, var: &str) -> String {
+    let (flag, fine, coarse) = match os {
+        RemoteOs::Bsd => ("-f", "%i %Fm %Fc %z %Lp %u %g", "%i %m %c %z %Lp %u %g"),
+        RemoteOs::Linux | RemoteOs::Other(_) => {
+            ("-c", "%i %.9Y %.9Z %s %a %u %g", "%i %Y %Z %s %a %u %g")
+        }
+    };
+    format!(
+        "stat -L {flag} '{fine}' -- \"${var}\" 2>/dev/null || stat -L {flag} '{coarse}' -- \"${var}\""
+    )
+}
+
+/// Number of fields printed by [`stat_stamp`].
+const STAT_STAMP_FIELDS: usize = 7;
+
+/// Prints a fingerprint of the file at `path` (inode, mtime, ctime, size,
+/// mode, owner and a content checksum; symlinks followed), to tell later
+/// whether it changed.
+pub fn stamp_cmd(os: &RemoteOs, path: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"f=",
+        &sh_quote(path),
+        format!(
+            "; {} || {{ echo 'not a readable regular file' >&2; exit 1; }}; printf '%s %s' \"$s\" \"$k\"",
+            stamp_vars(os, "f")
+        )
+        .as_bytes(),
+    ])
+}
+
+/// `stat` printing the group id, of `os`.
+fn stat_gid_args(os: &RemoteOs) -> &'static str {
+    match os {
+        RemoteOs::Bsd => "stat -f %g --",
+        RemoteOs::Linux | RemoteOs::Other(_) => "stat -c %g --",
+    }
+}
 
 /// `stat` fields `mode nlink uid gid` of `os`.
 fn stat_meta_args(os: &RemoteOs) -> &'static str {
@@ -469,18 +535,30 @@ fn stat_meta_args(os: &RemoteOs) -> &'static str {
 
 /// Put the uploaded temp file `tmp` (`size` bytes) in place of the physical
 /// regular file `orig`, keeping its mode:
+/// - `orig` must still match `expect` (its [`stamp_cmd`] output when it was
+///   downloaded), checked right before writing (after the backup / the
+///   temp's group; the temp stays mode 600 until the check passes); else
+///   [`REPLACE_CHANGED`] and someone else's newer content is kept;
 /// - the temp's size must match, else [`REPLACE_SIZE`];
 /// - when the owner is not the current user (and we are not root) nothing is
 ///   replaced ([`REPLACE_NOT_OWNER`]): ownership cannot be kept;
 /// - the original's mode is applied to the temp, then `mv` replaces it
 ///   atomically (a failed upload never truncates the original);
-/// - a file with several hard links keeps its inode: the verified temp
-///   content is copied in place with `cat`, then the temp is removed. That
-///   copy is not atomic (a crash or full disk mid-write can leave the
-///   original truncated) - the price of not breaking the other links.
+/// - a file with several hard links keeps its inode: it is first copied to a
+///   private backup `.hdir-bak.XXXXXX` next to it (no backup, no write), then
+///   the verified temp content is written in place with `cat`. If that write
+///   fails the backup is copied back ([`REPLACE_RESTORED`]); if restoring
+///   fails too, the backup and the temp stay ([`REPLACE_BACKUP_KEPT`], the
+///   backup path printed NUL-terminated).
 ///
-/// The group of a replaced file becomes the user's/directory's group.
-pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8> {
+/// An original whose `stat` fields already differ from `expect` is refused
+/// first, before any checksum or backup.
+///
+/// - before the `mv`, the temp gets the original's group (`chgrp`, then the
+///   mode again, as `chgrp` may clear setgid); when that is not allowed
+///   nothing is replaced ([`REPLACE_GROUP`]) rather than exposing a
+///   group-restricted file to another group.
+pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64, expect: &[u8]) -> Vec<u8> {
     let (t, o) = (sh_quote(tmp), sh_quote(orig));
     cat(&[
         b"t=",
@@ -496,8 +574,43 @@ pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8>
             "if [ \"$3\" != \"$(id -u)\" ]; then [ \"$(id -u)\" = 0 ] && chown \"$3:$4\" \"$t\" || exit {REPLACE_NOT_OWNER}; fi\n"
         )
         .as_bytes(),
-        b"if [ \"$2\" -gt 1 ]; then cat -- \"$t\" > \"$o\" && rm -f -- \"$t\"\n\
-          else chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\"; fi",
+        format!("same() {{ {} && [ \"$s $k\" = ", stamp_vars(os, "o")).as_bytes(),
+        &sh_quote(expect),
+        b" ]; }\n",
+        format!(
+            "changed() {{ echo 'changed on the remote since it was downloaded' >&2; exit {REPLACE_CHANGED}; }}\n"
+        )
+        .as_bytes(),
+        format!("pre() {{ [ \"$({})\" = ", stat_stamp(os, "o")).as_bytes(),
+        &sh_quote(
+            &expect
+                .split(|&b| b == b' ')
+                .take(STAT_STAMP_FIELDS)
+                .collect::<Vec<_>>()
+                .join(&b' '),
+        ),
+        b" ]; }\n",
+        b"pre || changed\n\
+          if [ \"$2\" -gt 1 ]; then\n  \
+          b=$(mktemp \"${o%/*}/.hdir-bak.XXXXXX\") || exit 1\n  \
+          cp -- \"$o\" \"$b\" || { rm -f -- \"$b\"; exit 1; }\n  \
+          same || { rm -f -- \"$b\"; changed; }\n  \
+          if cat -- \"$t\" > \"$o\"; then rm -f -- \"$t\" \"$b\"; exit 0; fi\n  \
+          echo 'in-place write failed' >&2\n",
+        format!(
+            "  if cp -- \"$b\" \"$o\"; then rm -f -- \"$b\"; exit {REPLACE_RESTORED}; fi\n  \
+             printf '%s\\0' \"$b\"; exit {REPLACE_BACKUP_KEPT}\n"
+        )
+        .as_bytes(),
+        format!(
+            "else\n  g=$({} \"$t\") || exit 1\n  \
+             if [ \"$g\" != \"$4\" ]; then chgrp \"$4\" \"$t\" || exit {REPLACE_GROUP}; fi\n  \
+             same || changed\n  \
+             chmod \"$1\" \"$t\" || exit 1\n  \
+             mv -- \"$t\" \"$o\"\nfi",
+            stat_gid_args(os)
+        )
+        .as_bytes(),
     ])
 }
 
@@ -1104,11 +1217,13 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     fn delete_cmd_resolves_physical_paths_and_checks_before_rm() {
         let c = s(delete_cmd(b"/srv/it's", &[b"a b", b"-r", b"x\ny"]));
         assert!(
-            c.contains("h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P) || exit 40"),
+            c.contains(
+                "h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P && echo x) || exit 40; h=${h%?x}"
+            ),
             "{c}"
         );
         assert!(
-            c.contains("c=$(cd -- '/srv/it'\\''s' && pwd -P) || exit 41"),
+            c.contains("c=$(cd -- '/srv/it'\\''s' && pwd -P && echo x) || exit 41; c=${c%?x}"),
             "{c}"
         );
         assert!(c.contains("for n in 'a b' '-r' 'x\ny'; do"), "{c}");
@@ -1127,12 +1242,27 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     }
 
     #[test]
+    fn stamp_cmd_prints_inode_mtime_size_and_checksum_following_links() {
+        assert_eq!(
+            s(stamp_cmd(&RemoteOs::Linux, b"/d/it's")),
+            "f='/d/it'\\''s'; [ -f \"$f\" ] && s=$(stat -L -c '%i %.9Y %.9Z %s %a %u %g' -- \"$f\" 2>/dev/null || stat -L -c '%i %Y %Z %s %a %u %g' -- \"$f\") && k=$(cksum < \"$f\") && [ \"$(stat -L -c '%i %.9Y %.9Z %s %a %u %g' -- \"$f\" 2>/dev/null || stat -L -c '%i %Y %Z %s %a %u %g' -- \"$f\")\" = \"$s\" ] || { echo 'not a readable regular file' >&2; exit 1; }; printf '%s %s' \"$s\" \"$k\""
+        );
+        assert!(
+            s(stamp_cmd(&RemoteOs::Bsd, b"/x"))
+                .contains("stat -L -f '%i %Fm %Fc %z %Lp %u %g' -- \"$f\" 2>/dev/null || stat -L -f '%i %m %c %z %Lp %u %g' -- \"$f\"")
+        );
+    }
+
+    #[test]
     fn resolve_and_mktemp_cmds() {
         let c = s(resolve_cmd(b"/d/it's"));
         assert!(c.starts_with("p='/d/it'\\''s'; n=0\n"), "{c}");
         assert!(c.contains("while [ -L \"$p\" ]"), "{c}");
         assert!(c.contains("readlink -- \"$p\""), "{c}");
-        assert!(c.contains("pwd -P"), "{c}");
+        assert!(
+            c.contains("d=$(cd -- \"$d\" && pwd -P && echo x) || exit 1; d=${d%?x}"),
+            "{c}"
+        );
         assert!(c.ends_with("printf '%s\\0' \"$p\""), "{c}");
         assert_eq!(
             s(mktemp_cmd(b"/srv/it's")),
@@ -1151,6 +1281,7 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             b"/d/.hdir-edit.AB",
             b"/d/it's",
             42,
+            b"7 99 98 42 640 501 20 1234 42",
         ));
         assert!(
             l.starts_with("t='/d/.hdir-edit.AB'; o='/d/it'\\''s'\n"),
@@ -1165,19 +1296,79 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             "{l}"
         );
         assert!(l.contains("exit 32"), "{l}");
+        assert!(l.contains("chmod \"$1\" \"$t\" || exit 1\n"), "{l}");
+        assert!(l.contains("mv -- \"$t\" \"$o\"\nfi"), "{l}");
+        assert!(l.contains("if [ \"$2\" -gt 1 ]; then\n"), "{l}");
         assert!(
-            l.contains("chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\""),
+            l.contains("b=$(mktemp \"${o%/*}/.hdir-bak.XXXXXX\") || exit 1"),
             "{l}"
         );
+        let (bak, write) = (
+            l.find("cp -- \"$o\" \"$b\"").unwrap(),
+            l.find("cat --").unwrap(),
+        );
+        assert!(bak < write, "backup before the in-place write");
         assert!(
-            l.contains("if [ \"$2\" -gt 1 ]; then cat -- \"$t\" > \"$o\" && rm -f -- \"$t\""),
+            l.contains("cp -- \"$b\" \"$o\"; then rm -f -- \"$b\"; exit 33"),
             "{l}"
         );
+        assert!(l.contains("printf '%s\\0' \"$b\"; exit 34"), "{l}");
         assert!(l.find("exit 31").unwrap() < l.find("cat --").unwrap());
-        assert!(!l.contains("-L"), "no write-through-link branch any more");
-        let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1));
+        assert!(
+            l.contains(
+                "same() { [ -f \"$o\" ] && s=$(stat -L -c '%i %.9Y %.9Z %s %a %u %g' -- \"$o\" 2>/dev/null || stat -L -c '%i %Y %Z %s %a %u %g' -- \"$o\") && k=$(cksum < \"$o\") && [ \"$(stat -L -c '%i %.9Y %.9Z %s %a %u %g' -- \"$o\" 2>/dev/null || stat -L -c '%i %Y %Z %s %a %u %g' -- \"$o\")\" = \"$s\" ] && [ \"$s $k\" = '7 99 98 42 640 501 20 1234 42' ]; }\n"
+            ),
+            "{l}"
+        );
+        assert!(l.contains("exit 36; }\n"), "{l}");
+        assert!(
+            l.contains("pre() { [ \"$(stat -L -c '%i %.9Y %.9Z %s %a %u %g' -- \"$o\" 2>/dev/null || stat -L -c '%i %Y %Z %s %a %u %g' -- \"$o\")\" = '7 99 98 42 640 501 20' ]; }\n"),
+            "{l}"
+        );
+        let pre = l.find("pre || changed\n").unwrap();
+        assert!(
+            pre < l.find("if [ \"$2\" -gt 1 ]").unwrap(),
+            "before both branches"
+        );
+        // checked right before each write: after the backup, after chgrp/chmod
+        let backup = l.find("cp -- \"$o\" \"$b\"").unwrap();
+        let recheck_ln = l.find("same || { rm -f -- \"$b\"; changed; }").unwrap();
+        assert!(backup < recheck_ln && recheck_ln < l.find("cat --").unwrap());
+        let recheck_mv = l.find("same || changed\n").unwrap();
+        assert!(l.find("chgrp").unwrap() < recheck_mv);
+        assert!(
+            recheck_mv < l.find("chmod \"$1\"").unwrap(),
+            "private until checked"
+        );
+        assert!(l.find("chmod \"$1\"").unwrap() < l.find("mv --").unwrap());
+        assert!(l.contains("g=$(stat -c %g -- \"$t\") || exit 1"), "{l}");
+        assert!(
+            l.contains("if [ \"$g\" != \"$4\" ]; then chgrp \"$4\" \"$t\" || exit 35; fi"),
+            "{l}"
+        );
+        let (grp, mode, mv) = (
+            l.find("chgrp").unwrap(),
+            l.find("chmod \"$1\"").unwrap(),
+            l.find("mv --").unwrap(),
+        );
+        assert!(grp < mode && mode < mv, "chgrp, then chmod, then mv");
+        assert!(!l.contains("[ -L"), "no write-through-link branch any more");
+        let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1, b"x"));
         assert!(b.contains("stat -f '%Lp %l %u %g' -- \"$o\""), "{b}");
-        assert_eq!((REPLACE_SIZE, REPLACE_NOT_OWNER), (31, 32));
+        assert!(b.contains("g=$(stat -f %g -- \"$t\")"), "{b}");
+        assert!(
+            b.contains("s=$(stat -L -f '%i %Fm %Fc %z %Lp %u %g' -- \"$o\" 2>/dev/null || stat -L -f '%i %m %c %z %Lp %u %g' -- \"$o\")"),
+            "{b}"
+        );
+        assert_eq!(
+            (
+                REPLACE_SIZE,
+                REPLACE_NOT_OWNER,
+                REPLACE_RESTORED,
+                REPLACE_BACKUP_KEPT
+            ),
+            (31, 32, 33, 34)
+        );
         assert_eq!(s(rm_file_cmd(b"/d/-x y")), "rm -f -- '/d/-x y'");
     }
 
