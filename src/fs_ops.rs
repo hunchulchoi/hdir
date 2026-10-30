@@ -1667,7 +1667,8 @@ mod tests {
         let tot = measure(std::slice::from_ref(&root)).unwrap();
         assert_eq!(tot, Totals { files: 1, bytes: 4 });
         let mut c = ctl();
-        copy_items(std::slice::from_ref(&root), &d, &mut c);
+        let r = copy_items(std::slice::from_ref(&root), &d, &mut c);
+        assert_eq!(r.outcome, OpOutcome::Done, "{r:?}");
         let mut copied = d.join("root");
         for i in 0..50 {
             copied = copied.join(format!("l{i}"));
