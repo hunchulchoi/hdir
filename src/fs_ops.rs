@@ -1059,18 +1059,6 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
     Ok(target)
 }
 
-pub trait Trash {
-    fn trash(&self, paths: &[PathBuf]) -> io::Result<()>;
-}
-
-pub struct SystemTrash;
-
-impl Trash for SystemTrash {
-    fn trash(&self, paths: &[PathBuf]) -> io::Result<()> {
-        trash::delete_all(paths).map_err(io::Error::other)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1460,22 +1448,6 @@ mod tests {
             fs::read_to_string(dst.join("내 문서 'q'/가 나.txt")).unwrap(),
             "한"
         );
-    }
-
-    #[test]
-    fn trash_via_fake() {
-        use std::cell::RefCell;
-        struct Fake(RefCell<Vec<PathBuf>>);
-        impl Trash for Fake {
-            fn trash(&self, p: &[PathBuf]) -> io::Result<()> {
-                self.0.borrow_mut().extend_from_slice(p);
-                Ok(())
-            }
-        }
-        let f = Fake(RefCell::new(vec![]));
-        let t: &dyn Trash = &f;
-        t.trash(&[PathBuf::from("/x/y")]).unwrap();
-        assert_eq!(f.0.borrow().as_slice(), [PathBuf::from("/x/y")]);
     }
 
     // ---- HDIR-12 edge cases ----
