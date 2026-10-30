@@ -63,6 +63,18 @@ Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 전체 계�
 - 결과(통과 수, 실패 원문)를 PR 본문과 Plane 이슈 코멘트에 `[linux]` 태그로 기록.
 - 서버 작업 디렉터리에서는 테스트만 한다. 서버에서 커밋·push 금지, 리포 밖 파일 수정 금지.
 
+### Windows / PowerShell 테스트
+- Windows 동작(경로·드라이브 문자, 휴지통, 읽기 전용 속성, symlink 권한, PowerShell 셸 통합, Windows Terminal 키 입력)은 Windows 서버에서 검증한다.
+- 서버: `ssh win11.dgst` (기본 셸 PowerShell 7), 경로 `C:\Users\Docker\workspace\project\hdir`.
+- 절차 (명령은 PowerShell 문법으로 전달):
+  ```sh
+  git push
+  ssh win11.dgst 'Set-Location C:\Users\Docker\workspace\project\hdir; git fetch -q origin; git checkout -q <branch>; git reset -q --hard origin/<branch>; cargo fmt --check; if ($LASTEXITCODE -eq 0) { cargo clippy --all-targets -- -D warnings }; if ($LASTEXITCODE -eq 0) { cargo test }'
+  ```
+- 시점: PR 생성 전 필수 (Linux와 함께), `cfg(windows)`·`cfg(unix)` 분기를 바꾼 체크포인트마다.
+- 결과를 PR 본문과 Plane 코멘트에 `[windows]` 태그로 기록. 서버에서 커밋·push 금지.
+- 플랫폼 전용 코드는 `#[cfg(unix)]` / `#[cfg(windows)]`로 분리하고, 공통 로직은 플랫폼 독립 순수 함수로 둔다.
+
 ## 7. 코드 원칙
 - 반응성 최우선: UI 스레드에서 블로킹 IO(원격 명령, 큰 복사) 금지 → 워커 스레드 + mpsc.
 - 외부 명령 인자는 셸 이스케이프 필수. 파일명은 공백·한글·따옴표·개행 포함을 가정.
