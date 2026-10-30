@@ -425,7 +425,7 @@ fn build_listing(
         let path = cwd.join(&os_name);
         let Ok(meta) = fs::symlink_metadata(&path) else {
             // Hidden entries stay out of the error count when hidden are not shown.
-            if !(name.starts_with('.') && !show_hidden) {
+            if !name.starts_with('.') || show_hidden {
                 skipped += 1;
             }
             continue;
