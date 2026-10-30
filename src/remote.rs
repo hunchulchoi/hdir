@@ -467,6 +467,17 @@ pub const REPLACE_RESTORED: i32 = 33;
 /// The in-place write failed and so did restoring: the backup (path printed,
 /// NUL-terminated) and the temp file are kept.
 pub const REPLACE_BACKUP_KEPT: i32 = 34;
+/// The original's group could not be given to the temp file (not a member
+/// of it): nothing is replaced.
+pub const REPLACE_GROUP: i32 = 35;
+
+/// `stat` printing the group id, of `os`.
+fn stat_gid_args(os: &RemoteOs) -> &'static str {
+    match os {
+        RemoteOs::Bsd => "stat -f %g --",
+        RemoteOs::Linux | RemoteOs::Other(_) => "stat -c %g --",
+    }
+}
 
 /// `stat` fields `mode nlink uid gid` of `os`.
 fn stat_meta_args(os: &RemoteOs) -> &'static str {
@@ -490,7 +501,10 @@ fn stat_meta_args(os: &RemoteOs) -> &'static str {
 ///   fails too, the backup and the temp stay ([`REPLACE_BACKUP_KEPT`], the
 ///   backup path printed NUL-terminated).
 ///
-/// The group of a replaced file becomes the user's/directory's group.
+/// - before the `mv`, the temp gets the original's group (`chgrp`, then the
+///   mode again, as `chgrp` may clear setgid); when that is not allowed
+///   nothing is replaced ([`REPLACE_GROUP`]) rather than exposing a
+///   group-restricted file to another group.
 pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8> {
     let (t, o) = (sh_quote(tmp), sh_quote(orig));
     cat(&[
@@ -517,7 +531,13 @@ pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8>
              printf '%s\\0' \"$b\"; exit {REPLACE_BACKUP_KEPT}\n"
         )
         .as_bytes(),
-        b"else chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\"; fi",
+        format!(
+            "else\n  g=$({} \"$t\") || exit 1\n  \
+             if [ \"$g\" != \"$4\" ]; then chgrp \"$4\" \"$t\" || exit {REPLACE_GROUP}; fi\n  \
+             chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\"\nfi",
+            stat_gid_args(os)
+        )
+        .as_bytes(),
     ])
 }
 
@@ -1210,9 +1230,21 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         );
         assert!(l.contains("printf '%s\\0' \"$b\"; exit 34"), "{l}");
         assert!(l.find("exit 31").unwrap() < l.find("cat --").unwrap());
+        assert!(l.contains("g=$(stat -c %g -- \"$t\") || exit 1"), "{l}");
+        assert!(
+            l.contains("if [ \"$g\" != \"$4\" ]; then chgrp \"$4\" \"$t\" || exit 35; fi"),
+            "{l}"
+        );
+        let (grp, mode, mv) = (
+            l.find("chgrp").unwrap(),
+            l.find("chmod \"$1\"").unwrap(),
+            l.find("mv --").unwrap(),
+        );
+        assert!(grp < mode && mode < mv, "chgrp, then chmod, then mv");
         assert!(!l.contains("-L"), "no write-through-link branch any more");
         let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1));
         assert!(b.contains("stat -f '%Lp %l %u %g' -- \"$o\""), "{b}");
+        assert!(b.contains("g=$(stat -f %g -- \"$t\")"), "{b}");
         assert_eq!(
             (
                 REPLACE_SIZE,

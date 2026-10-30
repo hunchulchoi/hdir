@@ -10,9 +10,9 @@ use crate::platform::{os_bytes, os_from_bytes};
 use crate::preview::{self, Limits, Preview};
 use crate::remote::{
     DELETE_NO_CWD, DELETE_NO_HOME, DELETE_PROTECTED, PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING,
-    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_NOT_OWNER, REPLACE_RESTORED,
-    REPLACE_SIZE, delete_cmd, mkdir_cmd, mktemp_cmd, preview_cmd, rename_cmd, replace_cmd,
-    resolve_cmd, rm_file_cmd, rmdir_cmd,
+    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_GROUP, REPLACE_NOT_OWNER,
+    REPLACE_RESTORED, REPLACE_SIZE, delete_cmd, mkdir_cmd, mktemp_cmd, preview_cmd, rename_cmd,
+    replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd,
 };
 use crate::remote::{Endpoint, scp_argv};
 use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
@@ -335,6 +335,7 @@ pub fn upload_replace(s: &RemoteSession, local: &Path, remote: &Path) -> Result<
                 ))
             }
             Some(REPLACE_SIZE) => Err("업로드된 파일 크기가 맞지 않음".into()),
+            Some(REPLACE_GROUP) => Err("원격 파일의 그룹을 유지할 수 없어 교체하지 않음".into()),
             Some(REPLACE_RESTORED) => Err("원격 파일 쓰기 실패, 원본을 복원함".into()),
             Some(REPLACE_BACKUP_KEPT) => {
                 keep_tmp = true;
@@ -1208,12 +1209,22 @@ mod tests {
     /// `dir/a` hard-linked as `dir/b` ("shared"), a verified temp holding
     /// "edited!", and a `bin` dir of fake tools put first on PATH.
     fn hard_linked_with_fakes(fakes: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+        replace_with_fakes(fakes, true)
+    }
+
+    /// Like [`hard_linked_with_fakes`], `dir/b` only when `link`.
+    fn replace_with_fakes(
+        fakes: &[(&str, &str)],
+        link: bool,
+    ) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
         let dir = root.join("d");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a"), "shared").unwrap();
-        std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        if link {
+            std::fs::hard_link(dir.join("a"), dir.join("b")).unwrap();
+        }
         std::fs::write(dir.join(".hdir-edit.Hl1"), "edited!").unwrap();
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -1317,6 +1328,77 @@ mod tests {
         assert!(
             !f.remote_cmds().iter().any(|c| c.starts_with("rm -f -- ")),
             "nothing is cleaned up"
+        );
+    }
+
+    /// A group of the current user other than `not`, if any.
+    fn other_group(not: u32) -> Option<u32> {
+        let out = std::process::Command::new("id").arg("-G").output().ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|g| g.parse().ok())
+            .find(|&g| g != not)
+    }
+
+    #[test]
+    fn real_upload_keeps_the_group_of_the_original() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(t.path()).unwrap();
+        let target = dir.join("secret");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let dir_gid = std::fs::metadata(&dir).unwrap().gid();
+        let Some(g) = other_group(dir_gid) else {
+            eprintln!("skipped: the user belongs to a single group");
+            return;
+        };
+        let st = std::process::Command::new("chgrp")
+            .arg(g.to_string())
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let local = edited(&dir, "new secret");
+        upload_replace(&local_session(&dir), &local, &target).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new secret");
+        assert_eq!(std::fs::metadata(&target).unwrap().gid(), g, "group kept");
+        assert_eq!(mode_of(&target), 0o640, "mode kept after chgrp");
+        no_temp_left(&dir);
+    }
+
+    #[test]
+    fn real_replace_refuses_when_the_group_cannot_be_kept() {
+        use std::os::unix::fs::MetadataExt;
+        // the fake chgrp fails as for a group the user is not in
+        let (_t, dir, cmd) = replace_with_fakes(&[("chgrp", "exit 1")], false);
+        let gid = std::fs::metadata(dir.join("a")).unwrap().gid();
+        let Some(g) = other_group(gid) else {
+            eprintln!("skipped: the user belongs to a single group");
+            return;
+        };
+        let st = std::process::Command::new("chgrp")
+            .arg(g.to_string())
+            .arg(dir.join("a"))
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_GROUP));
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "shared");
+        assert_eq!(std::fs::metadata(dir.join("a")).unwrap().gid(), g);
+    }
+
+    #[test]
+    fn upload_reports_a_group_that_cannot_be_kept() {
+        let (f, _) = scp_fake("", ok(""), code(crate::remote::REPLACE_GROUP));
+        let s = session(Arc::clone(&f));
+        let t = tempfile::tempdir().unwrap();
+        let e = upload_replace(&s, &edited(t.path(), "x"), &p("/srv/a")).unwrap_err();
+        assert!(e.contains("그룹"), "{e}");
+        assert!(
+            f.remote_cmds().last().unwrap().starts_with("rm -f -- "),
+            "temp removed"
         );
     }
 
