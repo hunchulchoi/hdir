@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::panel::{Entry, EntryKind, Panel};
+use crate::trash::{TrashEntry, TrashView, format_local};
 
 /// Mdir DOS palette. Centralized so a later theme issue can replace it.
 mod palette {
@@ -37,6 +38,8 @@ pub struct View<'a> {
     pub status: Option<&'a str>,
     pub shell: &'a str,
     pub os: &'a str,
+    /// A panel showing the trash instead of its directory.
+    pub trash: [Option<&'a TrashView>; 2],
 }
 
 const FKEYS: [(&str, &str); 10] = [
@@ -49,6 +52,20 @@ const FKEYS: [(&str, &str); 10] = [
     ("7", "Mkdir"),
     ("8", "Del"),
     ("9", "Menu"),
+    ("10", "Quit"),
+];
+
+/// F-key bar while a panel shows the trash; unavailable keys stay blank.
+const TRASH_FKEYS: [(&str, &str); 10] = [
+    ("1", ""),
+    ("2", ""),
+    ("3", ""),
+    ("4", ""),
+    ("5", "Restore"),
+    ("6", ""),
+    ("7", ""),
+    ("8", "Purge"),
+    ("Esc", "Back"),
     ("10", "Quit"),
 ];
 
@@ -126,16 +143,23 @@ fn human_size(size: u64) -> String {
     format!("{v:.1}{}", UNITS[i])
 }
 
-fn title_for(panel: &Panel, width: usize) -> String {
-    let mut s = panel.cwd.display().to_string();
+/// `path` with a leading home directory shortened to `~`.
+fn tilde(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
     if let Some(home) = dirs::home_dir() {
         let h = home.display().to_string();
         if s == h {
-            s = "~".into();
-        } else if let Some(rest) = s.strip_prefix(&format!("{h}/")) {
-            s = format!("~/{rest}");
+            return "~".into();
+        }
+        if let Some(rest) = s.strip_prefix(&format!("{h}/")) {
+            return format!("~/{rest}");
         }
     }
+    s
+}
+
+fn title_for(panel: &Panel, width: usize) -> String {
+    let mut s = tilde(&panel.cwd);
     if panel.loading.is_some() {
         s.push_str(" 읽는 중…");
     }
@@ -232,6 +256,118 @@ fn draw_panel(frame: &mut Frame, area: Rect, panel: &Panel, active: bool) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+const TIME_W: usize = 16;
+const SIZE_W: usize = 7;
+
+fn trash_row_text(e: &TrashEntry, selected: bool, width: usize) -> String {
+    let mark = if selected { "*" } else { " " };
+    let size = if e.is_dir {
+        "<DIR>".to_string()
+    } else {
+        e.size.map_or_else(|| "-".to_string(), human_size)
+    };
+    let time = e.deleted_at().map_or_else(|| "-".to_string(), format_local);
+    // mark + name + ' ' + time + ' ' + size
+    let fixed = 1 + 1 + TIME_W + 1 + SIZE_W;
+    if width < fixed + 4 {
+        return fit_width(&format!("{mark}{}", e.name()), width);
+    }
+    let time = fit_width(&time, TIME_W);
+    // Room for a parent column only when both columns stay readable.
+    if width >= fixed + 1 + 28 {
+        let rest = width - fixed - 1;
+        let name_w = rest / 2;
+        let parent = e.original_parent().map_or_else(|| "-".to_string(), tilde);
+        return format!(
+            "{mark}{} {} {time} {size:>SIZE_W$}",
+            fit_width(&e.name(), name_w),
+            fit_width(&tail_width(&parent, rest - name_w), rest - name_w),
+        );
+    }
+    format!(
+        "{mark}{} {time} {size:>SIZE_W$}",
+        fit_width(&e.name(), width - fixed)
+    )
+}
+
+fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool) {
+    let border = if active {
+        palette::BORDER_ACTIVE
+    } else {
+        palette::BORDER
+    };
+    let mut title = "휴지통".to_string();
+    if tv.loading {
+        title.push_str(" 읽는 중…");
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border).bg(palette::BG))
+        .title(tail_width(&title, (area.width as usize).saturating_sub(4)))
+        .style(Style::default().fg(palette::FG).bg(palette::BG));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let w = inner.width as usize;
+    let mut rows = inner.height as usize;
+    let err_row = tv.error.is_some() && rows > 0;
+    if err_row {
+        rows -= 1;
+    }
+    let offset = visible_offset(tv.cursor, tv.scroll, rows);
+    let mut lines: Vec<Line> = tv
+        .entries
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(rows)
+        .map(|(i, e)| {
+            let sel = tv.selected.contains(e.id());
+            let mut style = Style::default().bg(palette::BG).fg(if sel {
+                palette::SELECTED
+            } else if e.is_dir {
+                palette::DIR
+            } else {
+                palette::FG
+            });
+            if e.is_dir {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if active && i == tv.cursor {
+                style = style.bg(palette::CURSOR_BG).fg(palette::CURSOR_FG);
+            }
+            Line::from(Span::styled(trash_row_text(e, sel, w), style))
+        })
+        .collect();
+    if let (true, Some(err)) = (err_row, &tv.error) {
+        while lines.len() < rows {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(Span::styled(
+            fit_width(err, w),
+            Style::default().fg(palette::ERROR).bg(palette::BG),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn trash_status(tv: &TrashView) -> String {
+    if tv.loading {
+        return "읽는 중…".to_string();
+    }
+    let place = match tv.current() {
+        Some(e) => match e.original_path() {
+            Some(p) => format!("원래 위치: {} · ", tilde(&p)),
+            None => "원래 위치: 알 수 없음 · ".to_string(),
+        },
+        None => String::new(),
+    };
+    let mut s = format!("{place}휴지통 {}개", tv.entries.len());
+    if !tv.selected.is_empty() {
+        s.push_str(&format!(" · 선택 {}개", tv.selected.len()));
+    }
+    s
+}
+
 fn default_status(panel: &Panel) -> String {
     if panel.loading.is_some() {
         return "읽는 중…".to_string();
@@ -245,17 +381,17 @@ fn default_status(panel: &Panel) -> String {
     format!("{files} files · {dirs} dirs")
 }
 
-fn fkey_line(width: usize) -> Line<'static> {
+fn fkey_line(width: usize, keys: &[(&str, &str); 10]) -> Line<'static> {
     let label_style = Style::default()
         .fg(palette::FKEY_LABEL_FG)
         .bg(palette::FKEY_LABEL_BG);
     let num_style = Style::default()
         .fg(palette::FKEY_NUM_FG)
         .bg(palette::FKEY_NUM_BG);
-    let slot = width / FKEYS.len();
+    let slot = width / keys.len();
     let mut spans = Vec::new();
-    for (i, (n, l)) in FKEYS.iter().enumerate() {
-        let w = if i == FKEYS.len() - 1 {
+    for (i, (n, l)) in keys.iter().enumerate() {
+        let w = if i == keys.len() - 1 {
             width - slot * i
         } else {
             slot
@@ -299,12 +435,17 @@ pub fn draw(frame: &mut Frame, view: &View) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
     for i in 0..2 {
-        draw_panel(frame, cols[i], view.panels[i], view.active == i);
+        match view.trash[i] {
+            Some(tv) => draw_trash_panel(frame, cols[i], tv, view.active == i),
+            None => draw_panel(frame, cols[i], view.panels[i], view.active == i),
+        }
     }
 
-    let status = match view.status {
-        Some(s) => s.to_string(),
-        None => default_status(view.panels[view.active.min(1)]),
+    let active = view.active.min(1);
+    let status = match (view.status, view.trash[active]) {
+        (Some(s), _) => s.to_string(),
+        (None, Some(tv)) => trash_status(tv),
+        (None, None) => default_status(view.panels[active]),
     };
     frame.render_widget(
         Paragraph::new(fit_width(&format!(" {status}"), area.width as usize)).style(
@@ -314,7 +455,15 @@ pub fn draw(frame: &mut Frame, view: &View) {
         ),
         rows[2],
     );
-    frame.render_widget(Paragraph::new(fkey_line(area.width as usize)), rows[3]);
+    let keys = if view.trash[active].is_some() {
+        &TRASH_FKEYS
+    } else {
+        &FKEYS
+    };
+    frame.render_widget(
+        Paragraph::new(fkey_line(area.width as usize, keys)),
+        rows[3],
+    );
 }
 
 #[cfg(test)]
@@ -324,6 +473,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn fit_width_truncates_ascii() {
@@ -368,6 +518,7 @@ mod tests {
             status,
             shell: "zsh",
             os: "macos",
+            trash: [None, None],
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -566,5 +717,158 @@ mod tests {
         }
         // The idle panel carries no marker.
         assert!(!row(&buf, 1).chars().skip(30).any(|c| c == '읽'));
+    }
+
+    // ---- HDIR-62: trash view ----
+
+    use crate::trash::{TrashEntry, TrashView, format_local};
+
+    const TS: i64 = 1_700_000_000;
+
+    fn tentry(name: &str, parent: Option<&str>, at: Option<i64>, size: Option<u64>) -> TrashEntry {
+        let item = trash::TrashItem {
+            id: format!("id-{name}").into(),
+            name: name.into(),
+            original_parent: parent.map(PathBuf::from).unwrap_or_default(),
+            time_deleted: at.unwrap_or(0),
+        };
+        TrashEntry::new(item, size, size.is_none() && at.is_some())
+    }
+
+    fn trash_view() -> TrashView {
+        let mut v = TrashView::new(PathBuf::from("/prev"));
+        v.set_entries(vec![
+            tentry("report.pdf", Some("/srv/data"), Some(TS), Some(1536)),
+            tentry("한글 문서", Some("/srv/data/a"), Some(TS + 60), None),
+            tentry("stray", None, None, Some(3)),
+        ]);
+        v
+    }
+
+    fn render_trash(tv: &TrashView, active: usize, w: u16) -> Buffer {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (Panel::new(dir.path()), Panel::new(dir.path()));
+        let mut t = Terminal::new(TestBackend::new(w, 24)).unwrap();
+        let view = View {
+            panels: [&a, &b],
+            active,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            trash: [Some(tv), None],
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    /// Text of cells `x0..x1` with the filler cell after a wide char skipped.
+    fn cells(buf: &Buffer, y: u16, x0: u16, x1: u16) -> String {
+        let mut out = String::new();
+        let mut x = x0;
+        while x < x1 {
+            let sym = buf[(x, y)].symbol();
+            out.push_str(sym);
+            x += if sym.width() > 1 { 2 } else { 1 };
+        }
+        out
+    }
+
+    fn left_half(buf: &Buffer, y: u16) -> String {
+        cells(buf, y, 0, 40)
+    }
+
+    fn trow(buf: &Buffer, y: u16) -> String {
+        cells(buf, y, 0, buf.area.width)
+    }
+
+    #[test]
+    fn trash_view_80x24_rows_snapshot() {
+        let buf = render_trash(&trash_view(), 0, 80);
+        let title = left_half(&buf, 1);
+        assert!(title.starts_with("┌휴지통"), "{title}");
+        assert_eq!(
+            left_half(&buf, 2),
+            format!("│ report.pdf   {}    1.5K│", format_local(TS))
+        );
+        assert!(left_half(&buf, 3).contains("<DIR>"));
+        assert!(left_half(&buf, 3).contains(&format_local(TS + 60)));
+        assert_eq!(
+            left_half(&buf, 4),
+            format!(
+                "│ {} {} {:>7}│",
+                fit_width("stray", 12),
+                fit_width("-", 16),
+                "3B"
+            )
+        );
+        assert_eq!(left_half(&buf, 5), format!("│{}│", " ".repeat(38)));
+        let keys = trow(&buf, 23);
+        for want in ["5Restore", "8Purge", "EscBack", "10Quit"] {
+            assert!(keys.contains(want), "{want} missing in {keys}");
+        }
+        assert!(!keys.contains("Copy") && !keys.contains("Mkdir"));
+        // the other half is a normal panel
+        assert!(cells(&buf, 2, 40, 80).contains(".."));
+    }
+
+    #[test]
+    fn trash_view_cursor_selection_and_active_border() {
+        let mut v = trash_view();
+        v.toggle_current(); // select report.pdf, cursor -> 한글 문서
+        let buf = render_trash(&v, 0, 80);
+        assert!(left_half(&buf, 2).starts_with("│*report.pdf"));
+        assert_eq!(buf[(20, 3)].bg, palette::CURSOR_BG);
+        assert_ne!(buf[(20, 2)].bg, palette::CURSOR_BG);
+        let inactive = render_trash(&v, 1, 80);
+        assert_ne!(inactive[(20, 3)].bg, palette::CURSOR_BG);
+        assert_eq!(buf[(0, 1)].fg, palette::BORDER_ACTIVE);
+        assert_eq!(inactive[(0, 1)].fg, palette::BORDER);
+    }
+
+    #[test]
+    fn trash_view_wide_shows_original_parent_column() {
+        let buf = render_trash(&trash_view(), 0, 140);
+        let r = trow(&buf, 2);
+        assert!(r.contains("report.pdf") && r.contains("/srv/data"), "{r}");
+        assert!(r.find("report.pdf") < r.find("/srv/data"));
+        assert!(r.find("/srv/data") < r.find(&format_local(TS)));
+    }
+
+    #[test]
+    fn trash_view_status_shows_original_path_of_current() {
+        let mut v = trash_view();
+        let buf = render_trash(&v, 0, 80);
+        assert!(trow(&buf, 22).contains("원래 위치: /srv/data/report.pdf"));
+        v.end();
+        let buf = render_trash(&v, 0, 80);
+        assert!(trow(&buf, 22).contains("원래 위치: 알 수 없음"));
+    }
+
+    #[test]
+    fn trash_view_loading_and_error_and_empty() {
+        let mut v = TrashView::new(PathBuf::from("/prev"));
+        let buf = render_trash(&v, 0, 80);
+        assert!(left_half(&buf, 1).contains("휴지통 읽는 중…"));
+        assert!(trow(&buf, 22).contains("읽는 중…"));
+        v.set_entries(vec![]);
+        v.error = Some("휴지통 접근 권한 없음".into());
+        let buf = render_trash(&v, 0, 80);
+        assert!(!left_half(&buf, 1).contains("읽는 중"));
+        assert!(left_half(&buf, 20).contains("휴지통 접근 권한 없음"));
+        assert!(trow(&buf, 22).contains("휴지통 0개"));
+    }
+
+    #[test]
+    fn trash_view_scrolls_with_cursor() {
+        let mut v = TrashView::new(PathBuf::from("/prev"));
+        v.set_entries(
+            (0..40)
+                .map(|i| tentry(&format!("file{i:02}"), Some("/x"), Some(TS + i), Some(1)))
+                .collect(),
+        );
+        v.cursor = 30;
+        let buf = render_trash(&v, 0, 80);
+        let text: String = (2..21).map(|y| left_half(&buf, y)).collect();
+        assert!(text.contains("file30") && !text.contains("file00"));
     }
 }

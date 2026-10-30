@@ -168,13 +168,17 @@ shell/
    - 진행률: 선택 항목별 scp 실행 → `전송 중 3/12 · prod-web` 표시, 시작 전 원격 `du -sb`로 총 크기 계산해 바이트 진행률 근사.
    - 덮어쓰기 충돌: 대상 존재 여부 사전 확인 → 기존 충돌 dialog 재사용.
    - Esc로 전송 취소(scp 프로세스 kill, 부분 파일 남음을 알림).
-12-0. **휴지통 보기·복원**
-   - F8은 OS 휴지통으로 이동(macOS Finder 휴지통, Linux freedesktop). Alt+F8 또는 `:trash`로 활성 패널을 "휴지통" 가상 위치로 전환.
-   - 목록: 이름 · 원래 경로 · 삭제 시각 · 크기 (최근 삭제순). Enter/F5 = 원래 위치로 복원, F8 = 영구 삭제(빨간 경고), Backspace/Esc = 이전 위치 복귀.
-   - 원래 경로에 같은 이름이 있으면 덮어쓰지 않고 충돌 dialog(이름 바꿔 복원 / 건너뛰기).
-   - 백엔드 `TrashStore { list, restore, purge }`: Linux는 `trash::os_limited`, macOS는 `NSFileManager trashItemAtURL:resultingItemURL`로 실제 휴지통 경로를 받아 hdir 인덱스(`~/.local/share/hdir/trash-index.jsonl`)에 기록 후 인덱스 기반 복원. 인덱스에 없는 항목은 원래 경로 미상 → 복원 시 대상 폴더 입력.
-   - Ctrl+Z: 방금 F8로 보낸 항목 복원.
-   - 복원·영구 삭제는 워커 스레드에서 실행.
+12-0. **휴지통 보기·복원** — OS 휴지통만 사용 (hdir 자체 인덱스·자체 휴지통 구현 없음)
+   - F8 (모든 OS): 확인 후 `trash::delete_all(paths)`를 워커 스레드에서 실행. macOS는 crate 기본 방식(Finder)이라 Finder의 "되돌려 놓기(Put Back)"가 동작. 일부 실패 시 남은 경로를 하나씩 재시도해 경로별 오류를 보고하고 성공분은 유지 ("휴지통: N개" / "휴지통: N개, 실패 M개: …").
+   - 백엔드는 작은 trait `TrashBackend { delete, list, restore, purge, open_os_trash, supports_view }` 뒤에 둔다. 실제 구현 `SystemTrash`(OS별 cfg)와 앱 테스트용 fake.
+   - **Linux** Alt+F8: 패널 안 "휴지통" 보기 (`trash::os_limited::{list, restore_all, purge_all}`만 사용).
+     - 목록: 이름 · 원래 위치 · 삭제 시각 · 크기 (최근 삭제순). Space = 선택, Enter/F5 = 복원, F8 = 영구 삭제(빨간 경고 dialog), Esc/Backspace = 이전 위치 복귀. 복원·삭제 후 양쪽 패널 보기와 디렉터리를 새로 고침.
+     - 복원은 항상 원래 경로로 `restore_all`. 같은 이름이 이미 있으면(`RestoreCollision`) 덮어쓰지 않고 해당 항목만 건너뛰며 "원래 위치에 같은 이름이 있어 건너뜀: <경로>" 표시 (이름 바꿔 복원·다른 폴더 지정 없음). 원래 경로를 모르는 항목은 복원 불가 메시지.
+     - 영구 삭제는 선택 항목만, 실행 직전 `list()`를 다시 받아 `TrashItem.id`로 대조하고 이미 사라진 항목은 건너뜀.
+   - **macOS** Alt+F8: 인패널 보기 없음. `open ~/.Trash`로 Finder 휴지통 창을 열고 상태줄 "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".
+   - Ctrl+Z (F8 직후): Linux는 `list()`에서 (원래 부모+이름 일치, 삭제 시각 ≥ F8 시작 시각) 항목을 찾아 `restore_all` (충돌은 보고만, 재시도용으로 남김). macOS는 Finder 휴지통 창을 열고 "Finder 휴지통에서 '되돌려 놓기'로 복원하세요" (op 소비).
+   - 복원·영구 삭제·목록 조회는 워커 스레드에서 실행.
+   - 테스트: 앱 로직은 fake(Linux형 `supports_view=true` / macOS형 `false`)로 검증. 실제 freedesktop 휴지통 왕복(삭제→목록→복원→재삭제→영구 삭제)은 `#[ignore]` Linux 전용 테스트 1개.
 12-1. **키 설정 (키맵 변경)**
    - 모든 조작은 `Action` enum(`cursor_up`, `enter`, `parent`, `switch_panel`, `toggle_select`, `view`, `edit`, `copy`, `move`, `mkdir`, `rename`, `delete`, `menu`, `quit`, `quit_no_cd`, `undo`, `command_line`, `toggle_mode`, `toggle_hidden`, `connect_left`, `connect_right`, `open_with` …)로 정의. 키 → Action은 테이블 조회만 → 하드코딩 금지.
    - 내장 프리셋: `mdir`(기본, 위 F키 표), `vim`(hjkl·`/`·`yy`→copy 등 단일키 위주). `keys.preset = "mdir"`.

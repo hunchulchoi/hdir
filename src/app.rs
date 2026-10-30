@@ -9,11 +9,14 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::dialog::{self, Dialog, DialogResult};
-use crate::fs_ops::{self, SystemTrash, Trash};
+use crate::fs_ops::{self};
 use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
 use crate::loader::Loader;
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
+use crate::trash::{
+    self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
+};
 use crate::ui::{self, View};
 use crate::undo::{UndoApplied, UndoOp, UndoStack};
 
@@ -45,6 +48,10 @@ pub enum PendingAction {
     },
     /// Answer to a worker's overwrite question.
     Conflict,
+    TrashPurge {
+        panel: usize,
+        entries: Vec<TrashEntry>,
+    },
 }
 
 /// The single background copy/move job.
@@ -66,7 +73,6 @@ enum BgKind {
     Trash {
         panel: usize,
         cwd: PathBuf,
-        paths: Vec<PathBuf>,
     },
     Undo,
     Mkdir {
@@ -79,10 +85,29 @@ enum BgKind {
         from: PathBuf,
         name: String,
     },
+    OpenOsTrash,
+    TrashList {
+        panel: usize,
+    },
+    TrashRestore {
+        panel: usize,
+    },
+    TrashPurge {
+        panel: usize,
+    },
 }
 
+type TrashListing = Result<Vec<TrashEntry>, String>;
+
 enum BgResult {
-    Trash(std::io::Result<()>),
+    Trash(TrackedDelete),
+    TrashList(TrashListing),
+    OpenOsTrash(Result<(), String>),
+    /// Restore result, how many selected items had no known original
+    /// location, plus the refreshed listing.
+    TrashRestore(RestoreResult, usize, TrashListing),
+    /// Purge result plus the refreshed listing.
+    TrashPurge(PurgeReport, TrashListing),
     Undo(UndoApplied),
     Mkdir(std::io::Result<PathBuf>),
     Rename(std::io::Result<PathBuf>),
@@ -150,7 +175,9 @@ pub struct App {
     pub task: Option<BgTask>,
     /// A conflict question that arrived while another dialog was open.
     pending_conflict: Option<PathBuf>,
-    trash: Arc<dyn Trash + Send + Sync>,
+    trash: Arc<dyn TrashBackend>,
+    /// Per panel: showing the trash instead of its directory.
+    pub trash_views: [Option<TrashView>; 2],
     /// Runs one undo op on the worker; tests may swap in a gated one.
     pub undo_runner: UndoRunner,
     pub undo: UndoStack,
@@ -169,10 +196,10 @@ impl Default for App {
 
 impl App {
     pub fn new(left: PathBuf, right: PathBuf) -> Self {
-        Self::with_trash(left, right, Arc::new(SystemTrash))
+        Self::with_trash(left, right, trash::system_store())
     }
 
-    pub fn with_trash(left: PathBuf, right: PathBuf, trash: Arc<dyn Trash + Send + Sync>) -> Self {
+    pub fn with_trash(left: PathBuf, right: PathBuf, trash: Arc<dyn TrashBackend>) -> Self {
         let shell = std::env::var("SHELL")
             .ok()
             .and_then(|s| {
@@ -182,6 +209,7 @@ impl App {
             })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "sh".to_string());
+        let undo_store = Arc::clone(&trash);
         Self {
             running: true,
             panels: [Panel::new(left), Panel::new(right)],
@@ -193,7 +221,8 @@ impl App {
             task: None,
             pending_conflict: None,
             trash,
-            undo_runner: Arc::new(UndoStack::apply),
+            trash_views: [None, None],
+            undo_runner: Arc::new(move |op| UndoStack::apply_with_store(op, &*undo_store)),
             undo: UndoStack::default(),
             loader: Loader::default(),
             next_load_id: 0,
@@ -248,6 +277,10 @@ impl App {
             self.handle_dialog_key(key);
             return;
         }
+        if self.trash_views[self.active].is_some() {
+            self.handle_trash_key(key);
+            return;
+        }
         let page = self.page_height.max(1);
         match key.code {
             KeyCode::Esc => {
@@ -265,6 +298,7 @@ impl App {
             KeyCode::F(7) => self.open_mkdir(),
             KeyCode::F(2) => self.open_rename(),
             KeyCode::F(6) if key.modifiers.contains(KeyModifiers::SHIFT) => self.open_rename(),
+            KeyCode::F(8) if key.modifiers.contains(KeyModifiers::ALT) => self.open_trash_view(),
             KeyCode::F(8) => self.open_trash(),
             KeyCode::F(10) | KeyCode::Char('q') => self.running = false,
             KeyCode::Tab => self.active = 1 - self.active,
@@ -442,16 +476,37 @@ impl App {
             return false;
         };
         match (task.kind, result) {
-            (BgKind::Trash { panel, cwd, paths }, Some(BgResult::Trash(res))) => {
-                let status = match res {
-                    Ok(()) => {
-                        let n = paths.len();
-                        self.undo.push(UndoOp::Trash { count: n });
-                        self.clear_selection(panel, &cwd, &paths);
-                        format!("휴지통: {n}개")
-                    }
-                    Err(e) => format!("오류: {e}"),
+            (BgKind::Trash { panel, cwd }, Some(BgResult::Trash(tracked))) => {
+                let TrackedDelete {
+                    results,
+                    undo,
+                    lost,
+                } = tracked;
+                let failed: Vec<&(PathBuf, Result<(), String>)> =
+                    results.iter().filter(|(_, r)| r.is_err()).collect();
+                let done: Vec<PathBuf> = results
+                    .iter()
+                    .filter(|(_, r)| r.is_ok())
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                let ok = done.len();
+                let first = failed
+                    .first()
+                    .and_then(|(_, r)| r.as_ref().err())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut status = match failed.len() {
+                    0 => format!("휴지통: {ok}개"),
+                    _ if ok == 0 => format!("오류: {first}"),
+                    n => format!("휴지통: {ok}개, 실패 {n}개: {first}"),
                 };
+                if lost > 0 {
+                    status.push_str(" · 되돌리기 정보 없음");
+                }
+                if !undo.is_empty() {
+                    self.undo.push(UndoOp::Trash { items: undo });
+                }
+                self.clear_selection(panel, &cwd, &done);
                 self.reload_both();
                 self.status = Some(status);
             }
@@ -483,6 +538,36 @@ impl App {
                     self.status = Some(format!("오류: {e}"));
                 }
             },
+            (BgKind::OpenOsTrash, Some(BgResult::OpenOsTrash(res))) => {
+                self.status = Some(match res {
+                    Ok(()) => "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".to_string(),
+                    Err(e) => format!("오류: {e}"),
+                });
+            }
+            (BgKind::TrashList { panel }, Some(BgResult::TrashList(res))) => {
+                self.status = match self.apply_trash_listing(panel, &res) {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("오류: {e}")),
+                };
+            }
+            (
+                BgKind::TrashRestore { panel },
+                Some(BgResult::TrashRestore(result, unknown, list)),
+            ) => {
+                self.finish_trash_restore(panel, result, unknown, list);
+            }
+            (BgKind::TrashPurge { panel }, Some(BgResult::TrashPurge(report, list))) => {
+                let _ = self.apply_trash_listing_all(panel, &list);
+                let skipped = report.skipped;
+                self.status = Some(match report.error {
+                    Some(e) => format!("오류: {e}"),
+                    None if skipped > 0 => format!(
+                        "영구 삭제: {}개, 휴지통 항목이 바뀌어 건너뜀 {skipped}개",
+                        report.purged
+                    ),
+                    None => format!("영구 삭제: {}개", report.purged),
+                });
+            }
             (BgKind::Undo, Some(BgResult::Undo(done))) => {
                 if let Some(retry) = done.retry {
                     self.undo.push(retry);
@@ -658,6 +743,185 @@ impl App {
         ));
     }
 
+    // ---- trash view ----
+
+    fn open_trash_view(&mut self) {
+        if self.task.is_some() {
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
+        if !self.trash.supports_view() {
+            // No in-panel view: the OS file manager shows (and restores from)
+            // the trash. Spawning a process must not block the UI.
+            let store = Arc::clone(&self.trash);
+            self.task = Some(BgTask::spawn(BgKind::OpenOsTrash, move || {
+                BgResult::OpenOsTrash(store.open_os_trash())
+            }));
+            self.status = Some("휴지통 여는 중…".into());
+            return;
+        }
+        let idx = self.active;
+        self.trash_views[idx] = Some(TrashView::new(self.panels[idx].cwd.clone()));
+        let store = Arc::clone(&self.trash);
+        self.task = Some(BgTask::spawn(BgKind::TrashList { panel: idx }, move || {
+            BgResult::TrashList(store.list())
+        }));
+        self.status = Some("휴지통 읽는 중…".into());
+    }
+
+    fn close_trash_view(&mut self, idx: usize) {
+        if self.trash_views[idx].take().is_some() {
+            self.status = None;
+            // Restores may have changed the directory underneath.
+            self.reload_after_op(idx, None);
+        }
+    }
+
+    fn handle_trash_key(&mut self, key: KeyEvent) {
+        let idx = self.active;
+        let page = self.page_height.max(1);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let moved = |app: &mut App, f: &dyn Fn(&mut TrashView)| {
+            if app.task.is_none() {
+                app.status = None;
+            }
+            if let Some(v) = app.trash_views[idx].as_mut() {
+                f(v);
+            }
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => self.close_trash_view(idx),
+            KeyCode::Tab => self.active = 1 - self.active,
+            KeyCode::F(10) | KeyCode::Char('q') => self.running = false,
+            // Already in the trash view.
+            KeyCode::F(8) if alt => {}
+            KeyCode::F(8) => self.open_trash_purge(),
+            KeyCode::F(5) | KeyCode::Enter => self.open_trash_restore(),
+            KeyCode::F(_) => self.status = Some("휴지통에서는 사용할 수 없음".into()),
+            KeyCode::Up => moved(self, &TrashView::move_up),
+            KeyCode::Down => moved(self, &TrashView::move_down),
+            KeyCode::PageUp => moved(self, &|v| v.page_up(page)),
+            KeyCode::PageDown => moved(self, &|v| v.page_down(page)),
+            KeyCode::Home => moved(self, &TrashView::home),
+            KeyCode::End => moved(self, &TrashView::end),
+            KeyCode::Char(' ') | KeyCode::Insert => moved(self, &TrashView::toggle_current),
+            _ => {}
+        }
+    }
+
+    /// Entries a restore/purge in panel `idx` applies to.
+    fn trash_targets(&self, idx: usize) -> Vec<TrashEntry> {
+        self.trash_views[idx]
+            .as_ref()
+            .map(TrashView::targets)
+            .unwrap_or_default()
+    }
+
+    fn open_trash_restore(&mut self) {
+        if self.task.is_some() {
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
+        let idx = self.active;
+        let entries = self.trash_targets(idx);
+        if entries.is_empty() {
+            return;
+        }
+        // Items without a known original location cannot be restored.
+        let (known, unknown): (Vec<TrashEntry>, Vec<TrashEntry>) = entries
+            .into_iter()
+            .partition(|e| e.original_path().is_some());
+        if known.is_empty() {
+            let names: Vec<String> = unknown.iter().take(3).map(TrashEntry::name).collect();
+            self.status = Some(format!(
+                "원래 위치를 알 수 없어 복원할 수 없음: {}",
+                names.join(", ")
+            ));
+            return;
+        }
+        let skipped = unknown.len();
+        let store = Arc::clone(&self.trash);
+        self.task = Some(BgTask::spawn(
+            BgKind::TrashRestore { panel: idx },
+            move || {
+                let result = trash::restore_verified(&*store, &known);
+                BgResult::TrashRestore(result, skipped, store.list())
+            },
+        ));
+        self.status = Some("복원 중…".into());
+    }
+
+    fn open_trash_purge(&mut self) {
+        let idx = self.active;
+        let entries = self.trash_targets(idx);
+        if entries.is_empty() {
+            return;
+        }
+        let mut msg: Vec<String> = entries.iter().take(5).map(TrashEntry::name).collect();
+        if entries.len() > 5 {
+            msg.push(format!("외 {}개", entries.len() - 5));
+        }
+        self.status = None;
+        self.dialog = Some((
+            Dialog::danger("영구 삭제", msg),
+            PendingAction::TrashPurge {
+                panel: idx,
+                entries,
+            },
+        ));
+    }
+
+    /// Apply a fresh listing to the trash view of `panel` (if still open);
+    /// returns the error message on failure.
+    fn apply_trash_listing(&mut self, panel: usize, res: &TrashListing) -> Result<(), String> {
+        let Some(view) = self.trash_views[panel].as_mut() else {
+            return Ok(());
+        };
+        match res {
+            Ok(entries) => {
+                view.set_entries(entries.clone());
+                Ok(())
+            }
+            Err(e) => {
+                view.loading = false;
+                view.error = Some(e.clone());
+                Err(e.clone())
+            }
+        }
+    }
+
+    /// Apply one listing to every open trash view (a change in one panel
+    /// affects the other); returns `panel`'s error.
+    fn apply_trash_listing_all(&mut self, panel: usize, res: &TrashListing) -> Result<(), String> {
+        let _ = self.apply_trash_listing(1 - panel, res);
+        self.apply_trash_listing(panel, res)
+    }
+
+    fn finish_trash_restore(
+        &mut self,
+        panel: usize,
+        result: RestoreResult,
+        unknown: usize,
+        list: TrashListing,
+    ) {
+        let _ = self.apply_trash_listing_all(panel, &list);
+        let dirs: Vec<PathBuf> = result
+            .restored
+            .iter()
+            .filter_map(|p| p.parent().map(PathBuf::from))
+            .collect();
+        for i in 0..2 {
+            if dirs.contains(&self.panels[i].cwd) {
+                self.reload_after_op(i, None);
+            }
+        }
+        let mut status = result.summary();
+        if unknown > 0 {
+            status.push_str(&format!(" · 원래 위치를 알 수 없어 건너뜀: {unknown}개"));
+        }
+        self.status = Some(status);
+    }
+
     fn handle_dialog_key(&mut self, key: KeyEvent) {
         self.dispatch_dialog_key(key);
         self.open_pending_conflict();
@@ -714,16 +978,25 @@ impl App {
                     return;
                 }
                 let trash = Arc::clone(&self.trash);
-                let work = paths.clone();
                 self.task = Some(BgTask::spawn(
                     BgKind::Trash {
                         panel: self.active,
                         cwd: self.active_panel().cwd.clone(),
-                        paths,
                     },
-                    move || BgResult::Trash(trash.trash(&work)),
+                    move || BgResult::Trash(trash::delete_tracked(&*trash, &paths)),
                 ));
                 self.status = Some("휴지통으로 이동 중…".into());
+            }
+            (PendingAction::TrashPurge { panel, entries }, DialogResult::Confirmed) => {
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
+                }
+                let store = Arc::clone(&self.trash);
+                self.task = Some(BgTask::spawn(BgKind::TrashPurge { panel }, move || {
+                    BgResult::TrashPurge(purge_verified(&*store, &entries), store.list())
+                }));
+                self.status = Some("영구 삭제 중…".into());
             }
             (PendingAction::Transfer { kind, sources }, DialogResult::Submitted(input)) => {
                 self.start_job(kind, sources, &input);
@@ -800,17 +1073,54 @@ impl App {
         for p in &mut self.panels {
             p.ensure_visible(rows);
         }
+        for v in self.trash_views.iter_mut().flatten() {
+            v.ensure_visible(rows);
+        }
         let view = View {
             panels: [&self.panels[0], &self.panels[1]],
             active: self.active,
             status: self.status.as_deref(),
             shell: &self.shell,
             os: std::env::consts::OS,
+            trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
         };
         ui::draw(frame, &view);
         if let Some((dlg, _)) = &self.dialog {
             dialog::render(frame, frame.area(), dlg);
         }
+    }
+}
+
+/// Purge only the `wanted` items that a fresh listing still contains (matched
+/// by id); the rest are skipped, never purged.
+fn purge_verified(store: &dyn TrashBackend, wanted: &[TrashEntry]) -> PurgeReport {
+    let fresh = match store.list() {
+        Ok(f) => f,
+        Err(e) => {
+            return PurgeReport {
+                error: Some(e),
+                ..Default::default()
+            };
+        }
+    };
+    let (keep, skipped) = trash::match_fresh(wanted, &fresh);
+    if keep.is_empty() {
+        return PurgeReport {
+            skipped,
+            ..Default::default()
+        };
+    }
+    match store.purge(&keep) {
+        Ok(()) => PurgeReport {
+            purged: keep.len(),
+            skipped,
+            error: None,
+        },
+        Err(e) => PurgeReport {
+            skipped,
+            error: Some(e),
+            ..Default::default()
+        },
     }
 }
 
@@ -1129,27 +1439,22 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    #[derive(Clone, Default)]
-    struct FakeTrash(Arc<Mutex<Vec<PathBuf>>>);
-    impl crate::fs_ops::Trash for FakeTrash {
-        fn trash(&self, paths: &[PathBuf]) -> std::io::Result<()> {
-            self.0.lock().unwrap().extend(paths.iter().cloned());
-            Ok(())
-        }
+    use crate::trash::{FakeTrash, TrashBackend};
+
+    type Fake = Arc<FakeTrash>;
+
+    fn fixture_trash() -> (TempDir, App, Fake) {
+        fixture_with(FakeTrash::new())
     }
 
-    fn fixture_trash() -> (TempDir, App, FakeTrash) {
+    fn fixture_with(fake: FakeTrash) -> (TempDir, App, Fake) {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir(root.join("adir")).unwrap();
         fs::write(root.join("f.txt"), "x").unwrap();
         fs::write(root.join("g.txt"), "x").unwrap();
-        let fake = FakeTrash::default();
-        let app = App::with_trash(
-            root.to_path_buf(),
-            root.to_path_buf(),
-            Arc::new(fake.clone()),
-        );
+        let fake: Fake = Arc::new(fake);
+        let app = App::with_trash(root.to_path_buf(), root.to_path_buf(), fake.clone());
         (tmp, app, fake)
     }
 
@@ -1314,7 +1619,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert!(app.dialog.is_none());
         wait_idle(&mut app);
-        let got = fake.0.lock().unwrap().clone();
+        let got = fake.trashed.lock().unwrap().clone();
         assert_eq!(got, vec![root.join("adir"), root.join("f.txt")]);
         assert!(app.panels[0].selected.is_empty());
         assert_eq!(app.status.as_deref(), Some("휴지통: 2개"));
@@ -1328,7 +1633,7 @@ mod tests {
         press(&mut app, KeyCode::F(8));
         press(&mut app, KeyCode::Char('n'));
         assert!(app.dialog.is_none());
-        assert!(fake.0.lock().unwrap().is_empty());
+        assert!(fake.trashed.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1433,18 +1738,6 @@ mod tests {
             assert!(app.panels[i].entries.iter().any(|e| e.name == "f.txt"));
             assert!(app.panels[i].entries.iter().all(|e| e.name != "h.txt"));
         }
-    }
-
-    #[test]
-    fn ctrl_z_after_trash_explains() {
-        let (_t, mut app, _f) = fixture_trash();
-        press(&mut app, KeyCode::Down);
-        press(&mut app, KeyCode::F(8));
-        press(&mut app, KeyCode::Char('y'));
-        wait_idle(&mut app);
-        ctrl_z(&mut app);
-        wait_idle(&mut app);
-        assert!(app.status.as_deref().unwrap().contains("복원"));
     }
 
     #[test]
@@ -2002,18 +2295,6 @@ mod tests {
         }
     }
 
-    struct GatedTrash {
-        released: Arc<std::sync::atomic::AtomicBool>,
-        seen: Arc<Mutex<Vec<PathBuf>>>,
-    }
-    impl crate::fs_ops::Trash for GatedTrash {
-        fn trash(&self, paths: &[PathBuf]) -> std::io::Result<()> {
-            block_until(&self.released);
-            self.seen.lock().unwrap().extend(paths.iter().cloned());
-            Ok(())
-        }
-    }
-
     #[test]
     fn f8_trash_runs_on_worker_and_ui_stays_responsive() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2022,15 +2303,12 @@ mod tests {
             fs::write(tmp.path().join(n), "x").unwrap();
         }
         let released = Arc::new(AtomicBool::new(false));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let trash = GatedTrash {
-            released: Arc::clone(&released),
-            seen: Arc::clone(&seen),
-        };
+        let store = Arc::new(FakeTrash::new());
+        *store.gate.lock().unwrap() = Some(Arc::clone(&released));
         let mut app = App::with_trash(
             tmp.path().to_path_buf(),
             tmp.path().to_path_buf(),
-            Arc::new(trash),
+            store.clone(),
         );
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Char(' ')); // f.txt selected, cursor g.txt
@@ -2048,11 +2326,11 @@ mod tests {
         press(&mut app, KeyCode::F(8));
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
-        assert!(seen.lock().unwrap().is_empty());
+        assert!(store.trashed.lock().unwrap().is_empty());
         released.store(true, Ordering::SeqCst);
         wait_idle(&mut app);
         assert_eq!(app.status.as_deref(), Some("휴지통: 1개"));
-        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(store.trashed.lock().unwrap().len(), 1);
         assert!(app.panels[0].selected.is_empty());
         assert_eq!(app.undo.len(), 1);
     }
@@ -2064,12 +2342,10 @@ mod tests {
         fs::create_dir(tmp.path().join("adir")).unwrap();
         fs::write(tmp.path().join("f.txt"), "x").unwrap();
         let released = Arc::new(AtomicBool::new(false));
-        let trash = GatedTrash {
-            released: Arc::clone(&released),
-            seen: Arc::new(Mutex::new(Vec::new())),
-        };
+        let trash = Arc::new(FakeTrash::new());
+        *trash.gate.lock().unwrap() = Some(Arc::clone(&released));
         let root = tmp.path().to_path_buf();
-        let mut app = App::with_trash(root.clone(), root.clone(), Arc::new(trash));
+        let mut app = App::with_trash(root.clone(), root.clone(), trash);
         // Entries: .., adir, f.txt. Trash f.txt in the background.
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
@@ -2112,12 +2388,10 @@ mod tests {
         fs::create_dir(tmp.path().join("adir")).unwrap();
         fs::write(tmp.path().join("f.txt"), "x").unwrap();
         let released = Arc::new(AtomicBool::new(false));
-        let trash = GatedTrash {
-            released: Arc::clone(&released),
-            seen: Arc::new(Mutex::new(Vec::new())),
-        };
+        let trash = Arc::new(FakeTrash::new());
+        *trash.gate.lock().unwrap() = Some(Arc::clone(&released));
         let root = tmp.path().to_path_buf();
-        let mut app = App::with_trash(root.clone(), root.clone(), Arc::new(trash));
+        let mut app = App::with_trash(root.clone(), root.clone(), trash);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::F(8));
@@ -2162,26 +2436,53 @@ mod tests {
     }
 
     #[test]
-    fn f8_trash_error_is_reported_without_undo_entry() {
-        struct Failing;
-        impl crate::fs_ops::Trash for Failing {
-            fn trash(&self, _: &[PathBuf]) -> std::io::Result<()> {
-                Err(std::io::Error::other("boom"))
-            }
-        }
+    fn f8_total_failure_is_reported_without_undo_entry() {
+        let failing = Arc::new(FakeTrash::new());
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("f.txt"), "x").unwrap();
         let mut app = App::with_trash(
             tmp.path().to_path_buf(),
             tmp.path().to_path_buf(),
-            Arc::new(Failing),
+            failing.clone(),
         );
+        let key = app.panels[0].cwd.join("f.txt");
+        failing
+            .fail_paths
+            .lock()
+            .unwrap()
+            .insert(key, "boom".into());
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::F(8));
         press(&mut app, KeyCode::Enter);
         wait_idle(&mut app);
         assert_eq!(app.status.as_deref(), Some("오류: boom"));
         assert_eq!(app.undo.len(), 0);
+    }
+
+    #[test]
+    fn f8_partial_failure_reports_counts_and_keeps_successes_undoable() {
+        let (tmp, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        let _ = &tmp;
+        fake.fail_paths
+            .lock()
+            .unwrap()
+            .insert(root.join("g.txt"), "denied".into());
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::Down); // f.txt
+        press(&mut app, KeyCode::Char(' ')); // select f.txt, cursor g.txt
+        press(&mut app, KeyCode::Char(' ')); // select g.txt
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert_eq!(app.status.as_deref(), Some("휴지통: 1개, 실패 1개: denied"));
+        assert!(!root.join("f.txt").exists() && root.join("g.txt").exists());
+        assert_eq!(app.undo.len(), 1);
+        assert!(
+            !app.panels[0].selected.contains(OsStr::new("f.txt")),
+            "trashed one deselected"
+        );
+        assert!(app.panels[0].selected.contains(OsStr::new("g.txt")));
     }
 
     fn gated_undo_runner(released: Arc<std::sync::atomic::AtomicBool>) -> UndoRunner {
@@ -2272,5 +2573,550 @@ mod tests {
         let s = job_summary(JobKind::Move, &r);
         assert!(s.contains("경고 2개"), "{s}");
         assert!(s.contains("x: 빈 원본 폴더 삭제 실패"), "{s}");
+    }
+
+    // ---- OS trash: Alt+F8 view (Linux), Finder (macOS), undo ----
+
+    use std::sync::atomic::Ordering;
+
+    fn alt_f8(app: &mut App) {
+        app.handle_key(KeyEvent::new_with_kind(
+            KeyCode::F(8),
+            KeyModifiers::ALT,
+            KeyEventKind::Press,
+        ));
+    }
+
+    /// Alt+F8 and wait for the listing.
+    fn enter_trash(app: &mut App) {
+        alt_f8(app);
+        wait_idle(app);
+    }
+
+    fn trash_files(fake: &Fake, paths: &[PathBuf]) {
+        for (_, r) in fake.delete(paths) {
+            r.unwrap();
+        }
+    }
+
+    fn view_names(app: &App, idx: usize) -> Vec<String> {
+        app.trash_views[idx]
+            .as_ref()
+            .map(|v| v.entries.iter().map(|e| e.name()).collect())
+            .unwrap_or_default()
+    }
+
+    fn dialog_title(app: &App) -> String {
+        match &app.dialog {
+            Some((
+                Dialog::Input { title, .. }
+                | Dialog::Confirm { title, .. }
+                | Dialog::Choice { title, .. },
+                _,
+            )) => title.clone(),
+            None => String::new(),
+        }
+    }
+
+    fn screen_text(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        // Skip the filler cell that follows each wide character.
+        let mut out = String::new();
+        let mut skip = false;
+        for c in terminal.backend().buffer().content() {
+            if std::mem::take(&mut skip) {
+                continue;
+            }
+            out.push_str(c.symbol());
+            skip = unicode_width::UnicodeWidthStr::width(c.symbol()) > 1;
+        }
+        out
+    }
+
+    #[test]
+    fn alt_f8_enters_trash_view_loading_on_worker() {
+        let (tmp, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        trash_files(&fake, &[root.join("g.txt")]);
+        alt_f8(&mut app);
+        let view = app.trash_views[0].as_ref().expect("view opened at once");
+        assert!(view.loading);
+        assert!(app.trash_views[1].is_none());
+        assert_eq!(app.status.as_deref(), Some("휴지통 읽는 중…"));
+        wait_idle(&mut app);
+        assert!(!app.trash_views[0].as_ref().unwrap().loading);
+        assert_eq!(view_names(&app, 0), ["g.txt", "f.txt"], "newest first");
+        assert_eq!(app.trash_views[0].as_ref().unwrap().prev_cwd, root);
+        let text = screen_text(&mut app);
+        assert!(text.contains("휴지통"));
+        assert!(text.contains("g.txt") && text.contains("f.txt"));
+        assert!(text.contains("Restore") && text.contains("Purge"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn trash_view_keys_move_cursor_and_space_selects() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        for n in ["f.txt", "g.txt", "adir"] {
+            trash_files(&fake, &[root.join(n)]);
+        }
+        enter_trash(&mut app);
+        screen_text(&mut app); // sets the page height
+        let cursor = |app: &App| app.trash_views[0].as_ref().unwrap().cursor;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(cursor(&app), 1);
+        press(&mut app, KeyCode::End);
+        assert_eq!(cursor(&app), 2);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(cursor(&app), 0);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(cursor(&app), 2);
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(cursor(&app), 1);
+        assert_eq!(app.trash_views[0].as_ref().unwrap().selected.len(), 1);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(cursor(&app), 0);
+        assert_eq!(app.panels[0].cursor, 0, "normal panel untouched");
+    }
+
+    #[test]
+    fn enter_restores_current_entry_through_the_backend() {
+        let (tmp, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("복원 중…"));
+        wait_idle(&mut app);
+        assert_eq!(
+            *fake.restore_calls.lock().unwrap(),
+            vec![vec![root.join("f.txt")]]
+        );
+        assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), "x");
+        assert_eq!(app.status.as_deref(), Some("복원: 1개"));
+        assert!(view_names(&app, 0).is_empty(), "list refreshed");
+        assert!(app.trash_views[0].is_some(), "still in trash view");
+        // the other (normal) panel showing that directory was reloaded
+        settle(&mut app);
+        assert!(app.panels[1].entries.iter().any(|e| e.name == "f.txt"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn f5_restores_all_selected_entries() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        for n in ["f.txt", "g.txt"] {
+            trash_files(&fake, &[root.join(n)]);
+        }
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::F(5));
+        wait_idle(&mut app);
+        assert!(root.join("f.txt").exists() && root.join("g.txt").exists());
+        assert_eq!(app.status.as_deref(), Some("복원: 2개"));
+        assert!(app.trash_views[0].as_ref().unwrap().selected.is_empty());
+    }
+
+    #[test]
+    fn restore_skips_entries_changed_since_the_view_listed_them() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        fake.bump_times();
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(!root.join("f.txt").exists());
+        assert!(fake.restore_calls.lock().unwrap().is_empty());
+        let st = app.status.clone().unwrap();
+        assert!(st.contains("휴지통 항목이 바뀌어 건너뜀"), "{st}");
+    }
+
+    #[test]
+    fn restore_collision_is_skipped_and_reported_without_overwriting() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        fs::write(root.join("f.txt"), "newer").unwrap();
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(app.dialog.is_none(), "no rename/destination prompt");
+        assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), "newer");
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                format!(
+                    "원래 위치에 같은 이름이 있어 건너뜀: {}",
+                    root.join("f.txt").display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(view_names(&app, 0), ["f.txt"], "item stays in the trash");
+    }
+
+    #[test]
+    fn restore_of_unknown_original_location_is_refused() {
+        let (_t, mut app, fake) = fixture_trash();
+        fake.add_orphan("lost.txt");
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none(), "no destination prompt");
+        wait_idle(&mut app);
+        assert!(fake.restore_calls.lock().unwrap().is_empty());
+        let s = app.status.clone().unwrap();
+        assert!(s.contains("원래 위치를 알 수 없어"), "{s}");
+        assert!(s.contains("lost.txt"), "{s}");
+        assert_eq!(view_names(&app, 0), ["lost.txt"]);
+    }
+
+    #[test]
+    fn restore_with_unknown_items_restores_the_known_ones() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        fake.add_orphan("lost.txt");
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(root.join("f.txt").exists());
+        let s = app.status.clone().unwrap();
+        assert!(
+            s.contains("복원: 1개") && s.contains("원래 위치를 알 수 없어"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn f8_in_trash_view_purges_after_danger_confirm() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        for n in ["f.txt", "g.txt"] {
+            trash_files(&fake, &[root.join(n)]);
+        }
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::F(8));
+        assert_eq!(dialog_title(&app), "영구 삭제");
+        let Some((
+            Dialog::Confirm {
+                message, danger, ..
+            },
+            _,
+        )) = &app.dialog
+        else {
+            panic!("expected confirm dialog");
+        };
+        assert!(*danger);
+        assert_eq!(message, &["g.txt"]);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.dialog.is_none());
+        assert_eq!(fake.count(), 2, "cancel keeps items");
+        assert!(fake.purge_calls.lock().unwrap().is_empty());
+        press(&mut app, KeyCode::Char(' ')); // select g.txt
+        press(&mut app, KeyCode::Char(' ')); // select f.txt
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status.as_deref(), Some("영구 삭제 중…"));
+        wait_idle(&mut app);
+        assert_eq!(fake.count(), 0);
+        assert!(view_names(&app, 0).is_empty());
+        assert_eq!(app.status.as_deref(), Some("영구 삭제: 2개"));
+        assert!(!root.join("f.txt").exists());
+    }
+
+    #[test]
+    fn purge_only_touches_the_selected_items() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        for n in ["f.txt", "g.txt"] {
+            trash_files(&fake, &[root.join(n)]);
+        }
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Char(' ')); // g.txt only
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert_eq!(fake.names(), ["f.txt"]);
+        assert_eq!(fake.purge_calls.lock().unwrap().len(), 1);
+        assert_eq!(fake.purge_calls.lock().unwrap()[0].len(), 1);
+    }
+
+    #[test]
+    fn purge_matches_a_fresh_listing_and_skips_vanished_items() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        let stale = app.trash_views[0].as_ref().unwrap().entries[0].clone();
+        // Behind the view's back the item is purged and a new one with the
+        // same name takes its place (different id).
+        fake.purge(std::slice::from_ref(&stale)).unwrap();
+        fake.purge_calls.lock().unwrap().clear();
+        fs::write(root.join("f.txt"), "newer").unwrap();
+        trash_files(&fake, &[root.join("f.txt")]);
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert_eq!(fake.count(), 1, "new item survives");
+        assert!(
+            fake.purge_calls.lock().unwrap().is_empty(),
+            "nothing left to purge, so no backend call"
+        );
+        let s = app.status.clone().unwrap();
+        assert!(s.contains("건너뜀 1개"), "{s}");
+    }
+
+    #[test]
+    fn esc_and_backspace_return_to_previous_directory() {
+        for key in [KeyCode::Esc, KeyCode::Backspace] {
+            let (_t, mut app, _fake) = fixture_trash();
+            let root = app.panels[0].cwd.clone();
+            enter_trash(&mut app);
+            press(&mut app, key);
+            assert!(app.trash_views[0].is_none());
+            assert_eq!(app.panels[0].cwd, root, "{key:?} did not navigate up");
+            assert!(!screen_text(&mut app).contains("Restore"));
+        }
+    }
+
+    #[test]
+    fn other_function_keys_are_disabled_in_trash_view() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        for n in [1, 2, 3, 4, 6, 7, 9] {
+            app.status = None;
+            press(&mut app, KeyCode::F(n));
+            assert_eq!(
+                app.status.as_deref(),
+                Some("휴지통에서는 사용할 수 없음"),
+                "F{n}"
+            );
+            assert!(app.dialog.is_none());
+        }
+        assert!(app.job.is_none() && app.task.is_none());
+        alt_f8(&mut app); // already there: no reload, no change
+        assert!(app.task.is_none());
+    }
+
+    #[test]
+    fn f10_quits_from_trash_view_and_tab_switches_panels() {
+        let (_t, mut app, _fake) = fixture_trash();
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.active, 1);
+        press(&mut app, KeyCode::Down); // normal panel navigation again
+        assert_eq!(app.panels[1].cursor, 1);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::F(10));
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn alt_f8_while_task_runs_reports_busy() {
+        let (_t, mut app, fake) = fixture_trash();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *fake.gate.lock().unwrap() = Some(Arc::clone(&released));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        alt_f8(&mut app);
+        assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+        assert!(app.trash_views[0].is_none());
+        released.store(true, Ordering::SeqCst);
+        wait_idle(&mut app);
+    }
+
+    #[test]
+    fn empty_trash_view_ignores_restore_and_purge() {
+        let (_t, mut app, _fake) = fixture_trash();
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::F(8));
+        assert!(app.dialog.is_none() && app.task.is_none());
+    }
+
+    #[test]
+    fn trash_list_error_is_shown() {
+        let (_t, mut app, fake) = fixture_trash();
+        *fake.fail_list.lock().unwrap() = Some("휴지통 접근 불가".into());
+        enter_trash(&mut app);
+        assert_eq!(app.status.as_deref(), Some("오류: 휴지통 접근 불가"));
+        let v = app.trash_views[0].as_ref().unwrap();
+        assert!(!v.loading);
+        assert_eq!(v.error.as_deref(), Some("휴지통 접근 불가"));
+    }
+
+    #[test]
+    fn purge_in_one_panel_refreshes_the_other_trash_view() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        for n in ["f.txt", "g.txt"] {
+            trash_files(&fake, &[root.join(n)]);
+        }
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(view_names(&app, 1).len(), 2);
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(view_names(&app, 0).is_empty());
+        assert!(view_names(&app, 1).is_empty(), "other panel is stale");
+    }
+
+    #[test]
+    fn restore_in_one_panel_refreshes_the_other_trash_view() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        enter_trash(&mut app);
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(view_names(&app, 1).is_empty(), "other panel is stale");
+    }
+
+    // ---- macOS mode: no in-panel view, Finder does the work ----
+
+    #[test]
+    fn mac_alt_f8_opens_the_os_trash_on_a_worker() {
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = FakeTrash::mac();
+        *fake.open_gate.lock().unwrap() = Some(Arc::clone(&released));
+        let (_t, mut app, fake) = fixture_with(fake);
+        alt_f8(&mut app);
+        assert!(app.task.is_some(), "open runs as a background task");
+        assert_eq!(app.status.as_deref(), Some("휴지통 여는 중…"));
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 0);
+        press(&mut app, KeyCode::Down); // UI stays responsive
+        released.store(true, Ordering::SeqCst);
+        wait_idle(&mut app);
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'")
+        );
+    }
+
+    #[test]
+    fn mac_alt_f8_opens_the_os_trash_instead_of_a_view() {
+        let (_t, mut app, fake) = fixture_with(FakeTrash::mac());
+        alt_f8(&mut app);
+        wait_idle(&mut app);
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 1);
+        assert!(app.trash_views[0].is_none());
+        assert!(app.task.is_none());
+        assert_eq!(fake.list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'")
+        );
+    }
+
+    #[test]
+    fn f8_then_ctrl_z_on_mac_opens_the_trash_and_consumes_the_op() {
+        let (_t, mut app, fake) = fixture_with(FakeTrash::mac());
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // f.txt
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert_eq!(app.undo.len(), 1);
+        ctrl_z(&mut app);
+        wait_idle(&mut app);
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Finder 휴지통에서 '되돌려 놓기'로 복원하세요")
+        );
+        assert_eq!(app.undo.len(), 0, "op consumed");
+        assert!(!root.join("f.txt").exists(), "hdir restores nothing itself");
+        assert!(fake.restore_calls.lock().unwrap().is_empty());
+    }
+
+    // ---- Linux mode: Ctrl+Z after F8 ----
+
+    #[test]
+    fn f8_then_ctrl_z_restores_the_trashed_items_via_the_backend() {
+        let (tmp, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::Char(' ')); // select adir, cursor f.txt
+        press(&mut app, KeyCode::Char(' ')); // select f.txt
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Char('y'));
+        wait_idle(&mut app);
+        assert!(!root.join("f.txt").exists() && !root.join("adir").exists());
+        assert_eq!(app.undo.len(), 1);
+        assert_eq!(fake.count(), 2);
+        ctrl_z(&mut app);
+        wait_idle(&mut app);
+        assert!(root.join("f.txt").exists() && root.join("adir").is_dir());
+        assert_eq!(app.status.as_deref(), Some("되돌림: 휴지통 복원 2개"));
+        assert_eq!(fake.count(), 0);
+        assert_eq!(fake.open_calls.load(Ordering::SeqCst), 0);
+        settle(&mut app);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn f8_without_listing_warns_no_undo_info_and_pushes_no_undo_op() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        *fake.fail_list.lock().unwrap() = Some("busy".into());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // f.txt
+        press(&mut app, KeyCode::F(8));
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(!root.join("f.txt").exists(), "still trashed");
+        let s = app.status.clone().unwrap();
+        assert!(
+            s.contains("휴지통: 1개") && s.contains("되돌리기 정보 없음"),
+            "{s}"
+        );
+        assert_eq!(app.undo.len(), 0);
+    }
+
+    #[test]
+    fn ctrl_z_after_trash_collision_reports_keeps_file_and_retry() {
+        let (tmp, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::F(8)); // g.txt
+        press(&mut app, KeyCode::Char('y'));
+        wait_idle(&mut app);
+        fs::write(root.join("g.txt"), "new").unwrap();
+        ctrl_z(&mut app);
+        wait_idle(&mut app);
+        let s = app.status.clone().unwrap();
+        assert!(
+            s.contains("원래 위치에 같은 이름이 있어 건너뜀")
+                && s.contains(&root.join("g.txt").to_string_lossy().into_owned()),
+            "{s}"
+        );
+        assert_eq!(fs::read_to_string(root.join("g.txt")).unwrap(), "new");
+        assert_eq!(app.undo.len(), 1, "failed item kept for retry");
+        assert_eq!(fake.count(), 1);
+        let _ = tmp;
     }
 }
