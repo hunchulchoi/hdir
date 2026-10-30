@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::config::{self, Mode, Settings};
 use crate::dialog::{self, Dialog, DialogResult};
 use crate::fs_ops::{self};
 use crate::fs_ops::{OpOutcome, OpReport};
@@ -188,6 +189,13 @@ pub struct App {
     page_height: usize,
     /// Effective theme for the current mode (after any color-depth fallback).
     pub theme: Theme,
+    pub mode: Mode,
+    /// Directory holding `config.toml` and `themes/`; `None` = defaults only.
+    pub config_dir: Option<PathBuf>,
+    /// Config-derived state (keymap, themes, assoc, warnings).
+    pub settings: Settings,
+    /// Terminal supports 24-bit color; otherwise themes are mapped to 256.
+    truecolor: bool,
 }
 
 impl Default for App {
@@ -231,7 +239,45 @@ impl App {
             next_load_id: 0,
             page_height: 1,
             theme: theme::builtin("mdir").expect("mdir is built in"),
+            mode: Mode::Classic,
+            config_dir: None,
+            settings: config::load_settings(None),
+            truecolor: true,
         }
+    }
+
+    /// Load the config from `config_dir` (file IO, so call before the first
+    /// draw) and adopt it. `colorterm` is the `COLORTERM` value, injected so
+    /// tests do not depend on the environment. Warnings from every source go to
+    /// the status line (first one plus a count).
+    pub fn configure(&mut self, config_dir: Option<PathBuf>, colorterm: Option<&str>) {
+        self.config_dir = config_dir;
+        self.truecolor = theme::supports_truecolor(colorterm);
+        self.reload_settings();
+        if let Some(s) = config::warning_summary(&self.settings.warnings) {
+            self.status = Some(s);
+        }
+    }
+
+    /// Re-read config, themes, keymap and assoc from `config_dir`.
+    fn reload_settings(&mut self) {
+        self.settings = config::load_settings(self.config_dir.as_deref());
+        self.apply_theme();
+    }
+
+    /// Switch layout mode; the theme follows the per-mode setting.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.apply_theme();
+    }
+
+    fn apply_theme(&mut self) {
+        let base = self.settings.theme_for(self.mode);
+        self.theme = if self.truecolor {
+            base.clone()
+        } else {
+            base.to_256()
+        };
     }
 
     pub fn active_panel(&self) -> &Panel {
@@ -1198,6 +1244,77 @@ mod tests {
             .current()
             .map(|e| e.name.clone())
             .unwrap_or_default()
+    }
+
+    // ---- HDIR-17/25: config wiring ----
+
+    fn config_with(text: &str) -> TempDir {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("config.toml"), text).unwrap();
+        d
+    }
+
+    fn configured(text: &str, colorterm: Option<&str>) -> (TempDir, App) {
+        let (t, mut app) = fixture();
+        let cfg = config_with(text);
+        app.configure(Some(cfg.path().to_path_buf()), colorterm);
+        (t, app)
+        // `cfg` lives only as long as the files are read at configure time
+    }
+
+    #[test]
+    fn configure_applies_theme_for_current_mode() {
+        let (_t, mut app) = configured(
+            "[theme]\nclassic = \"dark\"\ndev = \"light\"\n",
+            Some("truecolor"),
+        );
+        assert_eq!(app.mode, crate::config::Mode::Classic);
+        assert_eq!(app.theme, theme::builtin("dark").unwrap());
+        app.set_mode(crate::config::Mode::Dev);
+        assert_eq!(app.theme, theme::builtin("light").unwrap());
+        app.set_mode(crate::config::Mode::Classic);
+        assert_eq!(app.theme.name, "dark");
+    }
+
+    #[test]
+    fn without_truecolor_theme_is_mapped_to_256() {
+        let (_t, app) = configured("", Some("256color"));
+        assert_eq!(app.theme, theme::builtin("mdir").unwrap().to_256());
+        assert!(matches!(app.theme.bg, ratatui::style::Color::Indexed(_)));
+        let (_t, app) = configured("", None);
+        assert!(matches!(app.theme.bg, ratatui::style::Color::Indexed(_)));
+        let (_t, app) = configured("", Some("24bit"));
+        assert!(matches!(app.theme.bg, ratatui::style::Color::Rgb(..)));
+    }
+
+    #[test]
+    fn startup_status_shows_first_warning_and_count() {
+        let (_t, app) = configured(
+            "[theme]\nclassic = \"nope\"\n[keys.bind]\nfrob = \"F5\"\n",
+            Some("truecolor"),
+        );
+        let st = app.status.clone().unwrap();
+        assert!(st.starts_with("설정 경고: "), "{st}");
+        assert!(st.contains("(외 1개)"), "{st}");
+        assert_eq!(app.settings.warnings.len(), 2);
+        assert_eq!(app.theme.name, "mdir", "unknown theme falls back");
+    }
+
+    #[test]
+    fn startup_without_config_has_no_status_or_warning() {
+        let (_t, mut app) = fixture();
+        let empty = tempfile::tempdir().unwrap();
+        app.configure(Some(empty.path().to_path_buf()), Some("truecolor"));
+        assert!(app.status.is_none());
+        assert!(app.settings.warnings.is_empty());
+        assert_eq!(app.config_dir.as_deref(), Some(empty.path()));
+    }
+
+    #[test]
+    fn broken_config_falls_back_to_defaults_with_warning() {
+        let (_t, app) = configured("[theme\n", Some("truecolor"));
+        assert_eq!(app.theme.name, "mdir");
+        assert!(app.status.as_deref().unwrap().contains("config.toml"));
     }
 
     #[test]

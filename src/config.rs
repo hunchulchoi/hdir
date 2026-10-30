@@ -94,6 +94,13 @@ pub fn default_config_dir() -> Option<PathBuf> {
     }
 }
 
+/// `COLORTERM` to base the color depth on. Windows Terminal does not set it
+/// but handles 24-bit color, so it defaults to `truecolor` there.
+pub fn colorterm_value(env: Option<String>, windows: bool) -> Option<String> {
+    env.filter(|v| !v.is_empty())
+        .or_else(|| windows.then(|| "truecolor".to_string()))
+}
+
 pub fn config_file(dir: &Path) -> PathBuf {
     dir.join("config.toml")
 }
@@ -519,6 +526,21 @@ cmd = "x {}"
             ("light", "dark")
         );
         assert!(!dir.join("config.toml.tmp").exists());
+    }
+
+    #[test]
+    fn colorterm_defaults_to_truecolor_only_on_windows() {
+        assert_eq!(colorterm_value(None, false), None);
+        assert_eq!(colorterm_value(Some(String::new()), false), None);
+        assert_eq!(colorterm_value(None, true).as_deref(), Some("truecolor"));
+        assert_eq!(
+            colorterm_value(Some("24bit".into()), true).as_deref(),
+            Some("24bit")
+        );
+        assert_eq!(
+            colorterm_value(Some("256color".into()), true).as_deref(),
+            Some("256color")
+        );
     }
 
     #[test]
