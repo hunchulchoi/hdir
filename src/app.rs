@@ -5964,6 +5964,7 @@ mod tests {
 
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AO};
 
+        #[cfg(unix)]
         fn add_file(e: &mut Env, name: &str) {
             let root = e.app.panels[0].cwd.clone();
             fs::write(root.join(name), "y").unwrap();
