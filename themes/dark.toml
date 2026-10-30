@@ -1,0 +1,42 @@
+name = "dark"
+base = "mdir"
+
+[colors]
+bg = "#1E1E2E"
+fg = "#CDD6F4"
+border = "#585B70"
+border_active = "#89B4FA"
+title = "#CDD6F4"
+dir = "#89B4FA"
+file = "#CDD6F4"
+exec = "#A6E3A1"
+symlink = "#94E2D5"
+hidden = "#6C7086"
+assoc_file = "#F9E2AF"
+selected = "#F9E2AF"
+cursor_bg = "#45475A"
+cursor_fg = "#CDD6F4"
+status_bg = "#313244"
+status_fg = "#CDD6F4"
+fkey_num_fg = "#1E1E2E"
+fkey_num_bg = "#89B4FA"
+fkey_label_fg = "#CDD6F4"
+fkey_label_bg = "#313244"
+dialog_bg = "#313244"
+dialog_fg = "#CDD6F4"
+danger_bg = "#F38BA8"
+danger_fg = "#1E1E2E"
+preview_bg = "#181825"
+error = "#F38BA8"
+
+[ext_colors.exec]
+exts = ["sh", "command"]
+color = "#A6E3A1"
+
+[ext_colors.archive]
+exts = ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"]
+color = "#F5C2E7"
+
+[ext_colors.doc]
+exts = ["md", "txt", "rs", "toml", "json", "yaml", "yml", "js", "ts", "py", "go", "java", "c", "h"]
+color = "#94E2D5"

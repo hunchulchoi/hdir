@@ -12,6 +12,7 @@
 //! - Windows has no `file_index` on stable std, so the case-only rename identity
 //!   check compares canonicalized paths case-insensitively.
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
@@ -34,6 +35,37 @@ pub fn truncated_name(name: &OsStr, max: usize) -> OsString {
         .take(max)
         .collect::<String>()
         .into()
+}
+
+// ------------------------------------------------------- os string <-> bytes
+
+/// Bytes of an `OsStr`. Unix: the raw bytes. Windows: UTF-8 of the lossy
+/// conversion (unpaired surrogates become U+FFFD). Used for remote (POSIX)
+/// command text, which is byte oriented regardless of the local OS.
+#[cfg(unix)]
+pub fn os_bytes(s: &OsStr) -> Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Cow::Borrowed(s.as_bytes())
+}
+
+#[cfg(windows)]
+pub fn os_bytes(s: &OsStr) -> Cow<'_, [u8]> {
+    match s.to_string_lossy() {
+        Cow::Borrowed(b) => Cow::Borrowed(b.as_bytes()),
+        Cow::Owned(o) => Cow::Owned(o.into_bytes()),
+    }
+}
+
+/// Inverse of [`os_bytes`]. Windows: invalid UTF-8 becomes U+FFFD.
+#[cfg(unix)]
+pub fn os_from_bytes(b: Vec<u8>) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(b)
+}
+
+#[cfg(windows)]
+pub fn os_from_bytes(b: Vec<u8>) -> OsString {
+    String::from_utf8_lossy(&b).into_owned().into()
 }
 
 // ----------------------------------------------------------- open / create

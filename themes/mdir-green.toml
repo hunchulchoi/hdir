@@ -1,0 +1,13 @@
+name = "mdir-green"
+base = "mdir"
+
+[colors]
+bg = "#00AA00"
+preview_bg = "#00AA00"
+border = "#FFFF55"
+border_active = "#FFFFFF"
+fg = "#000000"
+file = "#000000"
+hidden = "#555555"
+cursor_bg = "#000000"
+cursor_fg = "#55FF55"

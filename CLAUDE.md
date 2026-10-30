@@ -74,6 +74,7 @@ Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 전체 계�
 - 시점: PR 생성 전 필수 (Linux와 함께), `cfg(windows)`·`cfg(unix)` 분기를 바꾼 체크포인트마다.
 - 결과를 PR 본문과 Plane 코멘트에 `[windows]` 태그로 기록. 서버에서 커밋·push 금지.
 - 플랫폼 전용 코드는 `#[cfg(unix)]` / `#[cfg(windows)]`로 분리하고, 공통 로직은 플랫폼 독립 순수 함수로 둔다.
+- **Windows 지원 범위 (사용자 결정)**: 무리하지 않는다. Windows는 빌드·테스트 통과만 유지하고, 어려운 기능(휴지통 보기, 셸 통합, 확장자 실행, SSH, 드라이브 이동 등)은 Windows에서 "Windows 지원 예정" 안내로 막는다. 관련 이슈는 Plane M10 Backlog.
 
 ## 7. 코드 원칙
 - 반응성 최우선: UI 스레드에서 블로킹 IO(원격 명령, 큰 복사) 금지 → 워커 스레드 + mpsc.

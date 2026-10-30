@@ -1,0 +1,10 @@
+name = "mdir-red"
+base = "mdir"
+
+[colors]
+bg = "#AA0000"
+preview_bg = "#AA0000"
+border = "#FFFF55"
+border_active = "#FFFFFF"
+cursor_bg = "#00AAAA"
+danger_bg = "#0000AA"

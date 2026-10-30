@@ -1,0 +1,42 @@
+name = "light"
+base = "mdir"
+
+[colors]
+bg = "#FFFFFF"
+fg = "#24292F"
+border = "#8C959F"
+border_active = "#0969DA"
+title = "#24292F"
+dir = "#0969DA"
+file = "#24292F"
+exec = "#1A7F37"
+symlink = "#0A7B83"
+hidden = "#8C959F"
+assoc_file = "#9A6700"
+selected = "#BF8700"
+cursor_bg = "#DDF4FF"
+cursor_fg = "#24292F"
+status_bg = "#EAEEF2"
+status_fg = "#24292F"
+fkey_num_fg = "#FFFFFF"
+fkey_num_bg = "#0969DA"
+fkey_label_fg = "#24292F"
+fkey_label_bg = "#EAEEF2"
+dialog_bg = "#F6F8FA"
+dialog_fg = "#24292F"
+danger_bg = "#CF222E"
+danger_fg = "#FFFFFF"
+preview_bg = "#F6F8FA"
+error = "#CF222E"
+
+[ext_colors.exec]
+exts = ["sh", "command"]
+color = "#1A7F37"
+
+[ext_colors.archive]
+exts = ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"]
+color = "#8250DF"
+
+[ext_colors.doc]
+exts = ["md", "txt", "rs", "toml", "json", "yaml", "yml", "js", "ts", "py", "go", "java", "c", "h"]
+color = "#0A7B83"

@@ -12,6 +12,10 @@ DOS 시절 Mdir의 키보드 조작감과 현대 Bash/Zsh 기능을 합친 개�
 - 테마: 기본 Mdir 파란 화면, 사용자 테마
 - SSH 원격 패널 + scp 파일 전송, 서버별 테마
 
+## 지원 플랫폼
+- macOS, Linux: 지원
+- Windows: 빌드는 되지만 기능은 **지원 예정** (휴지통 보기, PowerShell 셸 통합, 확장자 실행, SSH 등)
+
 ## 문서
 - [구현 계획](docs/plan.md)
 - [초기 구상](docs/mvp계획.md)
