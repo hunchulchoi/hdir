@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -23,8 +24,10 @@ use crate::launcher::{self, SharedLauncher};
 use crate::loader::Loader;
 use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
+use crate::platform::os_bytes;
 use crate::preview::{self, Preview};
-use crate::remote::SshTarget;
+use crate::remote::{self, SshTarget};
+use crate::remote_ops::{self, EditCopy};
 use crate::screen::{self, TextScreen};
 use crate::servers::{self, Server, SshHost};
 use crate::session::{self, Cmd, DISCONNECTED_MSG, Established, RemoteSession, SystemCmd};
@@ -51,6 +54,13 @@ pub enum PendingAction {
     },
     Trash {
         paths: Vec<PathBuf>,
+    },
+    /// Permanent delete on a remote host (no trash there).
+    RemoteDelete {
+        panel: usize,
+        session: Arc<RemoteSession>,
+        cwd: PathBuf,
+        names: Vec<OsString>,
     },
     /// Destination prompt for F5 (copy) / F6 (move).
     Transfer {
@@ -112,6 +122,8 @@ enum MenuKind {
     OpenWith {
         path: PathBuf,
         choices: Vec<OpenChoice>,
+        /// Set when `path` is on a remote host.
+        session: Option<Arc<RemoteSession>>,
     },
     /// Alt+F1/F2 location picker for `panel`: item 0 is local, then `servers`.
     Location {
@@ -147,7 +159,7 @@ const MENU_OPEN_WITH: usize = 5;
 pub type TextProbe = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
 /// Status shown when Enter lands on a FIFO, socket or device.
-const SPECIAL_FILE: &str = "특수 파일은 열 수 없음";
+const SPECIAL_FILE: &str = remote_ops::SPECIAL_FILE;
 
 /// Reads the first 8 KiB of `path` and classifies it like the preview does.
 /// Errors (vanished, unreadable, dangling symlink, special file) carry the
@@ -187,12 +199,71 @@ struct RunJob {
     name: OsString,
     /// What the user configured, for error messages.
     label: String,
+    /// Downloaded copy of a remote file; removed when the run is over.
+    temp: Option<tempfile::TempDir>,
 }
+
+/// What to do with a remote file once it is downloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FetchPurpose {
+    Edit,
+    Rule(AssocRule),
+    System,
+}
+
+/// An F4 edit of a remote file: the downloaded copy waits here while the
+/// editor runs, then decides whether to upload.
+struct RemoteEditCtx {
+    session: Arc<RemoteSession>,
+    remote: PathBuf,
+    copy: EditCopy,
+}
+
+/// An upload of an edited remote file running on a worker.
+struct Upload {
+    rx: Receiver<UploadDone>,
+    name: String,
+    session: Arc<RemoteSession>,
+    remote: PathBuf,
+    /// The edited local copy (kept whenever the upload does not complete).
+    local: PathBuf,
+    /// Set when the app quits without waiting any longer: the worker then
+    /// keeps the local copy whatever happens.
+    abandon: Arc<AtomicBool>,
+    /// The editor exited cleanly (shown as "편집 완료 (변경 없음)").
+    edited: bool,
+    /// What to show when the content turns out unchanged after an editor error.
+    editor_status: String,
+}
+
+struct UploadDone {
+    result: Result<(), String>,
+    /// The content did not change: nothing was uploaded.
+    unchanged: bool,
+    /// Where the local copy was kept after a failure.
+    kept: Option<PathBuf>,
+}
+
+/// What [`App::finish_uploads`] found at quit time.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UploadReport {
+    /// Lines for stderr: where every unsent edit was kept and where it was
+    /// meant to go.
+    pub notes: Vec<String>,
+    /// Some upload did not complete.
+    pub failed: bool,
+}
+
+/// Uploads an edited copy over a remote file (`local`, `remote`); tests
+/// inject slow or failing fakes.
+pub type Uploader = Arc<dyn Fn(&RemoteSession, &Path, &Path) -> Result<(), String> + Send + Sync>;
 
 /// A command line command waiting for the main loop to suspend the TUI.
 struct ShellJob {
     cmd: String,
     cwd: PathBuf,
+    /// Set for a remote panel: the command runs there over `ssh -t`.
+    session: Option<Arc<RemoteSession>>,
 }
 
 /// An in-flight text-or-not decision for a file without a rule.
@@ -208,6 +279,8 @@ struct ProbeReq {
     path: PathBuf,
     active: usize,
     cwd: PathBuf,
+    /// The host the file lives on (`None`: local).
+    session: Option<Arc<RemoteSession>>,
 }
 
 /// Computes one preview off the UI thread; tests may swap in a gated fake.
@@ -216,10 +289,29 @@ pub type PreviewRunner = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
 /// Reads the F3 viewer's file off the UI thread; tests may swap in a gated fake.
 pub type ViewerLoader = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
 
+/// What the Dev preview shows: a path and, for remote panels, the session
+/// that can read it (the same path on another host is a different target).
+#[derive(Debug, Clone)]
+pub struct PreviewTarget {
+    pub path: PathBuf,
+    pub session: Option<Arc<RemoteSession>>,
+}
+
+impl PartialEq for PreviewTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && match (&self.session, &other.session) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
+    }
+}
+
 /// Dev-mode preview bookkeeping: debounce, latest-wins ids, last result.
 pub struct PreviewState {
-    /// Path under the cursor that the preview should show.
-    wanted: Option<PathBuf>,
+    /// Target under the cursor that the preview should show.
+    wanted: Option<PreviewTarget>,
     wanted_at: Instant,
     /// A request for `wanted` has been started (or is done).
     requested: bool,
@@ -228,9 +320,9 @@ pub struct PreviewState {
     in_flight: bool,
     /// Results with another id are stale and dropped.
     latest_id: u64,
-    shown: Option<(PathBuf, Preview)>,
-    tx: Sender<(u64, PathBuf, Preview)>,
-    rx: Receiver<(u64, PathBuf, Preview)>,
+    shown: Option<(PreviewTarget, Preview)>,
+    tx: Sender<(u64, PreviewTarget, Preview)>,
+    rx: Receiver<(u64, PreviewTarget, Preview)>,
 }
 
 impl PreviewState {
@@ -295,6 +387,35 @@ enum BgKind {
         from: PathBuf,
         name: String,
     },
+    RemoteMkdir {
+        panel: usize,
+        parent: PathBuf,
+        name: String,
+        session: Arc<RemoteSession>,
+    },
+    RemoteRename {
+        panel: usize,
+        from: PathBuf,
+        name: String,
+        session: Arc<RemoteSession>,
+    },
+    RemoteDelete {
+        panel: usize,
+        cwd: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    /// Download a remote file to a private temp dir for `purpose`.
+    RemoteFetch {
+        panel: usize,
+        session: Arc<RemoteSession>,
+        remote: PathBuf,
+        purpose: FetchPurpose,
+    },
+    /// Resolve a remote `cd` on the server.
+    RemoteCd {
+        panel: usize,
+        session: Arc<RemoteSession>,
+    },
     OpenOsTrash,
     /// Re-read config.toml, themes, keymap and assoc.
     ConfigReload,
@@ -330,6 +451,11 @@ enum BgResult {
     Undo(UndoApplied),
     Mkdir(std::io::Result<PathBuf>),
     Rename(std::io::Result<PathBuf>),
+    RemoteMkdir(Result<PathBuf, String>),
+    RemoteRename(Result<PathBuf, String>),
+    RemoteDelete(Result<(), String>),
+    RemoteFetch(Result<EditCopy, String>),
+    RemoteCd(Result<PathBuf, String>),
 }
 
 /// The F3 viewer's own load slot (independent of the shared [`BgTask`]).
@@ -438,6 +564,17 @@ pub struct App {
     /// Runs the editor argv; tests may swap in a fake.
     pub editor_runner: EditorRunner,
     pending_edit: Option<EditJob>,
+    /// The downloaded copy behind `pending_edit` when the file is remote.
+    pending_remote_edit: Option<RemoteEditCtx>,
+    /// Uploads of edited remote files in flight.
+    uploads: Vec<Upload>,
+    /// Uploads an edited copy; tests may swap in a fake.
+    pub uploader: Uploader,
+    /// Local copies of edits whose upload failed, for the report at quit.
+    failed_copies: Vec<String>,
+    /// Downloaded copies a background program may still be reading; they
+    /// are removed with the app.
+    keep_temp: Vec<tempfile::TempDir>,
     pub preview: PreviewState,
     pub preview_runner: PreviewRunner,
     /// Wait this long after the cursor stops before computing a preview.
@@ -446,6 +583,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub viewer_loader: ViewerLoader,
     viewer_load: Option<ViewerLoad>,
+    /// The session the open viewer's file lives on (`None`: a local file).
+    viewer_session: Option<Arc<RemoteSession>>,
     /// The F9 popup menu (or theme picker).
     pub menu: Option<OpenMenu>,
     /// Starts association programs; tests inject a fake.
@@ -543,12 +682,18 @@ impl App {
             editor_vars: (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok()),
             editor_runner: editor::system_runner(),
             pending_edit: None,
+            pending_remote_edit: None,
+            uploads: Vec::new(),
+            uploader: Arc::new(remote_ops::upload_replace),
+            failed_copies: Vec::new(),
+            keep_temp: Vec::new(),
             preview: PreviewState::new(),
             preview_runner: Arc::new(preview::preview_path),
             preview_debounce: Duration::from_millis(80),
             viewer: None,
             viewer_loader: Arc::new(|p| preview::preview_path_with(p, preview::Limits::VIEWER)),
             viewer_load: None,
+            viewer_session: None,
             menu: None,
             launcher: launcher::system_launcher(),
             text_probe: Arc::new(probe_text),
@@ -778,13 +923,17 @@ impl App {
                 }
                 return;
             }
-            MenuKind::OpenWith { path, choices } => {
-                let (path, choices) = (path.clone(), choices.clone());
+            MenuKind::OpenWith {
+                path,
+                choices,
+                session,
+            } => {
+                let (path, choices, session) = (path.clone(), choices.clone(), session.clone());
                 match event {
                     MenuEvent::Chosen(i) => {
                         self.menu = None;
                         if let Some(c) = choices.get(i) {
-                            self.run_choice(c, path);
+                            self.run_choice(c, path, session);
                         }
                     }
                     MenuEvent::Cancelled => self.menu = None,
@@ -983,11 +1132,11 @@ impl App {
             }
             return;
         }
-        if self.active_panel().location.is_remote() {
-            self.status = Some(REMOTE_UNSUPPORTED.into());
+        let cwd = self.active_panel().cwd.clone();
+        if let Some(session) = self.active_panel().location.session().cloned() {
+            self.run_remote_command_line(session, cwd, cmd);
             return;
         }
-        let cwd = self.active_panel().cwd.clone();
         if let Some(target) = cmdline::parse_cd(cmd, self.home_dir.as_deref()) {
             self.change_dir_to(&cwd, &target);
             return;
@@ -999,7 +1148,53 @@ impl App {
         self.pending_shell = Some(ShellJob {
             cmd: cmd.to_string(),
             cwd,
+            session: None,
         });
+    }
+
+    /// A command line on a remote panel: `cd` is resolved on the server
+    /// (never leaves the TUI), everything else runs on `ssh -t`.
+    fn run_remote_command_line(&mut self, session: Arc<RemoteSession>, cwd: PathBuf, cmd: &str) {
+        if !session.is_alive() {
+            self.status = Some(DISCONNECTED_MSG.into());
+            return;
+        }
+        // "~" stands for the remote home; `~/x` becomes `~/x` again.
+        match cmdline::parse_cd(cmd, Some(Path::new("~"))) {
+            None => {
+                self.pending_shell = Some(ShellJob {
+                    cmd: cmd.to_string(),
+                    cwd,
+                    session: Some(session),
+                });
+            }
+            Some(target) => {
+                let text = match target {
+                    CdTarget::Home => "~".to_string(),
+                    CdTarget::Prev => match &self.prev_dirs[self.active] {
+                        Some(p) => p.to_string_lossy().into_owned(),
+                        None => {
+                            self.status = Some("이전 디렉터리 없음".into());
+                            return;
+                        }
+                    },
+                    CdTarget::Path(p) => p.to_string_lossy().into_owned(),
+                };
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
+                }
+                let sess = Arc::clone(&session);
+                self.task = Some(BgTask::spawn(
+                    BgKind::RemoteCd {
+                        panel: self.active,
+                        session,
+                    },
+                    move || BgResult::RemoteCd(remote_ops::resolve_cd(&sess, &cwd, &text)),
+                ));
+                self.status = Some("이동 중…".into());
+            }
+        }
     }
 
     fn change_dir_to(&mut self, cwd: &Path, target: &CdTarget) {
@@ -1319,14 +1514,25 @@ impl App {
             return;
         };
         let launcher = Arc::clone(&self.launcher);
-        let argv = [
-            self.shell_path.clone(),
-            OsString::from("-c"),
-            OsString::from(&job.cmd),
-        ];
+        // A remote command runs through the local `ssh`; the local process
+        // has no meaningful cwd of its own.
+        let (argv, run_cwd) = match &job.session {
+            Some(s) => (
+                remote::remote_shell_argv(&s.target, &os_bytes(job.cwd.as_os_str()), &job.cmd),
+                PathBuf::from("."),
+            ),
+            None => (
+                vec![
+                    self.shell_path.clone(),
+                    OsString::from("-c"),
+                    OsString::from(&job.cmd),
+                ],
+                job.cwd.clone(),
+            ),
+        };
         let mut result: Result<i32, String> = Err("실행되지 않음".into());
         let outcome = suspend(&mut || {
-            let r = launcher.run_shell(&argv, &job.cwd);
+            let r = launcher.run_shell(&argv, &run_cwd);
             if let Ok(code) = &r {
                 launcher.wait_key_after(*code);
             }
@@ -1347,15 +1553,12 @@ impl App {
         let page = self.page_height.max(1);
         let remote_here = self.active_panel().location.is_remote();
         let remote_any = remote_here || self.other_panel().location.is_remote();
+        if action == Action::TrashView && remote_here {
+            self.status = Some("원격: 휴지통 없음".into());
+            return;
+        }
         let blocked = match action {
             Action::Copy | Action::Move => remote_any,
-            Action::Mkdir
-            | Action::Rename
-            | Action::Delete
-            | Action::TrashView
-            | Action::View
-            | Action::Edit
-            | Action::OpenWith => remote_here,
             _ => false,
         };
         if blocked {
@@ -1414,9 +1617,6 @@ impl App {
                 }
                 let id = self.next_id();
                 match self.active_panel_mut().begin_enter(id) {
-                    AsyncEnter::Opened(_) if remote_here => {
-                        self.status = Some(REMOTE_UNSUPPORTED.into());
-                    }
                     AsyncEnter::Opened(path) => self.activate_file(path),
                     AsyncEnter::Load(req) => {
                         self.invalidate_probe();
@@ -1478,7 +1678,61 @@ impl App {
             return;
         }
         let path = panel.cwd.join(&e.os_name);
-        self.queue_edit(&path);
+        match panel.location.session().cloned() {
+            Some(session) => self.start_remote_fetch(session, path, FetchPurpose::Edit),
+            None => self.queue_edit(&path),
+        }
+    }
+
+    /// Download `remote` on a worker; what happens next depends on `purpose`
+    /// (see [`App::tick_task`]).
+    fn start_remote_fetch(
+        &mut self,
+        session: Arc<RemoteSession>,
+        remote: PathBuf,
+        purpose: FetchPurpose,
+    ) {
+        if self.busy() {
+            self.status = Some("작업 진행 중".into());
+            return;
+        }
+        let (r, sess) = (remote.clone(), Arc::clone(&session));
+        self.task = Some(BgTask::spawn(
+            BgKind::RemoteFetch {
+                panel: self.active,
+                session,
+                remote,
+                purpose,
+            },
+            move || BgResult::RemoteFetch(remote_ops::fetch(&sess, &r)),
+        ));
+        self.status = Some("내려받는 중…".into());
+    }
+
+    /// The download for an F4 edit is done: queue the editor on the copy.
+    fn begin_remote_edit(
+        &mut self,
+        session: Arc<RemoteSession>,
+        remote: PathBuf,
+        copy: EditCopy,
+        panel: usize,
+    ) {
+        let Some(name) = remote.file_name().map(OsString::from) else {
+            return;
+        };
+        let (visual, editor) = &self.editor_vars;
+        match editor::editor_argv(visual.as_deref(), editor.as_deref(), &copy.local) {
+            Ok(argv) => {
+                self.status = None;
+                self.pending_edit = Some(EditJob { argv, panel, name });
+                self.pending_remote_edit = Some(RemoteEditCtx {
+                    session,
+                    remote,
+                    copy,
+                });
+            }
+            Err(e) => self.status = Some(e),
+        }
     }
 
     /// Queue an edit of `path` (a file in the active panel's directory).
@@ -1515,11 +1769,10 @@ impl App {
     }
 
     /// Path the Dev preview should show: the active panel's cursor entry.
-    fn preview_target(&self) -> Option<PathBuf> {
+    fn preview_target(&self) -> Option<PreviewTarget> {
         if self.mode != Mode::Dev
             || self.viewer.is_some()
             || self.trash_views[self.active].is_some()
-            || self.active_panel().location.is_remote()
         {
             return None;
         }
@@ -1529,7 +1782,10 @@ impl App {
             return self.preview.wanted.clone();
         }
         match panel.current() {
-            Some(e) if e.kind != EntryKind::Parent => Some(panel.cwd.join(&e.os_name)),
+            Some(e) if e.kind != EntryKind::Parent => Some(PreviewTarget {
+                path: panel.cwd.join(&e.os_name),
+                session: panel.location.session().cloned(),
+            }),
             _ => None,
         }
     }
@@ -1564,7 +1820,7 @@ impl App {
                 changed = true;
             }
         }
-        if let Some(path) = st.wanted.clone()
+        if let Some(target) = st.wanted.clone()
             && !st.requested
             && !st.in_flight
             && st.wanted_at.elapsed() >= self.preview_debounce
@@ -1577,9 +1833,16 @@ impl App {
                 // A panicking runner must still report back or the single
                 // slot would stay occupied forever.
                 let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner(&path)))
-                        .unwrap_or_else(|_| Preview::Error("미리보기 실패".into()));
-                let _ = tx.send((id, path, result));
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match &target.session {
+                            Some(sess) => {
+                                remote_ops::preview(sess, &target.path, preview::Limits::PREVIEW)
+                            }
+                            None => runner(&target.path),
+                        }
+                    }))
+                    .unwrap_or_else(|_| Preview::Error("미리보기 실패".into()));
+                let _ = tx.send((id, target, result));
             });
         }
         changed
@@ -1601,6 +1864,7 @@ impl App {
         };
         let runner = Arc::clone(&self.editor_runner);
         let argv = job.argv;
+        let remote = self.pending_remote_edit.take();
         let outcome = suspend(&mut || runner(&argv));
         let cwd = self.panels[job.panel].cwd.clone();
         if self.panels[1 - job.panel].cwd == cwd {
@@ -1611,17 +1875,191 @@ impl App {
             self.start_viewer_load(path); // show what the editor saved
         }
         self.reload_after_op(job.panel, Some(job.name));
-        self.status = Some(match outcome {
+        let edited = outcome.as_ref().is_ok_and(Result::is_ok);
+        let mut status = match outcome {
             Ok(Ok(())) => format!("편집 완료: {name}"),
             Ok(Err(msg)) => msg,
             Err(e) => format!("터미널 복귀 실패: {e}"),
+        };
+        if let Some(ctx) = remote {
+            // Even after an editor error the user may have saved: a worker
+            // hashes the copy and uploads it if the content changed.
+            let editor_status = std::mem::replace(&mut status, format!("변경 확인 중…: {name}"));
+            self.start_upload(ctx, name, edited, editor_status);
+        }
+        self.status = Some(status);
+    }
+
+    /// On a worker: hash the edited copy and, if the content changed, upload
+    /// it. The temp dir goes away after a successful upload (or no change)
+    /// and is kept (and reported) after a failure or an abandoned wait.
+    fn start_upload(
+        &mut self,
+        ctx: RemoteEditCtx,
+        name: String,
+        edited: bool,
+        editor_status: String,
+    ) {
+        let RemoteEditCtx {
+            session,
+            remote,
+            copy,
+        } = ctx;
+        let EditCopy { dir, local, stamp } = copy;
+        let (tx, rx) = mpsc::channel();
+        let abandon = Arc::new(AtomicBool::new(false));
+        let (s2, r2, l2) = (Arc::clone(&session), remote.clone(), local.clone());
+        let (up, ab) = (Arc::clone(&self.uploader), Arc::clone(&abandon));
+        std::thread::spawn(move || {
+            let (result, unchanged) = match stamp.differs(&l2) {
+                Ok(false) => (Ok(()), true),
+                Ok(true) => (up(&s2, &l2, &r2), false),
+                Err(e) => (Err(format!("편집한 파일을 읽을 수 없음: {e}")), false),
+            };
+            let kept = (result.is_err() || ab.load(Ordering::SeqCst)).then(|| {
+                let _ = dir.keep();
+                l2.clone()
+            });
+            let _ = tx.send(UploadDone {
+                result,
+                unchanged,
+                kept,
+            });
         });
+        self.uploads.push(Upload {
+            rx,
+            name,
+            session,
+            remote,
+            local,
+            abandon,
+            edited,
+            editor_status,
+        });
+    }
+
+    pub fn has_uploads(&self) -> bool {
+        !self.uploads.is_empty()
+    }
+
+    /// Apply finished uploads; returns true when the screen changed.
+    fn tick_uploads(&mut self) -> bool {
+        let mut done = Vec::new();
+        let mut pending = Vec::new();
+        for u in std::mem::take(&mut self.uploads) {
+            match u.rx.try_recv() {
+                Ok(d) => done.push((u, d)),
+                Err(TryRecvError::Empty) => pending.push(u),
+                Err(TryRecvError::Disconnected) => {
+                    let d = UploadDone {
+                        result: Err("업로드 중단됨".into()),
+                        unchanged: false,
+                        kept: Some(u.local.clone()),
+                    };
+                    done.push((u, d));
+                }
+            }
+        }
+        self.uploads = pending;
+        let changed = !done.is_empty();
+        for (u, d) in done {
+            let Upload {
+                name,
+                session,
+                remote,
+                edited,
+                editor_status,
+                ..
+            } = u;
+            self.status = Some(match &d.result {
+                Ok(()) if d.unchanged && edited => format!("편집 완료: {name} (변경 없음)"),
+                Ok(()) if d.unchanged => editor_status,
+                Ok(()) => format!("편집 완료: {name} (업로드됨)"),
+                Err(e) => {
+                    let kept = d
+                        .kept
+                        .as_ref()
+                        .map(|k| format!(" · 임시 복사본: {}", k.display()))
+                        .unwrap_or_default();
+                    if let Some(k) = &d.kept {
+                        self.failed_copies.push(format!(
+                            "업로드 실패: {name}: {e}\n  편집한 복사본: {}\n  원격 대상: {}:{}",
+                            k.display(),
+                            session.target.host,
+                            remote.display()
+                        ));
+                    }
+                    format!("업로드 실패: {name}: {e}{kept}")
+                }
+            });
+            let dir = remote.parent().map(Path::to_path_buf).unwrap_or_default();
+            for i in 0..2 {
+                let same = self.panels[i]
+                    .location
+                    .session()
+                    .is_some_and(|s| Arc::ptr_eq(s, &session));
+                if same && self.panels[i].cwd == dir {
+                    self.reload_after_op(i, None);
+                }
+            }
+            let viewing = self.viewer.as_ref().is_some_and(|v| v.path == remote)
+                && self
+                    .viewer_session
+                    .as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(s, &session));
+            if viewing && d.result.is_ok() {
+                self.start_viewer_load(remote);
+            }
+        }
+        changed
+    }
+
+    /// Wait (bounded) for uploads still running when the app quits. Every
+    /// edit that did not reach the server (failed earlier, failed now, or
+    /// still running when the wait expires) keeps its local copy; the report
+    /// names the copy and the remote destination so the caller can print them
+    /// once the terminal is restored.
+    pub fn finish_uploads(&mut self, timeout: Duration) -> UploadReport {
+        let deadline = Instant::now() + timeout;
+        while self.has_uploads() && Instant::now() < deadline {
+            self.tick_uploads();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut notes = std::mem::take(&mut self.failed_copies);
+        for u in &self.uploads {
+            u.abandon.store(true, Ordering::SeqCst);
+            notes.push(format!(
+                "업로드가 끝나지 않음: {}\n  편집한 복사본: {}\n  원격 대상: {}:{}",
+                u.name,
+                u.local.display(),
+                u.session.target.host,
+                u.remote.display()
+            ));
+        }
+        UploadReport {
+            failed: !notes.is_empty(),
+            notes,
+        }
+    }
+
+    /// The quit path of `main`: wait for uploads, print the report to `err`
+    /// (call after the terminal is restored); `false` means an edit was not
+    /// uploaded and the process should exit non-zero.
+    pub fn quit_uploads(&mut self, timeout: Duration, err: &mut dyn std::io::Write) -> bool {
+        let report = self.finish_uploads(timeout);
+        for note in &report.notes {
+            let _ = writeln!(err, "hdir: {note}");
+        }
+        !report.failed
     }
 
     /// F3: view the current file (directories and `..` do nothing).
     fn open_viewer(&mut self) {
         if let Some(path) = self.current_file() {
-            self.view_path(path);
+            match self.active_panel().location.session().cloned() {
+                Some(session) => self.view_remote(session, path),
+                None => self.view_path(path),
+            }
         }
     }
 
@@ -1639,6 +2077,15 @@ impl App {
 
     fn view_path(&mut self, path: PathBuf) {
         self.status = None;
+        self.viewer_session = None;
+        self.viewer = Some(Viewer::loading(path.clone()));
+        self.start_viewer_load(path);
+    }
+
+    /// F3 on a remote file: read its head over ssh.
+    fn view_remote(&mut self, session: Arc<RemoteSession>, path: PathBuf) {
+        self.status = None;
+        self.viewer_session = Some(session);
         self.viewer = Some(Viewer::loading(path.clone()));
         self.start_viewer_load(path);
     }
@@ -1648,14 +2095,20 @@ impl App {
     fn start_viewer_load(&mut self, path: PathBuf) {
         let (tx, rx) = mpsc::channel();
         let loader = Arc::clone(&self.viewer_loader);
+        let session = self.viewer_session.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(loader(&path));
+            let preview = match session {
+                Some(s) => remote_ops::preview(&s, &path, preview::Limits::VIEWER),
+                None => loader(&path),
+            };
+            let _ = tx.send(preview);
         });
         self.viewer_load = Some(ViewerLoad { rx });
     }
 
     fn close_viewer(&mut self) {
         self.viewer = None;
+        self.viewer_session = None;
         self.viewer_load = None; // abandon: the worker's send just fails
     }
 
@@ -1686,8 +2139,14 @@ impl App {
         let Some(name) = path.file_name() else {
             return;
         };
+        let session = self.active_panel().location.session().cloned();
         if let Some(rule) = self.settings.assoc.find(name).cloned() {
-            self.run_rule(&rule, path);
+            match session {
+                Some(s) => self.start_remote_fetch(s, path, FetchPurpose::Rule(rule)),
+                None => {
+                    self.run_rule(&rule, path);
+                }
+            }
             return;
         }
         self.probe_gen += 1;
@@ -1696,6 +2155,7 @@ impl App {
             path,
             active: self.active,
             cwd: self.active_panel().cwd.clone(),
+            session,
         };
         if self.probe.is_some() {
             // One probe at a time: the newest request replaces any waiting one.
@@ -1715,10 +2175,14 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let probe = Arc::clone(&self.text_probe);
         let target = req.path.clone();
+        let session = req.session.clone();
         let spawned = std::thread::Builder::new()
             .name("hdir-probe".into())
             .spawn(move || {
-                let _ = tx.send(probe(&target));
+                let _ = tx.send(match session {
+                    Some(s) => remote_ops::probe_text(&s, &target),
+                    None => probe(&target),
+                });
             });
         match spawned {
             Ok(_) => self.probe = Some(ProbeLoad { rx, req }),
@@ -1735,6 +2199,11 @@ impl App {
             && self.menu.is_none()
             && self.active == req.active
             && self.panels[req.active].cwd == req.cwd
+            && match (self.panels[req.active].location.session(), &req.session) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 
     /// Apply a finished text probe; true when the screen changed.
@@ -1754,10 +2223,17 @@ impl App {
         if self.probe_state_holds(&load.req) {
             changed = true;
             let path = load.req.path;
+            let session = load.req.session;
             match result {
-                Ok(is_text) => match assoc::default_action(is_text) {
-                    DefaultAction::View => self.view_path(path),
-                    DefaultAction::OpenWithSystem => self.run_system(path),
+                Ok(is_text) => match (assoc::default_action(is_text), session) {
+                    (DefaultAction::View, None) => self.view_path(path),
+                    (DefaultAction::View, Some(s)) => self.view_remote(s, path),
+                    (DefaultAction::OpenWithSystem, None) => {
+                        self.run_system(path);
+                    }
+                    (DefaultAction::OpenWithSystem, Some(s)) => {
+                        self.start_remote_fetch(s, path, FetchPurpose::System);
+                    }
                 },
                 Err(e) if e == SPECIAL_FILE => self.status = Some(e),
                 Err(e) => {
@@ -1775,15 +2251,19 @@ impl App {
         changed
     }
 
-    fn run_rule(&mut self, rule: &AssocRule, path: PathBuf) {
+    /// Returns whether a program was queued or started.
+    fn run_rule(&mut self, rule: &AssocRule, path: PathBuf) -> bool {
         let cwd = self.run_cwd(&path);
         match assoc::plan_run(rule, &path, &cwd, &self.shell) {
             Ok((argv, mode)) => self.launch(argv, mode, rule.cmd.clone(), &path, cwd),
-            Err(e) => self.status = Some(e),
+            Err(e) => {
+                self.status = Some(e);
+                false
+            }
         }
     }
 
-    fn run_system(&mut self, path: PathBuf) {
+    fn run_system(&mut self, path: PathBuf) -> bool {
         let cwd = self.run_cwd(&path);
         match assoc::system_opener_argv(&path) {
             Ok(argv) => self.launch(
@@ -1793,7 +2273,10 @@ impl App {
                 &path,
                 cwd,
             ),
-            Err(e) => self.status = Some(e),
+            Err(e) => {
+                self.status = Some(e);
+                false
+            }
         }
     }
 
@@ -1811,7 +2294,7 @@ impl App {
         label: String,
         path: &Path,
         cwd: PathBuf,
-    ) {
+    ) -> bool {
         let name = path.file_name().map(OsString::from).unwrap_or_default();
         if mode == RunMode::Background {
             // spawn() can be slow (PATH search, a hung mount): keep it off
@@ -1831,8 +2314,9 @@ impl App {
                 });
             if let Err(e) = spawned {
                 self.status = Some(format!("오류: {label}: {e}"));
+                return false;
             }
-            return;
+            return true;
         }
         self.status = None;
         self.pending_run = Some(RunJob {
@@ -1842,14 +2326,32 @@ impl App {
             panel: self.active,
             name,
             label,
+            temp: None,
         });
+        true
     }
 
-    fn run_choice(&mut self, choice: &OpenChoice, path: PathBuf) {
-        match choice {
-            OpenChoice::Rule(rule) => self.run_rule(rule, path),
-            OpenChoice::System => self.run_system(path),
-            OpenChoice::Viewer => self.view_path(path),
+    fn run_choice(
+        &mut self,
+        choice: &OpenChoice,
+        path: PathBuf,
+        session: Option<Arc<RemoteSession>>,
+    ) {
+        match (choice, session) {
+            (OpenChoice::Rule(rule), None) => {
+                self.run_rule(rule, path);
+            }
+            (OpenChoice::Rule(rule), Some(s)) => {
+                self.start_remote_fetch(s, path, FetchPurpose::Rule(rule.clone()));
+            }
+            (OpenChoice::System, None) => {
+                self.run_system(path);
+            }
+            (OpenChoice::System, Some(s)) => {
+                self.start_remote_fetch(s, path, FetchPurpose::System);
+            }
+            (OpenChoice::Viewer, None) => self.view_path(path),
+            (OpenChoice::Viewer, Some(s)) => self.view_remote(s, path),
         }
     }
 
@@ -1875,7 +2377,11 @@ impl App {
         choices.push(OpenChoice::Viewer);
         self.menu = Some(OpenMenu {
             menu: Menu::new("연결 프로그램 선택", items, 0),
-            kind: MenuKind::OpenWith { path, choices },
+            kind: MenuKind::OpenWith {
+                path,
+                choices,
+                session: self.active_panel().location.session().cloned(),
+            },
         });
     }
 
@@ -1934,6 +2440,12 @@ impl App {
             return;
         };
         match action {
+            Action::Edit if self.viewer_session.is_some() => {
+                let path = v.path.clone();
+                if let Some(session) = self.viewer_session.clone() {
+                    self.start_remote_fetch(session, path, FetchPurpose::Edit);
+                }
+            }
             Action::Edit => {
                 let path = v.path.clone();
                 self.queue_edit(&path);
@@ -2068,7 +2580,8 @@ impl App {
     /// Poll background loads and the job; returns true when the screen needs a redraw.
     pub fn tick(&mut self) -> bool {
         let loaded = self.drain_loads() | self.tick_connect();
-        let task = self.tick_task() | self.tick_viewer_load() | self.tick_probe();
+        let task =
+            self.tick_task() | self.tick_viewer_load() | self.tick_probe() | self.tick_uploads();
         let spawned = self.tick_spawn();
         let preview = self.tick_preview();
         self.tick_job() || loaded || task || preview || spawned
@@ -2159,6 +2672,79 @@ impl App {
                     self.status = Some(format!("오류: {e}"));
                 }
             },
+            (
+                BgKind::RemoteMkdir {
+                    panel,
+                    parent,
+                    name,
+                    session,
+                },
+                Some(BgResult::RemoteMkdir(res)),
+            ) => match res {
+                Ok(path) => {
+                    self.undo.push(UndoOp::RemoteMkdir { session, path });
+                    self.after_fs_op(panel, &parent, Some(&name), format!("폴더 생성: {name}"));
+                }
+                Err(e) => {
+                    self.reload_both();
+                    self.status = Some(format!("오류: {e}"));
+                }
+            },
+            (
+                BgKind::RemoteRename {
+                    panel,
+                    from,
+                    name,
+                    session,
+                },
+                Some(BgResult::RemoteRename(res)),
+            ) => match res {
+                Ok(to) => {
+                    let parent = from.parent().map(PathBuf::from).unwrap_or_default();
+                    self.undo.push(UndoOp::RemoteRename { session, from, to });
+                    self.after_fs_op(panel, &parent, Some(&name), format!("이름 변경: {name}"));
+                }
+                Err(e) => {
+                    self.reload_both();
+                    self.status = Some(format!("오류: {e}"));
+                }
+            },
+            (BgKind::RemoteDelete { panel, cwd, paths }, Some(BgResult::RemoteDelete(res))) => {
+                // Even a failed rm -rf may have removed some of the items.
+                self.clear_selection(panel, &cwd, &paths);
+                self.reload_both();
+                self.status = Some(match res {
+                    Ok(()) => format!("영구 삭제: {}개 (원격 삭제는 되돌릴 수 없음)", paths.len()),
+                    Err(e) => format!("오류: {e}"),
+                });
+            }
+            (
+                BgKind::RemoteFetch {
+                    panel,
+                    session,
+                    remote,
+                    purpose,
+                },
+                Some(BgResult::RemoteFetch(res)),
+            ) => self.finish_fetch(panel, session, remote, purpose, res),
+            (BgKind::RemoteCd { panel, session }, Some(BgResult::RemoteCd(res))) => {
+                let same = self.panels[panel]
+                    .location
+                    .session()
+                    .is_some_and(|s| Arc::ptr_eq(s, &session));
+                match res {
+                    Ok(dir) if same => {
+                        self.status = None;
+                        self.invalidate_probe();
+                        let id = self.next_id();
+                        let req =
+                            self.panels[panel].begin_change_dir(id, dir, None, LoadKind::Enter);
+                        self.dispatch(panel, req);
+                    }
+                    Ok(_) => self.status = None, // the panel left that host meanwhile
+                    Err(e) => self.status = Some(e),
+                }
+            }
             (BgKind::OpenOsTrash, Some(BgResult::OpenOsTrash(res))) => {
                 self.status = Some(match res {
                     Ok(()) => "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".to_string(),
@@ -2218,6 +2804,50 @@ impl App {
             }
         }
         true
+    }
+
+    /// A remote download finished: edit it, or run the program chosen for it.
+    fn finish_fetch(
+        &mut self,
+        panel: usize,
+        session: Arc<RemoteSession>,
+        remote: PathBuf,
+        purpose: FetchPurpose,
+        res: Result<EditCopy, String>,
+    ) {
+        let copy = match res {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = Some(format!("오류: {e}"));
+                return;
+            }
+        };
+        match purpose {
+            FetchPurpose::Edit => self.begin_remote_edit(session, remote, copy, panel),
+            FetchPurpose::Rule(rule) => {
+                let EditCopy { dir, local, .. } = copy;
+                let queued = self.run_rule(&rule, local);
+                self.adopt_temp(dir, queued);
+            }
+            FetchPurpose::System => {
+                let EditCopy { dir, local, .. } = copy;
+                let queued = self.run_system(local);
+                self.adopt_temp(dir, queued);
+            }
+        }
+    }
+
+    /// Tie a downloaded copy's lifetime to the program started on it: a
+    /// foreground run removes it afterwards, a background opener keeps it
+    /// until the app exits, a failed start removes it right away.
+    fn adopt_temp(&mut self, dir: tempfile::TempDir, started: bool) {
+        if !started {
+            return;
+        }
+        match self.pending_run.as_mut() {
+            Some(job) => job.temp = Some(dir),
+            None => self.keep_temp.push(dir),
+        }
     }
 
     fn reload_both(&mut self) {
@@ -2362,6 +2992,29 @@ impl App {
             return;
         }
         let cwd = self.active_panel().cwd.clone();
+        if let Some(session) = self.active_panel().location.session().cloned() {
+            // No trash on a remote host: a red permanent-delete confirmation.
+            let mut msg: Vec<String> = names
+                .iter()
+                .take(5)
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+            if names.len() > 5 {
+                msg.push(format!("외 {}개", names.len() - 5));
+            }
+            let title = format!("영구 삭제 (원격: {})", session.name);
+            self.status = None;
+            self.dialog = Some((
+                Dialog::danger(&title, msg),
+                PendingAction::RemoteDelete {
+                    panel: self.active,
+                    session,
+                    cwd,
+                    names,
+                },
+            ));
+            return;
+        }
         let paths: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
         let mut msg: Vec<String> = names
             .iter()
@@ -2611,6 +3264,20 @@ impl App {
                 }
                 let parent = self.active_panel().cwd.clone();
                 let (p, n) = (parent.clone(), name.clone());
+                if let Some(session) = self.active_panel().location.session().cloned() {
+                    let sess = Arc::clone(&session);
+                    self.task = Some(BgTask::spawn(
+                        BgKind::RemoteMkdir {
+                            panel: self.active,
+                            parent,
+                            name,
+                            session,
+                        },
+                        move || BgResult::RemoteMkdir(remote_ops::mkdir(&sess, &p, &n)),
+                    ));
+                    self.status = Some("폴더 생성 중…".into());
+                    return;
+                }
                 self.task = Some(BgTask::spawn(
                     BgKind::Mkdir {
                         panel: self.active,
@@ -2627,6 +3294,20 @@ impl App {
                     return;
                 }
                 let (f, n) = (from.clone(), name.clone());
+                if let Some(session) = self.active_panel().location.session().cloned() {
+                    let sess = Arc::clone(&session);
+                    self.task = Some(BgTask::spawn(
+                        BgKind::RemoteRename {
+                            panel: self.active,
+                            from,
+                            name,
+                            session,
+                        },
+                        move || BgResult::RemoteRename(remote_ops::rename(&sess, &f, &n)),
+                    ));
+                    self.status = Some("이름 변경 중…".into());
+                    return;
+                }
                 self.task = Some(BgTask::spawn(
                     BgKind::Rename {
                         panel: self.active,
@@ -2651,6 +3332,27 @@ impl App {
                     move || BgResult::Trash(trash::delete_tracked(&*trash, &paths)),
                 ));
                 self.status = Some("휴지통으로 이동 중…".into());
+            }
+            (
+                PendingAction::RemoteDelete {
+                    panel,
+                    session,
+                    cwd,
+                    names,
+                },
+                DialogResult::Confirmed,
+            ) => {
+                if self.busy() {
+                    self.status = Some("작업 진행 중".into());
+                    return;
+                }
+                let paths: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
+                let dir = cwd.clone();
+                self.task = Some(BgTask::spawn(
+                    BgKind::RemoteDelete { panel, cwd, paths },
+                    move || BgResult::RemoteDelete(remote_ops::delete(&session, &dir, &names)),
+                ));
+                self.status = Some("영구 삭제 중…".into());
             }
             (PendingAction::TrashPurge { panel, entries }, DialogResult::Confirmed) => {
                 if self.busy() {
@@ -2709,7 +3411,9 @@ impl App {
         focus: Option<&str>,
         status: String,
     ) {
-        if self.panels[1 - idx].cwd == dir {
+        let same_source = self.panels[idx].location.vfs().source_key()
+            == self.panels[1 - idx].location.vfs().source_key();
+        if same_source && self.panels[1 - idx].cwd == dir {
             self.reload_after_op(1 - idx, None);
         }
         self.reload_after_op(idx, focus.map(OsString::from));
@@ -2752,7 +3456,7 @@ impl App {
                 .preview
                 .wanted
                 .as_ref()
-                .and_then(|p| p.file_name())
+                .and_then(|t| t.path.file_name())
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let body = match (&self.preview.wanted, self.preview.shown_for_wanted()) {
@@ -7159,7 +7863,15 @@ mod tests {
             /// Held by a test to make every remote listing hang.
             list_gate: Mutex<()>,
             tree: HashMap<&'static str, Vec<(&'static str, &'static str)>>,
+            /// Every ssh/scp argv that is not a master check or `ssh -V`.
+            calls: Mutex<Vec<Vec<String>>>,
+            /// Tests script answers here; `None` falls through to the defaults.
+            hook: Mutex<Option<Hook>>,
+            /// What `printf "$HOME"` answers.
+            home: Mutex<String>,
         }
+
+        type Hook = Box<dyn Fn(&[String]) -> Option<CmdOutput> + Send + Sync>;
 
         impl FakeSsh {
             fn new(master_up: bool) -> Arc<Self> {
@@ -7178,6 +7890,9 @@ mod tests {
                     checks: Mutex::new(0),
                     list_gate: Mutex::new(()),
                     tree,
+                    calls: Mutex::new(Vec::new()),
+                    hook: Mutex::new(None),
+                    home: Mutex::new("/home/choi".into()),
                 })
             }
         }
@@ -7221,9 +7936,26 @@ mod tests {
                     return out(255, "");
                 }
                 let i = a.iter().position(|s| s == "--").unwrap();
-                let cmd = a[i + 2].as_str();
+                let cmd = a.get(i + 2).map_or("", String::as_str);
+                if cmd != "uname -s" {
+                    self.calls.lock().unwrap().push(a.clone());
+                }
+                if let Some(h) = self.hook.lock().unwrap().as_ref()
+                    && let Some(o) = h(&a)
+                {
+                    return o;
+                }
+                if a[0] == "scp" {
+                    return out(0, "");
+                }
                 if cmd == "uname -s" {
                     return out(0, "Linux\n");
+                }
+                if cmd.contains("\"$HOME\"") && !cmd.starts_with("cd -- ") {
+                    return out(0, &format!("{}\0", self.home.lock().unwrap()));
+                }
+                if !cmd.starts_with("cd -- ") {
+                    return out(0, ""); // mkdir, mv, rm, ... succeed by default
                 }
                 let dir = cmd
                     .strip_prefix("cd -- ")
@@ -7262,6 +7994,31 @@ mod tests {
                     out(255, "")
                 }
             }
+        }
+
+        /// Remote shell commands other than listings and path lookups.
+        fn cmds(f: &FakeSsh) -> Vec<String> {
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|a| crate::testutil::remote_cmd(a).map(str::to_string))
+                .filter(|c| !c.starts_with("cd -- "))
+                .collect()
+        }
+
+        /// Every remote shell command, listings included.
+        fn all_cmds(f: &FakeSsh) -> Vec<String> {
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|a| crate::testutil::remote_cmd(a).map(str::to_string))
+                .collect()
+        }
+
+        fn script(f: &FakeSsh, h: impl Fn(&[String]) -> Option<CmdOutput> + Send + Sync + 'static) {
+            *f.hook.lock().unwrap() = Some(Box::new(h));
         }
 
         fn env_with(master_up: bool) -> (TempDir, App, Arc<FakeSsh>) {
@@ -7596,26 +8353,1163 @@ mod tests {
             assert!(f.interactive.lock().unwrap().is_empty());
         }
 
+        // ---- HDIR-38: remote mkdir / rename / delete ----
+
+        fn rename_to(app: &mut App, new: &str) {
+            press(app, KeyCode::F(2));
+            for _ in 0..40 {
+                press(app, KeyCode::Backspace);
+            }
+            type_str(app, new);
+            press(app, KeyCode::Enter);
+        }
+
         #[test]
-        fn file_operations_on_remote_panels_are_not_supported_yet() {
+        fn remote_f7_makes_the_dir_over_ssh_and_is_undoable() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "new dir");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.status.as_deref(), Some("폴더 생성 중…"));
+            assert!(app.task.is_some(), "runs on a worker");
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(cmds(&f), vec!["mkdir -- '/srv/data/new dir'".to_string()]);
+            assert_eq!(app.status.as_deref(), Some("폴더 생성: new dir"));
+            assert_eq!(app.undo.len(), 1);
+            ctrl_z(&mut app);
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(cmds(&f)[1], "rmdir -- '/srv/data/new dir'");
+            assert_eq!(
+                app.status.as_deref(),
+                Some("되돌림: 폴더 생성 취소 new dir")
+            );
+        }
+
+        #[test]
+        fn remote_f7_with_weird_names_stays_quoted_and_rejects_slashes() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "한글 'q' -x");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert_eq!(
+                cmds(&f),
+                vec!["mkdir -- '/srv/data/한글 '\\''q'\\'' -x'".to_string()]
+            );
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "a/b");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert_eq!(cmds(&f).len(), 1, "invalid name never reaches ssh");
+            assert!(app.status.as_deref().unwrap().starts_with("오류"));
+        }
+
+        #[test]
+        fn remote_f7_failure_is_reported_without_undo_entry() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("mkdir"))
+                    .map(|_| CmdOutput {
+                        code: Some(1),
+                        stdout: Vec::new(),
+                        stderr: b"mkdir: cannot create directory 'x': File exists\n".to_vec(),
+                    })
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "x");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert!(app.status.as_deref().unwrap().contains("File exists"));
+            assert_eq!(app.undo.len(), 0);
+        }
+
+        #[test]
+        fn remote_f2_renames_without_clobbering_and_undo_moves_back() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // a.txt
+            rename_to(&mut app, "b c.txt");
+            assert_eq!(app.status.as_deref(), Some("이름 변경 중…"));
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            let fwd = crate::remote::rename_cmd(b"/srv/data/a.txt", b"/srv/data/b c.txt");
+            assert_eq!(cmds(&f), vec![String::from_utf8(fwd).unwrap()]);
+            assert_eq!(app.status.as_deref(), Some("이름 변경: b c.txt"));
+            assert_eq!(app.undo.len(), 1);
+            ctrl_z(&mut app);
+            wait_idle(&mut app);
+            let back = crate::remote::rename_cmd(b"/srv/data/b c.txt", b"/srv/data/a.txt");
+            assert_eq!(cmds(&f)[1], String::from_utf8(back).unwrap());
+            assert_eq!(
+                app.status.as_deref(),
+                Some("되돌림: 이름 변경 b c.txt → a.txt")
+            );
+        }
+
+        #[test]
+        fn remote_f2_onto_an_existing_name_is_an_error() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -e"))
+                    .map(|_| out(crate::remote::RENAME_EXISTS, ""))
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            rename_to(&mut app, "sub");
+            wait_idle(&mut app);
+            assert_eq!(app.status.as_deref(), Some("오류: 이미 존재함: sub"));
+            assert_eq!(app.undo.len(), 0);
+        }
+
+        #[test]
+        fn remote_f8_asks_with_a_danger_dialog_naming_the_server() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char(' ')); // sub
+            press(&mut app, KeyCode::Char(' ')); // a.txt
+            press(&mut app, KeyCode::F(8));
+            let Some((
+                Dialog::Confirm {
+                    title,
+                    message,
+                    danger,
+                },
+                _,
+            )) = app.dialog.clone()
+            else {
+                panic!("expected a confirm dialog: {:?}", app.dialog);
+            };
+            assert!(danger, "red permanent-delete style");
+            assert_eq!(title, "영구 삭제 (원격: prod)");
+            assert_eq!(message, vec!["a.txt".to_string(), "sub".to_string()]);
+            press(&mut app, KeyCode::Esc);
+            assert!(app.dialog.is_none());
+            assert!(cmds(&f).is_empty(), "cancel deletes nothing");
+        }
+
+        #[test]
+        fn remote_f8_confirm_runs_rm_rf_and_is_not_undoable() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Char(' ')); // a.txt
+            press(&mut app, KeyCode::Char(' ')); // 한글 b.txt
+            press(&mut app, KeyCode::F(8));
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.status.as_deref(), Some("영구 삭제 중…"));
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            let rm: Vec<String> = cmds(&f)
+                .into_iter()
+                .filter(|c| c.contains("rm -rf --"))
+                .collect();
+            let want = crate::remote::delete_cmd(
+                b"/srv/data",
+                &["a.txt".as_bytes(), "한글 b.txt".as_bytes()],
+            );
+            assert_eq!(rm, vec![String::from_utf8(want).unwrap()]);
+            assert_eq!(
+                app.status.as_deref(),
+                Some("영구 삭제: 2개 (원격 삭제는 되돌릴 수 없음)")
+            );
+            assert_eq!(app.undo.len(), 0);
+            assert!(app.panels[1].selected.is_empty());
+            ctrl_z(&mut app);
+            assert_eq!(app.status.as_deref(), Some("되돌릴 작업 없음"));
+        }
+
+        #[test]
+        fn remote_f8_refuses_the_remote_home_directory() {
+            let (_t, mut app, f) = env();
+            // the delete script itself refuses (it resolves $HOME on the host)
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.contains("rm -rf --"))
+                    .map(|_| out(crate::remote::DELETE_PROTECTED, ""))
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down); // sub == $HOME
+            press(&mut app, KeyCode::F(8));
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert!(app.status.as_deref().unwrap().contains("삭제 거부"));
+            assert!(app.status.as_deref().unwrap().contains("홈 디렉터리"));
+        }
+
+        #[test]
+        fn remote_ops_are_refused_while_another_task_runs() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.task = Some(BgTask {
+                rx,
+                kind: BgKind::Undo,
+            });
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "nope");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+            assert!(cmds(&f).is_empty());
+        }
+
+        #[test]
+        fn remote_ops_on_a_dropped_connection_say_so() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            f.down.store(true, Ordering::SeqCst);
+            press(&mut app, KeyCode::F(7));
+            type_str(&mut app, "x");
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert_eq!(
+                app.status.as_deref(),
+                Some(&format!("오류: {DISCONNECTED_MSG}")[..])
+            );
+            assert!(!app.panels[1].location.session().unwrap().is_alive());
+        }
+
+        // ---- HDIR-39: remote preview and F3 ----
+
+        /// Serve `size\nbody` for preview commands.
+        fn serve_files(f: &FakeSsh, body: &'static str) {
+            script(f, move |a| {
+                let c = crate::testutil::remote_cmd(a)?;
+                if c.starts_with("if [ -d ") {
+                    return Some(out(0, &format!("{}\n{body}", body.len())));
+                }
+                None
+            });
+        }
+
+        fn wait_preview(app: &mut App) {
+            let start = Instant::now();
+            while app.preview_shown().is_none() {
+                assert!(start.elapsed() < Duration::from_secs(5), "preview timeout");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[test]
+        fn dev_preview_of_a_remote_file_reads_the_head_over_ssh() {
+            let (_t, mut app, f) = env();
+            serve_files(&f, "hello 한글\nline2\n");
+            app.preview_debounce = Duration::ZERO;
+            app.set_mode(Mode::Dev);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // a.txt
+            wait_preview(&mut app);
+            assert_eq!(
+                app.preview_shown(),
+                Some(&Preview::Text {
+                    lines: vec!["hello 한글".into(), "line2".into()],
+                    truncated: false
+                })
+            );
+            let want = crate::remote::preview_cmd(
+                &crate::remote::RemoteOs::Linux,
+                b"/srv/data/a.txt",
+                65536 + 3,
+            );
+            assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
+        }
+
+        #[test]
+        fn dev_preview_of_a_remote_dir_shows_an_entry_count() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(crate::remote::PREVIEW_DIR, ""))
+            });
+            app.preview_debounce = Duration::ZERO;
+            app.set_mode(Mode::Dev);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down); // sub (1 entry)
+            wait_preview(&mut app);
+            assert_eq!(
+                app.preview_shown(),
+                Some(&Preview::Info("원격 디렉터리 · 항목 1개".into()))
+            );
+        }
+
+        #[test]
+        fn remote_preview_is_not_confused_with_a_local_file_of_the_same_path() {
+            let (_t, mut app, f) = env();
+            serve_files(&f, "remote text\n");
+            app.preview_debounce = Duration::ZERO;
+            app.set_mode(Mode::Dev);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            wait_preview(&mut app);
+            assert!(
+                matches!(app.preview_shown(), Some(Preview::Text { lines, .. }) if lines[0] == "remote text")
+            );
+        }
+
+        fn wait_viewer(app: &mut App) {
+            let start = Instant::now();
+            while matches!(
+                app.viewer.as_ref().map(|v| &v.content),
+                Some(viewer::Content::Loading)
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(5), "viewer timeout");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[test]
+        fn remote_f3_views_the_head_with_the_4_mib_cap() {
+            let (_t, mut app, f) = env();
+            serve_files(&f, "first\nsecond\n");
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down); // a.txt
+            press(&mut app, KeyCode::F(3));
+            assert!(app.viewer.is_some());
+            wait_viewer(&mut app);
+            let v = app.viewer.as_ref().unwrap();
+            assert_eq!(v.path, PathBuf::from("/srv/data/a.txt"));
+            assert!(
+                matches!(&v.content, viewer::Content::Text { lines, .. } if lines == &["first", "second"])
+            );
+            let want = crate::remote::preview_cmd(
+                &crate::remote::RemoteOs::Linux,
+                b"/srv/data/a.txt",
+                4 * 1024 * 1024 + 3,
+            );
+            assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
+            press(&mut app, KeyCode::Esc);
+            assert!(app.viewer.is_none());
+        }
+
+        #[test]
+        fn remote_f3_on_a_special_file_says_so_and_on_a_dir_does_nothing() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(crate::remote::PREVIEW_SPECIAL, ""))
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down); // sub (dir)
+            press(&mut app, KeyCode::F(3));
+            assert!(app.viewer.is_none());
+            press(&mut app, KeyCode::Down); // a.txt, reported special
+            press(&mut app, KeyCode::F(3));
+            wait_viewer(&mut app);
+            assert!(matches!(&app.viewer.as_ref().unwrap().content,
+                viewer::Content::Message(m) if m.contains("특수 파일")));
+        }
+
+        #[test]
+        fn remote_f3_error_is_shown_in_the_viewer() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| CmdOutput {
+                        code: Some(1),
+                        stdout: Vec::new(),
+                        stderr: b"wc: x: Permission denied\n".to_vec(),
+                    })
+            });
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::F(3));
+            wait_viewer(&mut app);
+            assert!(matches!(&app.viewer.as_ref().unwrap().content,
+                viewer::Content::Message(m) if m.contains("Permission denied")));
+        }
+
+        // ---- HDIR-40: remote F4 edit and Enter / open-with ----
+
+        type Uploads = Arc<Mutex<Vec<(String, String)>>>;
+
+        /// Fake scp: downloads create `<dest dir>/<basename>` containing
+        /// `body`; uploads answer `up` and are recorded with the local file's
+        /// content at that moment.
+        fn scp_hook(f: &FakeSsh, body: &'static str, up: CmdOutput) -> Uploads {
+            let uploads: Uploads = Arc::new(Mutex::new(Vec::new()));
+            let rec = Arc::clone(&uploads);
+            script(f, move |a| {
+                if a[0] != "scp" {
+                    // the upload's resolve and mktemp scripts (see remote_ops)
+                    let c = crate::testutil::remote_cmd(a)?;
+                    let unq = |q: &str| q[1..q.len() - 1].replace("'\\''", "'");
+                    if let Some(r) = c.strip_prefix("p=") {
+                        let q = r.split_once("; n=0\n").unwrap().0;
+                        return Some(out(0, &format!("{}\0", unq(q))));
+                    }
+                    if let Some(r) = c.strip_prefix("t=$(mktemp ") {
+                        let q = r.split_once(") || exit 1").unwrap().0;
+                        return Some(out(0, &format!("{}\0", unq(q).replace("XXXXXX", "Ab12Cd"))));
+                    }
+                    return None;
+                }
+                let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
+                if dst.starts_with("prod-web:") {
+                    let content = fs::read_to_string(src).unwrap_or_default();
+                    rec.lock().unwrap().push((dst.clone(), content));
+                    return Some(up.clone());
+                }
+                let name = src.rsplit('/').next().unwrap();
+                fs::write(Path::new(dst).join(name), body).unwrap();
+                Some(out(0, ""))
+            });
+            uploads
+        }
+
+        /// Editor fake: remembers (path, content before, dir mode), then
+        /// writes `after` (nothing when `None`).
+        fn edit_with(app: &mut App, after: Option<&'static str>) -> Arc<Mutex<Vec<String>>> {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let s2 = Arc::clone(&seen);
+            app.editor_runner = Arc::new(move |argv: &[OsString]| {
+                use std::os::unix::fs::PermissionsExt;
+                let p = PathBuf::from(argv.last().unwrap());
+                let mode = p.parent().unwrap().metadata().unwrap().permissions().mode() & 0o777;
+                s2.lock().unwrap().push(format!(
+                    "{}|{}|{:o}",
+                    p.display(),
+                    fs::read_to_string(&p).unwrap(),
+                    mode
+                ));
+                if let Some(a) = after {
+                    fs::write(&p, a).unwrap();
+                }
+                Ok(())
+            });
+            seen
+        }
+
+        fn wait_uploads(app: &mut App) {
+            let start = Instant::now();
+            while app.has_uploads() {
+                assert!(start.elapsed() < Duration::from_secs(5), "upload timeout");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Connected, cursor on a.txt, editor "ed".
+        fn edit_env() -> (TempDir, App, Arc<FakeSsh>) {
+            let (t, mut app, f) = env();
+            app.editor_vars = (None, Some("ed".into()));
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            (t, app, f)
+        }
+
+        fn f4_and_download(app: &mut App) {
+            press(app, KeyCode::F(4));
+            assert_eq!(app.status.as_deref(), Some("내려받는 중…"));
+            wait_idle(app);
+        }
+
+        #[test]
+        fn remote_f4_downloads_edits_and_uploads_a_changed_file() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            let seen = edit_with(&mut app, Some("edited"));
+            f4_and_download(&mut app);
+            assert!(app.has_pending_edit());
+            app.run_edit(|f| Ok(f()));
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            let (path, rest) = seen[0].split_once('|').unwrap();
+            assert!(
+                path.ends_with("/a.txt") && !path.starts_with("/srv"),
+                "{path}"
+            );
+            assert_eq!(rest, "orig|700", "private dir, downloaded content");
+            assert_eq!(
+                app.status.as_deref(),
+                Some("변경 확인 중…: a.txt"),
+                "hashing runs on a worker"
+            );
+            wait_uploads(&mut app);
+            let ups = ups.lock().unwrap().clone();
+            assert_eq!(ups.len(), 1);
+            assert_eq!(ups[0].0, "prod-web:/srv/data/.hdir-edit.Ab12Cd");
+            assert_eq!(ups[0].1, "edited");
+            let tmp = ups[0].0.strip_prefix("prod-web:").unwrap();
+            let want = crate::remote::replace_cmd(
+                &crate::remote::RemoteOs::Linux,
+                tmp.as_bytes(),
+                b"/srv/data/a.txt",
+                6,
+            );
+            assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
+            assert_eq!(app.status.as_deref(), Some("편집 완료: a.txt (업로드됨)"));
+            assert!(!Path::new(path).exists(), "temp copy removed after upload");
+        }
+
+        #[test]
+        fn remote_f4_without_changes_uploads_nothing_and_cleans_up() {
+            for after in [None, Some("orig")] {
+                let (_t, mut app, f) = edit_env();
+                let ups = scp_hook(&f, "orig", out(0, ""));
+                let seen = edit_with(&mut app, after);
+                f4_and_download(&mut app);
+                app.run_edit(|f| Ok(f()));
+                wait_uploads(&mut app);
+                assert!(ups.lock().unwrap().is_empty());
+                assert_eq!(app.status.as_deref(), Some("편집 완료: a.txt (변경 없음)"));
+                let path = seen.lock().unwrap()[0]
+                    .split('|')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                assert!(!Path::new(&path).exists());
+            }
+        }
+
+        #[test]
+        fn remote_f4_upload_failure_keeps_the_temp_copy_and_names_it() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(
+                &f,
+                "orig",
+                CmdOutput {
+                    code: Some(1),
+                    stdout: Vec::new(),
+                    stderr: b"scp: write failed: No space left on device\n".to_vec(),
+                },
+            );
+            let seen = edit_with(&mut app, Some("precious edits"));
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            wait_uploads(&mut app);
+            let path = seen.lock().unwrap()[0]
+                .split('|')
+                .next()
+                .unwrap()
+                .to_string();
+            let status = app.status.clone().unwrap();
+            assert!(status.starts_with("업로드 실패: a.txt"), "{status}");
+            assert!(status.contains("No space left"), "{status}");
+            assert!(status.contains(&path), "tells where the copy is: {status}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "precious edits");
+            let tmp = ups.lock().unwrap()[0]
+                .0
+                .strip_prefix("prod-web:")
+                .unwrap()
+                .to_string();
+            let rm = String::from_utf8(crate::remote::rm_file_cmd(tmp.as_bytes())).unwrap();
+            assert!(cmds(&f).contains(&rm), "remote temp file cleaned up");
+            fs::remove_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+        }
+
+        #[test]
+        fn remote_f4_download_failure_is_an_error_and_starts_no_editor() {
+            let (_t, mut app, f) = edit_env();
+            script(&f, |a| {
+                (a[0] == "scp").then(|| CmdOutput {
+                    code: Some(1),
+                    stdout: Vec::new(),
+                    stderr: b"scp: /srv/data/a.txt: Permission denied\n".to_vec(),
+                })
+            });
+            press(&mut app, KeyCode::F(4));
+            wait_idle(&mut app);
+            assert!(!app.has_pending_edit());
+            assert!(app.status.as_deref().unwrap().contains("Permission denied"));
+        }
+
+        #[test]
+        fn remote_f4_uploads_even_when_the_editor_exits_with_an_error() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            app.editor_runner = Arc::new(|argv: &[OsString]| {
+                fs::write(argv.last().unwrap(), "saved before crash").unwrap();
+                Err("편집기가 오류로 종료됨 (종료 코드 1)".into())
+            });
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            wait_uploads(&mut app);
+            assert_eq!(ups.lock().unwrap()[0].1, "saved before crash");
+        }
+
+        #[test]
+        fn remote_f4_from_the_remote_viewer_edits_that_file() {
+            let (_t, mut app, f) = edit_env();
+            serve_files(&f, "view me");
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            let hook_inner = f.hook.lock().unwrap().take().unwrap();
+            // previews answer first, scp falls through to the scp hook
+            let preview_answer = |a: &[String]| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(0, "7\nview me"))
+            };
+            script(&f, move |a| preview_answer(a).or_else(|| hook_inner(a)));
+            edit_with(&mut app, Some("edited in viewer"));
+            press(&mut app, KeyCode::F(3));
+            wait_viewer(&mut app);
+            press(&mut app, KeyCode::F(4));
+            assert_eq!(app.status.as_deref(), Some("내려받는 중…"));
+            wait_idle(&mut app);
+            assert!(app.has_pending_edit());
+            app.run_edit(|f| Ok(f()));
+            wait_uploads(&mut app);
+            assert_eq!(ups.lock().unwrap()[0].1, "edited in viewer");
+            assert!(app.viewer.is_some(), "viewer stays open and reloads");
+        }
+
+        #[test]
+        fn remote_f4_uploads_when_the_content_changed_but_size_and_mtime_were_restored() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            app.editor_runner = Arc::new(|argv: &[OsString]| {
+                let p = PathBuf::from(argv.last().unwrap());
+                let old = fs::metadata(&p).unwrap().modified().unwrap();
+                fs::write(&p, "ORIG").unwrap(); // same length
+                fs::File::options()
+                    .write(true)
+                    .open(&p)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+                Ok(())
+            });
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            wait_uploads(&mut app);
+            assert_eq!(ups.lock().unwrap().len(), 1, "content decides");
+            assert_eq!(ups.lock().unwrap()[0].1, "ORIG");
+        }
+
+        #[test]
+        fn remote_f4_unchanged_after_an_editor_error_keeps_the_editor_message() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            app.editor_runner =
+                Arc::new(|_: &[OsString]| Err("편집기가 오류로 종료됨 (종료 코드 1)".into()));
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            wait_uploads(&mut app);
+            assert!(ups.lock().unwrap().is_empty());
+            assert_eq!(
+                app.status.as_deref(),
+                Some("편집기가 오류로 종료됨 (종료 코드 1)")
+            );
+        }
+
+        /// F4 edit of a.txt with `up` as the uploader (scp only serves the
+        /// download), left running after `run_edit`.
+        fn editing_with_uploader(
+            up: impl Fn(&RemoteSession, &Path, &Path) -> Result<(), String> + Send + Sync + 'static,
+        ) -> (TempDir, App, Arc<FakeSsh>) {
+            let (t, mut app, f) = edit_env();
+            scp_hook(&f, "orig", out(0, ""));
+            app.uploader = Arc::new(up);
+            edit_with(&mut app, Some("slow edit"));
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            assert!(app.has_uploads());
+            (t, app, f)
+        }
+
+        #[test]
+        fn quitting_waits_for_a_running_upload() {
+            let (_t, mut app, _f) = editing_with_uploader(|_, _, _| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            });
+            let mut err = Vec::new();
+            assert!(app.quit_uploads(Duration::from_secs(5), &mut err));
+            assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+            assert!(!app.has_uploads());
+        }
+
+        #[test]
+        fn quit_timeout_keeps_the_edited_copy_and_reports_where_it_goes() {
+            let (_t, mut app, _f) = editing_with_uploader(|_, local, _| {
+                std::thread::sleep(Duration::from_millis(400));
+                assert_eq!(fs::read_to_string(local).unwrap(), "slow edit");
+                Ok(())
+            });
+            let mut err = Vec::new();
+            assert!(
+                !app.quit_uploads(Duration::from_millis(30), &mut err),
+                "an unfinished upload fails the exit code"
+            );
+            let text = String::from_utf8(err).unwrap();
+            assert!(
+                text.starts_with("hdir: 업로드가 끝나지 않음: a.txt"),
+                "{text}"
+            );
+            assert!(
+                text.contains("원격 대상: prod-web:/srv/data/a.txt"),
+                "{text}"
+            );
+            let local = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("편집한 복사본: "))
+                .expect("names the local copy");
+            // the worker finishing later must not delete what was reported
+            std::thread::sleep(Duration::from_millis(600));
+            assert_eq!(fs::read_to_string(local).unwrap(), "slow edit");
+            fs::remove_dir_all(Path::new(local).parent().unwrap()).unwrap();
+        }
+
+        #[test]
+        fn quit_reports_failed_uploads_with_their_kept_copies() {
+            let (_t, mut app, _f) =
+                editing_with_uploader(|_, _, _| Err("scp: No space left on device".into()));
+            let start = Instant::now();
+            while app.has_uploads() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(app.status.as_deref().unwrap().starts_with("업로드 실패"));
+            let mut err = Vec::new();
+            assert!(!app.quit_uploads(Duration::from_secs(1), &mut err));
+            let text = String::from_utf8(err).unwrap();
+            assert!(text.contains("No space left"), "{text}");
+            assert!(
+                text.contains("원격 대상: prod-web:/srv/data/a.txt"),
+                "{text}"
+            );
+            let local = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("편집한 복사본: "))
+                .unwrap();
+            assert_eq!(fs::read_to_string(local).unwrap(), "slow edit");
+            // reported once
+            let mut again = Vec::new();
+            assert!(app.quit_uploads(Duration::from_millis(10), &mut again));
+            assert!(again.is_empty());
+            fs::remove_dir_all(Path::new(local).parent().unwrap()).unwrap();
+        }
+
+        #[test]
+        fn remote_f4_is_refused_while_busy_and_on_directories() {
+            let (_t, mut app, f) = edit_env();
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.task = Some(BgTask {
+                rx,
+                kind: BgKind::Undo,
+            });
+            press(&mut app, KeyCode::F(4));
+            assert_eq!(app.status.as_deref(), Some("작업 진행 중"));
+            app.task = None;
+            app.status = None;
+            press(&mut app, KeyCode::Up); // sub (dir)
+            press(&mut app, KeyCode::F(4));
+            assert!(app.task.is_none() && app.status.is_none());
+            assert!(f.calls.lock().unwrap().iter().all(|a| a[0] != "scp"));
+        }
+
+        /// Launcher fake logging `kind argv @cwd`.
+        struct LaunchLog(Arc<Mutex<Vec<String>>>);
+
+        impl crate::launcher::Launcher for LaunchLog {
+            fn run(&self, argv: &[OsString], cwd: &Path) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("run {} @{}", join(argv), cwd.display()));
+                Ok(())
+            }
+            fn spawn_detached(&self, argv: &[OsString], cwd: &Path) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("spawn {} @{}", join(argv), cwd.display()));
+                Ok(())
+            }
+            fn wait_key(&self) {}
+        }
+
+        fn join(argv: &[OsString]) -> String {
+            argv.iter()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        fn launch_log(app: &mut App) -> Arc<Mutex<Vec<String>>> {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            app.launcher = Arc::new(LaunchLog(Arc::clone(&log)));
+            log
+        }
+
+        fn wait_log(log: &Arc<Mutex<Vec<String>>>, app: &mut App) -> Vec<String> {
+            let start = Instant::now();
+            while log.lock().unwrap().is_empty() {
+                assert!(start.elapsed() < Duration::from_secs(5), "launch timeout");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            log.lock().unwrap().clone()
+        }
+
+        fn txt_rule(wait: bool) -> crate::assoc::AssocTable {
+            crate::assoc::AssocTable::from_rules(vec![AssocRule {
+                ext: Some(vec!["txt".into()]),
+                glob: None,
+                cmd: "cat {}".into(),
+                wait,
+                background: false,
+                name: None,
+            }])
+            .0
+        }
+
+        #[test]
+        fn remote_enter_runs_a_rule_on_a_downloaded_copy_and_removes_it_after() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            let log = launch_log(&mut app);
+            app.settings.assoc = txt_rule(true);
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert!(app.has_pending_run(), "queued for the main loop");
+            app.run_pending(|f| Ok(f()));
+            let got = log.lock().unwrap().clone();
+            assert_eq!(got.len(), 1, "{got:?}");
+            let line = &got[0];
+            assert!(
+                line.starts_with("run ") && line.contains("|-c|cat \"$1\"|hdir|"),
+                "{line}"
+            );
+            let local = line.split('|').nth(4).unwrap().to_string();
+            assert!(
+                local.ends_with("/a.txt") && !local.starts_with("/srv"),
+                "{local}"
+            );
+            assert!(line.contains(&format!(
+                "@{}",
+                Path::new(&local).parent().unwrap().display()
+            )));
+            assert!(
+                !Path::new(&local).exists(),
+                "temp copy removed after the run"
+            );
+            assert!(
+                ups.lock().unwrap().is_empty(),
+                "read-only use: never uploaded"
+            );
+            assert_eq!(app.status.as_deref(), Some("실행 완료: a.txt"));
+        }
+
+        #[test]
+        fn remote_enter_on_text_without_a_rule_opens_the_remote_viewer() {
+            let (_t, mut app, f) = edit_env();
+            serve_files(&f, "just text\n");
+            press(&mut app, KeyCode::Enter);
+            let start = Instant::now();
+            while app.viewer.is_none() {
+                assert!(start.elapsed() < Duration::from_secs(5), "no viewer");
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            wait_viewer(&mut app);
+            assert!(matches!(&app.viewer.as_ref().unwrap().content,
+                viewer::Content::Text { lines, .. } if lines == &["just text"]));
+            assert!(
+                f.calls.lock().unwrap().iter().all(|a| a[0] != "scp"),
+                "no download"
+            );
+        }
+
+        #[test]
+        fn remote_enter_on_a_binary_file_opens_a_downloaded_copy_with_the_system_opener() {
+            let (_t, mut app, f) = edit_env();
+            let preview_bin = |a: &[String]| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(0, "4\n\0\0\0\0"))
+            };
+            let _ups = scp_hook(&f, "\0\0\0\0", out(0, ""));
+            let scp_inner = f.hook.lock().unwrap().take().unwrap();
+            script(&f, move |a| preview_bin(a).or_else(|| scp_inner(a)));
+            let log = launch_log(&mut app);
+            press(&mut app, KeyCode::Enter);
+            let got = wait_log(&log, &mut app);
+            assert!(
+                got[0].starts_with(&format!("spawn {}|", assoc::system_opener())),
+                "{got:?}"
+            );
+            let local = got[0]
+                .split('|')
+                .nth(1)
+                .unwrap()
+                .split(" @")
+                .next()
+                .unwrap();
+            assert!(
+                local.ends_with("/a.txt") && !local.starts_with("/srv"),
+                "{local}"
+            );
+            assert!(
+                Path::new(local).exists(),
+                "a background opener may still be reading it"
+            );
+        }
+
+        #[test]
+        fn remote_enter_on_a_special_file_reports_it() {
+            let (_t, mut app, f) = edit_env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(crate::remote::PREVIEW_SPECIAL, ""))
+            });
+            press(&mut app, KeyCode::Enter);
+            let start = Instant::now();
+            while app.status.as_deref() != Some("특수 파일은 열 수 없음") {
+                assert!(start.elapsed() < Duration::from_secs(5), "{:?}", app.status);
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        #[test]
+        fn remote_open_with_menu_offers_rules_system_and_viewer() {
+            let (_t, mut app, f) = edit_env();
+            serve_files(&f, "menu text\n");
+            let hook_inner = {
+                let _ups = scp_hook(&f, "orig", out(0, ""));
+                f.hook.lock().unwrap().take().unwrap()
+            };
+            let preview_answer = |a: &[String]| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.starts_with("if [ -d "))
+                    .map(|_| out(0, "10\nmenu text\n"))
+            };
+            script(&f, move |a| preview_answer(a).or_else(|| hook_inner(a)));
+            let log = launch_log(&mut app);
+            app.settings.assoc = txt_rule(false);
+            press_mods(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+            let items = app.menu.as_ref().expect("menu").menu.items.clone();
+            assert_eq!(items.last().unwrap(), "뷰어(F3)");
+            assert!(items.len() >= 3, "{items:?}");
+            // "cat {}" rule, foreground: downloaded copy, run suspended
+            press(&mut app, KeyCode::Enter);
+            wait_idle(&mut app);
+            assert!(app.has_pending_run());
+            app.run_pending(|f| Ok(f()));
+            assert!(log.lock().unwrap()[0].contains("cat \"$1\""));
+            // viewer entry reads over ssh
+            press_mods(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+            for _ in 1..items.len() {
+                press(&mut app, KeyCode::Down);
+            }
+            press(&mut app, KeyCode::Enter);
+            wait_viewer(&mut app);
+            assert!(app.viewer.is_some());
+        }
+
+        // ---- HDIR-41: remote command line ----
+
+        /// Launcher fake for command line runs: logs argv/cwd and the prompt.
+        struct ShellLog {
+            log: Arc<Mutex<Vec<String>>>,
+            code: i32,
+        }
+
+        impl crate::launcher::Launcher for ShellLog {
+            fn run(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                unreachable!("command lines use run_shell")
+            }
+            fn spawn_detached(&self, _: &[OsString], _: &Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait_key(&self) {}
+            fn run_shell(&self, argv: &[OsString], cwd: &Path) -> Result<i32, String> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("shell {} @{}", join(argv), cwd.display()));
+                Ok(self.code)
+            }
+            fn wait_key_after(&self, code: i32) {
+                self.log.lock().unwrap().push(format!("prompt {code}"));
+            }
+        }
+
+        fn shell_log(app: &mut App, code: i32) -> Arc<Mutex<Vec<String>>> {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            app.launcher = Arc::new(ShellLog {
+                log: Arc::clone(&log),
+                code,
+            });
+            log
+        }
+
+        fn listings(f: &FakeSsh) -> usize {
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|a| crate::testutil::remote_cmd(a))
+                .filter(|c| c.contains("find "))
+                .count()
+        }
+
+        #[test]
+        fn remote_command_runs_over_ssh_t_in_the_remote_cwd_then_prompts_and_reloads() {
+            let (_t, mut app, f) = env();
+            connect_prod(&mut app);
+            let log = shell_log(&mut app, 7);
+            let before = listings(&f);
+            submit(&mut app, "ls -la \"it's\"");
+            assert!(app.has_pending_shell(), "queued for the main loop");
+            assert!(log.lock().unwrap().is_empty());
+            app.run_shell(|f| Ok(f()));
+            let t = app.panels[1].location.session().unwrap().target.clone();
+            let want = crate::remote::remote_shell_argv(&t, b"/srv/data", "ls -la \"it's\"");
+            let got = log.lock().unwrap().clone();
+            assert_eq!(
+                got,
+                vec![format!("shell {} @.", join(&want)), "prompt 7".to_string()]
+            );
+            assert!(got[0].contains("|-t|--|prod-web|cd -- '/srv/data' && {\nls -la \"it's\"\n}"));
+            assert_eq!(app.status.as_deref(), Some("종료 코드 7: ls -la \"it's\""));
+            wait_remote(&mut app);
+            assert!(listings(&f) > before, "remote panels are reloaded");
+            assert!(!app.has_pending_shell());
+        }
+
+        #[test]
+        fn remote_cd_is_resolved_on_the_server_without_leaving_the_tui() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.contains("&& cd -- "))
+                    .map(|c| {
+                        if c.contains("'nope'") {
+                            CmdOutput {
+                                code: Some(1),
+                                stdout: Vec::new(),
+                                stderr: b"sh: cd: nope: No such file or directory\n".to_vec(),
+                            }
+                        } else {
+                            out(0, "/srv/data/sub\0")
+                        }
+                    })
+            });
+            connect_prod(&mut app);
+            submit(&mut app, "cd sub");
+            assert!(!app.has_pending_shell(), "cd never suspends");
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data/sub"));
+            assert_eq!(names(&app, 1), vec!["..", "deep.txt"]);
+            assert!(all_cmds(&f).contains(
+                &"cd -- '/srv/data' && cd -- 'sub' && printf '%s\\0' \"$PWD\"".to_string()
+            ));
+            // cd - returns, cd to a missing dir reports the server's reason
+            submit(&mut app, "cd -");
+            wait_idle(&mut app);
+            wait_remote(&mut app);
+            assert_eq!(
+                app.panels[1].cwd,
+                PathBuf::from("/srv/data/sub"),
+                "scripted pwd"
+            );
+            submit(&mut app, "cd nope");
+            wait_idle(&mut app);
+            assert!(app.status.as_deref().unwrap().contains("No such file"));
+            assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data/sub"));
+        }
+
+        #[test]
+        fn remote_cd_variants_build_the_right_targets() {
+            let (_t, mut app, f) = env();
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.contains("&& cd -- "))
+                    .map(|_| out(0, "/srv/data\0"))
+            });
+            connect_prod(&mut app);
+            for line in ["cd", "cd ~", "cd ~/ab", "cd '/x y'", "cd .."] {
+                submit(&mut app, line);
+                wait_idle(&mut app);
+                wait_remote(&mut app);
+            }
+            let cds: Vec<String> = all_cmds(&f)
+                .into_iter()
+                .filter(|c| c.contains("&& cd -- "))
+                .collect();
+            let tail = " && printf '%s\\0' \"$PWD\"";
+            let pre = "cd -- '/srv/data' && cd -- ";
+            assert_eq!(
+                cds,
+                vec![
+                    format!("{pre}\"$HOME\"{tail}"),
+                    format!("{pre}\"$HOME\"{tail}"),
+                    format!("{pre}\"$HOME\"'/ab'{tail}"),
+                    format!("{pre}'/x y'{tail}"),
+                    format!("{pre}'..'{tail}"),
+                ]
+            );
+        }
+
+        #[test]
+        fn complex_cd_lines_go_to_the_remote_shell() {
             let (_t, mut app, _f) = env();
             connect_prod(&mut app);
-            for f in [2u8, 3, 4, 5, 6, 7, 8] {
+            submit(&mut app, "cd sub && ls");
+            assert!(app.has_pending_shell());
+        }
+
+        #[test]
+        fn remote_command_on_a_dead_connection_does_not_start() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            app.panels[1].location.session().unwrap().set_alive(false);
+            submit(&mut app, "ls");
+            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert!(!app.has_pending_shell());
+            submit(&mut app, "cd sub");
+            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+        }
+
+        #[test]
+        fn local_panels_still_run_commands_locally_with_the_shell() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Tab);
+            submit(&mut app, "echo hi");
+            assert!(app.has_pending_shell());
+            let log = shell_log(&mut app, 0);
+            app.run_shell(|f| Ok(f()));
+            let got = log.lock().unwrap().clone();
+            assert!(got[0].contains("|-c|echo hi @"), "{got:?}");
+            assert!(!got[0].starts_with("shell ssh"), "{got:?}");
+        }
+
+        #[test]
+        fn remote_transfers_stay_unsupported_until_m8() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            for f in [5u8, 6] {
                 app.status = None;
                 press(&mut app, KeyCode::F(f));
                 assert_eq!(app.status.as_deref(), Some(UNSUPPORTED), "F{f}");
                 assert!(app.dialog.is_none() && app.viewer.is_none(), "F{f}");
             }
-            // Enter on a remote file
-            press(&mut app, KeyCode::Down);
-            press(&mut app, KeyCode::Down); // a.txt
-            app.status = None;
-            press(&mut app, KeyCode::Enter);
-            assert_eq!(app.status.as_deref(), Some(UNSUPPORTED));
-            // command line: shell commands never run locally
-            submit(&mut app, "ls");
-            assert_eq!(app.status.as_deref(), Some(UNSUPPORTED));
-            assert!(!app.has_pending_shell());
         }
 
         #[test]
@@ -7659,7 +9553,7 @@ mod tests {
         }
 
         #[test]
-        fn exit_cwd_and_preview_ignore_remote_panels() {
+        fn exit_cwd_ignores_remote_panels() {
             let (_t, mut app, _f) = env();
             let local = app.panels[1].cwd.clone();
             app.set_mode(Mode::Dev);

@@ -45,6 +45,12 @@ pub trait Cmd: Send + Sync {
     fn run(&self, argv: &[OsString]) -> CmdOutput;
     /// Run attached to the real terminal (prompts); output is not captured.
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput;
+    /// Like [`run`](Self::run) for file transfers, which may legitimately take
+    /// longer than [`CMD_TIMEOUT`] (a dead link is still caught by ssh's
+    /// ServerAlive options).
+    fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
+        self.run(argv)
+    }
 }
 
 /// Stderr text of a command that was killed for running too long.
@@ -52,6 +58,9 @@ pub const TIMEOUT_MSG: &str = "시간 초과";
 
 /// Hard limit for any non-interactive command run through [`SystemCmd`].
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upper bound for a single scp.
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 
 /// The real process runner.
 pub struct SystemCmd;
@@ -112,6 +121,9 @@ impl Cmd for SystemCmd {
     fn run(&self, argv: &[OsString]) -> CmdOutput {
         run_limited(argv, CMD_TIMEOUT)
     }
+    fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
+        run_limited(argv, TRANSFER_TIMEOUT)
+    }
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
         let Some((prog, args)) = argv.split_first() else {
             return spawn_failed("empty command");
@@ -135,7 +147,7 @@ fn spawn_failed(msg: &str) -> CmdOutput {
 }
 
 /// First non-empty stderr line, or `fallback`.
-fn first_line(stderr: &[u8], fallback: &str) -> String {
+pub(crate) fn first_line(stderr: &[u8], fallback: &str) -> String {
     String::from_utf8_lossy(stderr)
         .lines()
         .map(str::trim)
@@ -179,6 +191,16 @@ impl std::fmt::Debug for RemoteSession {
     }
 }
 
+/// Sessions are identities, not values: two are equal only when they are the
+/// same connection.
+impl PartialEq for RemoteSession {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for RemoteSession {}
+
 impl RemoteSession {
     pub fn new(
         name: String,
@@ -219,6 +241,26 @@ impl RemoteSession {
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
                 "ssh 실행 실패",
+            ))),
+            Some(_) => Ok(out),
+        }
+    }
+
+    /// Run an `scp` argv (see [`crate::remote::scp_argv`]) through the same
+    /// liveness rules as [`exec`](Self::exec).
+    pub fn scp(&self, argv: &[OsString]) -> Result<CmdOutput, SessionError> {
+        if !self.is_alive() {
+            return Err(SessionError::Disconnected);
+        }
+        let out = self.cmd.run_transfer(argv);
+        match out.code {
+            Some(255) => {
+                self.set_alive(false);
+                Err(SessionError::Disconnected)
+            }
+            None => Err(SessionError::Spawn(first_line(
+                &out.stderr,
+                "scp 실행 실패",
             ))),
             Some(_) => Ok(out),
         }
@@ -372,6 +414,19 @@ pub fn start_path_cmd(path: &str) -> Vec<u8> {
         b"cd -- ".as_slice(),
         &target,
         b" && printf '%s\\0' \"$PWD\"",
+    ]
+    .concat()
+}
+
+/// Remote command that changes to `cwd`, then to `target` (see
+/// [`start_path_cmd`] for the forms: `~`, `~/x`, plain paths) and prints the
+/// resulting absolute directory, NUL-terminated.
+pub fn cd_cmd(cwd: &[u8], target: &str) -> Vec<u8> {
+    [
+        b"cd -- ".as_slice(),
+        &sh_quote(cwd),
+        b" && ",
+        &start_path_cmd(target),
     ]
     .concat()
 }
@@ -645,6 +700,22 @@ mod tests {
         );
         assert_eq!(s("~"), format!("cd -- \"$HOME\"{tail}"));
         assert_eq!(s("~/my dir"), format!("cd -- \"$HOME\"'/my dir'{tail}"));
+    }
+
+    #[test]
+    fn cd_cmd_resolves_relative_to_the_cwd_and_prints_the_new_pwd() {
+        let s = |cwd: &str, t: &str| String::from_utf8(cd_cmd(cwd.as_bytes(), t)).unwrap();
+        let tail = r#" && printf '%s\0' "$PWD""#;
+        assert_eq!(
+            s("/srv/it's", "sub dir"),
+            format!("cd -- '/srv/it'\\''s' && cd -- 'sub dir'{tail}")
+        );
+        assert_eq!(s("/x", "~"), format!("cd -- '/x' && cd -- \"$HOME\"{tail}"));
+        assert_eq!(
+            s("/x", "~/a b"),
+            format!("cd -- '/x' && cd -- \"$HOME\"'/a b'{tail}")
+        );
+        assert_eq!(s("/x", "-v"), format!("cd -- '/x' && cd -- '-v'{tail}"));
     }
 
     fn establish_fake(ssh_v: &'static str, uname: &'static str, pwd: &'static [u8]) -> Arc<Fake> {

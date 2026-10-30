@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::remote_ops;
+use crate::session::{DISCONNECTED_MSG, RemoteSession};
 use crate::trash::{TrashBackend, TrashEntry, TrashedItem};
 use ::trash::TrashItem;
 
@@ -24,6 +27,17 @@ pub enum UndoOp {
         pairs: Vec<(PathBuf, PathBuf)>,
         /// Emptied source directories that were removed by a merge.
         removed_dirs: Vec<PathBuf>,
+    },
+    /// A folder created on a remote host; undo runs `rmdir` there.
+    RemoteMkdir {
+        session: Arc<RemoteSession>,
+        path: PathBuf,
+    },
+    /// A rename on a remote host; undo moves it back without clobbering.
+    RemoteRename {
+        session: Arc<RemoteSession>,
+        from: PathBuf,
+        to: PathBuf,
     },
     /// Items sent to the trash; undo restores them to their original paths.
     Trash {
@@ -118,6 +132,26 @@ fn apply_with(
                 .map(|()| format!("되돌림: 폴더 생성 취소 {}", base(&path)))
                 .map_err(|e| format!("되돌릴 수 없음: {e}")),
         ),
+        UndoOp::RemoteMkdir { session, path } => {
+            let res = remote_ops::rmdir(&session, &path);
+            remote_undo(
+                res,
+                format!("되돌림: 폴더 생성 취소 {}", base(&path)),
+                || UndoOp::RemoteMkdir {
+                    session: Arc::clone(&session),
+                    path: path.clone(),
+                },
+            )
+        }
+        UndoOp::RemoteRename { session, from, to } => {
+            let res = remote_ops::rename(&session, &to, &base(&from)).map(|_| ());
+            let ok_msg = format!("되돌림: 이름 변경 {} → {}", base(&to), base(&from));
+            remote_undo(res, ok_msg, || UndoOp::RemoteRename {
+                session: Arc::clone(&session),
+                from: from.clone(),
+                to: to.clone(),
+            })
+        }
         UndoOp::Rename { from, to } => done(
             restore(&to, &from)
                 .map(|()| format!("되돌림: 이름 변경 {} → {}", base(&to), base(&from)))
@@ -172,6 +206,25 @@ fn apply_with(
             };
             undo_trash(store, items)
         }
+    }
+}
+
+/// Result of a remote undo. A dropped connection keeps the op for a retry;
+/// any other failure consumes it (the remote state is unknown).
+fn remote_undo(
+    res: Result<(), String>,
+    ok_msg: String,
+    again: impl FnOnce() -> UndoOp,
+) -> UndoApplied {
+    match res {
+        Ok(()) => UndoApplied {
+            message: Ok(ok_msg),
+            retry: None,
+        },
+        Err(e) => UndoApplied {
+            retry: (e == DISCONNECTED_MSG).then(again),
+            message: Err(format!("되돌릴 수 없음: {e}")),
+        },
     }
 }
 
@@ -294,6 +347,81 @@ fn restore(current: &Path, target: &Path) -> Result<(), Restore> {
 mod tests {
     use super::*;
     use crate::trash::{FakeTrash, TrashBackend};
+
+    #[cfg(unix)]
+    mod remote {
+        use super::*;
+        use crate::testutil::{FakeCmd, code, fail, ok, session};
+        use std::sync::Arc;
+
+        #[test]
+        fn remote_mkdir_undo_runs_rmdir_remotely() {
+            let f = FakeCmd::new(|_| ok(""));
+            let s = session(Arc::clone(&f));
+            let r = UndoStack::apply(UndoOp::RemoteMkdir {
+                session: s,
+                path: PathBuf::from("/srv/it's new"),
+            });
+            assert_eq!(r.message.unwrap(), "되돌림: 폴더 생성 취소 it's new");
+            assert!(r.retry.is_none());
+            assert_eq!(
+                f.remote_cmds(),
+                vec!["rmdir -- '/srv/it'\\''s new'".to_string()]
+            );
+        }
+
+        #[test]
+        fn remote_mkdir_undo_of_a_non_empty_dir_fails_without_retry() {
+            let f = FakeCmd::new(|_| fail(1, "rmdir: failed: Directory not empty\n"));
+            let r = UndoStack::apply(UndoOp::RemoteMkdir {
+                session: session(f),
+                path: PathBuf::from("/srv/d"),
+            });
+            assert!(r.message.unwrap_err().contains("not empty"));
+            assert!(r.retry.is_none());
+        }
+
+        #[test]
+        fn remote_rename_undo_moves_back_without_clobbering() {
+            let f = FakeCmd::new(|_| ok(""));
+            let s = session(Arc::clone(&f));
+            let r = UndoStack::apply(UndoOp::RemoteRename {
+                session: s,
+                from: PathBuf::from("/srv/old"),
+                to: PathBuf::from("/srv/new"),
+            });
+            assert_eq!(r.message.unwrap(), "되돌림: 이름 변경 new → old");
+            assert_eq!(
+                f.remote_cmds(),
+                vec![
+                    String::from_utf8(crate::remote::rename_cmd(b"/srv/new", b"/srv/old")).unwrap()
+                ]
+            );
+        }
+
+        #[test]
+        fn remote_rename_undo_onto_an_existing_name_is_reported() {
+            let f = FakeCmd::new(|_| code(crate::remote::RENAME_EXISTS));
+            let r = UndoStack::apply(UndoOp::RemoteRename {
+                session: session(f),
+                from: PathBuf::from("/srv/old"),
+                to: PathBuf::from("/srv/new"),
+            });
+            assert!(r.message.unwrap_err().contains("이미 존재함"));
+        }
+
+        #[test]
+        fn a_dropped_connection_keeps_the_op_for_a_retry() {
+            let f = FakeCmd::new(|_| code(255));
+            let op = UndoOp::RemoteMkdir {
+                session: session(f),
+                path: PathBuf::from("/srv/d"),
+            };
+            let r = UndoStack::apply(op.clone());
+            assert!(r.message.is_err());
+            assert_eq!(r.retry, Some(op));
+        }
+    }
 
     fn assert_send<T: Send>() {}
 

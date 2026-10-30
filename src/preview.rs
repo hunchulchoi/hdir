@@ -29,6 +29,8 @@ pub enum Preview {
     },
     Empty,
     Error(String),
+    /// A one-line note (e.g. a remote directory summary).
+    Info(String),
 }
 
 /// Read caps for a preview (`PREVIEW` for the panel, `VIEWER` for F3).
