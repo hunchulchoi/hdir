@@ -3,7 +3,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -24,7 +25,7 @@ use crate::theme::{self, Theme};
 use crate::trash::{
     self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
 };
-use crate::ui::{self, View};
+use crate::ui::{self, PreviewBody, PreviewView, View};
 use crate::undo::{UndoApplied, UndoOp, UndoStack};
 use crate::viewer::{self, Viewer};
 
@@ -77,6 +78,45 @@ const MENU_HIDDEN: usize = 1;
 const MENU_KEYS: usize = 2;
 const MENU_RELOAD: usize = 3;
 const MENU_WARNINGS: usize = 4;
+
+/// Computes one preview off the UI thread; tests may swap in a gated fake.
+pub type PreviewRunner = Arc<dyn Fn(&std::path::Path) -> Preview + Send + Sync>;
+
+/// Dev-mode preview bookkeeping: debounce, latest-wins ids, last result.
+pub struct PreviewState {
+    /// Path under the cursor that the preview should show.
+    wanted: Option<PathBuf>,
+    wanted_at: Instant,
+    /// A request for `wanted` is in flight or done.
+    requested: bool,
+    /// Results with another id are stale and dropped.
+    latest_id: u64,
+    shown: Option<(PathBuf, Preview)>,
+    tx: Sender<(u64, PathBuf, Preview)>,
+    rx: Receiver<(u64, PathBuf, Preview)>,
+}
+
+impl PreviewState {
+    fn shown_for_wanted(&self) -> Option<&Preview> {
+        match (&self.wanted, &self.shown) {
+            (Some(w), Some((p, pv))) if w == p => Some(pv),
+            _ => None,
+        }
+    }
+
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            wanted: None,
+            wanted_at: Instant::now(),
+            requested: false,
+            latest_id: 0,
+            shown: None,
+            tx,
+            rx,
+        }
+    }
+}
 
 /// An F4 edit waiting for the main loop to suspend the TUI and run it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +287,10 @@ pub struct App {
     /// Runs the editor argv; tests may swap in a fake.
     pub editor_runner: EditorRunner,
     pending_edit: Option<EditJob>,
+    pub preview: PreviewState,
+    pub preview_runner: PreviewRunner,
+    /// Wait this long after the cursor stops before computing a preview.
+    pub preview_debounce: Duration,
     /// The F3 file viewer (full screen).
     pub viewer: Option<Viewer>,
     /// The F9 popup menu (or theme picker).
@@ -302,6 +346,9 @@ impl App {
             editor_vars: (std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok()),
             editor_runner: editor::system_runner(),
             pending_edit: None,
+            preview: PreviewState::new(),
+            preview_runner: Arc::new(preview::preview_path),
+            preview_debounce: Duration::from_millis(80),
             viewer: None,
             menu: None,
         }
@@ -738,6 +785,79 @@ impl App {
         }
     }
 
+    /// The finished preview for the entry under the cursor, if any.
+    pub fn preview_shown(&self) -> Option<&Preview> {
+        self.preview.shown_for_wanted()
+    }
+
+    /// Dev mode wants a preview that has not arrived yet.
+    pub fn preview_pending(&self) -> bool {
+        self.mode == Mode::Dev && self.preview.wanted.is_some() && self.preview_shown().is_none()
+    }
+
+    /// Path the Dev preview should show: the active panel's cursor entry.
+    fn preview_target(&self) -> Option<PathBuf> {
+        if self.mode != Mode::Dev
+            || self.viewer.is_some()
+            || self.trash_views[self.active].is_some()
+        {
+            return None;
+        }
+        let panel = self.active_panel();
+        if panel.loading.is_some() {
+            // Navigating: keep what we had instead of flickering.
+            return self.preview.wanted.clone();
+        }
+        match panel.current() {
+            Some(e) if e.kind != EntryKind::Parent => Some(panel.cwd.join(&e.os_name)),
+            _ => None,
+        }
+    }
+
+    /// Drop in-flight results and recompute for the current target (the old
+    /// result stays on screen until the new one lands).
+    fn preview_refresh(&mut self) {
+        self.preview.latest_id += 1;
+        self.preview.requested = false;
+        self.preview.wanted_at = Instant::now();
+    }
+
+    /// Track the cursor, dispatch a debounced worker for the latest position
+    /// and apply fresh results; returns true when a result changed the screen.
+    fn tick_preview(&mut self) -> bool {
+        let target = self.preview_target();
+        let st = &mut self.preview;
+        if target != st.wanted {
+            st.wanted = target;
+            st.wanted_at = Instant::now();
+            st.requested = false;
+            st.latest_id += 1; // anything in flight is now stale
+            if st.wanted.is_none() {
+                st.shown = None;
+            }
+        }
+        let mut changed = false;
+        while let Ok((id, path, result)) = st.rx.try_recv() {
+            if id == st.latest_id {
+                st.shown = Some((path, result));
+                changed = true;
+            }
+        }
+        if let Some(path) = st.wanted.clone()
+            && !st.requested
+            && st.wanted_at.elapsed() >= self.preview_debounce
+        {
+            st.requested = true;
+            let (id, tx) = (st.latest_id, st.tx.clone());
+            let runner = Arc::clone(&self.preview_runner);
+            std::thread::spawn(move || {
+                let result = runner(&path);
+                let _ = tx.send((id, path, result));
+            });
+        }
+        changed
+    }
+
     pub fn has_pending_edit(&self) -> bool {
         self.pending_edit.is_some()
     }
@@ -900,6 +1020,7 @@ impl App {
             let kind = self.panels[idx].loading.as_ref().map(|r| r.kind);
             if self.panels[idx].finish_load(res) {
                 changed = true;
+                self.preview_refresh();
                 if idx == self.active
                     && kind != Some(LoadKind::Reload)
                     && let Some(err) = self.panels[idx].error.clone()
@@ -918,7 +1039,8 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let loaded = self.drain_loads();
         let task = self.tick_task();
-        self.tick_job() || loaded || task
+        let preview = self.tick_preview();
+        self.tick_job() || loaded || task || preview
     }
 
     fn tick_task(&mut self) -> bool {
@@ -1590,6 +1712,21 @@ impl App {
             Context::Panel
         };
         let fkeys = ui::fkey_bar(&self.settings.keymap, bar_ctx);
+        let preview_view = (self.mode == Mode::Dev).then(|| {
+            let title = self
+                .preview
+                .wanted
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let body = match (&self.preview.wanted, self.preview.shown_for_wanted()) {
+                (None, _) => PreviewBody::Idle,
+                (Some(_), Some(p)) => PreviewBody::Ready(p),
+                (Some(_), None) => PreviewBody::Loading,
+            };
+            PreviewView { title, body }
+        });
         let view = View {
             panels: [&self.panels[0], &self.panels[1]],
             active: self.active,
@@ -1597,6 +1734,7 @@ impl App {
             shell: &self.shell,
             os: std::env::consts::OS,
             mode: self.mode,
+            preview: preview_view,
             trash: [self.trash_views[0].as_ref(), self.trash_views[1].as_ref()],
             theme: &self.theme,
             fkeys: &fkeys,
@@ -4670,5 +4808,205 @@ mod tests {
         draw_app(&mut app, 100, 30);
         press(&mut app, KeyCode::PageDown);
         assert_eq!(app.panels[0].cursor, 16);
+    }
+    // ---- HDIR-15: preview panel ----
+
+    fn dev_app() -> (TempDir, App) {
+        let (t, mut app) = fixture();
+        app.set_mode(Mode::Dev);
+        app.preview_debounce = Duration::ZERO;
+        (t, app)
+    }
+
+    fn settle_preview(app: &mut App) {
+        let start = Instant::now();
+        loop {
+            app.tick();
+            if !app.preview_pending() {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "preview timed out"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn counting_runner(app: &mut App) -> Log2 {
+        let log = Log2::default();
+        let l = Arc::clone(&log);
+        app.preview_runner = Arc::new(move |p: &std::path::Path| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            l.lock().unwrap().push(name.clone());
+            Preview::Text {
+                lines: vec![format!("content of {name}")],
+                truncated: false,
+            }
+        });
+        log
+    }
+
+    type Log2 = Arc<Mutex<Vec<String>>>;
+
+    #[test]
+    fn dev_preview_shows_the_cursor_entry_text() {
+        let (t, mut app) = dev_app();
+        fs::write(t.path().join("f.txt"), "hello preview\n둘째 줄\n").unwrap();
+        cursor_to(&mut app, "f.txt");
+        app.tick();
+        assert!(app.preview_pending(), "computed on a worker, not inline");
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("읽는 중")), "{rows:?}");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        let pv: Vec<_> = rows[19..27].iter().map(|r| r.replace(' ', "")).collect();
+        assert!(pv[0].contains("미리보기:f.txt"), "{pv:?}");
+        assert!(pv[1].contains("hellopreview"), "{pv:?}");
+        assert!(pv[2].contains("둘째줄"), "{pv:?}");
+    }
+
+    #[test]
+    fn classic_mode_computes_no_preview() {
+        let (_t, mut app) = fixture();
+        let log = counting_runner(&mut app);
+        app.preview_debounce = Duration::ZERO;
+        cursor_to(&mut app, "f.txt");
+        for _ in 0..5 {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(log.lock().unwrap().is_empty());
+        assert!(!app.preview_pending());
+    }
+
+    #[test]
+    fn debounce_computes_only_the_latest_cursor_position() {
+        let (_t, mut app) = dev_app();
+        let log = counting_runner(&mut app);
+        app.preview_debounce = Duration::from_millis(60);
+        cursor_to(&mut app, "adir");
+        app.tick();
+        cursor_to(&mut app, "bdir");
+        app.tick();
+        cursor_to(&mut app, "f.txt");
+        app.tick();
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "nothing before the debounce"
+        );
+        std::thread::sleep(Duration::from_millis(90));
+        settle_preview(&mut app);
+        assert_eq!(*log.lock().unwrap(), ["f.txt"]);
+    }
+
+    #[test]
+    fn stale_results_are_dropped_by_id() {
+        let (_t, mut app) = dev_app();
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock().unwrap();
+        let g = Arc::clone(&gate);
+        app.preview_runner = Arc::new(move |p: &std::path::Path| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            if name == "f.txt" {
+                drop(g.lock().unwrap());
+            }
+            Preview::Text {
+                lines: vec![format!("content of {name}")],
+                truncated: false,
+            }
+        });
+        cursor_to(&mut app, "f.txt");
+        app.tick(); // slow request for f.txt is now blocked
+        cursor_to(&mut app, "bdir");
+        settle_preview(&mut app);
+        assert!(
+            matches!(app.preview_shown(), Some(Preview::Text { lines, .. }) if lines[0] == "content of bdir")
+        );
+        drop(guard); // the stale f.txt result lands now
+        std::thread::sleep(Duration::from_millis(80));
+        app.tick();
+        assert!(
+            matches!(app.preview_shown(), Some(Preview::Text { lines, .. }) if lines[0] == "content of bdir"),
+            "{:?}",
+            app.preview_shown()
+        );
+    }
+
+    #[test]
+    fn old_result_is_not_shown_for_a_different_entry() {
+        let (_t, mut app) = dev_app();
+        counting_runner(&mut app);
+        cursor_to(&mut app, "f.txt");
+        settle_preview(&mut app);
+        assert!(app.preview_shown().is_some());
+        cursor_to(&mut app, "adir");
+        app.tick();
+        assert!(app.preview_shown().is_none(), "no stale content for adir");
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(!rows.join("").contains("content of f.txt"));
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.join("").contains("content of adir"));
+        assert!(!rows.join("").contains("content of f.txt"));
+    }
+
+    #[test]
+    fn dir_entry_shows_a_summary_including_unreadable_count() {
+        let (_t, mut app) = dev_app();
+        cursor_to(&mut app, "adir");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("폴더 0개, 파일 1개")),
+            "{rows:?}"
+        );
+        app.preview_runner = Arc::new(|_| Preview::Dir {
+            files: 1,
+            dirs: 1,
+            total_size: 0,
+            truncated: false,
+            errors: 3,
+        });
+        cursor_to(&mut app, "bdir");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("읽지 못함 3개")), "{rows:?}");
+    }
+
+    #[test]
+    fn parent_entry_and_trash_view_have_nothing_to_preview() {
+        let (_t, mut app) = dev_app();
+        let log = counting_runner(&mut app);
+        for _ in 0..3 {
+            app.tick();
+        }
+        assert!(log.lock().unwrap().is_empty(), "cursor starts on '..'");
+        assert!(!app.preview_pending());
+        assert!(app.preview_shown().is_none());
+    }
+
+    #[test]
+    fn preview_refreshes_after_the_panel_reloads() {
+        let (t, mut app) = dev_app();
+        fs::write(t.path().join("f.txt"), "version1").unwrap();
+        cursor_to(&mut app, "f.txt");
+        settle_preview(&mut app);
+        let rows = draw_app(&mut app, 100, 30);
+        assert!(rows.join("").contains("version1"));
+        fs::write(t.path().join("f.txt"), "version2").unwrap();
+        app.reload_panel(0, Some(OsString::from("f.txt")));
+        settle(&mut app);
+        settle_preview(&mut app);
+        let start = Instant::now();
+        loop {
+            let rows = draw_app(&mut app, 100, 30);
+            if rows.join("").contains("version2") {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "{rows:?}");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

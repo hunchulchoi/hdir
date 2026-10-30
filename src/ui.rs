@@ -12,10 +12,28 @@ use unicode_width::UnicodeWidthStr;
 use crate::config::Mode;
 use crate::keymap::{Action, Context, Keymap};
 use crate::panel::{Entry, EntryKind, Panel};
+use crate::preview::Preview;
 use crate::theme::Theme;
 use crate::trash::{TrashEntry, TrashView, format_local};
 
+/// What the Dev-mode preview area shows.
+#[derive(Debug, Clone, Copy)]
+pub enum PreviewBody<'a> {
+    /// Nothing to preview (no entry, `..`, trash view).
+    Idle,
+    Loading,
+    Ready(&'a Preview),
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewView<'a> {
+    /// Name of the previewed entry.
+    pub title: String,
+    pub body: PreviewBody<'a>,
+}
+
 pub struct View<'a> {
+    pub preview: Option<PreviewView<'a>>,
     pub mode: Mode,
     pub panels: [&'a Panel; 2],
     pub active: usize,
@@ -558,7 +576,7 @@ pub fn draw(frame: &mut Frame, view: &View) {
     }
 
     if let Some(r) = areas.preview {
-        draw_preview(frame, r, theme);
+        draw_preview(frame, r, view.preview.as_ref(), theme);
     }
     if let Some(r) = areas.command {
         frame.render_widget(
@@ -585,14 +603,82 @@ pub fn draw(frame: &mut Frame, view: &View) {
     );
 }
 
-/// The Dev-mode preview area (content arrives with HDIR-15).
-fn draw_preview(frame: &mut Frame, area: Rect, theme: &Theme) {
+/// The Dev-mode preview area.
+/// Text rows describing a preview (one per screen row, uncut).
+fn preview_lines(p: &Preview) -> Vec<String> {
+    match p {
+        Preview::Text { lines, .. } => lines.clone(),
+        Preview::Binary {
+            kind: "특수 파일",
+        ..
+        } => vec!["특수 파일".to_string()],
+        Preview::Binary { size, kind } => {
+            vec![format!("바이너리 파일 ({kind}, {})", human_size(*size))]
+        }
+        Preview::Empty => vec!["빈 파일".to_string()],
+        Preview::Error(e) => vec![format!("오류: {e}")],
+        Preview::Dir {
+            files,
+            dirs,
+            total_size,
+            truncated,
+            errors,
+        } => {
+            let mut v = vec![
+                format!("폴더 {dirs}개, 파일 {files}개"),
+                format!("총 크기 {}", human_size(*total_size)),
+            ];
+            if *errors > 0 {
+                v.push(format!("읽지 못함 {errors}개"));
+            }
+            if *truncated {
+                v.push("일부만 집계됨 (항목이 너무 많음)".to_string());
+            }
+            v
+        }
+    }
+}
+
+/// The Dev-mode preview area.
+fn draw_preview(frame: &mut Frame, area: Rect, pv: Option<&PreviewView>, theme: &Theme) {
+    let base = Style::default().fg(theme.fg).bg(theme.preview_bg);
+    let mut title = " 미리보기".to_string();
+    if let Some(pv) = pv {
+        if !pv.title.is_empty() {
+            title.push_str(": ");
+            title.push_str(&pv.title);
+        }
+        if let PreviewBody::Ready(Preview::Text {
+            truncated: true, ..
+        }) = pv.body
+        {
+            title.push_str(" · 잘림");
+        }
+    }
+    title.push(' ');
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border).bg(theme.preview_bg))
-        .title(" 미리보기 ")
-        .style(Style::default().fg(theme.fg).bg(theme.preview_bg));
+        .title(tail_width(&title, (area.width as usize).saturating_sub(2)))
+        .style(base);
+    let inner = block.inner(area);
     frame.render_widget(block, area);
+    let Some(pv) = pv else {
+        return;
+    };
+    let w = inner.width as usize;
+    let (text, style) = match pv.body {
+        PreviewBody::Idle => return,
+        PreviewBody::Loading => (vec!["읽는 중…".to_string()], base),
+        PreviewBody::Ready(p @ Preview::Error(_)) => (preview_lines(p), base.fg(theme.error)),
+        PreviewBody::Ready(p) => (preview_lines(p), base),
+    };
+    let lines: Vec<Line> = text
+        .iter()
+        .take(inner.height as usize)
+        .map(|l| Line::styled(fit_width(l, w), style))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 #[cfg(test)]
@@ -683,6 +769,7 @@ mod tests {
             shell: "zsh",
             os: "macos",
             mode: Mode::Classic,
+            preview: None,
             trash: [None, None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
@@ -838,6 +925,7 @@ mod tests {
             shell: "zsh",
             os: "macos",
             mode: Mode::Classic,
+            preview: None,
             trash: [None, None],
             theme,
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
@@ -1036,6 +1124,7 @@ mod tests {
             shell: "zsh",
             os: "macos",
             mode: Mode::Classic,
+            preview: None,
             trash: [None, None],
             theme: &th(),
             fkeys: &fkeys,
@@ -1142,6 +1231,7 @@ mod tests {
             shell: "zsh",
             os: "macos",
             mode: Mode::Classic,
+            preview: None,
             trash: [Some(tv), None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
@@ -1277,6 +1367,7 @@ mod tests {
             shell: "zsh",
             os: "macos",
             mode,
+            preview: None,
             trash: [None, None],
             theme: &th(),
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
@@ -1358,5 +1449,188 @@ mod tests {
             render_mode(Mode::Dev, w, h);
             render_mode(Mode::Classic, w, h);
         }
+    }
+    #[test]
+    fn preview_lines_cover_every_kind() {
+        let l = |p: &Preview| preview_lines(p);
+        assert_eq!(l(&Preview::Empty), ["빈 파일"]);
+        assert_eq!(
+            l(&Preview::Binary {
+                size: 2048,
+                kind: "PNG 이미지"
+            }),
+            ["바이너리 파일 (PNG 이미지, 2.0K)"]
+        );
+        assert_eq!(
+            l(&Preview::Binary {
+                size: 0,
+                kind: "특수 파일"
+            }),
+            ["특수 파일"]
+        );
+        assert_eq!(l(&Preview::Error("권한 없음".into())), ["오류: 권한 없음"]);
+        assert_eq!(
+            l(&Preview::Text {
+                lines: vec!["a".into(), "b".into()],
+                truncated: true
+            }),
+            ["a", "b"]
+        );
+        let dir = l(&Preview::Dir {
+            files: 3,
+            dirs: 2,
+            total_size: 1536,
+            truncated: false,
+            errors: 0,
+        });
+        assert_eq!(dir, ["폴더 2개, 파일 3개", "총 크기 1.5K"]);
+        let dir = l(&Preview::Dir {
+            files: 1,
+            dirs: 0,
+            total_size: 10,
+            truncated: true,
+            errors: 4,
+        });
+        assert_eq!(dir.len(), 4, "{dir:?}");
+        assert_eq!(dir[2], "읽지 못함 4개");
+        assert!(dir[3].contains("일부만"));
+    }
+
+    fn render_preview(pv: PreviewView, theme: &Theme, w: u16, h: u16) -> Buffer {
+        let (a, b) = setup();
+        let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let view = View {
+            preview: Some(pv),
+            panels: [&pa, &pb],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            os: "macos",
+            mode: Mode::Dev,
+            trash: [None, None],
+            theme,
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    #[test]
+    fn preview_area_shows_text_title_and_truncation() {
+        let p = Preview::Text {
+            lines: (0..20).map(|i| format!("줄{i}")).collect(),
+            truncated: true,
+        };
+        let buf = render_preview(
+            PreviewView {
+                title: "a.txt".into(),
+                body: PreviewBody::Ready(&p),
+            },
+            &th(),
+            100,
+            30,
+        );
+        let rows = rows_of(&buf);
+        // preview block: y 19..27, 6 inner rows
+        let top = rows[19].replace(' ', "");
+        assert!(
+            top.contains("미리보기:a.txt") && top.contains("잘림"),
+            "{top}"
+        );
+        assert!(
+            rows[20].replace(' ', "").starts_with("│줄0"),
+            "{:?}",
+            rows[20]
+        );
+        assert!(
+            rows[25].replace(' ', "").starts_with("│줄5"),
+            "{:?}",
+            rows[25]
+        );
+        assert!(
+            !rows.join("").replace(' ', "").contains("줄6"),
+            "clipped to the area"
+        );
+    }
+
+    #[test]
+    fn preview_area_shows_loading_idle_and_binary() {
+        let buf = render_preview(
+            PreviewView {
+                title: "x".into(),
+                body: PreviewBody::Loading,
+            },
+            &th(),
+            100,
+            30,
+        );
+        assert!(rows_of(&buf)[20].replace(' ', "").contains("읽는중"));
+        let buf = render_preview(
+            PreviewView {
+                title: String::new(),
+                body: PreviewBody::Idle,
+            },
+            &th(),
+            100,
+            30,
+        );
+        assert!(rows_of(&buf)[20].replace(' ', "").starts_with("│"));
+        let bin = Preview::Binary {
+            size: 5,
+            kind: "ELF 실행파일",
+        };
+        let buf = render_preview(
+            PreviewView {
+                title: "bin".into(),
+                body: PreviewBody::Ready(&bin),
+            },
+            &th(),
+            100,
+            30,
+        );
+        assert!(
+            rows_of(&buf)[20]
+                .replace(' ', "")
+                .contains("바이너리파일(ELF실행파일,5B)")
+        );
+    }
+
+    #[test]
+    fn preview_area_uses_the_preview_bg_slot() {
+        let mut theme = th();
+        theme.preview_bg = Color::Rgb(1, 2, 3);
+        let p = Preview::Empty;
+        let buf = render_preview(
+            PreviewView {
+                title: "e".into(),
+                body: PreviewBody::Ready(&p),
+            },
+            &theme,
+            100,
+            30,
+        );
+        assert_eq!(buf[(5, 22)].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(buf[(40, 20)].bg, Color::Rgb(1, 2, 3));
+        assert_ne!(buf[(5, 5)].bg, Color::Rgb(1, 2, 3), "panels keep bg");
+    }
+
+    #[test]
+    fn preview_long_lines_are_cut_to_the_width() {
+        let p = Preview::Text {
+            lines: vec!["한".repeat(100)],
+            truncated: false,
+        };
+        let buf = render_preview(
+            PreviewView {
+                title: "w".into(),
+                body: PreviewBody::Ready(&p),
+            },
+            &th(),
+            40,
+            30,
+        );
+        let r = rows_of(&buf);
+        assert!(r[20].contains('…'), "cut with an ellipsis: {:?}", r[20]);
     }
 }
