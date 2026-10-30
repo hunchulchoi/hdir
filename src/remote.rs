@@ -474,7 +474,7 @@ pub const REPLACE_GROUP: i32 = 35;
 /// [`stamp_cmd`]): nothing is replaced.
 pub const REPLACE_CHANGED: i32 = 36;
 
-/// Shell that sets `s` (inode, mtime, size, following symlinks) and `k`
+/// Shell that sets `s` (the [`stat_stamp_args`] fields) and `k`
 /// (`cksum` of the content) for the file named by `$var`; fails without
 /// reading anything unless it is a regular file (a FIFO would block), and
 /// when the `stat` fields changed while the checksum ran.
@@ -485,16 +485,22 @@ fn stamp_vars(os: &RemoteOs, var: &str) -> String {
     )
 }
 
-/// `stat` fields `inode mtime size` (symlinks followed) of `os`.
+/// `stat` fields `inode mtime ctime size mode uid gid` (symlinks followed)
+/// of `os`. ctime cannot be set back by a user, so a rewrite that restores
+/// the mtime still shows; mode and owner changes count as changes too.
 fn stat_stamp_args(os: &RemoteOs) -> &'static str {
     match os {
-        RemoteOs::Bsd => "stat -L -f '%i %m %z' --",
-        RemoteOs::Linux | RemoteOs::Other(_) => "stat -L -c '%i %Y %s' --",
+        RemoteOs::Bsd => "stat -L -f '%i %m %c %z %Lp %u %g' --",
+        RemoteOs::Linux | RemoteOs::Other(_) => "stat -L -c '%i %Y %Z %s %a %u %g' --",
     }
 }
 
-/// Prints a fingerprint of the file at `path` (inode, mtime, size and a
-/// content checksum; symlinks followed), to tell later whether it changed.
+/// Number of fields printed by [`stat_stamp_args`].
+const STAT_STAMP_FIELDS: usize = 7;
+
+/// Prints a fingerprint of the file at `path` (inode, mtime, ctime, size,
+/// mode, owner and a content checksum; symlinks followed), to tell later
+/// whether it changed.
 pub fn stamp_cmd(os: &RemoteOs, path: &[u8]) -> Vec<u8> {
     cat(&[
         b"f=",
@@ -570,7 +576,13 @@ pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64, expect: &[
         )
         .as_bytes(),
         format!("pre() {{ [ \"$({} \"$o\")\" = ", stat_stamp_args(os)).as_bytes(),
-        &sh_quote(&expect.split(|&b| b == b' ').take(3).collect::<Vec<_>>().join(&b' ')),
+        &sh_quote(
+            &expect
+                .split(|&b| b == b' ')
+                .take(STAT_STAMP_FIELDS)
+                .collect::<Vec<_>>()
+                .join(&b' '),
+        ),
         b" ]; }\n",
         b"if [ \"$2\" -gt 1 ]; then\n  \
           pre || changed\n  \
@@ -1227,9 +1239,12 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     fn stamp_cmd_prints_inode_mtime_size_and_checksum_following_links() {
         assert_eq!(
             s(stamp_cmd(&RemoteOs::Linux, b"/d/it's")),
-            "f='/d/it'\\''s'; [ -f \"$f\" ] && s=$(stat -L -c '%i %Y %s' -- \"$f\") && k=$(cksum < \"$f\") && [ \"$(stat -L -c '%i %Y %s' -- \"$f\")\" = \"$s\" ] || { echo 'not a readable regular file' >&2; exit 1; }; printf '%s %s' \"$s\" \"$k\""
+            "f='/d/it'\\''s'; [ -f \"$f\" ] && s=$(stat -L -c '%i %Y %Z %s %a %u %g' -- \"$f\") && k=$(cksum < \"$f\") && [ \"$(stat -L -c '%i %Y %Z %s %a %u %g' -- \"$f\")\" = \"$s\" ] || { echo 'not a readable regular file' >&2; exit 1; }; printf '%s %s' \"$s\" \"$k\""
         );
-        assert!(s(stamp_cmd(&RemoteOs::Bsd, b"/x")).contains("stat -L -f '%i %m %z' -- \"$f\""));
+        assert!(
+            s(stamp_cmd(&RemoteOs::Bsd, b"/x"))
+                .contains("stat -L -f '%i %m %c %z %Lp %u %g' -- \"$f\"")
+        );
     }
 
     #[test]
@@ -1260,7 +1275,7 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             b"/d/.hdir-edit.AB",
             b"/d/it's",
             42,
-            b"7 99 42 1234 42",
+            b"7 99 98 42 640 501 20 1234 42",
         ));
         assert!(
             l.starts_with("t='/d/.hdir-edit.AB'; o='/d/it'\\''s'\n"),
@@ -1295,13 +1310,13 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         assert!(l.find("exit 31").unwrap() < l.find("cat --").unwrap());
         assert!(
             l.contains(
-                "same() { [ -f \"$o\" ] && s=$(stat -L -c '%i %Y %s' -- \"$o\") && k=$(cksum < \"$o\") && [ \"$(stat -L -c '%i %Y %s' -- \"$o\")\" = \"$s\" ] && [ \"$s $k\" = '7 99 42 1234 42' ]; }\n"
+                "same() { [ -f \"$o\" ] && s=$(stat -L -c '%i %Y %Z %s %a %u %g' -- \"$o\") && k=$(cksum < \"$o\") && [ \"$(stat -L -c '%i %Y %Z %s %a %u %g' -- \"$o\")\" = \"$s\" ] && [ \"$s $k\" = '7 99 98 42 640 501 20 1234 42' ]; }\n"
             ),
             "{l}"
         );
         assert!(l.contains("exit 36; }\n"), "{l}");
         assert!(
-            l.contains("pre() { [ \"$(stat -L -c '%i %Y %s' -- \"$o\")\" = '7 99 42' ]; }\n"),
+            l.contains("pre() { [ \"$(stat -L -c '%i %Y %Z %s %a %u %g' -- \"$o\")\" = '7 99 98 42 640 501 20' ]; }\n"),
             "{l}"
         );
         assert!(l.find("pre || changed").unwrap() < l.find("b=$(mktemp").unwrap());
@@ -1331,7 +1346,10 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1, b"x"));
         assert!(b.contains("stat -f '%Lp %l %u %g' -- \"$o\""), "{b}");
         assert!(b.contains("g=$(stat -f %g -- \"$t\")"), "{b}");
-        assert!(b.contains("s=$(stat -L -f '%i %m %z' -- \"$o\")"), "{b}");
+        assert!(
+            b.contains("s=$(stat -L -f '%i %m %c %z %Lp %u %g' -- \"$o\")"),
+            "{b}"
+        );
         assert_eq!(
             (
                 REPLACE_SIZE,

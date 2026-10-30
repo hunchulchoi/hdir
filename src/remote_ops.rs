@@ -1372,6 +1372,39 @@ mod tests {
     }
 
     #[test]
+    fn real_replace_refuses_a_same_length_rewrite_with_the_mtime_restored() {
+        // during the checksum: same-length rewrite, mtime put back (ctime
+        // cannot be put back; wait so it lands in another second)
+        let (_t, dir, cmd) = replace_with_fakes(
+            &[(
+                "cksum",
+                "/usr/bin/cksum \"$@\"; r=$?; d=\"$(dirname \"$0\")\"; \
+                 touch -r \"$d/../d/a\" \"$d/ref\"; printf SHARED > \"$d/../d/a\"; \
+                 touch -r \"$d/ref\" \"$d/../d/a\"; exit $r",
+            )],
+            false,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let out = local_session(&dir).exec(&cmd).unwrap();
+        assert_eq!(out.code, Some(crate::remote::REPLACE_CHANGED));
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "SHARED");
+    }
+
+    #[test]
+    fn real_replace_refuses_when_the_mode_was_tightened_meanwhile() {
+        let (_t, dir, _) = replace_with_fakes(&[], false);
+        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let s = local_session(&dir);
+        let stale = remote_stamp(&s, &dir.join("a")).unwrap();
+        std::fs::set_permissions(dir.join("a"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let local = edited(dir.parent().unwrap(), "mine");
+        let e = upload_replace(&s, &local, &dir.join("a"), &stale).unwrap_err();
+        assert!(e.contains("원격 파일이 바뀌어"), "{e}");
+        assert_eq!(mode_of(&dir.join("a")), 0o600);
+        assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "shared");
+    }
+
+    #[test]
     fn real_replace_of_a_changed_hard_linked_file_makes_no_backup() {
         // a fake cp records any backup attempt
         let (_t, dir, cmd) = hard_linked_with_fakes(&[(
