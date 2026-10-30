@@ -19,6 +19,7 @@ pub mod preview;
 pub mod remote;
 pub mod screen;
 pub mod servers;
+pub mod session;
 pub mod term;
 pub mod theme;
 pub mod trash;

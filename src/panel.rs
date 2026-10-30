@@ -472,6 +472,12 @@ fn build_listing_with(
         });
     }
 
+    (finish_listing(cwd, items), skipped)
+}
+
+/// Sort entries (dirs first, then case-insensitive by name) and put `..`
+/// first unless `cwd` is a root.
+pub(crate) fn finish_listing(cwd: &Path, mut items: Vec<Entry>) -> Vec<Entry> {
     let is_dirlike = |e: &Entry| {
         matches!(
             e.kind,
@@ -490,7 +496,7 @@ fn build_listing_with(
 
     let mut out = parent_only(cwd);
     out.extend(items);
-    (out, skipped)
+    out
 }
 
 #[cfg(test)]

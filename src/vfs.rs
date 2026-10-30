@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::loader::Listing;
+use crate::session::{RemoteSession, SshVfs};
 
 /// Lists directories. Implementations block, so they run on loader workers.
 pub trait Vfs: Send + Sync {
@@ -35,15 +36,28 @@ impl Vfs for LocalVfs {
 pub enum Location {
     #[default]
     Local,
+    Remote(Arc<RemoteSession>),
 }
 
 impl Location {
     pub fn vfs(&self) -> Arc<dyn Vfs> {
-        Arc::new(LocalVfs)
+        match self {
+            Location::Local => Arc::new(LocalVfs),
+            Location::Remote(s) => Arc::new(SshVfs {
+                session: Arc::clone(s),
+            }),
+        }
     }
 
     pub fn is_remote(&self) -> bool {
-        false
+        matches!(self, Location::Remote(_))
+    }
+
+    pub fn session(&self) -> Option<&Arc<RemoteSession>> {
+        match self {
+            Location::Remote(s) => Some(s),
+            Location::Local => None,
+        }
     }
 }
 
@@ -80,6 +94,26 @@ mod tests {
             LocalVfs.display_path(Path::new("/tmp/한글 dir")),
             "/tmp/한글 dir"
         );
+    }
+
+    #[test]
+    fn remote_location_lists_through_ssh() {
+        use crate::remote::{RemoteOs, ScpMode, SshTarget};
+        use crate::session::SystemCmd;
+        let s = Arc::new(RemoteSession::new(
+            "web".into(),
+            SshTarget {
+                host: "h".into(),
+                port: None,
+                control_path: "/tmp/x".into(),
+            },
+            RemoteOs::Linux,
+            ScpMode::Sftp,
+            Arc::new(SystemCmd),
+        ));
+        let loc = Location::Remote(s);
+        assert!(loc.is_remote() && loc.session().is_some());
+        assert_eq!(loc.vfs().display_path(Path::new("/a")), "web:/a");
     }
 
     #[test]
