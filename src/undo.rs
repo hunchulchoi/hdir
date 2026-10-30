@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::trash::{TrashBackend, TrashEntry, TrashedItem};
+use ::trash::TrashItem;
 
 const CAP: usize = 50;
 
@@ -187,7 +188,7 @@ fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied 
             retry: None,
         };
     }
-    let list = match store.list() {
+    let list = match store.list_items() {
         Ok(l) => l,
         Err(e) => {
             return UndoApplied {
@@ -196,16 +197,13 @@ fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied 
             };
         }
     };
-    let by_id: HashMap<&OsStr, &TrashEntry> = list.iter().map(|e| (e.id(), e)).collect();
+    let by_id: HashMap<&OsStr, &TrashItem> = list.iter().map(|i| (i.id.as_os_str(), i)).collect();
     let mut found = Vec::new();
     let mut missing = Vec::new();
     for it in items {
         match by_id.get(it.id.as_os_str()) {
-            Some(e)
-                if e.original_path().as_deref() == Some(it.path.as_path())
-                    && e.item.time_deleted == it.time_deleted =>
-            {
-                found.push(((*e).clone(), it));
+            Some(i) if i.original_path() == it.path && i.time_deleted == it.time_deleted => {
+                found.push((TrashEntry::new((*i).clone(), None, false), it));
             }
             _ => missing.push(it),
         }
@@ -221,11 +219,11 @@ fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied 
         } else {
             problem = true;
             parts.push(format!("되돌림 일부 실패: {}", res.summary()));
-            // Collisions can be retried once the blocker is gone.
+            // Everything not restored (collision, error, refusal) stays.
             retry_items.extend(
                 found
                     .into_iter()
-                    .filter(|(_, it)| res.collisions.contains(&it.path))
+                    .filter(|(_, it)| !res.restored.contains(&it.path))
                     .map(|(_, it)| it),
             );
         }
@@ -667,6 +665,23 @@ mod tests {
         let retry = r.retry.expect("missing item kept for retry");
         assert_eq!(items_of(&retry).len(), 1);
         assert_eq!(items_of(&retry)[0].path, a);
+    }
+
+    #[test]
+    fn undo_trash_keeps_every_unrestored_item_for_retry() {
+        let store = FakeTrash::new();
+        let t = tempfile::tempdir().unwrap();
+        let (ok, link) = (t.path().join("ok.txt"), t.path().join("link"));
+        fs::write(&ok, "O").unwrap();
+        std::os::unix::fs::symlink(t.path(), &link).unwrap();
+        let op = trash_files(&store, &[&ok, &link]);
+        let r = UndoStack::apply_with_store(op, &store);
+        assert!(r.message.is_err());
+        assert_eq!(fs::read_to_string(&ok).unwrap(), "O");
+        let retry = r.retry.expect("the refused symlink stays for retry");
+        let items = items_of(&retry);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path, link);
     }
 
     #[test]

@@ -844,7 +844,7 @@ impl App {
         self.task = Some(BgTask::spawn(
             BgKind::TrashRestore { panel: idx },
             move || {
-                let result = store.restore(&known);
+                let result = trash::restore_verified(&*store, &known);
                 BgResult::TrashRestore(result, skipped, store.list())
             },
         ));
@@ -2721,6 +2721,21 @@ mod tests {
         assert!(root.join("f.txt").exists() && root.join("g.txt").exists());
         assert_eq!(app.status.as_deref(), Some("복원: 2개"));
         assert!(app.trash_views[0].as_ref().unwrap().selected.is_empty());
+    }
+
+    #[test]
+    fn restore_skips_entries_changed_since_the_view_listed_them() {
+        let (_t, mut app, fake) = fixture_trash();
+        let root = app.panels[0].cwd.clone();
+        trash_files(&fake, &[root.join("f.txt")]);
+        enter_trash(&mut app);
+        fake.bump_times();
+        press(&mut app, KeyCode::Enter);
+        wait_idle(&mut app);
+        assert!(!root.join("f.txt").exists());
+        assert!(fake.restore_calls.lock().unwrap().is_empty());
+        let st = app.status.clone().unwrap();
+        assert!(st.contains("휴지통 항목이 바뀌어 건너뜀"), "{st}");
     }
 
     #[test]

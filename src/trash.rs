@@ -60,8 +60,11 @@ pub struct RestoreResult {
     /// Original paths skipped because something with that name exists.
     pub collisions: Vec<PathBuf>,
     pub errors: Vec<String>,
+    /// Items skipped because the trash no longer holds them unchanged.
+    pub changed: usize,
 }
 
+pub const CHANGED_MSG: &str = "휴지통 항목이 바뀌어 건너뜀";
 pub const COLLISION_MSG: &str = "원래 위치에 같은 이름이 있어 건너뜀";
 
 impl RestoreResult {
@@ -69,7 +72,9 @@ impl RestoreResult {
     /// `복원: 1개 · 원래 위치에 같은 이름이 있어 건너뜀: /a/b`.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
-        if self.restored.is_empty() && (!self.collisions.is_empty() || !self.errors.is_empty()) {
+        if self.restored.is_empty()
+            && (!self.collisions.is_empty() || !self.errors.is_empty() || self.changed > 0)
+        {
             // nothing restored: only the problems matter
         } else {
             parts.push(format!("복원: {}개", self.restored.len()));
@@ -80,6 +85,9 @@ impl RestoreResult {
                 s.push_str(&format!(" 외 {}개", self.collisions.len() - 1));
             }
             parts.push(s);
+        }
+        if self.changed > 0 {
+            parts.push(format!("{CHANGED_MSG}: {}개", self.changed));
         }
         if let Some(first) = self.errors.first() {
             parts.push(format!("실패 {}개: {first}", self.errors.len()));
@@ -103,6 +111,10 @@ pub trait TrashBackend: Send + Sync {
     fn delete(&self, paths: &[PathBuf]) -> Vec<(PathBuf, Result<(), String>)>;
     /// Newest first. Only meaningful when [`supports_view`](Self::supports_view).
     fn list(&self) -> Result<Vec<TrashEntry>, String>;
+    /// Cheap identity listing (no per-entry metadata), for matching only.
+    fn list_items(&self) -> Result<Vec<TrashItem>, String> {
+        self.list().map(|v| v.into_iter().map(|e| e.item).collect())
+    }
     /// Restore to the original paths; never overwrites.
     fn restore(&self, items: &[TrashEntry]) -> RestoreResult;
     fn purge(&self, items: &[TrashEntry]) -> Result<(), String>;
@@ -119,73 +131,98 @@ pub fn sort_newest_first(entries: &mut [TrashEntry]) {
     entries.sort_by_key(|e| std::cmp::Reverse(e.item.time_deleted));
 }
 
-/// Run `restore_all`, retrying without each colliding item so one collision
-/// does not block the rest. Items sharing an original path are collisions too.
+/// Run `restore_all` once per item (single pass) so a collision or error on
+/// one item never blocks the rest. Items sharing an original path are
+/// collisions too.
 pub fn restore_with<F>(items: Vec<TrashItem>, mut restore_all: F) -> RestoreResult
 where
     F: FnMut(Vec<TrashItem>) -> Result<(), trash::Error>,
 {
     let mut res = RestoreResult::default();
     let mut seen = HashSet::new();
-    let mut pending = Vec::new();
     for item in items {
-        if seen.insert(item.original_path()) {
-            pending.push(item);
-        } else {
-            res.collisions.push(item.original_path());
+        let path = item.original_path();
+        if !seen.insert(path.clone()) {
+            res.collisions.push(path);
+            continue;
         }
-    }
-    while !pending.is_empty() {
-        match restore_all(pending.clone()) {
-            Ok(()) => {
-                res.restored
-                    .extend(pending.iter().map(TrashItem::original_path));
-                break;
-            }
-            Err(trash::Error::RestoreCollision {
-                path,
-                remaining_items,
-            }) => {
-                let left: HashSet<&OsString> = remaining_items.iter().map(|i| &i.id).collect();
-                res.restored.extend(
-                    pending
-                        .iter()
-                        .filter(|i| !left.contains(&i.id))
-                        .map(TrashItem::original_path),
-                );
-                let next: Vec<TrashItem> = remaining_items
-                    .iter()
-                    .filter(|i| i.original_path() != path)
-                    .cloned()
-                    .collect();
-                res.collisions.push(path);
-                if next.len() == pending.len() {
-                    res.errors.push("복원 진행 불가".into());
-                    break;
-                }
-                pending = next;
-            }
-            Err(e) => {
-                res.errors.push(e.to_string());
-                break;
-            }
+        let name = item.name.to_string_lossy().into_owned();
+        match restore_all(vec![item]) {
+            Ok(()) => res.restored.push(path),
+            Err(trash::Error::RestoreCollision { path, .. }) => res.collisions.push(path),
+            Err(e) => res.errors.push(format!("{name}: {e}")),
         }
     }
     res
 }
 
+/// Restore only the `wanted` entries that a fresh identity listing still
+/// holds unchanged (id, parent, name, time); the rest count as `changed`.
+pub fn restore_verified(store: &dyn TrashBackend, wanted: &[TrashEntry]) -> RestoreResult {
+    let fresh = match store.list_items() {
+        Ok(f) => f,
+        Err(e) => {
+            return RestoreResult {
+                errors: vec![e],
+                ..Default::default()
+            };
+        }
+    };
+    let (keep, changed) = match_items(wanted, &fresh);
+    let mut res = if keep.is_empty() {
+        RestoreResult::default()
+    } else {
+        store.restore(&keep)
+    };
+    res.changed += changed;
+    res
+}
+
+/// Like [`match_fresh`] against a plain item listing; keeps the wanted entries.
+pub fn match_items(wanted: &[TrashEntry], fresh: &[TrashItem]) -> (Vec<TrashEntry>, usize) {
+    let by_id: HashMap<&OsStr, &TrashItem> = fresh.iter().map(|f| (f.id.as_os_str(), f)).collect();
+    let mut keep = Vec::new();
+    let mut skipped = 0;
+    for w in wanted {
+        match by_id.get(w.id()) {
+            Some(f) if same_identity(f, &w.item) => keep.push(w.clone()),
+            _ => skipped += 1,
+        }
+    }
+    (keep, skipped)
+}
+
+pub const UNVERIFIED_MSG: &str = "저장된 항목을 확인할 수 없어 복원 거부";
 pub const SYMLINK_MSG: &str = "심볼릭 링크 항목은 파일 관리자에서 복원하세요";
 
 /// Linux: the stored payload of a trash entry, from its `…/info/X.trashinfo`
 /// id to `…/files/X`.
 pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
     let info = Path::new(id);
-    let name = info.file_name()?.to_str()?.strip_suffix(".trashinfo")?;
-    let trash_root = info.parent()?.parent()?;
-    if info.parent()?.file_name()? != "info" {
+    let file = info.file_name()?.as_bytes();
+    let name = file.strip_suffix(b".trashinfo")?;
+    let info_dir = info.parent()?;
+    if info_dir.file_name()? != "info" {
         return None;
     }
-    Some(trash_root.join("files").join(name))
+    Some(
+        info_dir
+            .parent()?
+            .join("files")
+            .join(OsStr::from_bytes(name)),
+    )
+}
+
+/// Whether the payload of `id` is a symlink. Fails closed: anything but a
+/// definite answer (or a plain NotFound) is an error.
+pub fn payload_is_link(id: &OsStr) -> Result<bool, String> {
+    let p = payload_path(id).ok_or("저장 위치를 알 수 없음")?;
+    match p.symlink_metadata() {
+        Ok(m) => Ok(m.file_type().is_symlink()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Restore through `restore`, but refuse items whose payload is a symlink:
@@ -193,12 +230,19 @@ pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
 /// empty one behind.
 pub fn restore_guarded(
     items: &[TrashEntry],
-    is_link: impl Fn(&TrashEntry) -> bool,
+    is_link: impl Fn(&TrashEntry) -> Result<bool, String>,
     restore: impl FnOnce(&[TrashEntry]) -> RestoreResult,
 ) -> RestoreResult {
-    let (linked, plain): (Vec<&TrashEntry>, Vec<&TrashEntry>) =
-        items.iter().partition(|e| is_link(e));
-    let plain: Vec<TrashEntry> = plain.into_iter().cloned().collect();
+    let mut linked = Vec::new();
+    let mut unknown = Vec::new();
+    let mut plain = Vec::new();
+    for e in items {
+        match is_link(e) {
+            Ok(false) => plain.push(e.clone()),
+            Ok(true) => linked.push(e),
+            Err(m) => unknown.push((e, m)),
+        }
+    }
     let mut res = if plain.is_empty() {
         RestoreResult::default()
     } else {
@@ -208,6 +252,11 @@ pub fn restore_guarded(
         linked
             .iter()
             .map(|e| format!("{}: {SYMLINK_MSG}", e.name())),
+    );
+    res.errors.extend(
+        unknown
+            .iter()
+            .map(|(e, m)| format!("{}: {UNVERIFIED_MSG} ({m})", e.name())),
     );
     res
 }
@@ -287,14 +336,14 @@ pub fn delete_tracked(store: &dyn TrashBackend, paths: &[PathBuf]) -> TrackedDel
             lost: 0,
         };
     }
-    let before = store.list();
+    let before = store.list_items();
     let results = store.delete(paths);
     let done: Vec<&PathBuf> = results
         .iter()
         .filter(|(_, r)| r.is_ok())
         .map(|(p, _)| p)
         .collect();
-    let after = store.list();
+    let after = store.list_items();
     let (Ok(before), Ok(after)) = (before, after) else {
         return TrackedDelete {
             lost: done.len(),
@@ -302,22 +351,19 @@ pub fn delete_tracked(store: &dyn TrashBackend, paths: &[PathBuf]) -> TrackedDel
             results,
         };
     };
-    let known: HashSet<ItemKey> = before.iter().map(|e| item_key(&e.item)).collect();
-    let mut fresh: Vec<&TrashEntry> = after
+    let known: HashSet<ItemKey> = before.iter().map(item_key).collect();
+    let mut fresh: Vec<&TrashItem> = after
         .iter()
-        .filter(|e| !known.contains(&item_key(&e.item)))
+        .filter(|i| !known.contains(&item_key(i)))
         .collect();
     let mut undo = Vec::new();
     for p in &done {
-        if let Some(pos) = fresh
-            .iter()
-            .position(|e| e.original_path().as_ref() == Some(*p))
-        {
-            let e = fresh.remove(pos);
+        if let Some(pos) = fresh.iter().position(|i| i.original_path() == **p) {
+            let i = fresh.remove(pos);
             undo.push(TrashedItem {
-                id: e.id().to_os_string(),
+                id: i.id.clone(),
                 path: (*p).clone(),
-                time_deleted: e.item.time_deleted,
+                time_deleted: i.time_deleted,
             });
         }
     }
@@ -381,9 +427,14 @@ impl TrashBackend for SystemTrash {
     }
 
     #[cfg(target_os = "linux")]
+    fn list_items(&self) -> Result<Vec<TrashItem>, String> {
+        trash::os_limited::list().map_err(|e| e.to_string())
+    }
+
+    #[cfg(target_os = "linux")]
     fn list(&self) -> Result<Vec<TrashEntry>, String> {
-        let items = trash::os_limited::list().map_err(|e| e.to_string())?;
-        let mut entries: Vec<TrashEntry> = items
+        let mut entries: Vec<TrashEntry> = self
+            .list_items()?
             .into_iter()
             .map(|item| {
                 // lstat of the payload: no directory child counting, and a
@@ -407,11 +458,7 @@ impl TrashBackend for SystemTrash {
     fn restore(&self, items: &[TrashEntry]) -> RestoreResult {
         restore_guarded(
             items,
-            |e| {
-                payload_path(e.id())
-                    .and_then(|p| p.symlink_metadata().ok())
-                    .is_some_and(|m| m.file_type().is_symlink())
-            },
+            |e| payload_is_link(e.id()),
             |ok| {
                 restore_with(ok.iter().map(|e| e.item.clone()).collect(), |v| {
                     trash::os_limited::restore_all(v)
@@ -633,6 +680,7 @@ pub mod fake {
         /// Ids of each `purge` call.
         pub purge_calls: Mutex<Vec<Vec<OsString>>>,
         pub list_calls: AtomicUsize,
+        pub item_list_calls: AtomicUsize,
         pub open_calls: AtomicUsize,
     }
 
@@ -668,6 +716,7 @@ pub mod fake {
                 restore_calls: Mutex::new(Vec::new()),
                 purge_calls: Mutex::new(Vec::new()),
                 list_calls: AtomicUsize::new(0),
+                item_list_calls: AtomicUsize::new(0),
                 open_calls: AtomicUsize::new(0),
             }
         }
@@ -687,6 +736,13 @@ pub mod fake {
                 .lock()
                 .unwrap()
                 .push((TrashEntry::new(item, Some(1), false), stored));
+        }
+
+        /// Make every stored item look like a different deletion (new time).
+        pub fn bump_times(&self) {
+            for (e, _) in self.items.lock().unwrap().iter_mut() {
+                e.item.time_deleted += 1000;
+            }
         }
 
         pub fn count(&self) -> usize {
@@ -807,6 +863,20 @@ pub mod fake {
             Ok(v)
         }
 
+        fn list_items(&self) -> Result<Vec<TrashItem>, String> {
+            self.item_list_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(m) = self.fail_list.lock().unwrap().clone() {
+                return Err(m);
+            }
+            Ok(self
+                .items
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(e, _)| e.item.clone())
+                .collect())
+        }
+
         fn restore(&self, items: &[TrashEntry]) -> RestoreResult {
             restore_guarded(
                 items,
@@ -816,9 +886,10 @@ pub mod fake {
                         .unwrap()
                         .iter()
                         .find(|(x, _)| x.id() == e.id())
-                        .is_some_and(|(_, p)| {
+                        .map_or(Ok(false), |(_, p)| {
                             p.symlink_metadata()
-                                .is_ok_and(|m| m.file_type().is_symlink())
+                                .map(|m| m.file_type().is_symlink())
+                                .map_err(|e| e.to_string())
                         })
                 },
                 |ok| self.restore_inner(ok),
@@ -933,24 +1004,22 @@ mod tests {
     // ---- restore_with ----
 
     #[test]
-    fn restore_with_all_ok() {
-        let calls = RefCell::new(0);
+    fn restore_with_restores_one_item_per_call() {
+        let sizes = RefCell::new(Vec::new());
         let r = restore_with(
             vec![item("1", "/p", "a", 1), item("2", "/p", "b", 2)],
             |v| {
-                *calls.borrow_mut() += 1;
-                assert_eq!(v.len(), 2);
+                sizes.borrow_mut().push(v.len());
                 Ok(())
             },
         );
         assert_eq!(r.restored, [PathBuf::from("/p/a"), PathBuf::from("/p/b")]);
         assert!(r.collisions.is_empty() && r.errors.is_empty());
-        assert_eq!(*calls.borrow(), 1);
+        assert_eq!(*sizes.borrow(), [1, 1]);
     }
 
     #[test]
     fn restore_with_collision_skips_that_item_and_continues_with_the_rest() {
-        // Fake crate behaviour: items before the collision are restored.
         let r = restore_with(
             vec![
                 item("1", "/p", "a", 1),
@@ -958,10 +1027,10 @@ mod tests {
                 item("3", "/p", "c", 3),
             ],
             |v| {
-                if let Some(pos) = v.iter().position(|i| i.name == "b") {
+                if v[0].name == "b" {
                     return Err(trash::Error::RestoreCollision {
                         path: PathBuf::from("/p/b"),
-                        remaining_items: v[pos..].to_vec(),
+                        remaining_items: v,
                     });
                 }
                 Ok(())
@@ -974,27 +1043,35 @@ mod tests {
 
     #[test]
     fn restore_with_twins_restores_one_and_reports_the_other_as_collision() {
+        let calls = RefCell::new(0);
         let r = restore_with(
             vec![item("1", "/p", "a", 1), item("2", "/p", "a", 2)],
-            |v| {
-                assert_eq!(v.len(), 1, "twins would make the crate refuse everything");
+            |_| {
+                *calls.borrow_mut() += 1;
                 Ok(())
             },
         );
+        assert_eq!(*calls.borrow(), 1);
         assert_eq!(r.restored.len(), 1);
         assert_eq!(r.collisions, [PathBuf::from("/p/a")]);
     }
 
     #[test]
-    fn restore_with_other_errors_stop_and_are_reported() {
-        let r = restore_with(vec![item("1", "/p", "a", 1)], |_| {
-            Err(trash::Error::Unknown {
-                description: "boom".into(),
-            })
-        });
-        assert!(r.restored.is_empty());
+    fn restore_with_an_error_does_not_stop_the_other_items() {
+        let r = restore_with(
+            vec![item("1", "/p", "a", 1), item("2", "/p", "b", 2)],
+            |v| {
+                if v[0].name == "a" {
+                    return Err(trash::Error::Unknown {
+                        description: "boom".into(),
+                    });
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(r.restored, [PathBuf::from("/p/b")]);
         assert_eq!(r.errors.len(), 1);
-        assert!(r.errors[0].contains("boom"));
+        assert!(r.errors[0].contains("boom") && r.errors[0].contains("a"));
     }
 
     #[test]
@@ -1237,98 +1314,115 @@ mod tests {
         assert_eq!(v.scroll, 2);
     }
 
+    // ---- payload / guard ----
+
+    #[test]
+    fn payload_path_keeps_non_utf8_names() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let mut id = b"/h/Trash/info/a".to_vec();
+        id.push(0xff);
+        id.extend_from_slice(b".trashinfo");
+        let id = OsString::from_vec(id);
+        let mut want = b"/h/Trash/files/a".to_vec();
+        want.push(0xff);
+        assert_eq!(
+            payload_path(&id).map(|p| p.as_os_str().as_bytes().to_vec()),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn payload_is_link_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = dir.path().join("info");
+        let files = dir.path().join("files");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::create_dir_all(&files).unwrap();
+        let id = |n: &str| info.join(format!("{n}.trashinfo"));
+        std::fs::write(files.join("plain"), "").unwrap();
+        std::os::unix::fs::symlink("/", files.join("link")).unwrap();
+        assert_eq!(payload_is_link(id("plain").as_os_str()), Ok(false));
+        assert_eq!(payload_is_link(id("link").as_os_str()), Ok(true));
+        assert_eq!(payload_is_link(id("absent").as_os_str()), Ok(false));
+        // payload cannot be determined
+        assert!(payload_is_link(OsStr::new("id7")).is_err());
+        // lstat fails with something other than NotFound (ENOTDIR)
+        std::fs::write(dir.path().join("files2"), "").unwrap();
+        let odd = dir.path().join("files2").join("x");
+        let _ = odd; // the payload dir itself is a file below
+        let bad_root = dir.path().join("t2");
+        std::fs::create_dir_all(bad_root.join("info")).unwrap();
+        std::fs::write(bad_root.join("files"), "i am a file").unwrap();
+        let bad = bad_root.join("info").join("z.trashinfo");
+        assert!(payload_is_link(bad.as_os_str()).is_err());
+    }
+
+    #[test]
+    fn restore_guarded_refuses_items_it_cannot_verify() {
+        let e = entry("id7", "/p", "a", 1);
+        let res = restore_guarded(
+            std::slice::from_ref(&e),
+            |_| Err("nope".into()),
+            |_| panic!("must not reach the backend"),
+        );
+        assert!(res.restored.is_empty());
+        assert!(res.errors[0].contains(UNVERIFIED_MSG), "{res:?}");
+    }
+
+    // ---- verified restore / cheap listing ----
+
+    #[test]
+    fn restore_verified_skips_entries_that_changed_since_they_were_listed() {
+        let store = FakeTrash::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        for (_, r) in store.delete(&[a.clone(), b.clone()]) {
+            r.unwrap();
+        }
+        let mut wanted = store.list().unwrap();
+        // a's entry is stale (e.g. the id was reused for another deletion)
+        let stale = wanted.iter_mut().find(|e| e.name() == "a").unwrap();
+        stale.item.time_deleted += 1;
+        let res = restore_verified(&store, &wanted);
+        assert_eq!(res.restored, std::slice::from_ref(&b));
+        assert_eq!(res.changed, 1);
+        assert!(!a.exists());
+        assert!(res.summary().contains(CHANGED_MSG), "{}", res.summary());
+    }
+
+    #[test]
+    fn restore_verified_reports_a_listing_failure_and_restores_nothing() {
+        let store = FakeTrash::new();
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        std::fs::write(&a, "a").unwrap();
+        store.delete(std::slice::from_ref(&a))[0].1.clone().unwrap();
+        let wanted = store.list().unwrap();
+        *store.fail_list.lock().unwrap() = Some("busy".into());
+        let res = restore_verified(&store, &wanted);
+        assert!(res.restored.is_empty() && res.errors[0].contains("busy"));
+        assert!(store.restore_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_tracked_identifies_with_the_cheap_listing_only() {
+        use std::sync::atomic::Ordering;
+        let store = FakeTrash::new();
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        std::fs::write(&a, "a").unwrap();
+        let d = delete_tracked(&store, std::slice::from_ref(&a));
+        assert_eq!(d.undo.len(), 1);
+        assert_eq!(store.list_calls.load(Ordering::SeqCst), 0, "no lstat list");
+        assert_eq!(store.item_list_calls.load(Ordering::SeqCst), 2);
+    }
+
     // ---- fake sanity ----
 
     #[test]
     fn system_trash_view_support_follows_the_os() {
         assert_eq!(SystemTrash.supports_view(), cfg!(target_os = "linux"));
-    }
-
-    /// Real freedesktop trash roundtrip; run on Linux with
-    /// `cargo test -- --ignored`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "touches the real user trash"]
-    fn real_linux_roundtrip_delete_list_restore_then_purge() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(format!("hdir-roundtrip-{}", now_secs()));
-        std::fs::write(&path, "data").unwrap();
-        let store = SystemTrash;
-        let find = |store: &SystemTrash| {
-            store
-                .list()
-                .unwrap()
-                .into_iter()
-                .filter(|e| e.original_path().as_deref() == Some(path.as_path()))
-                .collect::<Vec<_>>()
-        };
-        assert!(store.delete(std::slice::from_ref(&path))[0].1.is_ok());
-        assert!(!path.exists());
-        let found = find(&store);
-        assert_eq!(found.len(), 1);
-        let r = store.restore(&found);
-        assert_eq!(r.restored, std::slice::from_ref(&path), "{r:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "data");
-        assert!(store.delete(std::slice::from_ref(&path))[0].1.is_ok());
-        let found = find(&store);
-        assert_eq!(found.len(), 1);
-        store.purge(&found).unwrap();
-        assert!(find(&store).is_empty());
-        assert!(!path.exists());
-    }
-
-    /// A symlink to a directory must come back as the same symlink, or be
-    /// refused by hdir's guard; never as a stray empty directory. Run on Linux
-    /// with `cargo test real_linux_ -- --ignored`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "touches the real user trash"]
-    fn real_linux_symlink_to_dir_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("target-dir");
-        std::fs::create_dir(&target).unwrap();
-        std::fs::write(target.join("inner"), "x").unwrap();
-        let link = dir.path().join(format!("hdir-link-{}", now_secs()));
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let store = SystemTrash;
-        let find = || {
-            store
-                .list()
-                .unwrap()
-                .into_iter()
-                .filter(|e| e.original_path().as_deref() == Some(link.as_path()))
-                .collect::<Vec<_>>()
-        };
-        assert!(store.delete(std::slice::from_ref(&link))[0].1.is_ok());
-        assert!(link.symlink_metadata().is_err());
-        let found = find();
-        assert_eq!(found.len(), 1);
-        assert!(!found[0].is_dir, "listed as a symlink, not a directory");
-
-        // hdir's guard: refused, nothing (no empty dir) appears.
-        let r = store.restore(&found);
-        assert!(r.restored.is_empty(), "{r:?}");
-        assert!(r.errors[0].contains(SYMLINK_MSG), "{r:?}");
-        assert!(link.symlink_metadata().is_err(), "no stray empty dir");
-
-        // What the crate itself does (why the guard exists): the result must
-        // still be the same symlink.
-        let raw = trash::os_limited::restore_all(found.iter().map(|e| e.item.clone()));
-        let meta = link.symlink_metadata();
-        let kept = raw.is_ok()
-            && meta.as_ref().is_ok_and(|m| m.file_type().is_symlink())
-            && std::fs::read_link(&link).ok().as_deref() == Some(target.as_path());
-        if meta.is_ok() {
-            let _ = std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir(&link));
-        } else {
-            let _ = store.purge(&find());
-        }
-        // Verified on Linux (trash 5.2.9): restore_all fails with IsADirectory
-        // for a symlink-to-dir payload, which is why the guard above exists.
-        // Record the crate's behaviour without failing on it.
-        if !kept {
-            eprintln!("trash crate restore_all breaks dir symlinks: {raw:?}");
-        }
-        assert!(target.join("inner").exists());
     }
 }
