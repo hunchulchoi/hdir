@@ -15,6 +15,7 @@ use crate::fs_ops::{OpOutcome, OpReport};
 use crate::job::{ConflictAnswer, JobEvent, JobHandle, JobKind, JobSpec, ProgressView};
 use crate::keymap::{Action, Context};
 use crate::loader::Loader;
+use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
 use crate::screen::{self, TextScreen};
 use crate::theme::{self, Theme};
@@ -57,6 +58,28 @@ pub enum PendingAction {
         entries: Vec<TrashEntry>,
     },
 }
+
+/// What an open F9 menu is choosing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuKind {
+    Main,
+    /// Theme names, parallel to the menu items.
+    Theme(Vec<String>),
+}
+
+/// The open popup menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenMenu {
+    pub menu: Menu,
+    kind: MenuKind,
+}
+
+/// Main menu entries (label prefixes are matched by tests).
+const MENU_THEME: usize = 0;
+const MENU_HIDDEN: usize = 1;
+const MENU_KEYS: usize = 2;
+const MENU_RELOAD: usize = 3;
+const MENU_WARNINGS: usize = 4;
 
 /// The single background copy/move job.
 pub struct RunningJob {
@@ -200,6 +223,8 @@ pub struct App {
     truecolor: bool,
     /// A full-screen text page (help, key settings, warnings) over the panels.
     pub screen: Option<TextScreen>,
+    /// The F9 popup menu (or theme picker).
+    pub menu: Option<OpenMenu>,
 }
 
 impl Default for App {
@@ -248,6 +273,7 @@ impl App {
             settings: config::load_settings(None),
             truecolor: true,
             screen: None,
+            menu: None,
         }
     }
 
@@ -326,6 +352,124 @@ impl App {
         self.open_screen("설정 경고", lines);
     }
 
+    pub fn open_main_menu(&mut self) {
+        let mut warnings = "설정 경고 보기".to_string();
+        if !self.settings.warnings.is_empty() {
+            warnings.push_str(&format!(" ({})", self.settings.warnings.len()));
+        }
+        let mut items: Vec<String> = [
+            "테마 선택",
+            "숨김 파일 보기 토글",
+            "키 설정 보기",
+            "설정 다시 읽기",
+        ]
+        .map(String::from)
+        .to_vec();
+        items.push(warnings);
+        self.status = None;
+        self.menu = Some(OpenMenu {
+            menu: Menu::new("메뉴", items, 0),
+            kind: MenuKind::Main,
+        });
+    }
+
+    fn open_theme_menu(&mut self) {
+        let mut names: Vec<String> = theme::builtin_names()
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        for t in &self.settings.user_themes {
+            if !names.contains(&t.name) {
+                names.push(t.name.clone());
+            }
+        }
+        let current = self.settings.config.theme.name_for(self.mode);
+        let cursor = names.iter().position(|n| n == current).unwrap_or(0);
+        self.menu = Some(OpenMenu {
+            menu: Menu::new(
+                &format!("테마 선택 ({})", self.mode.key()),
+                names.clone(),
+                cursor,
+            ),
+            kind: MenuKind::Theme(names),
+        });
+    }
+
+    fn preview_theme(&mut self, name: &str) {
+        let (t, _) = theme::resolve(name, &self.settings.user_themes);
+        self.theme = if self.truecolor { t } else { t.to_256() };
+    }
+
+    /// Adopt `name` for the current mode and write it to config.toml.
+    fn commit_theme(&mut self, name: &str) {
+        let (t, _) = theme::resolve(name, &self.settings.user_themes);
+        match self.mode {
+            Mode::Classic => {
+                self.settings.config.theme.classic = name.to_string();
+                self.settings.classic = t;
+            }
+            Mode::Dev => {
+                self.settings.config.theme.dev = name.to_string();
+                self.settings.dev = t;
+            }
+        }
+        self.apply_theme();
+        let saved = match &self.config_dir {
+            Some(dir) => config::save_theme(dir, self.mode, name),
+            None => Err("설정 디렉터리를 알 수 없음".to_string()),
+        };
+        self.status = Some(match saved {
+            Ok(()) => format!("테마 저장: {name} ({})", self.mode.key()),
+            Err(e) => format!("테마 저장 실패: {e}"),
+        });
+    }
+
+    fn handle_menu_key(&mut self, key: KeyEvent) {
+        let Some(action) = self.settings.keymap.lookup(Context::Menu, &key) else {
+            return;
+        };
+        let Some(open) = self.menu.as_mut() else {
+            return;
+        };
+        let event = open.menu.apply(action);
+        let theme_names = match &open.kind {
+            MenuKind::Theme(names) => Some(names.clone()),
+            MenuKind::Main => None,
+        };
+        match (event, theme_names) {
+            (MenuEvent::Moved, Some(names)) => {
+                let cursor = self.menu.as_ref().map_or(0, |m| m.menu.cursor);
+                if let Some(n) = names.get(cursor) {
+                    self.preview_theme(n);
+                }
+            }
+            (MenuEvent::Cancelled, kind) => {
+                self.menu = None;
+                if kind.is_some() {
+                    self.apply_theme();
+                }
+            }
+            (MenuEvent::Chosen(i), Some(names)) => {
+                self.menu = None;
+                if let Some(n) = names.get(i) {
+                    self.commit_theme(n);
+                }
+            }
+            (MenuEvent::Chosen(i), None) => {
+                self.menu = None;
+                match i {
+                    MENU_THEME => self.open_theme_menu(),
+                    MENU_HIDDEN => self.panel_action(Action::ToggleHidden),
+                    MENU_KEYS => self.open_key_settings(),
+                    MENU_RELOAD => self.reload_config(),
+                    MENU_WARNINGS => self.open_warnings(),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_screen_key(&mut self, key: KeyEvent) {
         let Some(action) = self.settings.keymap.lookup(Context::Viewer, &key) else {
             return;
@@ -399,6 +543,10 @@ impl App {
         }
         if self.screen.is_some() {
             self.handle_screen_key(key);
+            return;
+        }
+        if self.menu.is_some() {
+            self.handle_menu_key(key);
             return;
         }
         if self.trash_views[self.active].is_some() {
@@ -492,7 +640,7 @@ impl App {
             Action::CommandLine => self.unsupported("명령줄"),
             Action::ConnectLeft | Action::ConnectRight => self.unsupported("SSH 연결"),
             Action::OpenWith => self.unsupported("연결 프로그램 선택"),
-            Action::Menu => self.unsupported("메뉴"),
+            Action::Menu => self.open_main_menu(),
             Action::Help => self.open_help(),
             Action::Confirm | Action::Cancel => {}
         }
@@ -1272,6 +1420,9 @@ impl App {
         } else {
             ui::draw(frame, &view);
         }
+        if let Some(open) = &self.menu {
+            menu::render(frame, frame.area(), &open.menu, &self.theme);
+        }
         if let Some((dlg, _)) = &self.dialog {
             dialog::render_themed(frame, frame.area(), dlg, &self.theme);
         }
@@ -1725,6 +1876,239 @@ mod tests {
         let (_t, mut app) = fixture();
         app.open_warnings();
         assert!(page_text(&app).contains("경고 없음"));
+    }
+
+    // ---- HDIR-16 (F9 menu) / HDIR-24: theme selection ----
+
+    /// App with a live config dir (kept alive by the returned guard).
+    fn app_with_dir(text: &str) -> (TempDir, TempDir, App) {
+        let (t, mut app) = fixture();
+        let cfg = config_with(text);
+        app.configure(Some(cfg.path().to_path_buf()), Some("truecolor"));
+        (t, cfg, app)
+    }
+
+    fn menu_items(app: &App) -> Vec<String> {
+        app.menu.as_ref().unwrap().menu.items.clone()
+    }
+
+    fn pick(app: &mut App, label: &str) {
+        let idx = menu_items(app)
+            .iter()
+            .position(|i| i.starts_with(label))
+            .unwrap_or_else(|| panic!("no item {label}: {:?}", menu_items(app)));
+        let cur = app.menu.as_ref().unwrap().menu.cursor;
+        for _ in 0..cur {
+            press(app, KeyCode::Up);
+        }
+        for _ in 0..idx {
+            press(app, KeyCode::Down);
+        }
+        press(app, KeyCode::Enter);
+    }
+
+    #[test]
+    fn f9_opens_the_menu_with_the_listed_items_and_esc_or_f9_closes() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(9));
+        assert_eq!(
+            menu_items(&app),
+            [
+                "테마 선택",
+                "숨김 파일 보기 토글",
+                "키 설정 보기",
+                "설정 다시 읽기",
+                "설정 경고 보기"
+            ]
+        );
+        let text = draw_text(&mut app, 80, 24);
+        assert!(
+            text.contains("테마 선택") && text.contains("설정 경고 보기"),
+            "{text}"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.menu.is_none());
+        press(&mut app, KeyCode::F(9));
+        press(&mut app, KeyCode::F(9));
+        assert!(app.menu.is_none(), "F9 toggles the menu");
+    }
+
+    #[test]
+    fn menu_captures_navigation_keys() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(9));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.menu.as_ref().unwrap().menu.cursor, 1);
+        assert_eq!(app.panels[0].cursor, 0);
+        press(&mut app, KeyCode::F(5));
+        assert!(app.dialog.is_none());
+        assert!(app.menu.is_some());
+    }
+
+    #[test]
+    fn menu_warning_item_shows_count() {
+        let (_t, _c, mut app) = app_with_dir("[theme]\nclassic = \"nope\"\n");
+        press(&mut app, KeyCode::F(9));
+        assert_eq!(menu_items(&app)[4], "설정 경고 보기 (1)");
+    }
+
+    #[test]
+    fn menu_toggle_hidden_item_toggles_and_closes() {
+        let (_t, mut app) = fixture();
+        press(&mut app, KeyCode::F(9));
+        pick(&mut app, "숨김 파일");
+        assert!(app.menu.is_none());
+        settle(&mut app);
+        assert!(app.panels[0].entries.iter().any(|e| e.name == ".h"));
+    }
+
+    #[test]
+    fn menu_key_settings_and_warnings_open_pages() {
+        let (_t, _c, mut app) = app_with_dir("[theme]\nclassic = \"nope\"\n");
+        press(&mut app, KeyCode::F(9));
+        pick(&mut app, "키 설정 보기");
+        assert!(app.menu.is_none());
+        assert!(page_text(&app).contains("설정 파일:"));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::F(9));
+        pick(&mut app, "설정 경고 보기");
+        assert!(page_text(&app).contains("nope"));
+    }
+
+    #[test]
+    fn menu_reload_item_reloads_and_closes() {
+        let (_t, cfg, mut app) = app_with_dir("");
+        fs::write(
+            cfg.path().join("config.toml"),
+            "[theme]\nclassic = \"dark\"\n",
+        )
+        .unwrap();
+        press(&mut app, KeyCode::F(9));
+        pick(&mut app, "설정 다시 읽기");
+        assert!(app.menu.is_none());
+        assert_eq!(app.theme.name, "dark");
+        assert_eq!(app.status.as_deref(), Some("설정을 다시 읽었음"));
+    }
+
+    fn open_theme_menu(app: &mut App) {
+        press(app, KeyCode::F(9));
+        pick(app, "테마 선택");
+    }
+
+    #[test]
+    fn theme_menu_lists_builtin_then_user_themes_with_cursor_on_current() {
+        let (_t, cfg, mut app) = app_with_dir("[theme]\nclassic = \"dark\"\n");
+        fs::create_dir(cfg.path().join("themes")).unwrap();
+        fs::write(cfg.path().join("themes/mine.toml"), "base = \"dark\"\n").unwrap();
+        fs::write(
+            cfg.path().join("themes/dark.toml"),
+            "[colors]\nbg = \"#010203\"\n",
+        )
+        .unwrap();
+        app.reload_config();
+        open_theme_menu(&mut app);
+        let items = menu_items(&app);
+        assert_eq!(
+            items,
+            ["mdir", "mdir-red", "mdir-green", "dark", "light", "mine"],
+            "built-ins first, user themes after; same name is listed once"
+        );
+        assert_eq!(app.menu.as_ref().unwrap().menu.cursor, 3, "current theme");
+    }
+
+    #[test]
+    fn theme_cursor_move_previews_and_esc_restores() {
+        let (_t, cfg, mut app) = app_with_dir("");
+        let before = fs::read_to_string(cfg.path().join("config.toml")).unwrap();
+        open_theme_menu(&mut app);
+        assert_eq!(app.theme.name, "mdir");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.theme.name, "mdir-red");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.theme.name, "mdir-green");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.menu.is_none());
+        assert_eq!(app.theme.name, "mdir", "Esc restores the previous theme");
+        assert_eq!(app.settings.config.theme.classic, "mdir");
+        assert_eq!(
+            fs::read_to_string(cfg.path().join("config.toml")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn theme_enter_saves_for_the_current_mode_preserving_the_file() {
+        let (_t, cfg, mut app) = app_with_dir("# mine\n[keys]\npreset = \"mdir\"\n");
+        open_theme_menu(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down); // dark
+        press(&mut app, KeyCode::Enter);
+        assert!(app.menu.is_none());
+        assert_eq!(app.theme.name, "dark");
+        assert_eq!(app.settings.config.theme.classic, "dark");
+        assert_eq!(app.settings.config.theme.dev, "mdir");
+        let saved = fs::read_to_string(cfg.path().join("config.toml")).unwrap();
+        assert!(
+            saved.starts_with("# mine\n[keys]\npreset = \"mdir\"\n"),
+            "{saved}"
+        );
+        assert!(saved.contains("[theme]\nclassic = \"dark\""), "{saved}");
+        assert!(app.status.as_deref().unwrap().contains("dark"));
+        // survives a reload from disk
+        app.reload_config();
+        assert_eq!(app.theme.name, "dark");
+    }
+
+    #[test]
+    fn theme_save_targets_dev_key_in_dev_mode_and_keeps_classic() {
+        let (_t, cfg, mut app) = app_with_dir("[theme]\nclassic = \"light\"\n");
+        app.set_mode(Mode::Dev);
+        open_theme_menu(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter); // mdir-red
+        assert_eq!(app.theme.name, "mdir-red");
+        app.set_mode(Mode::Classic);
+        assert_eq!(app.theme.name, "light", "classic untouched");
+        let (c, w) = config::load_config(Some(cfg.path()));
+        assert!(w.is_empty());
+        assert_eq!(
+            (c.theme.classic.as_str(), c.theme.dev.as_str()),
+            ("light", "mdir-red")
+        );
+    }
+
+    #[test]
+    fn theme_preview_honors_256_color_fallback() {
+        let (_t, mut app) = fixture();
+        app.configure(None, Some("256color"));
+        open_theme_menu(&mut app);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.theme, theme::builtin("mdir-red").unwrap().to_256());
+    }
+
+    #[test]
+    fn theme_save_failure_is_reported_and_theme_stays_for_the_session() {
+        let (_t, mut app) = fixture(); // no config dir
+        open_theme_menu(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.status.as_deref().unwrap().contains("저장 실패"),
+            "{:?}",
+            app.status
+        );
+        assert_eq!(app.theme.name, "mdir-red");
+    }
+
+    #[test]
+    fn menu_keys_are_remappable() {
+        let (_t, _c, mut app) = app_with_dir("[keys.menu]\ncancel = [\"x\"]\n");
+        press(&mut app, KeyCode::F(9));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.menu.is_some(), "Esc was rebound away");
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.menu.is_none());
     }
 
     #[test]
