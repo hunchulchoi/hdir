@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::platform::{
     create_private_dir, create_private_file, create_symlink, is_cross_device, is_link_refused,
-    is_symlink_privilege_error, is_unsupported, open_source, rename_noreplace_os, rename_replace,
-    same_file, set_dir_modified, truncated_name,
+    is_symlink_privilege_error, is_unsupported, open_source, remove_link, rename_noreplace_os,
+    rename_replace, same_file, set_dir_modified, truncated_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +151,41 @@ fn validate_name(name: &str) -> io::Result<()> {
     {
         return Err(invalid("invalid file name"));
     }
+    // Exactly one plain component, on every platform.
+    let mut comps = Path::new(name).components();
+    if !matches!(
+        (comps.next(), comps.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) {
+        return Err(invalid(UNUSABLE_NAME));
+    }
+    if cfg!(windows) && !windows_name_ok(name) {
+        return Err(invalid(UNUSABLE_NAME));
+    }
     Ok(())
+}
+
+const UNUSABLE_NAME: &str = "사용할 수 없는 이름";
+
+/// Windows file-name rules: no `:` (drive-relative paths, alternate data
+/// streams), no `<>"|?*`, no control chars, no trailing `.`/space, no reserved
+/// device names (also with an extension). Pure, so it is testable everywhere.
+fn windows_name_ok(name: &str) -> bool {
+    if name
+        .chars()
+        .any(|c| c.is_control() || ":<>\"|?*".contains(c))
+        || name.ends_with('.')
+        || name.ends_with(' ')
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let up = stem.to_ascii_uppercase();
+    let reserved = matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((up.starts_with("COM") || up.starts_with("LPT"))
+            && up.len() == 4
+            && matches!(up.as_bytes()[3], b'1'..=b'9'));
+    !reserved
 }
 
 /// Recursive file/byte count. Symlinks count as one file, zero bytes, and are not followed.
@@ -361,12 +395,12 @@ fn place(
                     rename_replace(tmp, dest)
                 }
                 ConflictAction::Skip => {
-                    let _ = fs::remove_file(tmp);
+                    let _ = remove_link(tmp);
                     acc.skipped += 1;
                     return Ok(Step::Skipped);
                 }
                 ConflictAction::Cancel => {
-                    let _ = fs::remove_file(tmp);
+                    let _ = remove_link(tmp);
                     return Ok(Step::Cancelled);
                 }
             },
@@ -374,7 +408,7 @@ fn place(
         }
     };
     if let Err(e) = res {
-        let _ = fs::remove_file(tmp);
+        let _ = remove_link(tmp);
         return Err(e);
     }
     if replaced {
@@ -391,20 +425,29 @@ fn copy_symlink(
     acc: &mut Acc,
     approved: bool,
 ) -> io::Result<Step> {
-    copy_symlink_with(src, dest, ctl, acc, approved, &create_symlink)
+    copy_symlink_with(
+        src,
+        dest,
+        ctl,
+        acc,
+        approved,
+        &|p| fs::read_link(p),
+        &create_symlink,
+    )
 }
 
-/// [`copy_symlink`] with an injectable link creator `(target, link, src)`.
+/// [`copy_symlink`] with an injectable link reader and link creator `(target, link, src)`.
 fn copy_symlink_with(
     src: &Path,
     dest: &Path,
     ctl: &mut dyn OpControl,
     acc: &mut Acc,
     approved: bool,
+    read: &dyn Fn(&Path) -> io::Result<PathBuf>,
     create: &dyn Fn(&Path, &Path, &Path) -> io::Result<()>,
 ) -> io::Result<Step> {
     let tmp = temp_sibling(dest);
-    if let Err(e) = create(&fs::read_link(src)?, &tmp, src) {
+    if let Err(e) = create(&read(src)?, &tmp, src) {
         if is_symlink_privilege_error(&e) {
             acc.skipped += 1;
             acc.warnings.push(format!(
@@ -632,7 +675,7 @@ fn remove_source(src: &Path) -> io::Result<()> {
     if is_real_dir(src) {
         fs::remove_dir_all(src)
     } else {
-        fs::remove_file(src)
+        remove_link(src)
     }
 }
 
@@ -2774,6 +2817,58 @@ mod tests {
         assert_eq!(r.done_sources, vec![s.join("a")]);
     }
 
+    #[test]
+    fn accepted_names_are_exactly_one_normal_component() {
+        for n in ["a", "한글 파일", "x.tar.gz", ".hidden", "a b", "it's"] {
+            validate_name(n).unwrap_or_else(|e| panic!("{n}: {e}"));
+            let c: Vec<_> = Path::new(n).components().collect();
+            assert!(
+                matches!(c.as_slice(), [std::path::Component::Normal(_)]),
+                "{n}: {c:?}"
+            );
+        }
+        for n in ["", ".", "..", "a/b", "/", "a/", "../x"] {
+            assert!(validate_name(n).is_err(), "{n:?}");
+        }
+    }
+
+    #[test]
+    fn windows_name_rules_reject_unusable_names() {
+        for n in [
+            "C:foo",
+            "file:stream",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "a\u{1}b",
+            "a\tb",
+            "trail.",
+            "trail ",
+            "CON",
+            "con",
+            "PRN",
+            "Aux",
+            "NUL",
+            "nul.txt",
+            "COM1",
+            "com9.x",
+            "LPT1",
+            "lpt9.tar.gz",
+            "NUL .txt",
+        ] {
+            assert!(!windows_name_ok(n), "{n:?} must be rejected");
+        }
+        for n in [
+            "a", "한글", ".hidden", "console", "COM0", "COM10", "LPT", "nul2", "x.nul", "a b",
+            "file.txt",
+        ] {
+            assert!(windows_name_ok(n), "{n:?} must be accepted");
+        }
+    }
+
     // ---- Windows (HDIR-65) ----
 
     #[cfg(windows)]
@@ -2879,13 +2974,19 @@ mod tests {
         }
 
         #[test]
-        fn privilege_error_skips_a_symlink_with_a_warning() {
-            use std::os::windows::fs::symlink_file;
-            let (_t, s, d) = two_dirs();
-            fs::write(s.join("t"), "x").unwrap();
-            if symlink_file("t", s.join("l")).is_err() {
-                return; // no privilege to even build the fixture
+        fn unusable_names_are_rejected_with_the_message() {
+            for n in ["C:foo", "f:stream", "nul", "NUL.txt", "a?", "t.", "t "] {
+                let e = validate_name(n).unwrap_err();
+                assert!(e.to_string().contains("사용할 수 없는 이름"), "{n}: {e}");
             }
+            assert!(make_dir(Path::new("."), "C:foo").is_err());
+        }
+
+        #[test]
+        fn privilege_error_skips_a_symlink_with_a_warning() {
+            // Link reading and creation are both injected: no privilege needed.
+            let (_t, s, d) = two_dirs();
+            let read = |_: &Path| Ok(PathBuf::from("t"));
             let denied = |_: &Path, _: &Path, _: &Path| Err(io::Error::from_raw_os_error(1314));
             let mut acc = Acc::default();
             let step = copy_symlink_with(
@@ -2894,6 +2995,7 @@ mod tests {
                 &mut ctl(),
                 &mut acc,
                 false,
+                &read,
                 &denied,
             )
             .unwrap();
@@ -2908,35 +3010,85 @@ mod tests {
         }
 
         #[test]
-        fn file_and_dir_symlinks_are_copied_as_links() {
-            use std::os::windows::fs::{symlink_dir, symlink_file};
+        fn other_creation_errors_are_not_swallowed() {
+            let (_t, s, d) = two_dirs();
+            let read = |_: &Path| Ok(PathBuf::from("t"));
+            let broken = |_: &Path, _: &Path, _: &Path| Err(io::Error::from_raw_os_error(5));
+            let r = copy_symlink_with(
+                &s.join("l"),
+                &d.join("l"),
+                &mut ctl(),
+                &mut Acc::default(),
+                false,
+                &read,
+                &broken,
+            );
+            assert!(r.is_err());
+        }
+
+        /// Build a symlink fixture. `None` only for the privilege error (1314);
+        /// any other failure is a real failure.
+        fn try_link(
+            make: impl Fn(&Path, &Path) -> io::Result<()>,
+            target: &str,
+            link: &Path,
+        ) -> Option<()> {
+            match make(Path::new(target), link) {
+                Ok(()) => Some(()),
+                Err(e) if is_symlink_privilege_error(&e) => {
+                    eprintln!("symlink privilege missing (1314): fixture skipped");
+                    None
+                }
+                Err(e) => panic!("symlink fixture failed: {e}"),
+            }
+        }
+
+        #[test]
+        fn file_dir_and_broken_dir_symlinks_are_copied_as_the_right_kind() {
+            use std::os::windows::fs::{FileTypeExt, symlink_dir, symlink_file};
             let (_t, s, d) = two_dirs();
             fs::write(s.join("t"), "x").unwrap();
             fs::create_dir(s.join("td")).unwrap();
-            if symlink_file("t", s.join("lf")).is_err() || symlink_dir("td", s.join("ld")).is_err()
-            {
-                return; // symlinks need developer mode / privilege
+            fs::create_dir(s.join("gone")).unwrap();
+            if try_link(|t, l| symlink_file(t, l), "t", &s.join("lf")).is_none() {
+                return;
             }
-            let r = copy_items(&[s.join("lf"), s.join("ld")], &d, &mut ctl());
-            assert_eq!(r.outcome, OpOutcome::Done, "{r:?}");
-            for n in ["lf", "ld"] {
-                let m = fs::symlink_metadata(d.join(n)).unwrap();
-                assert!(m.file_type().is_symlink(), "{n}");
-            }
-            assert_eq!(fs::read_link(d.join("lf")).unwrap(), Path::new("t"));
-            // the dir link must be a *directory* symlink
-            assert!(fs::metadata(s.join("ld")).unwrap().is_dir());
+            try_link(|t, l| symlink_dir(t, l), "td", &s.join("ld")).unwrap();
+            try_link(|t, l| symlink_dir(t, l), "gone", &s.join("bd")).unwrap();
+            fs::remove_dir(s.join("gone")).unwrap(); // now a broken dir link
             assert!(
-                fs::metadata(d.join("ld")).is_err(),
-                "dangling here: td is not in d"
-            );
-            use std::os::windows::fs::FileTypeExt;
-            assert!(
-                fs::symlink_metadata(d.join("ld"))
+                fs::symlink_metadata(s.join("bd"))
                     .unwrap()
                     .file_type()
                     .is_symlink_dir()
             );
+            let r = copy_items(&[s.join("lf"), s.join("ld"), s.join("bd")], &d, &mut ctl());
+            assert_eq!(r.outcome, OpOutcome::Done, "{r:?}");
+            for (n, dir, target) in [("lf", false, "t"), ("ld", true, "td"), ("bd", true, "gone")] {
+                let ft = fs::symlink_metadata(d.join(n)).unwrap().file_type();
+                assert!(ft.is_symlink(), "{n}");
+                assert_eq!(ft.is_symlink_dir(), dir, "{n} kind");
+                assert_eq!(ft.is_symlink_file(), !dir, "{n} kind");
+                assert_eq!(fs::read_link(d.join(n)).unwrap(), Path::new(target));
+            }
+        }
+
+        #[test]
+        fn removing_dir_and_file_symlinks_works() {
+            use std::os::windows::fs::{symlink_dir, symlink_file};
+            let (_t, s, _d) = two_dirs();
+            fs::write(s.join("t"), "x").unwrap();
+            fs::create_dir(s.join("td")).unwrap();
+            fs::write(s.join("td/in"), "keep").unwrap();
+            if try_link(|t, l| symlink_file(t, l), "t", &s.join("lf")).is_none() {
+                return;
+            }
+            try_link(|t, l| symlink_dir(t, l), "td", &s.join("ld")).unwrap();
+            remove_source(&s.join("ld")).unwrap();
+            remove_source(&s.join("lf")).unwrap();
+            assert!(!exists(&s.join("ld")) && !exists(&s.join("lf")));
+            assert_eq!(fs::read_to_string(s.join("td/in")).unwrap(), "keep");
+            assert!(s.join("t").exists());
         }
 
         #[test]

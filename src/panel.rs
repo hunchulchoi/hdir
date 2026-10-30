@@ -414,6 +414,16 @@ fn build_listing(
     names: impl Iterator<Item = io::Result<OsString>>,
     show_hidden: bool,
 ) -> (Vec<Entry>, usize) {
+    build_listing_with(cwd, names, show_hidden, &|p| fs::symlink_metadata(p))
+}
+
+/// [`build_listing`] with an injectable `lstat`.
+fn build_listing_with(
+    cwd: &Path,
+    names: impl Iterator<Item = io::Result<OsString>>,
+    show_hidden: bool,
+    stat: &dyn Fn(&Path) -> io::Result<fs::Metadata>,
+) -> (Vec<Entry>, usize) {
     let mut skipped = 0;
     let mut items: Vec<Entry> = Vec::new();
     for r in names {
@@ -422,8 +432,12 @@ fn build_listing(
             continue;
         };
         let name = os_name.to_string_lossy().into_owned();
+        // Dot-prefixed names are hidden everywhere: skip them before any stat.
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
         let path = cwd.join(&os_name);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
+        let Ok(meta) = stat(&path) else {
             // Hidden entries stay out of the error count when hidden are not shown.
             if !name.starts_with('.') || show_hidden {
                 skipped += 1;
@@ -879,6 +893,26 @@ mod tests {
         assert_eq!(skipped, 2);
         let n: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(n, vec!["..", "ok"]);
+    }
+
+    #[test]
+    fn hidden_dot_names_are_not_statted_when_hidden_are_off() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join(".h"), "").unwrap();
+        fs::write(t.path().join("v"), "").unwrap();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let stat = |p: &Path| {
+            calls.borrow_mut().push(p.to_path_buf());
+            fs::symlink_metadata(p)
+        };
+        let items = || vec![Ok(OsString::from(".h")), Ok(OsString::from("v"))].into_iter();
+        let (entries, _) = build_listing_with(t.path(), items(), false, &stat);
+        assert_eq!(*calls.borrow(), vec![t.path().join("v")]);
+        assert!(entries.iter().all(|e| e.name != ".h"));
+        calls.borrow_mut().clear();
+        let (entries, _) = build_listing_with(t.path(), items(), true, &stat);
+        assert_eq!(calls.borrow().len(), 2);
+        assert!(entries.iter().any(|e| e.name == ".h"));
     }
 
     #[test]

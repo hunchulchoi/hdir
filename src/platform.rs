@@ -59,7 +59,22 @@ pub fn open_source(src: &Path) -> io::Result<Option<fs::File>> {
 
 #[cfg(windows)]
 pub fn open_source(src: &Path) -> io::Result<Option<fs::File>> {
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    open_source_with(src, &|| {}, &|f| {
+        use std::os::windows::fs::MetadataExt;
+        Ok(f.metadata()?.file_attributes())
+    })
+}
+
+/// [`open_source`] with two seams: `between` runs after the lstat check and
+/// before the open (a place to swap the entry), `attrs` reads the opened handle's
+/// file attributes.
+#[cfg(windows)]
+fn open_source_with(
+    src: &Path,
+    between: &dyn Fn(),
+    attrs: &dyn Fn(&fs::File) -> io::Result<u32>,
+) -> io::Result<Option<fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     };
@@ -67,13 +82,14 @@ pub fn open_source(src: &Path) -> io::Result<Option<fs::File>> {
     if lmeta.file_type().is_symlink() || !lmeta.is_file() {
         return Ok(None);
     }
+    between();
     // Do not traverse a reparse point swapped in after the lstat, then verify the
     // handle we actually got.
     let f = fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(src)?;
-    if f.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    if attrs(&f)? & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Ok(None);
     }
     Ok(Some(f))
@@ -374,11 +390,30 @@ pub fn create_symlink(target: &Path, link: &Path, _src: &Path) -> io::Result<()>
 
 #[cfg(windows)]
 pub fn create_symlink(target: &Path, link: &Path, src: &Path) -> io::Result<()> {
-    // Windows distinguishes file and directory links; follow `src` to decide.
-    if fs::metadata(src).is_ok_and(|m| m.is_dir()) {
+    // Windows distinguishes file and directory links. The kind is a property of
+    // the source link itself, so a broken or inaccessible dir link stays a dir link.
+    use std::os::windows::fs::FileTypeExt;
+    if fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_symlink_dir()) {
         std::os::windows::fs::symlink_dir(target, link)
     } else {
         std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+/// Delete a symlink (or any non-directory entry). Windows directory symlinks
+/// need `remove_dir`; file links and files need `remove_file`.
+#[cfg(unix)]
+pub fn remove_link(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+#[cfg(windows)]
+pub fn remove_link(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink_dir()) {
+        fs::remove_dir(path)
+    } else {
+        fs::remove_file(path)
     }
 }
 
@@ -415,6 +450,38 @@ mod tests {
         );
         let rel = "y".repeat(300);
         assert_eq!(long_path(Path::new(&rel)), Path::new(&rel));
+    }
+
+    #[test]
+    fn swapped_in_symlink_between_check_and_open_is_never_read() {
+        use std::os::windows::fs::symlink_file;
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("f");
+        let secret = t.path().join("secret");
+        fs::write(&f, "plain").unwrap();
+        fs::write(&secret, "SECRET").unwrap();
+        let swapped = std::cell::Cell::new(false);
+        let swap = || {
+            fs::remove_file(&f).unwrap();
+            match symlink_file(&secret, &f) {
+                Ok(()) => swapped.set(true),
+                Err(e) if is_symlink_privilege_error(&e) => fs::write(&f, "plain").unwrap(),
+                Err(e) => panic!("swap failed: {e}"),
+            }
+        };
+        let real = |h: &fs::File| {
+            use std::os::windows::fs::MetadataExt;
+            Ok(h.metadata()?.file_attributes())
+        };
+        let r = open_source_with(&f, &swap, &real).unwrap();
+        if swapped.get() {
+            assert!(r.is_none(), "a swapped-in symlink must not be opened");
+        } else {
+            // No symlink privilege: simulate the handle re-check seeing a reparse point.
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            let r = open_source_with(&f, &|| {}, &|_| Ok(FILE_ATTRIBUTE_REPARSE_POINT)).unwrap();
+            assert!(r.is_none(), "reparse-point handle must be rejected");
+        }
     }
 
     #[test]

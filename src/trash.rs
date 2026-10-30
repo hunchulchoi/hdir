@@ -523,8 +523,7 @@ pub fn fmt_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> String {
 #[cfg(windows)]
 pub fn format_local(ts: i64) -> String {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
-    use windows_sys::Win32::System::Time::FileTimeToSystemTime;
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
     // Unix seconds -> 100ns ticks since 1601-01-01.
     let Some(ticks) = ts
         .checked_add(11_644_473_600)
@@ -537,15 +536,15 @@ pub fn format_local(ts: i64) -> String {
         dwLowDateTime: ticks as u32,
         dwHighDateTime: (ticks >> 32) as u32,
     };
-    let mut local = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    // SAFETY: plain-data structs; both pointers are valid for the call.
+    // SAFETY: plain-data structs; all pointers are valid for the call.
+    let mut utc_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
     let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
+    // The zone conversion uses the DST rules in force *at that instant*
+    // (FileTimeToLocalFileTime would apply today's offset to every date).
+    // SAFETY: as above; a null zone means the current time zone.
     let ok = unsafe {
-        FileTimeToLocalFileTime(&utc, &mut local) != 0 && FileTimeToSystemTime(&local, &mut st) != 0
+        FileTimeToSystemTime(&utc, &mut utc_st) != 0
+            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut st) != 0
     };
     if !ok {
         return "-".to_string();
@@ -1478,10 +1477,42 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn format_local_uses_the_local_time_zone_api() {
-        // 2001-09-09 01:46:40 UTC: the local date is 08..10 whatever the zone.
-        let s = format_local(1_000_000_000);
-        assert!(s.starts_with("2001-09-") && s.len() == 16, "{s}");
+    fn format_local_matches_the_zone_api_for_known_instants() {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
+        // (unix seconds, UTC y, mo, d, h, mi, s): winter, summer and autumn dates, so
+        // a zone with DST yields different offsets; the UTC fields are written out
+        // by hand, independent of format_local's FILETIME path.
+        let cases = [
+            (1_011_096_000_i64, (2002u16, 1u16, 15u16, 12u16, 0u16, 0u16)),
+            (993_988_800, (2001, 7, 1, 12, 0, 0)),
+            (1_000_000_000, (2001, 9, 9, 1, 46, 40)),
+        ];
+        for (ts, (y, mo, d, h, mi, sec)) in cases {
+            let utc = SYSTEMTIME {
+                wYear: y,
+                wMonth: mo,
+                wDayOfWeek: 0,
+                wDay: d,
+                wHour: h,
+                wMinute: mi,
+                wSecond: sec,
+                wMilliseconds: 0,
+            };
+            // SAFETY: plain data; valid pointers; null zone = current zone.
+            let mut l: SYSTEMTIME = unsafe { std::mem::zeroed() };
+            assert!(
+                unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut l) } != 0
+            );
+            let want = fmt_datetime(
+                l.wYear as i32,
+                l.wMonth as u32,
+                l.wDay as u32,
+                l.wHour as u32,
+                l.wMinute as u32,
+            );
+            assert_eq!(format_local(ts), want, "ts {ts}");
+        }
         assert_eq!(format_local(i64::MIN), "-");
     }
 }
