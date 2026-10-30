@@ -2855,7 +2855,6 @@ fn job_summary(kind: JobKind, report: &OpReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::SshTarget;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
