@@ -303,18 +303,28 @@ pub const PREVIEW_SPECIAL: i32 = 21;
 pub const PREVIEW_MISSING: i32 = 22;
 pub const PREVIEW_BROKEN: i32 = 23;
 
+/// `stat` size flags of `os` (symlinks followed, so a link reports its
+/// target's size like `head` reads it).
+fn stat_size_args(os: &RemoteOs) -> &'static str {
+    match os {
+        RemoteOs::Bsd => "stat -L -f %z --",
+        RemoteOs::Linux | RemoteOs::Other(_) => "stat -L -c %s --",
+    }
+}
+
 /// One round trip for a preview: a directory exits [`PREVIEW_DIR`], other
 /// non-regular files (fifo, device, socket: `head` could block) exit
-/// [`PREVIEW_SPECIAL`]; a regular file prints its size and a newline, then
-/// the first `max` bytes (`head -c`). Symlinks are followed.
-pub fn preview_cmd(path: &[u8], max: usize) -> Vec<u8> {
+/// [`PREVIEW_SPECIAL`]; a regular file prints its size (`stat`, not `wc -c`,
+/// which would read the whole file) and a newline, then the first `max`
+/// bytes (`head -c`). Symlinks are followed.
+pub fn preview_cmd(os: &RemoteOs, path: &[u8], max: usize) -> Vec<u8> {
     let q = sh_quote(path);
     cat(&[
         b"if [ -d ",
         &q,
         format!(" ]; then exit {PREVIEW_DIR}; elif [ -f ").as_bytes(),
         &q,
-        b" ]; then n=$(wc -c < ",
+        format!(" ]; then n=$({} ", stat_size_args(os)).as_bytes(),
         &q,
         b") || exit 1; printf '%s\\n' $n; ",
         &head_cmd(path, max),
@@ -368,25 +378,126 @@ pub fn rename_cmd(from: &[u8], to: &[u8]) -> Vec<u8> {
     ])
 }
 
-/// Put the uploaded temp file `tmp` in place of `orig`. A regular file is
-/// replaced by `mv` (a failed upload never truncates the original); a symlink
-/// is written through instead, so the link survives.
-pub fn replace_cmd(tmp: &[u8], orig: &[u8]) -> Vec<u8> {
+/// Exit codes of [`delete_cmd`].
+pub const DELETE_NO_HOME: i32 = 40;
+pub const DELETE_NO_CWD: i32 = 41;
+pub const DELETE_PROTECTED: i32 = 42;
+
+/// One script that deletes `names` (plain child names) of `cwd` with
+/// `rm -rf --`, after checking on the host with *physical* paths (`pwd -P`)
+/// that no target is `/`, the home directory or an ancestor of it. `cwd` is
+/// resolved first, so reaching the home through a symlinked directory is
+/// caught; a target that is itself a symlink is removed as a link, so its
+/// parent (the physical cwd) is what gets resolved. Nothing is removed when
+/// the home or cwd cannot be resolved ([`DELETE_NO_HOME`], [`DELETE_NO_CWD`])
+/// or a target is protected ([`DELETE_PROTECTED`]).
+pub fn delete_cmd(cwd: &[u8], names: &[&[u8]]) -> Vec<u8> {
+    let list = names
+        .iter()
+        .map(|n| sh_quote(n))
+        .collect::<Vec<_>>()
+        .join(&b' ');
+    cat(&[
+        b"[ -n \"$HOME\" ] || exit 40\n",
+        b"h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P) || exit 40\n",
+        b"c=$(cd -- ",
+        &sh_quote(cwd),
+        b" && pwd -P) || exit 41\n",
+        b"for n in ",
+        &list,
+        b"; do\n",
+        b"  case $c in /) t=/$n;; *) t=$c/$n;; esac\n",
+        b"  [ \"$t\" != / ] || exit 42\n",
+        b"  case \"$h/\" in \"$t\"/*) echo 'refusing to delete the home directory or a parent of it' >&2; exit 42;; esac\n",
+        b"done\n",
+        b"cd -- \"$c\" && rm -rf -- ",
+        &list,
+    ])
+}
+
+/// Prints the physical path of `path` with its final symlinks followed
+/// (portable `readlink -f`: a manual loop, 40 levels at most), NUL-terminated;
+/// fails unless it names a regular file.
+pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"p=",
+        &sh_quote(path),
+        b"; n=0\n\
+          while [ -L \"$p\" ]; do\n  \
+          n=$((n+1)); [ \"$n\" -le 40 ] || { echo 'too many levels of symbolic links' >&2; exit 1; }\n  \
+          l=$(readlink -- \"$p\"; echo x); l=${l%x}; l=${l%?}\n  \
+          case $l in /*) p=$l;; *) p=${p%/*}/$l;; esac\n\
+          done\n\
+          d=${p%/*}; [ -n \"$d\" ] || d=/; b=${p##*/}\n\
+          d=$(cd -- \"$d\" && pwd -P) || exit 1\n\
+          if [ \"$d\" = / ]; then p=/$b; else p=$d/$b; fi\n\
+          [ -f \"$p\" ] || { echo 'not a regular file' >&2; exit 1; }\n\
+          printf '%s\\0' \"$p\"",
+    ])
+}
+
+/// Creates an exclusive (mode 600) temp file `<dir>/.hdir-edit.XXXXXX` with
+/// `mktemp` and prints its path, NUL-terminated.
+pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
+    let mut template = dir.to_vec();
+    while template.len() > 1 && template.ends_with(b"/") {
+        template.pop();
+    }
+    if template != b"/" {
+        template.push(b'/');
+    }
+    template.extend_from_slice(b".hdir-edit.XXXXXX");
+    cat(&[
+        b"t=$(mktemp ",
+        &sh_quote(&template),
+        b") || exit 1; printf '%s\\0' \"$t\"",
+    ])
+}
+
+/// Exit codes of [`replace_cmd`]. On [`REPLACE_NOT_OWNER`] the temp file is
+/// left in place.
+pub const REPLACE_SIZE: i32 = 31;
+pub const REPLACE_NOT_OWNER: i32 = 32;
+
+/// `stat` fields `mode nlink uid gid` of `os`.
+fn stat_meta_args(os: &RemoteOs) -> &'static str {
+    match os {
+        RemoteOs::Bsd => "stat -f '%Lp %l %u %g' --",
+        RemoteOs::Linux | RemoteOs::Other(_) => "stat -c '%a %h %u %g' --",
+    }
+}
+
+/// Put the uploaded temp file `tmp` (`size` bytes) in place of the physical
+/// regular file `orig`, keeping its mode:
+/// - the temp's size must match, else [`REPLACE_SIZE`];
+/// - when the owner is not the current user (and we are not root) nothing is
+///   replaced ([`REPLACE_NOT_OWNER`]): ownership cannot be kept;
+/// - the original's mode is applied to the temp, then `mv` replaces it
+///   atomically (a failed upload never truncates the original);
+/// - a file with several hard links keeps its inode: the verified temp
+///   content is copied in place with `cat`, then the temp is removed. That
+///   copy is not atomic (a crash or full disk mid-write can leave the
+///   original truncated) - the price of not breaking the other links.
+///
+/// The group of a replaced file becomes the user's/directory's group.
+pub fn replace_cmd(os: &RemoteOs, tmp: &[u8], orig: &[u8], size: u64) -> Vec<u8> {
     let (t, o) = (sh_quote(tmp), sh_quote(orig));
     cat(&[
-        b"if [ -L ",
-        &o,
-        b" ]; then cat -- ",
+        b"t=",
         &t,
-        b" > ",
+        b"; o=",
         &o,
-        b" && rm -f -- ",
-        &t,
-        b"; else mv -- ",
-        &t,
-        b" ",
-        &o,
-        b"; fi",
+        format!(
+            "\n[ \"$(wc -c < \"$t\" | tr -d ' ')\" = {size} ] || exit {REPLACE_SIZE}\n"
+        )
+        .as_bytes(),
+        format!("m=$({} \"$o\") || exit 1; set -- $m\n", stat_meta_args(os)).as_bytes(),
+        format!(
+            "if [ \"$3\" != \"$(id -u)\" ]; then [ \"$(id -u)\" = 0 ] && chown \"$3:$4\" \"$t\" || exit {REPLACE_NOT_OWNER}; fi\n"
+        )
+        .as_bytes(),
+        b"if [ \"$2\" -gt 1 ]; then cat -- \"$t\" > \"$o\" && rm -f -- \"$t\"\n\
+          else chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\"; fi",
     ])
 }
 
@@ -398,11 +509,6 @@ pub fn rm_file_cmd(path: &[u8]) -> Vec<u8> {
 /// `rmdir` (fails unless the directory is empty): undo of a remote mkdir.
 pub fn rmdir_cmd(path: &[u8]) -> Vec<u8> {
     cat(&[b"rmdir -- ", &sh_quote(path)])
-}
-
-/// Prints the remote home directory, NUL-terminated.
-pub fn home_cmd() -> Vec<u8> {
-    b"printf '%s\\0' \"$HOME\"".to_vec()
 }
 
 /// How the local `scp` interprets remote paths.
@@ -966,9 +1072,9 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     #[test]
     fn preview_cmd_classifies_then_prints_size_and_head() {
         assert_eq!(
-            s(preview_cmd(b"/d/it's -x", 65539)),
+            s(preview_cmd(&RemoteOs::Linux, b"/d/it's -x", 65539)),
             "if [ -d '/d/it'\\''s -x' ]; then exit 20; \
-             elif [ -f '/d/it'\\''s -x' ]; then n=$(wc -c < '/d/it'\\''s -x') || exit 1; \
+             elif [ -f '/d/it'\\''s -x' ]; then n=$(stat -L -c %s -- '/d/it'\\''s -x') || exit 1; \
              printf '%s\\n' $n; head -c 65539 -- '/d/it'\\''s -x'; \
              elif [ -e '/d/it'\\''s -x' ]; then exit 21; \
              elif [ -L '/d/it'\\''s -x' ]; then exit 23; \
@@ -986,12 +1092,92 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     }
 
     #[test]
-    fn replace_cmd_moves_the_upload_over_the_original_or_writes_through_a_link() {
-        assert_eq!(
-            s(replace_cmd(b"/d/.hdir-edit-1", b"/d/it's")),
-            "if [ -L '/d/it'\\''s' ]; then cat -- '/d/.hdir-edit-1' > '/d/it'\\''s' \
-             && rm -f -- '/d/.hdir-edit-1'; else mv -- '/d/.hdir-edit-1' '/d/it'\\''s'; fi"
+    fn preview_size_comes_from_stat_per_os_never_wc() {
+        let l = s(preview_cmd(&RemoteOs::Linux, b"/a", 10));
+        let b = s(preview_cmd(&RemoteOs::Bsd, b"/a", 10));
+        assert!(l.contains("n=$(stat -L -c %s -- '/a')"), "{l}");
+        assert!(b.contains("n=$(stat -L -f %z -- '/a')"), "{b}");
+        assert!(!l.contains("wc -c") && !b.contains("wc -c"));
+    }
+
+    #[test]
+    fn delete_cmd_resolves_physical_paths_and_checks_before_rm() {
+        let c = s(delete_cmd(b"/srv/it's", &[b"a b", b"-r", b"x\ny"]));
+        assert!(
+            c.contains("h=$(cd -- \"$HOME\" 2>/dev/null && pwd -P) || exit 40"),
+            "{c}"
         );
+        assert!(
+            c.contains("c=$(cd -- '/srv/it'\\''s' && pwd -P) || exit 41"),
+            "{c}"
+        );
+        assert!(c.contains("for n in 'a b' '-r' 'x\ny'; do"), "{c}");
+        assert!(c.contains("case \"$h/\" in \"$t\"/*)"), "{c}");
+        assert!(c.contains("exit 42"), "{c}");
+        assert!(
+            c.ends_with("cd -- \"$c\" && rm -rf -- 'a b' '-r' 'x\ny'"),
+            "{c}"
+        );
+        let rm = c.find("rm -rf").unwrap();
+        assert!(c.find("exit 42").unwrap() < rm && c.find("exit 41").unwrap() < rm);
+        assert_eq!(
+            (DELETE_NO_HOME, DELETE_NO_CWD, DELETE_PROTECTED),
+            (40, 41, 42)
+        );
+    }
+
+    #[test]
+    fn resolve_and_mktemp_cmds() {
+        let c = s(resolve_cmd(b"/d/it's"));
+        assert!(c.starts_with("p='/d/it'\\''s'; n=0\n"), "{c}");
+        assert!(c.contains("while [ -L \"$p\" ]"), "{c}");
+        assert!(c.contains("readlink -- \"$p\""), "{c}");
+        assert!(c.contains("pwd -P"), "{c}");
+        assert!(c.ends_with("printf '%s\\0' \"$p\""), "{c}");
+        assert_eq!(
+            s(mktemp_cmd(b"/srv/it's")),
+            "t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+        );
+        assert_eq!(
+            s(mktemp_cmd(b"/")),
+            "t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+        );
+    }
+
+    #[test]
+    fn replace_cmd_checks_size_owner_applies_mode_then_moves_or_rewrites_in_place() {
+        let l = s(replace_cmd(
+            &RemoteOs::Linux,
+            b"/d/.hdir-edit.AB",
+            b"/d/it's",
+            42,
+        ));
+        assert!(
+            l.starts_with("t='/d/.hdir-edit.AB'; o='/d/it'\\''s'\n"),
+            "{l}"
+        );
+        assert!(
+            l.contains("[ \"$(wc -c < \"$t\" | tr -d ' ')\" = 42 ] || exit 31"),
+            "{l}"
+        );
+        assert!(
+            l.contains("m=$(stat -c '%a %h %u %g' -- \"$o\") || exit 1; set -- $m"),
+            "{l}"
+        );
+        assert!(l.contains("exit 32"), "{l}");
+        assert!(
+            l.contains("chmod \"$1\" \"$t\" && mv -- \"$t\" \"$o\""),
+            "{l}"
+        );
+        assert!(
+            l.contains("if [ \"$2\" -gt 1 ]; then cat -- \"$t\" > \"$o\" && rm -f -- \"$t\""),
+            "{l}"
+        );
+        assert!(l.find("exit 31").unwrap() < l.find("cat --").unwrap());
+        assert!(!l.contains("-L"), "no write-through-link branch any more");
+        let b = s(replace_cmd(&RemoteOs::Bsd, b"/t", b"/o", 1));
+        assert!(b.contains("stat -f '%Lp %l %u %g' -- \"$o\""), "{b}");
+        assert_eq!((REPLACE_SIZE, REPLACE_NOT_OWNER), (31, 32));
         assert_eq!(s(rm_file_cmd(b"/d/-x y")), "rm -f -- '/d/-x y'");
     }
 
@@ -1024,9 +1210,8 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     }
 
     #[test]
-    fn rmdir_and_home_cmds() {
+    fn rmdir_cmd_quotes() {
         assert_eq!(s(rmdir_cmd(b"/d/-x y")), "rmdir -- '/d/-x y'");
-        assert_eq!(s(home_cmd()), "printf '%s\\0' \"$HOME\"");
     }
 
     #[test]

@@ -196,7 +196,12 @@ fn lists_real_remote_files_with_odd_names() {
 }
 
 /// Names the file operations test creates (and the cleanup removes by name).
-const OPS_NAMES: [&str; 10] = [
+const OPS_NAMES: [&str; 15] = [
+    "mode600.txt",
+    "hl-a",
+    "hl-b",
+    "up-link",
+    "real-dir",
     "새 폴더 'q'",
     "moved dir",
     "t.txt",
@@ -222,7 +227,7 @@ impl Drop for OpsTmp {
         // Only the names this test created, relative to the (quoted) temp dir;
         // `&&` stops everything if the cd fails.
         let script = format!(
-            "cd -- {d} && rm -rf -- {n}; cd / && rmdir -- {d}",
+            "cd -- {d} && rm -rf -- {n} .hdir-edit.*; cd / && rmdir -- {d}",
             d = q(&self.dir),
             n = names.join(" ")
         );
@@ -332,34 +337,79 @@ fn remote_file_operations_round_trip() {
 
     // edit round trip: download -> change -> upload replaces atomically
     run("printf 'original' > 'edit me.txt' && chmod 640 'edit me.txt'");
+    const MODE_OF: &str = "stat -c %a 'edit me.txt' 2>/dev/null || stat -f %Lp 'edit me.txt'";
+    let mode_before = run(MODE_OF).trim().to_string();
+    assert_eq!(mode_before, "640");
     let copy = ops::fetch(&s, &d.join("edit me.txt")).expect("download");
     assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "original");
     assert!(!copy.stamp.differs(&copy.local).unwrap());
     std::fs::write(&copy.local, "changed on the server").unwrap();
     assert!(copy.stamp.differs(&copy.local).unwrap());
-    ops::upload_replace(&s, &copy.local, &d.join("edit me.txt"), &ops::edit_token())
-        .expect("upload");
+    ops::upload_replace(&s, &copy.local, &d.join("edit me.txt")).expect("upload");
     assert_eq!(run("cat 'edit me.txt'"), "changed on the server");
     assert_eq!(
         run("ls -A | grep -c hdir-edit || true").trim(),
         "0",
         "no temp left"
     );
-    println!(
-        "mode after upload: {}",
-        run("stat -c %a 'edit me.txt' 2>/dev/null || stat -f %Lp 'edit me.txt'").trim()
+    assert_eq!(
+        run(MODE_OF).trim(),
+        mode_before,
+        "permissions survive the upload"
     );
 
-    // symlink: the link survives and the target changes
-    run("printf 'before' > target.txt && ln -s target.txt ln-to-target");
+    // mode 600 survives too
+    run("printf 'secret' > mode600.txt && chmod 600 mode600.txt");
+    let m = |f: &str| {
+        run(&format!("stat -c %a {f} 2>/dev/null || stat -f %Lp {f}"))
+            .trim()
+            .to_string()
+    };
+    let before = m("mode600.txt");
+    let copy = ops::fetch(&s, &d.join("mode600.txt")).unwrap();
+    std::fs::write(&copy.local, "secret edited").unwrap();
+    ops::upload_replace(&s, &copy.local, &d.join("mode600.txt")).unwrap();
+    assert_eq!(run("cat mode600.txt"), "secret edited");
+    assert_eq!(m("mode600.txt"), before);
+    assert_eq!(before, "600");
+
+    // hard-linked file: rewritten in place, the link survives
+    run("printf 'shared' > hl-a && ln hl-a hl-b");
+    let nlink = |f: &str| {
+        run(&format!("stat -c %h {f} 2>/dev/null || stat -f %l {f}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(nlink("hl-a"), "2");
+    let copy = ops::fetch(&s, &d.join("hl-a")).unwrap();
+    std::fs::write(&copy.local, "shared edited").unwrap();
+    ops::upload_replace(&s, &copy.local, &d.join("hl-a")).unwrap();
+    assert_eq!(nlink("hl-a"), "2", "hard link count kept");
+    assert_eq!(run("cat hl-b"), "shared edited");
+
+    // symlink: the link survives and the target changes (target in another
+    // directory, mode kept, no temp left in either place)
+    run(
+        "mkdir real-dir && printf 'before' > real-dir/target.txt && chmod 640 real-dir/target.txt \
+         && ln -s real-dir/target.txt ln-to-target",
+    );
     let copy = ops::fetch(&s, &d.join("ln-to-target")).expect("download via link");
     std::fs::write(&copy.local, "after").unwrap();
-    ops::upload_replace(&s, &copy.local, &d.join("ln-to-target"), &ops::edit_token()).unwrap();
-    assert_eq!(run("[ -L ln-to-target ] && cat target.txt"), "after");
+    ops::upload_replace(&s, &copy.local, &d.join("ln-to-target")).unwrap();
+    assert_eq!(
+        run("[ -L ln-to-target ] && cat real-dir/target.txt"),
+        "after"
+    );
+    assert_eq!(m("real-dir/target.txt"), "640");
+    assert_eq!(
+        run("ls -A . real-dir | grep -c hdir-edit || true").trim(),
+        "0",
+        "no temp left"
+    );
 
     // failure path: a vanished directory leaves nothing behind and errors
     let gone = d.join("moved dir").join("nope").join("f.txt");
-    assert!(ops::upload_replace(&s, &copy.local, &gone, "x").is_err());
+    assert!(ops::upload_replace(&s, &copy.local, &gone).is_err());
 
     // cd resolution
     assert_eq!(ops::resolve_cd(&s, d, "moved dir").unwrap(), moved);
@@ -384,6 +434,18 @@ fn remote_file_operations_round_trip() {
             ))
             .trim(),
             "kept"
+        );
+    }
+    // reaching the home's parent through a symlink in the panel cwd
+    run("ln -s \"$(dirname \"$HOME\")\" up-link");
+    if let Some(name) = home_path.file_name() {
+        let via_link = d.join("up-link");
+        let e = ops::delete(&s, &via_link, &[name.to_os_string()]).unwrap_err();
+        assert!(e.contains("삭제 거부"), "{e}");
+        assert_eq!(
+            run("[ -d \"$HOME\" ] && echo kept").trim(),
+            "kept",
+            "home untouched"
         );
     }
     assert!(ops::delete(&s, Path::new("/"), &[OsString::from("..")]).is_err());

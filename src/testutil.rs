@@ -112,3 +112,73 @@ pub fn session_mode(cmd: Arc<FakeCmd>, mode: ScpMode) -> Arc<RemoteSession> {
         cmd,
     ))
 }
+
+/// Runs `ssh ... -- host CMD` as `sh -c CMD` on this machine (with `HOME`
+/// set) and `scp` as a file copy, so remote scripts can be exercised for real.
+/// The session's `os` must match this machine (`stat` flags).
+#[cfg(unix)]
+pub struct LocalSh {
+    pub home: PathBuf,
+}
+
+#[cfg(unix)]
+impl Cmd for LocalSh {
+    fn run(&self, argv: &[OsString]) -> CmdOutput {
+        let a = strs(argv);
+        let done = |o: std::process::Output| CmdOutput {
+            code: o.status.code(),
+            stdout: o.stdout,
+            stderr: o.stderr,
+        };
+        if a[0] == "scp" {
+            let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
+            let dst = dst.strip_prefix("prod-web:").unwrap_or(dst);
+            // Truncate in place like scp does (keeps the target's mode).
+            return match std::fs::read(src).and_then(|b| std::fs::write(dst, b)) {
+                Ok(()) => ok(""),
+                Err(e) => fail(1, &format!("scp: {e}\n")),
+            };
+        }
+        match remote_cmd(&a) {
+            Some(c) => done(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(c)
+                    .env("HOME", &self.home)
+                    .output()
+                    .unwrap(),
+            ),
+            None => fail(1, "unsupported\n"),
+        }
+    }
+    fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
+        self.run(argv)
+    }
+}
+
+/// The `RemoteOs` matching `stat` on this machine.
+#[cfg(unix)]
+pub fn local_os() -> RemoteOs {
+    if cfg!(target_os = "linux") {
+        RemoteOs::Linux
+    } else {
+        RemoteOs::Bsd
+    }
+}
+
+#[cfg(unix)]
+pub fn local_session(home: &std::path::Path) -> Arc<RemoteSession> {
+    Arc::new(RemoteSession::new(
+        "prod".into(),
+        SshTarget {
+            host: "prod-web".into(),
+            port: None,
+            control_path: PathBuf::from("/tmp/hdir-1/cm-%C"),
+        },
+        local_os(),
+        ScpMode::Sftp,
+        Arc::new(LocalSh {
+            home: home.to_path_buf(),
+        }),
+    ))
+}

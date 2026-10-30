@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -224,13 +225,38 @@ struct Upload {
     name: String,
     session: Arc<RemoteSession>,
     remote: PathBuf,
+    /// The edited local copy (kept whenever the upload does not complete).
+    local: PathBuf,
+    /// Set when the app quits without waiting any longer: the worker then
+    /// keeps the local copy whatever happens.
+    abandon: Arc<AtomicBool>,
+    /// The editor exited cleanly (shown as "편집 완료 (변경 없음)").
+    edited: bool,
+    /// What to show when the content turns out unchanged after an editor error.
+    editor_status: String,
 }
 
 struct UploadDone {
     result: Result<(), String>,
+    /// The content did not change: nothing was uploaded.
+    unchanged: bool,
     /// Where the local copy was kept after a failure.
     kept: Option<PathBuf>,
 }
+
+/// What [`App::finish_uploads`] found at quit time.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UploadReport {
+    /// Lines for stderr: where every unsent edit was kept and where it was
+    /// meant to go.
+    pub notes: Vec<String>,
+    /// Some upload did not complete.
+    pub failed: bool,
+}
+
+/// Uploads an edited copy over a remote file (`local`, `remote`); tests
+/// inject slow or failing fakes.
+pub type Uploader = Arc<dyn Fn(&RemoteSession, &Path, &Path) -> Result<(), String> + Send + Sync>;
 
 /// A command line command waiting for the main loop to suspend the TUI.
 struct ShellJob {
@@ -542,6 +568,10 @@ pub struct App {
     pending_remote_edit: Option<RemoteEditCtx>,
     /// Uploads of edited remote files in flight.
     uploads: Vec<Upload>,
+    /// Uploads an edited copy; tests may swap in a fake.
+    pub uploader: Uploader,
+    /// Local copies of edits whose upload failed, for the report at quit.
+    failed_copies: Vec<String>,
     /// Downloaded copies a background program may still be reading; they
     /// are removed with the app.
     keep_temp: Vec<tempfile::TempDir>,
@@ -654,6 +684,8 @@ impl App {
             pending_edit: None,
             pending_remote_edit: None,
             uploads: Vec::new(),
+            uploader: Arc::new(remote_ops::upload_replace),
+            failed_copies: Vec::new(),
             keep_temp: Vec::new(),
             preview: PreviewState::new(),
             preview_runner: Arc::new(preview::preview_path),
@@ -1850,54 +1882,59 @@ impl App {
             Err(e) => format!("터미널 복귀 실패: {e}"),
         };
         if let Some(ctx) = remote {
-            // Even after an editor error the user may have saved: upload if
-            // the content changed.
-            match ctx.copy.stamp.differs(&ctx.copy.local) {
-                Ok(true) => {
-                    self.start_upload(ctx, name);
-                    status = format!(
-                        "업로드 중…: {}",
-                        self.uploads.last().map_or("", |u| &u.name)
-                    );
-                }
-                Ok(false) if edited => status = format!("편집 완료: {name} (변경 없음)"),
-                Ok(false) => {}
-                Err(e) => {
-                    let kept = ctx.copy.dir.keep();
-                    status = format!(
-                        "오류: 편집한 파일을 읽을 수 없음: {e} · 임시 폴더: {}",
-                        kept.display()
-                    );
-                }
-            }
+            // Even after an editor error the user may have saved: a worker
+            // hashes the copy and uploads it if the content changed.
+            let editor_status = std::mem::replace(&mut status, format!("변경 확인 중…: {name}"));
+            self.start_upload(ctx, name, edited, editor_status);
         }
         self.status = Some(status);
     }
 
-    /// Upload the edited copy on a worker; the temp dir goes away with a
-    /// successful upload and is kept (and reported) after a failure.
-    fn start_upload(&mut self, ctx: RemoteEditCtx, name: String) {
+    /// On a worker: hash the edited copy and, if the content changed, upload
+    /// it. The temp dir goes away after a successful upload (or no change)
+    /// and is kept (and reported) after a failure or an abandoned wait.
+    fn start_upload(
+        &mut self,
+        ctx: RemoteEditCtx,
+        name: String,
+        edited: bool,
+        editor_status: String,
+    ) {
         let RemoteEditCtx {
             session,
             remote,
             copy,
         } = ctx;
-        let EditCopy { dir, local, .. } = copy;
+        let EditCopy { dir, local, stamp } = copy;
         let (tx, rx) = mpsc::channel();
-        let (s2, r2) = (Arc::clone(&session), remote.clone());
+        let abandon = Arc::new(AtomicBool::new(false));
+        let (s2, r2, l2) = (Arc::clone(&session), remote.clone(), local.clone());
+        let (up, ab) = (Arc::clone(&self.uploader), Arc::clone(&abandon));
         std::thread::spawn(move || {
-            let result = remote_ops::upload_replace(&s2, &local, &r2, &remote_ops::edit_token());
-            let kept = result.is_err().then(|| {
+            let (result, unchanged) = match stamp.differs(&l2) {
+                Ok(false) => (Ok(()), true),
+                Ok(true) => (up(&s2, &l2, &r2), false),
+                Err(e) => (Err(format!("편집한 파일을 읽을 수 없음: {e}")), false),
+            };
+            let kept = (result.is_err() || ab.load(Ordering::SeqCst)).then(|| {
                 let _ = dir.keep();
-                local.clone()
+                l2.clone()
             });
-            let _ = tx.send(UploadDone { result, kept });
+            let _ = tx.send(UploadDone {
+                result,
+                unchanged,
+                kept,
+            });
         });
         self.uploads.push(Upload {
             rx,
             name,
             session,
             remote,
+            local,
+            abandon,
+            edited,
+            editor_status,
         });
     }
 
@@ -1908,24 +1945,35 @@ impl App {
     /// Apply finished uploads; returns true when the screen changed.
     fn tick_uploads(&mut self) -> bool {
         let mut done = Vec::new();
-        self.uploads.retain(|u| match u.rx.try_recv() {
-            Ok(d) => {
-                done.push((u.name.clone(), Arc::clone(&u.session), u.remote.clone(), d));
-                false
+        let mut pending = Vec::new();
+        for u in std::mem::take(&mut self.uploads) {
+            match u.rx.try_recv() {
+                Ok(d) => done.push((u, d)),
+                Err(TryRecvError::Empty) => pending.push(u),
+                Err(TryRecvError::Disconnected) => {
+                    let d = UploadDone {
+                        result: Err("업로드 중단됨".into()),
+                        unchanged: false,
+                        kept: Some(u.local.clone()),
+                    };
+                    done.push((u, d));
+                }
             }
-            Err(TryRecvError::Empty) => true,
-            Err(TryRecvError::Disconnected) => {
-                let d = UploadDone {
-                    result: Err("업로드 중단됨".into()),
-                    kept: None,
-                };
-                done.push((u.name.clone(), Arc::clone(&u.session), u.remote.clone(), d));
-                false
-            }
-        });
+        }
+        self.uploads = pending;
         let changed = !done.is_empty();
-        for (name, session, remote, d) in done {
+        for (u, d) in done {
+            let Upload {
+                name,
+                session,
+                remote,
+                edited,
+                editor_status,
+                ..
+            } = u;
             self.status = Some(match &d.result {
+                Ok(()) if d.unchanged && edited => format!("편집 완료: {name} (변경 없음)"),
+                Ok(()) if d.unchanged => editor_status,
                 Ok(()) => format!("편집 완료: {name} (업로드됨)"),
                 Err(e) => {
                     let kept = d
@@ -1933,6 +1981,14 @@ impl App {
                         .as_ref()
                         .map(|k| format!(" · 임시 복사본: {}", k.display()))
                         .unwrap_or_default();
+                    if let Some(k) = &d.kept {
+                        self.failed_copies.push(format!(
+                            "업로드 실패: {name}: {e}\n  편집한 복사본: {}\n  원격 대상: {}:{}",
+                            k.display(),
+                            session.target.host,
+                            remote.display()
+                        ));
+                    }
                     format!("업로드 실패: {name}: {e}{kept}")
                 }
             });
@@ -1958,26 +2014,43 @@ impl App {
         changed
     }
 
-    /// Wait (bounded) for uploads still running when the app quits; returns
-    /// the messages of failures so the caller can print them.
-    pub fn finish_uploads(&mut self, timeout: Duration) -> Vec<String> {
+    /// Wait (bounded) for uploads still running when the app quits. Every
+    /// edit that did not reach the server (failed earlier, failed now, or
+    /// still running when the wait expires) keeps its local copy; the report
+    /// names the copy and the remote destination so the caller can print them
+    /// once the terminal is restored.
+    pub fn finish_uploads(&mut self, timeout: Duration) -> UploadReport {
         let deadline = Instant::now() + timeout;
-        let mut notes = Vec::new();
         while self.has_uploads() && Instant::now() < deadline {
             self.tick_uploads();
-            if self
-                .status
-                .as_deref()
-                .is_some_and(|s| s.starts_with("업로드 실패"))
-            {
-                notes.extend(self.status.take());
-            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        if self.has_uploads() {
-            notes.push("업로드가 끝나지 않았음 (원격 파일은 바뀌지 않음)".to_string());
+        let mut notes = std::mem::take(&mut self.failed_copies);
+        for u in &self.uploads {
+            u.abandon.store(true, Ordering::SeqCst);
+            notes.push(format!(
+                "업로드가 끝나지 않음: {}\n  편집한 복사본: {}\n  원격 대상: {}:{}",
+                u.name,
+                u.local.display(),
+                u.session.target.host,
+                u.remote.display()
+            ));
         }
-        notes
+        UploadReport {
+            failed: !notes.is_empty(),
+            notes,
+        }
+    }
+
+    /// The quit path of `main`: wait for uploads, print the report to `err`
+    /// (call after the terminal is restored); `false` means an edit was not
+    /// uploaded and the process should exit non-zero.
+    pub fn quit_uploads(&mut self, timeout: Duration, err: &mut dyn std::io::Write) -> bool {
+        let report = self.finish_uploads(timeout);
+        for note in &report.notes {
+            let _ = writeln!(err, "hdir: {note}");
+        }
+        !report.failed
     }
 
     /// F3: view the current file (directories and `..` do nothing).
@@ -8439,12 +8512,13 @@ mod tests {
             wait_remote(&mut app);
             let rm: Vec<String> = cmds(&f)
                 .into_iter()
-                .filter(|c| c.starts_with("rm "))
+                .filter(|c| c.contains("rm -rf --"))
                 .collect();
-            assert_eq!(
-                rm,
-                vec!["rm -rf -- '/srv/data/a.txt' '/srv/data/한글 b.txt'".to_string()]
+            let want = crate::remote::delete_cmd(
+                b"/srv/data",
+                &["a.txt".as_bytes(), "한글 b.txt".as_bytes()],
             );
+            assert_eq!(rm, vec![String::from_utf8(want).unwrap()]);
             assert_eq!(
                 app.status.as_deref(),
                 Some("영구 삭제: 2개 (원격 삭제는 되돌릴 수 없음)")
@@ -8458,14 +8532,19 @@ mod tests {
         #[test]
         fn remote_f8_refuses_the_remote_home_directory() {
             let (_t, mut app, f) = env();
-            *f.home.lock().unwrap() = "/srv/data/sub".into();
+            // the delete script itself refuses (it resolves $HOME on the host)
+            script(&f, |a| {
+                crate::testutil::remote_cmd(a)
+                    .filter(|c| c.contains("rm -rf --"))
+                    .map(|_| out(crate::remote::DELETE_PROTECTED, ""))
+            });
             connect_prod(&mut app);
             press(&mut app, KeyCode::Down); // sub == $HOME
             press(&mut app, KeyCode::F(8));
             press(&mut app, KeyCode::Enter);
             wait_idle(&mut app);
             assert!(app.status.as_deref().unwrap().contains("삭제 거부"));
-            assert!(cmds(&f).iter().all(|c| !c.starts_with("rm ")));
+            assert!(app.status.as_deref().unwrap().contains("홈 디렉터리"));
         }
 
         #[test]
@@ -8539,7 +8618,11 @@ mod tests {
                     truncated: false
                 })
             );
-            let want = crate::remote::preview_cmd(b"/srv/data/a.txt", 65536 + 3);
+            let want = crate::remote::preview_cmd(
+                &crate::remote::RemoteOs::Linux,
+                b"/srv/data/a.txt",
+                65536 + 3,
+            );
             assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
         }
 
@@ -8604,7 +8687,11 @@ mod tests {
             assert!(
                 matches!(&v.content, viewer::Content::Text { lines, .. } if lines == &["first", "second"])
             );
-            let want = crate::remote::preview_cmd(b"/srv/data/a.txt", 4 * 1024 * 1024 + 3);
+            let want = crate::remote::preview_cmd(
+                &crate::remote::RemoteOs::Linux,
+                b"/srv/data/a.txt",
+                4 * 1024 * 1024 + 3,
+            );
             assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
             press(&mut app, KeyCode::Esc);
             assert!(app.viewer.is_none());
@@ -8662,6 +8749,17 @@ mod tests {
             let rec = Arc::clone(&uploads);
             script(f, move |a| {
                 if a[0] != "scp" {
+                    // the upload's resolve and mktemp scripts (see remote_ops)
+                    let c = crate::testutil::remote_cmd(a)?;
+                    let unq = |q: &str| q[1..q.len() - 1].replace("'\\''", "'");
+                    if let Some(r) = c.strip_prefix("p=") {
+                        let q = r.split_once("; n=0\n").unwrap().0;
+                        return Some(out(0, &format!("{}\0", unq(q))));
+                    }
+                    if let Some(r) = c.strip_prefix("t=$(mktemp ") {
+                        let q = r.split_once(") || exit 1").unwrap().0;
+                        return Some(out(0, &format!("{}\0", unq(q).replace("XXXXXX", "Ab12Cd"))));
+                    }
                     return None;
                 }
                 let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
@@ -8741,17 +8839,23 @@ mod tests {
                 "{path}"
             );
             assert_eq!(rest, "orig|700", "private dir, downloaded content");
-            assert!(app.status.as_deref().unwrap().contains("업로드 중"));
+            assert_eq!(
+                app.status.as_deref(),
+                Some("변경 확인 중…: a.txt"),
+                "hashing runs on a worker"
+            );
             wait_uploads(&mut app);
             let ups = ups.lock().unwrap().clone();
             assert_eq!(ups.len(), 1);
-            assert!(
-                ups[0].0.starts_with("prod-web:/srv/data/.hdir-edit-"),
-                "{ups:?}"
-            );
+            assert_eq!(ups[0].0, "prod-web:/srv/data/.hdir-edit.Ab12Cd");
             assert_eq!(ups[0].1, "edited");
             let tmp = ups[0].0.strip_prefix("prod-web:").unwrap();
-            let want = crate::remote::replace_cmd(tmp.as_bytes(), b"/srv/data/a.txt");
+            let want = crate::remote::replace_cmd(
+                &crate::remote::RemoteOs::Linux,
+                tmp.as_bytes(),
+                b"/srv/data/a.txt",
+                6,
+            );
             assert!(cmds(&f).contains(&String::from_utf8(want).unwrap()));
             assert_eq!(app.status.as_deref(), Some("편집 완료: a.txt (업로드됨)"));
             assert!(!Path::new(path).exists(), "temp copy removed after upload");
@@ -8765,7 +8869,7 @@ mod tests {
                 let seen = edit_with(&mut app, after);
                 f4_and_download(&mut app);
                 app.run_edit(|f| Ok(f()));
-                assert!(!app.has_uploads(), "{after:?}");
+                wait_uploads(&mut app);
                 assert!(ups.lock().unwrap().is_empty());
                 assert_eq!(app.status.as_deref(), Some("편집 완료: a.txt (변경 없음)"));
                 let path = seen.lock().unwrap()[0]
@@ -8870,28 +8974,131 @@ mod tests {
         }
 
         #[test]
-        fn quitting_waits_for_a_running_upload_but_not_forever() {
-            for (delay_ms, wait_ms, left) in [(60u64, 5000u64, false), (600, 30, true)] {
-                let (_t, mut app, f) = edit_env();
-                let ups = scp_hook(&f, "orig", out(0, ""));
-                let inner = f.hook.lock().unwrap().take().unwrap();
-                script(&f, move |a| {
-                    if a[0] == "scp" && a.last().unwrap().starts_with("prod-web:") {
-                        std::thread::sleep(Duration::from_millis(delay_ms));
-                    }
-                    inner(a)
-                });
-                edit_with(&mut app, Some("slow edit"));
-                f4_and_download(&mut app);
-                app.run_edit(|f| Ok(f()));
-                assert!(app.has_uploads());
-                let notes = app.finish_uploads(Duration::from_millis(wait_ms));
-                assert_eq!(app.has_uploads(), left);
-                assert_eq!(notes.len(), usize::from(left), "{notes:?}");
-                if !left {
-                    assert_eq!(ups.lock().unwrap()[0].1, "slow edit");
-                }
+        fn remote_f4_uploads_when_the_content_changed_but_size_and_mtime_were_restored() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            app.editor_runner = Arc::new(|argv: &[OsString]| {
+                let p = PathBuf::from(argv.last().unwrap());
+                let old = fs::metadata(&p).unwrap().modified().unwrap();
+                fs::write(&p, "ORIG").unwrap(); // same length
+                fs::File::options()
+                    .write(true)
+                    .open(&p)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+                Ok(())
+            });
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            wait_uploads(&mut app);
+            assert_eq!(ups.lock().unwrap().len(), 1, "content decides");
+            assert_eq!(ups.lock().unwrap()[0].1, "ORIG");
+        }
+
+        #[test]
+        fn remote_f4_unchanged_after_an_editor_error_keeps_the_editor_message() {
+            let (_t, mut app, f) = edit_env();
+            let ups = scp_hook(&f, "orig", out(0, ""));
+            app.editor_runner =
+                Arc::new(|_: &[OsString]| Err("편집기가 오류로 종료됨 (종료 코드 1)".into()));
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            wait_uploads(&mut app);
+            assert!(ups.lock().unwrap().is_empty());
+            assert_eq!(
+                app.status.as_deref(),
+                Some("편집기가 오류로 종료됨 (종료 코드 1)")
+            );
+        }
+
+        /// F4 edit of a.txt with `up` as the uploader (scp only serves the
+        /// download), left running after `run_edit`.
+        fn editing_with_uploader(
+            up: impl Fn(&RemoteSession, &Path, &Path) -> Result<(), String> + Send + Sync + 'static,
+        ) -> (TempDir, App, Arc<FakeSsh>) {
+            let (t, mut app, f) = edit_env();
+            scp_hook(&f, "orig", out(0, ""));
+            app.uploader = Arc::new(up);
+            edit_with(&mut app, Some("slow edit"));
+            f4_and_download(&mut app);
+            app.run_edit(|f| Ok(f()));
+            assert!(app.has_uploads());
+            (t, app, f)
+        }
+
+        #[test]
+        fn quitting_waits_for_a_running_upload() {
+            let (_t, mut app, _f) = editing_with_uploader(|_, _, _| {
+                std::thread::sleep(Duration::from_millis(60));
+                Ok(())
+            });
+            let mut err = Vec::new();
+            assert!(app.quit_uploads(Duration::from_secs(5), &mut err));
+            assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+            assert!(!app.has_uploads());
+        }
+
+        #[test]
+        fn quit_timeout_keeps_the_edited_copy_and_reports_where_it_goes() {
+            let (_t, mut app, _f) = editing_with_uploader(|_, local, _| {
+                std::thread::sleep(Duration::from_millis(400));
+                assert_eq!(fs::read_to_string(local).unwrap(), "slow edit");
+                Ok(())
+            });
+            let mut err = Vec::new();
+            assert!(
+                !app.quit_uploads(Duration::from_millis(30), &mut err),
+                "an unfinished upload fails the exit code"
+            );
+            let text = String::from_utf8(err).unwrap();
+            assert!(
+                text.starts_with("hdir: 업로드가 끝나지 않음: a.txt"),
+                "{text}"
+            );
+            assert!(
+                text.contains("원격 대상: prod-web:/srv/data/a.txt"),
+                "{text}"
+            );
+            let local = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("편집한 복사본: "))
+                .expect("names the local copy");
+            // the worker finishing later must not delete what was reported
+            std::thread::sleep(Duration::from_millis(600));
+            assert_eq!(fs::read_to_string(local).unwrap(), "slow edit");
+            fs::remove_dir_all(Path::new(local).parent().unwrap()).unwrap();
+        }
+
+        #[test]
+        fn quit_reports_failed_uploads_with_their_kept_copies() {
+            let (_t, mut app, _f) =
+                editing_with_uploader(|_, _, _| Err("scp: No space left on device".into()));
+            let start = Instant::now();
+            while app.has_uploads() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
             }
+            assert!(app.status.as_deref().unwrap().starts_with("업로드 실패"));
+            let mut err = Vec::new();
+            assert!(!app.quit_uploads(Duration::from_secs(1), &mut err));
+            let text = String::from_utf8(err).unwrap();
+            assert!(text.contains("No space left"), "{text}");
+            assert!(
+                text.contains("원격 대상: prod-web:/srv/data/a.txt"),
+                "{text}"
+            );
+            let local = text
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("편집한 복사본: "))
+                .unwrap();
+            assert_eq!(fs::read_to_string(local).unwrap(), "slow edit");
+            // reported once
+            let mut again = Vec::new();
+            assert!(app.quit_uploads(Duration::from_millis(10), &mut again));
+            assert!(again.is_empty());
+            fs::remove_dir_all(Path::new(local).parent().unwrap()).unwrap();
         }
 
         #[test]

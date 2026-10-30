@@ -40,11 +40,13 @@ fn main() -> ExitCode {
     app.ssh_config_path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));
     let result = run_app(&mut app);
     // An edited remote file may still be uploading.
-    for note in app.finish_uploads(Duration::from_secs(120)) {
-        eprintln!("hdir: {note}");
-    }
-    // The terminal is back to normal here, so errors are visible.
-    let mut code = ExitCode::SUCCESS;
+    // The terminal is back to normal here, so the report is visible.
+    let uploaded = app.quit_uploads(Duration::from_secs(120), &mut std::io::stderr());
+    let mut code = if uploaded {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    };
     if let Err(e) = result {
         eprintln!("hdir: {e}");
         code = ExitCode::FAILURE;
