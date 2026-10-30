@@ -24,6 +24,8 @@ pub enum Preview {
         dirs: u64,
         total_size: u64,
         truncated: bool,
+        /// entries that could not be read (stat/readdir error)
+        errors: u64,
     },
     Empty,
     Error(String),
@@ -46,6 +48,13 @@ pub fn preview_path(path: &Path) -> Preview {
                 Ok((m.is_dir(), m.len()))
             })),
             Err(e) => Preview::Error(e.to_string()),
+        };
+    }
+    if !meta.is_file() {
+        // fifo / socket / device: opening could block forever or have side effects
+        return Preview::Binary {
+            size: meta.len(),
+            kind: "특수 파일",
         };
     }
     let mut buf = Vec::new();
@@ -149,7 +158,7 @@ pub fn classify(bytes: &[u8], file_size: u64) -> Preview {
 }
 
 pub fn summarize_dir(mut entries: impl Iterator<Item = io::Result<(bool, u64)>>) -> Preview {
-    let (mut files, mut dirs, mut total_size) = (0u64, 0u64, 0u64);
+    let (mut files, mut dirs, mut total_size, mut errors) = (0u64, 0u64, 0u64, 0u64);
     for _ in 0..DIR_LIMIT {
         match entries.next() {
             None => {
@@ -158,6 +167,7 @@ pub fn summarize_dir(mut entries: impl Iterator<Item = io::Result<(bool, u64)>>)
                     dirs,
                     total_size,
                     truncated: false,
+                    errors,
                 };
             }
             Some(Ok((true, _))) => dirs += 1,
@@ -165,7 +175,7 @@ pub fn summarize_dir(mut entries: impl Iterator<Item = io::Result<(bool, u64)>>)
                 files += 1;
                 total_size += sz;
             }
-            Some(Err(_)) => {}
+            Some(Err(_)) => errors += 1,
         }
     }
     Preview::Dir {
@@ -173,6 +183,7 @@ pub fn summarize_dir(mut entries: impl Iterator<Item = io::Result<(bool, u64)>>)
         dirs,
         total_size,
         truncated: entries.next().is_some(),
+        errors,
     }
 }
 
@@ -299,7 +310,8 @@ mod tests {
                 files: 3,
                 dirs: 2,
                 total_size: 30,
-                truncated: false
+                truncated: false,
+                errors: 1
             }
         );
     }
@@ -312,7 +324,8 @@ mod tests {
                 files: 10_000,
                 dirs: 0,
                 total_size: 100_000,
-                truncated: true
+                truncated: true,
+                errors: 0
             }
         );
         assert!(matches!(
@@ -395,5 +408,68 @@ mod tests {
             return; // running as root
         }
         assert!(matches!(preview_path(&f), Preview::Error(_)));
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(p: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_is_special_and_never_opened() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("fifo");
+        mkfifo(&f);
+        // would block forever if opened (no writer)
+        assert_eq!(
+            preview_path(&f),
+            Preview::Binary {
+                size: 0,
+                kind: "특수 파일"
+            }
+        );
+        let ln = d.path().join("ln");
+        std::os::unix::fs::symlink(&f, &ln).unwrap();
+        assert!(matches!(
+            preview_path(&ln),
+            Preview::Binary {
+                kind: "특수 파일",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn char_device_is_special() {
+        assert!(matches!(
+            preview_path(Path::new("/dev/null")),
+            Preview::Binary {
+                kind: "특수 파일",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dir_summary_error_count_when_truncated() {
+        let it = (0..10_001).map(|i| {
+            if i % 2 == 0 {
+                Err(io::Error::other("x"))
+            } else {
+                Ok((false, 1))
+            }
+        });
+        assert!(matches!(
+            summarize_dir(it),
+            Preview::Dir {
+                truncated: true,
+                errors: 5000,
+                ..
+            }
+        ));
     }
 }
