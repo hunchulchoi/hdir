@@ -1,6 +1,6 @@
 # hdir 프로젝트 룰
 
-Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 전체 계획: `docs/plan.md`, 원 구상: `docs/mvp계획.md`.
+Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 전체 계획: `docs/plan.md`, 원 구상: `docs/mvp계획.md`. 인수인계: `docs/HANDOFF.md`.
 
 ## 1. TDD 필수
 - 모든 기능 이슈는 Red → Green → Refactor 순서.
@@ -31,6 +31,7 @@ Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 전체 계�
   | In Progress | `c602bd20-e8a4-4b05-ab17-39cd1bae36dd` |
   | Done | `6df7a108-aebb-4dca-98ab-6092627cfa20` |
   | Cancelled | `c5df0cd3-c2e2-4889-9ca3-f70cd1a59935` |
+- 헬퍼: `scripts/plane.sh state <NN> <todo|progress|done|backlog>`, `scripts/plane.sh comment <NN> "..."`, `scripts/plane.sh status`.
 - 이슈 착수 → In Progress. 체크포인트 커밋마다 이슈 코멘트(커밋 SHA·요약·테스트 결과). PR 생성 → PR URL 코멘트. merge → Done.
 - 계획 변경·새 작업 발견 → 이슈 추가 후 모듈에 연결, Plane 계획 페이지 갱신.
 
