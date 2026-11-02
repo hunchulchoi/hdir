@@ -1409,31 +1409,48 @@ mod tests {
         let d = t.path().join("big");
         std::fs::create_dir(&d).unwrap();
         let cap = crate::remote::REMOTE_DIR_CAP;
-        // long names: far more than a pipe buffer, so find meets SIGPIPE
-        let pad = "x".repeat(120);
-        for i in 0..cap + 50 {
-            std::fs::File::create(d.join(format!("{pad}{i}"))).unwrap();
-        }
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(
-                <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
-                    &crate::remote::preview_cmd(
-                        &crate::testutil::local_os(),
-                        d.as_os_str().as_encoded_bytes(),
-                        10,
+        let count = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(
+                    <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+                        &crate::remote::preview_cmd(
+                            &crate::testutil::local_os(),
+                            d.as_os_str().as_encoded_bytes(),
+                            10,
+                        ),
                     ),
-                ),
-            )
-            .output()
-            .unwrap();
+                )
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(crate::remote::PREVIEW_DIR),
+                "{out:?}"
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<usize>()
+                .unwrap()
+        };
+        for i in 0..cap {
+            std::fs::File::create(d.join(format!("f{i}"))).unwrap();
+        }
+        assert_eq!(count(), cap);
+        let s = local_session(t.path());
         assert_eq!(
-            out.status.code(),
-            Some(crate::remote::PREVIEW_DIR),
-            "{out:?}"
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개"))
         );
-        let n: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
-        assert_eq!(n, cap + 1);
+        // "./fNNNN\0" x 10000+ is more than a pipe buffer: find is cut off
+        for i in 0..50 {
+            std::fs::File::create(d.join(format!("more\n{i}"))).unwrap();
+        }
+        assert_eq!(count(), cap + 1);
+        assert_eq!(
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개 이상"))
+        );
     }
 
     #[test]
@@ -1529,28 +1546,6 @@ mod tests {
         assert_eq!(
             preview(&s, &d, Limits::PREVIEW),
             Preview::Info(format!("원격 디렉터리 · 항목 {n}개"))
-        );
-    }
-
-    #[test]
-    fn real_dir_preview_cap_boundary() {
-        let t = tempfile::tempdir().unwrap();
-        let d = t.path().join("big");
-        std::fs::create_dir(&d).unwrap();
-        let cap = crate::remote::REMOTE_DIR_CAP;
-        for i in 0..cap {
-            std::fs::File::create(d.join(format!("f{i}"))).unwrap();
-        }
-        let s = local_session(t.path());
-        assert_eq!(
-            preview(&s, &d, Limits::PREVIEW),
-            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개"))
-        );
-        std::fs::File::create(d.join("one more")).unwrap();
-        std::fs::File::create(d.join("and\nanother")).unwrap();
-        assert_eq!(
-            preview(&s, &d, Limits::PREVIEW),
-            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개 이상"))
         );
     }
 
