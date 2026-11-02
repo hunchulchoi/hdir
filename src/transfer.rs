@@ -296,23 +296,39 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
               else mv -f -- $F $T || exit 1; fi; \
               elif [ -d $T ]; then exit 47; else mv -f -- $F $T || exit 1; fi; "
             .to_vec(),
+        // Nothing is ever renamed over a name that may have been taken: a
+        // file is hard-linked, a symlink re-created (both fail when the name
+        // exists), a directory renamed with -T (which cannot replace a file,
+        // a link or a non-empty directory).
         (false, true) => cat(&[
             there,
-            b"if [ -f $F ] && [ ! -L $F ]; then \
+            b"if [ -L $F ]; then l=$(readlink -- $F && echo x) || exit 1; l=${l%?x}; \
+              if ln -sT -- \"$l\" $T 2>/dev/null; then rm -f -- $F; else ",
+            there,
+            b"exit 1; fi; \
+              elif [ -f $F ]; then \
               if ln -T -- $F $T 2>/dev/null; then rm -f -- $F; else ",
             there,
             b"exit 49; fi; else mv -T -- $F $T || exit 1; fi; ",
         ]),
-        // Without -T, `ln` puts the link inside a directory that appeared
-        // meanwhile: that is detected (`-ef`), undone and refused.
+        // Without -T, `ln` and `mv` go into a directory that appeared
+        // meanwhile: that is detected afterwards (`-ef`, `-L`, the inode),
+        // undone and refused.
         (false, false) => cat(&[
             there,
-            b"if [ -f $F ] && [ ! -L $F ]; then \
-              if ln -- $F $T 2>/dev/null; then \
-              if [ $T -ef $F ]; then rm -f -- $F; else rm -f -- $I; exit 48; fi; \
-              else ",
+            b"if [ -L $F ]; then l=$(readlink -- $F && echo x) || exit 1; l=${l%?x}; \
+              if ln -s -- \"$l\" $T 2>/dev/null; then \
+              if [ -L $T ]; then rm -f -- $F; else rm -f -- $I; exit 48; fi; else ",
             there,
-            b"exit 49; fi; else mv -- $F $T || exit 1; fi; ",
+            b"exit 1; fi; \
+              elif [ -f $F ]; then \
+              if ln -- $F $T 2>/dev/null; then \
+              if [ $T -ef $F ]; then rm -f -- $F; else rm -f -- $I; exit 48; fi; else ",
+            there,
+            b"exit 49; fi; \
+              else set -- $(ls -di -- $F) || exit 1; i=$1; mv -- $F $T || exit 1; \
+              set -- $(ls -di -- $T) || exit 1; \
+              if [ \"$1\" != \"$i\" ]; then mv -- $I $F; exit 48; fi; fi; ",
         ]),
     };
     let body = fill(
@@ -361,20 +377,22 @@ pub fn stamp_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
 }
 
 /// After a failed same-server move into `stage`: put `stage/name` back to
-/// `src` if it got there, then remove the (then empty) stage.
-pub fn unmove_cmd(stage: &[u8], name: &[u8], src: &[u8]) -> Vec<u8> {
-    let staged = sh_quote(&cat(&[&into_dir(stage), name]));
+/// `src` without replacing anything there ([`place_cmd`], so [`APPEARED`]
+/// when `src` was taken meanwhile and the stage then stays), or just remove
+/// the stage when the item never got there.
+pub fn unmove_cmd(os: &RemoteOs, stage: &[u8], name: &[u8], src: &[u8]) -> Vec<u8> {
+    let staged = cat(&[&into_dir(stage), name]);
+    let q = sh_quote(&staged);
     cat(&[
         b"if [ -e ",
-        &staged,
+        &q,
         b" ] || [ -L ",
-        &staged,
-        b" ]; then mv -- ",
-        &staged,
-        b" ",
-        &sh_quote(src),
-        b" || exit 1; fi; rmdir -- ",
+        &q,
+        b" ]; then ",
+        &place_cmd(os, &staged, src, stage, false),
+        b"; else rmdir -- ",
         &sh_quote(stage),
+        b"; fi",
     ])
 }
 
@@ -692,9 +710,15 @@ fn place(
         Stage::Remote(s, dir, p) => {
             let to = cat(&[&into_dir(&dir), &os_bytes(name)]);
             let from = cat(&[&into_dir(&p), &os_bytes(name)]);
-            let out = s
-                .exec(&place_cmd(&s.os, &from, &to, &p, replace))
-                .map_err(|e| e.message())?;
+            let out = match s.exec(&place_cmd(&s.os, &from, &to, &p, replace)) {
+                Ok(o) => o,
+                // A same-server move: the stage holds the only copy. Try to
+                // put it back (the connection may be gone) and name it.
+                Err(e) if restore.is_some() => {
+                    return Err(unmove_or_name(s, &p, name, restore, e.message()));
+                }
+                Err(e) => return Err(e.message()),
+            };
             match out.code {
                 Some(0) => return Ok(Placed::Done(None)),
                 Some(STAGE_LEFT) => {
@@ -712,14 +736,14 @@ fn place(
                 }
                 _ => code_err(&out),
             };
-            if let Some(back) = restore {
-                let undo = cat(&[b"mv -- ", &sh_quote(&from), b" ", &sh_quote(&b(back))]);
-                if !matches!(s.exec(&undo), Ok(o) if o.code == Some(0)) {
-                    return Err(format!(
-                        "{e} · 옮기던 항목이 임시 폴더에 남음: {}",
-                        String::from_utf8_lossy(&from)
-                    ));
-                }
+            if restore.is_some() {
+                // put back without replacing; the stage goes with it
+                let m = unmove_or_name(s, &p, name, restore, e.clone());
+                return if out.code == Some(APPEARED) && m == e {
+                    Ok(Placed::Taken)
+                } else {
+                    Err(m)
+                };
             }
             let left = discard(Stage::Remote(s, dir, p));
             match (out.code, left) {
@@ -728,6 +752,28 @@ fn place(
                 (_, None) => Err(e),
             }
         }
+    }
+}
+
+/// Put a same-server move's staged source back ([`unmove_cmd`]); the
+/// error `e`, plus where the item stayed when that did not work.
+fn unmove_or_name(
+    s: &RemoteSession,
+    stage: &[u8],
+    name: &OsString,
+    back: Option<&Path>,
+    e: String,
+) -> String {
+    let Some(back) = back else {
+        return e;
+    };
+    let cmd = unmove_cmd(&s.os, stage, &os_bytes(name), &b(back));
+    match s.exec(&cmd) {
+        Ok(o) if o.code == Some(0) => e,
+        _ => format!(
+            "{e} · 옮기던 항목이 임시 폴더에 남음: {}",
+            String::from_utf8_lossy(&cat(&[&into_dir(stage), &os_bytes(name)]))
+        ),
     }
 }
 
@@ -937,7 +983,7 @@ fn item(
         r.warnings.extend(match (on_host_move, stage) {
             // the stage may hold the source itself: put it back, never rm -rf
             (true, Stage::Remote(s, _, p)) => {
-                let cmd = unmove_cmd(&p, &os_bytes(name), &b(&src));
+                let cmd = unmove_cmd(&s.os, &p, &os_bytes(name), &b(&src));
                 (!matches!(s.exec(&cmd), Ok(o) if o.code == Some(0))).then(|| {
                     format!(
                         "옮기던 항목이 임시 폴더에 남았을 수 있음: {}",
@@ -1115,15 +1161,18 @@ mod tests {
             false,
         ))
         .unwrap();
-        assert_eq!(
-            pl,
-            "if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; \
-             if [ -f '/d/S/x' ] && [ ! -L '/d/S/x' ]; then \
-             if ln -- '/d/S/x' '/d/x' 2>/dev/null; then \
-             if [ '/d/x' -ef '/d/S/x' ]; then rm -f -- '/d/S/x'; else rm -f -- '/d/x/x'; exit 48; fi; \
-             else if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; \
-             exit 49; fi; else mv -- '/d/S/x' '/d/x' || exit 1; fi; rmdir -- '/d/S' || exit 46"
-        );
+        for part in [
+            "if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; ",
+            "if ln -s -- \"$l\" '/d/x' 2>/dev/null; then if [ -L '/d/x' ]; then rm -f -- '/d/S/x'; \
+             else rm -f -- '/d/x/x'; exit 48; fi;",
+            "if ln -- '/d/S/x' '/d/x' 2>/dev/null; then \
+             if [ '/d/x' -ef '/d/S/x' ]; then rm -f -- '/d/S/x'; else rm -f -- '/d/x/x'; exit 48; fi;",
+            "set -- $(ls -di -- '/d/S/x') || exit 1; i=$1; mv -- '/d/S/x' '/d/x' || exit 1;",
+            "if [ \"$1\" != \"$i\" ]; then mv -- '/d/x/x' '/d/S/x'; exit 48; fi;",
+        ] {
+            assert!(pl.contains(part), "missing {part}\nin {pl}");
+        }
+        assert!(pl.ends_with("rmdir -- '/d/S' || exit 46"), "{pl}");
         // GNU: -T never takes the target as a directory to go into
         let pl = String::from_utf8(place_cmd(
             &RemoteOs::Linux,
@@ -1144,19 +1193,20 @@ mod tests {
             b"/d/S",
             false,
         ));
-        assert_eq!(
-            pl.unwrap(),
-            "if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; \
-             if [ -f '/d/S/x' ] && [ ! -L '/d/S/x' ]; then \
-             if ln -T -- '/d/S/x' '/d/x' 2>/dev/null; then rm -f -- '/d/S/x'; else \
-             if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; \
-             exit 49; fi; else mv -T -- '/d/S/x' '/d/x' || exit 1; fi; rmdir -- '/d/S' || exit 46"
+        let pl = pl.unwrap();
+        for part in [
+            "if ln -sT -- \"$l\" '/d/x' 2>/dev/null; then rm -f -- '/d/S/x';",
+            "if ln -T -- '/d/S/x' '/d/x' 2>/dev/null; then rm -f -- '/d/S/x';",
+            "else mv -T -- '/d/S/x' '/d/x' || exit 1; fi; rmdir -- '/d/S' || exit 46",
+        ] {
+            assert!(pl.contains(part), "missing {part}\nin {pl}");
+        }
+        let um = String::from_utf8(unmove_cmd(&RemoteOs::Linux, b"/d/S", b"b", b"/s/b")).unwrap();
+        assert!(
+            um.starts_with("if [ -e '/d/S/b' ] || [ -L '/d/S/b' ]; then if [ -e '/s/b' ]"),
+            "{um}"
         );
-        assert_eq!(
-            String::from_utf8(unmove_cmd(b"/d/S", b"b", b"/s/b")).unwrap(),
-            "if [ -e '/d/S/b' ] || [ -L '/d/S/b' ]; then mv -- '/d/S/b' '/s/b' || exit 1; fi; \
-             rmdir -- '/d/S'"
-        );
+        assert!(um.ends_with("; else rmdir -- '/d/S'; fi"), "{um}");
         // paths are substituted once: a name containing a slot stays as is
         let odd = String::from_utf8(place_cmd(
             &RemoteOs::Bsd,
@@ -2857,7 +2907,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_same_server_move_puts_the_source_back_before_cleaning_up() {
+    fn a_failed_same_server_move_puts_the_source_back_without_replacing() {
         let f = FakeCmd::new(|a| {
             let c = remote_cmd(a).unwrap_or_default();
             if c.ends_with("|| exit 46") {
@@ -2877,12 +2927,20 @@ mod tests {
         let r = run(&s, &mut Ctl::new());
         assert_eq!((r.outcome, r.skipped), (OpOutcome::Done, 1));
         let cmds = f.remote_cmds();
-        let back = cmds
-            .iter()
-            .position(|c| *c == format!("mv -- '{STAGE}/b' '/srv/b'"))
-            .expect("moved back");
-        let rm = cmds.iter().position(|c| c.starts_with("rm -rf")).unwrap();
-        assert!(back < rm, "{cmds:?}");
+        let back = String::from_utf8(unmove_cmd(
+            &RemoteOs::Linux,
+            STAGE.as_bytes(),
+            b"b",
+            b"/srv/b",
+        ));
+        assert!(
+            cmds.contains(&back.unwrap()),
+            "put back without replacing: {cmds:?}"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.starts_with("rm -rf")),
+            "the stage holds the source: {cmds:?}"
+        );
     }
 
     #[test]
@@ -2980,5 +3038,98 @@ mod tests {
         );
         let r = run(&s, &mut Ctl::new());
         assert!(matches!(&r.outcome, OpOutcome::Failed(m) if m.contains("그 안으로")));
+    }
+
+    #[test]
+    fn real_a_staged_link_is_recreated_and_never_replaces_a_file() {
+        for os in [RemoteOs::Bsd, crate::testutil::local_os()] {
+            let t = tempfile::tempdir().unwrap();
+            let dest = private_dir(t.path(), "dest");
+            let (dir, stage, sp) = stage_in(&dest);
+            std::os::unix::fs::symlink("target\nwith newline", sp.join("ln")).unwrap();
+            let to = cat(&[&dir, b"/ln"]);
+            let from = cat(&[&stage, b"/ln"]);
+            let out = sh(&place_cmd(&os, &from, &to, &stage, false));
+            assert!(out.status.success(), "{os:?} {out:?}");
+            assert_eq!(
+                fs::read_link(dest.join("ln")).unwrap(),
+                PathBuf::from("target\nwith newline")
+            );
+            assert!(!sp.exists());
+            // a file took the name meanwhile: kept
+            let (dir, stage, sp) = stage_in(&dest);
+            std::os::unix::fs::symlink("x", sp.join("f")).unwrap();
+            let to = cat(&[&dir, b"/f"]);
+            let from = cat(&[&stage, b"/f"]);
+            let script = cat(&[
+                // past the first check: the file appears right before ln
+                b"ln() { printf theirs > ",
+                &sh_quote(&to),
+                b"; command ln \"$@\"; }; ",
+                &place_cmd(&os, &from, &to, &stage, false)[..],
+            ]);
+            assert_eq!(sh(&script).status.code(), Some(APPEARED), "{os:?}");
+            assert_eq!(fs::read(dest.join("f")).unwrap(), b"theirs");
+        }
+    }
+
+    #[test]
+    fn real_a_folder_never_ends_up_inside_one_that_appeared() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let (dir, stage, sp) = stage_in(&dest);
+        fs::create_dir(sp.join("d")).unwrap();
+        fs::write(sp.join("d/x"), "mine").unwrap();
+        let to = cat(&[&dir, b"/d"]);
+        let from = cat(&[&stage, b"/d"]);
+        // without -T: `d` appears as a directory right before the rename
+        let script = cat(&[
+            b"m=0; mv() { if [ $m = 0 ]; then m=1; mkdir -- ",
+            &sh_quote(&to),
+            b"; fi; command mv \"$@\"; }; ",
+            &place_cmd(&RemoteOs::Bsd, &from, &to, &stage, false),
+        ]);
+        assert_eq!(sh(&script).status.code(), Some(APPEARED));
+        assert_eq!(
+            fs::read_dir(dest.join("d")).unwrap().count(),
+            0,
+            "theirs, empty"
+        );
+        assert_eq!(
+            fs::read(sp.join("d/x")).unwrap(),
+            b"mine",
+            "ours back in the stage"
+        );
+    }
+
+    #[test]
+    fn real_putting_a_moved_source_back_never_replaces_a_new_one() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let src_dir = private_dir(t.path(), "src");
+        let (_, stage, sp) = stage_in(&dest);
+        fs::write(sp.join("b"), "moved").unwrap();
+        let src = b(&src_dir.join("b"));
+        fs::write(src_dir.join("b"), "new one").unwrap();
+        let os = crate::testutil::local_os();
+        assert_eq!(
+            sh(&unmove_cmd(&os, &stage, b"b", &src)).status.code(),
+            Some(APPEARED)
+        );
+        assert_eq!(fs::read(src_dir.join("b")).unwrap(), b"new one");
+        assert_eq!(
+            fs::read(sp.join("b")).unwrap(),
+            b"moved",
+            "kept in the stage"
+        );
+        // free again: it goes back and the stage goes
+        fs::remove_file(src_dir.join("b")).unwrap();
+        assert!(sh(&unmove_cmd(&os, &stage, b"b", &src)).status.success());
+        assert_eq!(fs::read(src_dir.join("b")).unwrap(), b"moved");
+        assert!(!sp.exists());
+        // nothing staged: only the stage goes
+        let (_, stage, sp) = stage_in(&dest);
+        assert!(sh(&unmove_cmd(&os, &stage, b"b", &src)).status.success());
+        assert!(!sp.exists());
     }
 }
