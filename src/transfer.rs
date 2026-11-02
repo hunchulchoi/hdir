@@ -1286,6 +1286,24 @@ fn item(
         };
     }
     let restore = on_host_move.then_some(src.as_path());
+    // Esc during a same-server move (its rename cannot be interrupted):
+    // nothing is placed and the source goes back. An item that arrived in
+    // full by any other route is still placed.
+    if on_host_move && ctl.is_cancelled() {
+        r.warnings.extend(match (restore, stage) {
+            (Some(back), Stage::Remote(s, _, p)) => {
+                let cmd = unmove_cmd(&s.os, &p, &os_bytes(name), &b(back));
+                (!matches!(s.exec(&cmd), Ok(o) if o.code == Some(0))).then(|| {
+                    format!(
+                        "옮기던 항목이 임시 폴더에 남았을 수 있음: {}",
+                        String::from_utf8_lossy(&p)
+                    )
+                })
+            }
+            (_, stage) => discard(stage),
+        });
+        return Step::Stop(OpOutcome::Cancelled);
+    }
     match place(stage, name, overwrite, restore) {
         Ok(Placed::Done(w)) => r.warnings.extend(w),
         Ok(Placed::Taken) => {
@@ -3222,7 +3240,8 @@ mod tests {
     #[test]
     fn a_source_changed_during_a_move_is_kept() {
         let t = tempfile::tempdir().unwrap();
-        let stamps = Arc::new(Mutex::new(vec!["1:2:3:4\n", "1:2:9:5\n"]));
+        // "<top ctime> <tree checksum>": the tree changed after it was sent
+        let stamps = Arc::new(Mutex::new(vec!["7.1 11 2\n", "8.2 99 2\n"]));
         let s2 = Arc::clone(&stamps);
         let f = FakeCmd::new(move |a| {
             if a[0] == "pipe" {
@@ -3245,9 +3264,12 @@ mod tests {
         let r = run(&s, &mut Ctl::new());
         assert_eq!((r.outcome, r.partial), (OpOutcome::Done, 1));
         assert!(r.warnings[0].contains("바뀌었거나"), "{:?}", r.warnings);
+        assert!(stamps.lock().unwrap().is_empty(), "both fingerprints taken");
+        let cmds = f.remote_cmds();
+        assert!(!cmds.iter().any(|c| c.contains("rm -rf")), "source kept");
         assert!(
-            !f.remote_cmds().iter().any(|c| c.contains("rm -rf")),
-            "source kept"
+            cmds.iter().any(|c| c.starts_with("if [ -e '/srv/a' ]")),
+            "put back from the quarantine: {cmds:?}"
         );
         assert_eq!(
             fs::read(t.path().join("a")).unwrap(),
@@ -4162,6 +4184,46 @@ mod tests {
         assert_eq!(
             [mode("u"), mode("g"), mode("ug"), mode("plain")],
             [0o755, 0o755, 0o750, 0o640]
+        );
+    }
+
+    #[test]
+    fn esc_during_a_same_server_move_puts_the_source_back() {
+        let c = Ctl::new();
+        let flag = Arc::clone(&c.cancel);
+        let f = FakeCmd::new(move |a| {
+            let cm = remote_cmd(a).unwrap_or_default();
+            if cm.starts_with("mv -- '/srv/b'") {
+                flag.store(true, Ordering::SeqCst); // Esc while it ran
+                return ok("");
+            }
+            answer(cm, &[], &[], "")
+        });
+        let sess = session(Arc::clone(&f));
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(Arc::clone(&sess)),
+            &p("/srv"),
+            &["b"],
+            Side::Remote(sess),
+            &p("/dst"),
+        );
+        let mut c = c;
+        let r = run(&s, &mut c);
+        assert_eq!(r.outcome, OpOutcome::Cancelled);
+        let cmds = f.remote_cmds();
+        let back = String::from_utf8(unmove_cmd(
+            &RemoteOs::Linux,
+            STAGE.as_bytes(),
+            b"b",
+            b"/srv/b",
+        ));
+        assert!(cmds.contains(&back.unwrap()), "{cmds:?}");
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.ends_with("|| exit 46") && c.contains("'/dst/b'")),
+            "not placed"
         );
     }
 }

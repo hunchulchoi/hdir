@@ -329,6 +329,7 @@ fn copy_file(
     // Private until the data is complete; source permissions are applied below.
     let mut out = create_private_file(&tmp)?;
     let mut buf = vec![0u8; CHUNK];
+    let mut xattr_err = None;
     let res = (|| -> io::Result<bool> {
         loop {
             if ctl.is_cancelled() {
@@ -341,6 +342,8 @@ fn copy_file(
             out.write_all(&buf[..n])?;
             ctl.on_progress(n as u64, src);
         }
+        // Before the mode: a read-only copy could not take them afterwards.
+        xattr_err = crate::platform::copy_xattrs_fd(&input, &out).err();
         out.set_permissions(meta.permissions())?;
         out.set_modified(meta.modified()?)?;
         out.sync_all()?;
@@ -349,6 +352,9 @@ fn copy_file(
     drop(out);
     match res {
         Ok(true) => {
+            if let Some(e) = xattr_err {
+                acc.warnings.push(xattr_warning(dest, &e));
+            }
             let step = place(&tmp, dest, approved, ctl, acc)?;
             if step == Step::Done {
                 ctl.on_file_done(dest);
@@ -364,6 +370,10 @@ fn copy_file(
             Err(e)
         }
     }
+}
+
+fn xattr_warning(dest: &Path, e: &io::Error) -> String {
+    format!("{}: 확장 속성 일부를 복사하지 못함 ({e})", dest.display())
 }
 
 fn skip_changed(src: &Path, acc: &mut Acc) -> io::Result<Step> {
@@ -537,6 +547,7 @@ fn copy_dir(
         }
     }
     let skipped_before = acc.skipped;
+    let mut xattr_err = None;
     let mut run = || -> io::Result<Step> {
         for entry in fs::read_dir(src)? {
             let entry = entry?;
@@ -553,12 +564,18 @@ fn copy_dir(
             }
         }
         if created {
+            if let Err(e) = crate::platform::copy_xattrs_path(src, dest) {
+                xattr_err = Some(e);
+            }
             set_dir_modified(dest, meta.modified()?)?;
             fs::set_permissions(dest, meta.permissions())?;
         }
         Ok(Step::Done)
     };
     let mut res = run();
+    if let Some(e) = xattr_err {
+        acc.warnings.push(xattr_warning(dest, &e));
+    }
     if let Some(b) = backup {
         if matches!(res, Ok(Step::Done)) && acc.skipped != skipped_before {
             // Incomplete copy: it must not replace the original. Drop it, put the
@@ -1146,6 +1163,69 @@ mod tests {
         assert!(src.exists());
         assert_eq!(c.progress, 5);
         assert_eq!(c.done, vec![dst.join("a.txt")]);
+    }
+
+    /// A user-settable extended attribute name on this OS (Finder tags on
+    /// macOS are `com.apple.metadata:_kMDItemUserTags`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const XATTR: &str = if cfg!(target_os = "macos") {
+        "com.apple.metadata:_kMDItemUserTags"
+    } else {
+        "user.hdir.test"
+    };
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn copy_keeps_extended_attributes_of_files_and_folders() {
+        let t = tempdir().unwrap();
+        let src = t.path().join("src");
+        let dst = t.path().join("dst");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join("sub/tagged.txt"), "x").unwrap();
+        // read-only, so the attribute must be set before the mode
+        fs::set_permissions(
+            src.join("sub/tagged.txt"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let tag = b"bplist00\xa1\x01UGreen\n2";
+        let set = |p: &Path, v: &[u8]| crate::platform::xattr_set_path(p, XATTR, v);
+        if let Err(e) = set(&src.join("sub"), tag) {
+            // only a filesystem without xattrs may skip the test
+            let unsupported =
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP);
+            assert!(unsupported, "{e}");
+            eprintln!("skipped: no xattr support here ({e})");
+            return;
+        }
+        fs::set_permissions(
+            src.join("sub/tagged.txt"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        set(&src.join("sub/tagged.txt"), tag).unwrap();
+        fs::set_permissions(
+            src.join("sub/tagged.txt"),
+            fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let mut c = ctl();
+        let r = copy_items(std::slice::from_ref(&src), &dst, &mut c);
+        assert_eq!(r.outcome, OpOutcome::Done);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let get = |p: &Path| crate::platform::xattr_get_path(p, XATTR).unwrap();
+        assert_eq!(
+            get(&dst.join("src/sub/tagged.txt")).as_deref(),
+            Some(&tag[..])
+        );
+        assert_eq!(
+            get(&dst.join("src/sub")).as_deref(),
+            Some(&tag[..]),
+            "folders too"
+        );
+        let m = fs::metadata(dst.join("src/sub/tagged.txt")).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o444);
     }
 
     #[cfg(unix)]

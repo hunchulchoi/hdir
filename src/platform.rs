@@ -529,3 +529,218 @@ mod tests {
         assert_eq!(fs::read_to_string(d.join("b")).unwrap(), "x");
     }
 }
+
+// ---- extended attributes (Finder tags, resource forks, `user.*`) ----
+//
+// Copied best effort on Linux and macOS; elsewhere nothing happens. Paths
+// are never followed through a final symlink. A target filesystem without
+// xattr support is not an error.
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod xattr_sys {
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::os::raw::{c_char, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::RawFd;
+    use std::path::Path;
+
+    /// What the calls act on: an open file, or a path (not followed).
+    #[derive(Clone, Copy)]
+    pub enum On<'a> {
+        Fd(RawFd),
+        Path(&'a CStr),
+    }
+
+    pub fn cpath(p: &Path) -> io::Result<CString> {
+        CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
+    }
+
+    fn check(n: isize) -> io::Result<usize> {
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    const NOFOLLOW: i32 = libc::XATTR_NOFOLLOW;
+
+    // SAFETY (all calls below): the buffers are valid for the lengths passed,
+    // names and paths are NUL-terminated C strings.
+    fn raw_list(on: On, buf: *mut c_char, len: usize) -> io::Result<usize> {
+        check(unsafe {
+            match on {
+                #[cfg(target_os = "linux")]
+                On::Fd(fd) => libc::flistxattr(fd, buf, len),
+                #[cfg(target_os = "linux")]
+                On::Path(p) => libc::llistxattr(p.as_ptr(), buf, len),
+                #[cfg(target_os = "macos")]
+                On::Fd(fd) => libc::flistxattr(fd, buf, len, 0),
+                #[cfg(target_os = "macos")]
+                On::Path(p) => libc::listxattr(p.as_ptr(), buf, len, NOFOLLOW),
+            }
+        })
+    }
+
+    fn raw_get(on: On, name: &CStr, buf: *mut c_void, len: usize) -> io::Result<usize> {
+        check(unsafe {
+            match on {
+                #[cfg(target_os = "linux")]
+                On::Fd(fd) => libc::fgetxattr(fd, name.as_ptr(), buf, len),
+                #[cfg(target_os = "linux")]
+                On::Path(p) => libc::lgetxattr(p.as_ptr(), name.as_ptr(), buf, len),
+                #[cfg(target_os = "macos")]
+                On::Fd(fd) => libc::fgetxattr(fd, name.as_ptr(), buf, len, 0, 0),
+                #[cfg(target_os = "macos")]
+                On::Path(p) => libc::getxattr(p.as_ptr(), name.as_ptr(), buf, len, 0, NOFOLLOW),
+            }
+        })
+    }
+
+    pub fn set(on: On, name: &CStr, value: &[u8]) -> io::Result<()> {
+        let (v, n) = (value.as_ptr().cast::<c_void>(), value.len());
+        let r = unsafe {
+            match on {
+                #[cfg(target_os = "linux")]
+                On::Fd(fd) => libc::fsetxattr(fd, name.as_ptr(), v, n, 0),
+                #[cfg(target_os = "linux")]
+                On::Path(p) => libc::lsetxattr(p.as_ptr(), name.as_ptr(), v, n, 0),
+                #[cfg(target_os = "macos")]
+                On::Fd(fd) => libc::fsetxattr(fd, name.as_ptr(), v, n, 0, 0),
+                #[cfg(target_os = "macos")]
+                On::Path(p) => libc::setxattr(p.as_ptr(), name.as_ptr(), v, n, 0, NOFOLLOW),
+            }
+        };
+        if r < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Size query then read; retried when the value grew in between.
+    fn read_sized(
+        mut read: impl FnMut(*mut u8, usize) -> io::Result<usize>,
+    ) -> io::Result<Vec<u8>> {
+        for _ in 0..4 {
+            let len = read(std::ptr::null_mut(), 0)?;
+            let mut buf = vec![0u8; len];
+            match read(buf.as_mut_ptr(), len) {
+                // with a 0-length buffer the call is a size query again: a
+                // value that grew in between must be read anew
+                Ok(n) if n <= len && (len > 0 || n == 0) => {
+                    buf.truncate(n);
+                    return Ok(buf);
+                }
+                Ok(_) => continue,
+                Err(e) if e.raw_os_error() == Some(libc::ERANGE) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(io::Error::from_raw_os_error(libc::ERANGE))
+    }
+
+    pub fn names(on: On) -> io::Result<Vec<CString>> {
+        let all = read_sized(|b, n| raw_list(on, b.cast(), n))?;
+        Ok(all
+            .split(|&c| c == 0)
+            .filter(|n| !n.is_empty())
+            .filter_map(|n| CString::new(n).ok())
+            .collect())
+    }
+
+    pub fn get(on: On, name: &CStr) -> io::Result<Vec<u8>> {
+        read_sized(|b, n| raw_get(on, name, b.cast(), n))
+    }
+
+    pub fn is_missing(e: &io::Error) -> bool {
+        #[cfg(target_os = "linux")]
+        let nodata = libc::ENODATA;
+        #[cfg(target_os = "macos")]
+        let nodata = libc::ENOATTR;
+        e.raw_os_error() == Some(nodata)
+    }
+
+    pub fn is_unsupported(e: &io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP)
+    }
+}
+
+/// Copy every extended attribute from `from` to `to`. Attributes the target
+/// filesystem cannot hold at all are not an error; the first other failure
+/// is returned after trying the rest.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn copy_xattrs_on(from: xattr_sys::On, to: xattr_sys::On) -> io::Result<()> {
+    let names = match xattr_sys::names(from) {
+        Ok(n) => n,
+        Err(e) if xattr_sys::is_unsupported(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut first = None;
+    for name in names {
+        let res = xattr_sys::get(from, &name).and_then(|v| xattr_sys::set(to, &name, &v));
+        match res {
+            Ok(()) => {}
+            Err(e) if xattr_sys::is_unsupported(&e) || xattr_sys::is_missing(&e) => {}
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// [`copy_xattrs_on`] between two open files.
+pub fn copy_xattrs_fd(from: &fs::File, to: &fs::File) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        use xattr_sys::On;
+        copy_xattrs_on(On::Fd(from.as_raw_fd()), On::Fd(to.as_raw_fd()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (from, to);
+        Ok(())
+    }
+}
+
+/// [`copy_xattrs_on`] between two paths (final symlinks not followed).
+pub fn copy_xattrs_path(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use xattr_sys::{On, cpath};
+        let (f, t) = (cpath(from)?, cpath(to)?);
+        copy_xattrs_on(On::Path(&f), On::Path(&t))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (from, to);
+        Ok(())
+    }
+}
+
+/// Set one extended attribute on `path` (not followed).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn xattr_set_path(path: &Path, name: &str, value: &[u8]) -> io::Result<()> {
+    let p = xattr_sys::cpath(path)?;
+    let n = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in name"))?;
+    xattr_sys::set(xattr_sys::On::Path(&p), &n, value)
+}
+
+/// One extended attribute of `path` (not followed); `None` when absent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn xattr_get_path(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
+    let p = xattr_sys::cpath(path)?;
+    let n = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in name"))?;
+    match xattr_sys::get(xattr_sys::On::Path(&p), &n) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if xattr_sys::is_missing(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
