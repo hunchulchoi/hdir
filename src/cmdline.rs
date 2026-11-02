@@ -1,6 +1,7 @@
 //! Command line (`:`): pure parsing of the internal `cd`, path resolution,
 //! input history and the editable line state. No IO.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 use ratatui::crossterm::event::KeyEvent;
@@ -211,6 +212,7 @@ pub fn resolve_cd(
             .map(Path::to_path_buf)
             .ok_or_else(|| "이전 디렉터리 없음".to_string()),
         CdTarget::Path(p) => {
+            let p = &drive_root(p, cfg!(windows));
             let full = join_raw(cwd, p);
             canonical_dir(&full).map_err(|e| format!("{}: {e}", p.display()))
         }
@@ -583,5 +585,115 @@ mod tests {
         let mut l = CmdLine::default();
         l.key(k(KeyCode::Up), &h);
         assert_eq!(l.value, "");
+    }
+}
+
+/// Argv running the command line `cmd` with `shell`: PowerShell gets
+/// `-NoProfile -Command`, cmd.exe `/C`, anything else POSIX `-c`.
+pub fn shell_argv(shell: &OsStr, cmd: &str) -> Vec<OsString> {
+    // last component by either separator (a Windows path read on unix too)
+    let name = shell.to_string_lossy().to_ascii_lowercase();
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let stem = base.strip_suffix(".exe").unwrap_or(base);
+    let mut v = vec![shell.to_os_string()];
+    match stem {
+        "pwsh" | "powershell" => v.extend(["-NoProfile", "-Command"].map(OsString::from)),
+        "cmd" => v.push(OsString::from("/C")),
+        _ => v.push(OsString::from("-c")),
+    }
+    v.push(OsString::from(cmd));
+    v
+}
+
+/// The shell for command line commands: `$SHELL` when set; otherwise on
+/// Windows PowerShell 7 (`pwsh`) when it is on `path`, else Windows
+/// PowerShell, and `/bin/sh` elsewhere.
+pub fn default_shell(
+    shell_var: Option<OsString>,
+    path: Option<OsString>,
+    windows: bool,
+) -> OsString {
+    if let Some(s) = shell_var.filter(|s| !s.is_empty()) {
+        return s;
+    }
+    if !windows {
+        return OsString::from("/bin/sh");
+    }
+    let has_pwsh = path.is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| d.join("pwsh.exe").is_file() || d.join("pwsh").is_file())
+    });
+    OsString::from(if has_pwsh { "pwsh" } else { "powershell" })
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    fn s(v: &[OsString]) -> Vec<String> {
+        v.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn each_shell_gets_its_own_command_flag() {
+        assert_eq!(
+            s(&shell_argv(OsStr::new("/bin/zsh"), "ls")),
+            ["/bin/zsh", "-c", "ls"]
+        );
+        assert_eq!(
+            s(&shell_argv(OsStr::new("pwsh"), "Get-ChildItem")),
+            ["pwsh", "-NoProfile", "-Command", "Get-ChildItem"]
+        );
+        assert_eq!(
+            s(&shell_argv(
+                OsStr::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.exe"),
+                "dir"
+            ))[1..],
+            ["-NoProfile", "-Command", "dir"]
+        );
+        assert_eq!(
+            s(&shell_argv(OsStr::new("cmd.exe"), "dir"))[1..],
+            ["/C", "dir"]
+        );
+    }
+
+    #[test]
+    fn the_default_shell_prefers_shell_then_pwsh() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            default_shell(Some("/bin/fish".into()), None, true),
+            "/bin/fish"
+        );
+        assert_eq!(default_shell(Some("".into()), None, false), "/bin/sh");
+        assert_eq!(
+            default_shell(None, Some(d.path().into()), true),
+            "powershell"
+        );
+        std::fs::write(d.path().join("pwsh.exe"), "").unwrap();
+        assert_eq!(default_shell(None, Some(d.path().into()), true), "pwsh");
+    }
+}
+
+/// `D:` alone means the drive's current folder to Windows; hdir has none,
+/// so it is that drive's root (`D:\\`). Anything else is unchanged.
+pub fn drive_root(p: &Path, windows: bool) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy();
+    let b = s.as_bytes();
+    if windows && b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return PathBuf::from(format!("{s}\\"));
+    }
+    p.to_path_buf()
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_drive_letter_is_its_root_on_windows_only() {
+        assert_eq!(drive_root(Path::new("d:"), true), PathBuf::from("d:\\"));
+        assert_eq!(drive_root(Path::new("D:"), false), PathBuf::from("D:"));
+        for p in ["D:\\x", "DD:", "1:", "x"] {
+            assert_eq!(drive_root(Path::new(p), true), PathBuf::from(p));
+        }
     }
 }

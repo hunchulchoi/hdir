@@ -17,7 +17,9 @@ fn example(readme: &str, name: &str) -> String {
 
 #[test]
 fn readme_examples_load_without_warnings() {
-    let readme = include_str!("../README.md");
+    // a Windows checkout may have CRLF line ends
+    let readme = include_str!("../README.md").replace("\r\n", "\n");
+    let readme = readme.as_str();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("config.toml"),

@@ -189,8 +189,6 @@ fn glob_match(toks: &[Tok], name: &str) -> bool {
     toks[ti..].iter().all(|t| matches!(t, Tok::Star))
 }
 
-const WIN_PLANNED: &str = "Windows 지원 예정";
-
 /// Turns a command template into a POSIX shell script that never contains
 /// the file name: `{}` -> `$1` (path), `{dir}` -> `$2`, `{name}` -> `$3`
 /// (stem), quoted according to the surrounding quote context
@@ -279,6 +277,129 @@ pub fn plan_run(
     shell_argv(rule, path, cwd, shell).map(|a| (a, mode))
 }
 
+/// The PowerShell counterpart of [`render_script`], for a script run with
+/// `-File` and the path, folder and name as `$args[0..3]` (so they are never
+/// parsed as code). A placeholder inside `"..."` becomes `$($args[n])`; a
+/// bare word holding one becomes a single double-quoted string (PowerShell
+/// would otherwise split `{dir}\{name}` into two arguments), with `` ` ``,
+/// `"` and `$` of the word escaped. Placeholders inside `'...'` or in a
+/// word that also has quotes cannot be expressed and are refused. `{{`/`}}`
+/// are literal braces; without any placeholder ` "$($args[0])"` is appended.
+pub fn render_ps(template: &str) -> Result<String, String> {
+    const OPS: &[char] = &[';', '|', '&', '(', ')', ','];
+    // a real placeholder, not one written with doubled braces
+    fn has_placeholder(w: &str) -> bool {
+        let mut r = w;
+        while !r.is_empty() {
+            if r.starts_with("{{") || r.starts_with("}}") {
+                r = &r[2..];
+            } else if ["{}", "{dir}", "{name}"].iter().any(|p| r.starts_with(p)) {
+                return true;
+            } else {
+                let n = r.chars().next().map_or(1, char::len_utf8);
+                r = &r[n..];
+            }
+        }
+        false
+    }
+    const PH: [(&str, usize); 3] = [("{}", 0), ("{dir}", 1), ("{name}", 2)];
+    let refused = || "PowerShell: 작은따옴표나 따옴표가 섞인 단어 안의 {}는 쓸 수 없음".to_string();
+    let placeholder = |s: &str| {
+        PH.iter()
+            .find_map(|(p, n)| s.strip_prefix(p).map(|r| (r.len(), *n)))
+    };
+    let mut out = String::new();
+    let mut used = false;
+    let mut rest = template;
+    while let Some(c) = rest.chars().next() {
+        if c.is_whitespace() {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        // one word: up to the next whitespace outside quotes
+        let mut end = 0;
+        let mut q: Option<char> = None;
+        for (i, ch) in rest.char_indices() {
+            match q {
+                Some(open) if ch == open => q = None,
+                Some(_) => {}
+                None if ch == '"' || ch == '\'' => q = Some(ch),
+                None if ch.is_whitespace() => break,
+                None => {}
+            }
+            end = i + ch.len_utf8();
+        }
+        let word = &rest[..end];
+        rest = &rest[end..];
+        // operators around the word stay outside any quoting: `{};` is the
+        // path, then a statement separator
+        let core = word.trim_matches(|ch: char| OPS.contains(&ch));
+        let lead =
+            &word[..word.len() - word.trim_start_matches(|ch: char| OPS.contains(&ch)).len()];
+        let tail = &word[lead.len() + core.len()..];
+        out.push_str(lead);
+        let word = core;
+        let has_quotes = word.contains(['"', '\'']);
+        if !has_placeholder(word) {
+            out.push_str(&word.replace("{{", "{").replace("}}", "}"));
+            out.push_str(tail);
+            continue;
+        }
+        used = true;
+        if !has_quotes {
+            // a bare word: the whole word becomes one "..." string
+            out.push('"');
+            let mut w = word;
+            while let Some(ch) = w.chars().next() {
+                if let Some((left, n)) = placeholder(w) {
+                    out.push_str(&format!("$($args[{n}])"));
+                    w = &w[w.len() - left..];
+                } else if w.starts_with("{{") || w.starts_with("}}") {
+                    out.push(ch);
+                    w = &w[2..];
+                } else {
+                    if matches!(ch, '`' | '"' | '$') {
+                        out.push('`');
+                    }
+                    out.push(ch);
+                    w = &w[ch.len_utf8()..];
+                }
+            }
+            out.push('"');
+            out.push_str(tail);
+            continue;
+        }
+        // quoted parts: only double quotes may hold a placeholder, and only
+        // when the word is a single "..." string
+        let inner = word
+            .strip_prefix('"')
+            .and_then(|w| w.strip_suffix('"'))
+            .filter(|w| !w.contains('"'))
+            .ok_or_else(refused)?;
+        out.push('"');
+        let mut w = inner;
+        while let Some(ch) = w.chars().next() {
+            if let Some((left, n)) = placeholder(w) {
+                out.push_str(&format!("$($args[{n}])"));
+                w = &w[w.len() - left..];
+            } else if w.starts_with("{{") || w.starts_with("}}") {
+                out.push(ch);
+                w = &w[2..];
+            } else {
+                out.push(ch);
+                w = &w[ch.len_utf8()..];
+            }
+        }
+        out.push('"');
+        out.push_str(tail);
+    }
+    if !used {
+        out.push_str(" \"$($args[0])\"");
+    }
+    Ok(out)
+}
+
 #[cfg(unix)]
 fn shell_argv(
     rule: &AssocRule,
@@ -301,9 +422,56 @@ fn shell_argv(
     ])
 }
 
+/// Windows: the rule becomes a temporary `.ps1` ([`render_ps`]) that
+/// deletes itself first, run with `-File` so the path, folder and name
+/// arrive as `$args[0..3]`. `shell` is used when it is a PowerShell, else
+/// `pwsh` (or Windows PowerShell).
 #[cfg(windows)]
-fn shell_argv(_: &AssocRule, _: &Path, _: &Path, _: &str) -> Result<Vec<OsString>, String> {
-    Err(WIN_PLANNED.to_string())
+fn shell_argv(
+    rule: &AssocRule,
+    path: &Path,
+    cwd: &Path,
+    shell: &str,
+) -> Result<Vec<OsString>, String> {
+    use std::io::Write;
+    let body = render_ps(&rule.cmd)?;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => cwd,
+    };
+    let mut f = tempfile::Builder::new()
+        .prefix("hdir-assoc-")
+        .suffix(".ps1")
+        .tempfile()
+        .map_err(|e| format!("임시 스크립트를 만들 수 없음: {e}"))?;
+    // BOM: Windows PowerShell reads a BOM-less script as the ANSI code page
+    let script = format!(
+        "\u{feff}Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue\r\n{body}\r\n"
+    );
+    f.write_all(script.as_bytes())
+        .map_err(|e| format!("임시 스크립트를 쓸 수 없음: {e}"))?;
+    let (_, script_path) = f
+        .keep()
+        .map_err(|e| format!("임시 스크립트를 둘 수 없음: {e}"))?;
+    let ps = if matches!(
+        Path::new(shell)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("pwsh" | "powershell")
+    ) {
+        OsString::from(shell)
+    } else {
+        crate::cmdline::default_shell(None, std::env::var_os("PATH"), true)
+    };
+    let mut v = vec![ps];
+    v.extend(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"].map(OsString::from));
+    v.push(script_path.into_os_string());
+    v.push(path.as_os_str().to_os_string());
+    v.push(dir.as_os_str().to_os_string());
+    v.push(path.file_stem().unwrap_or_default().to_os_string());
+    Ok(v)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,17 +492,16 @@ pub fn default_action(preview_is_text: bool) -> DefaultAction {
 pub fn system_opener() -> &'static str {
     if cfg!(target_os = "macos") {
         "open"
+    } else if cfg!(windows) {
+        // hands the file to its registered application (ShellExecute)
+        "explorer.exe"
     } else {
         "xdg-open"
     }
 }
 
-/// Full argv to open `path` with the system default application
-/// (windows: not supported yet).
+/// Full argv to open `path` with the system default application.
 pub fn system_opener_argv(path: &Path) -> Result<Vec<OsString>, String> {
-    if cfg!(windows) {
-        return Err(WIN_PLANNED.to_string());
-    }
     Ok(vec![
         OsString::from(system_opener()),
         path.as_os_str().to_os_string(),
@@ -692,12 +859,38 @@ name = "build"
 
     #[cfg(windows)]
     #[test]
-    fn windows_is_planned_not_supported() {
-        let r = ext_rule(&["txt"], "type {}");
-        let e = plan_run(&r, Path::new(r"C:.txt"), Path::new(r"C:"), "sh").unwrap_err();
-        assert!(e.contains("Windows 지원 예정"), "{e}");
-        let e = system_opener_argv(Path::new(r"C:.png")).unwrap_err();
-        assert!(e.contains("Windows 지원 예정"), "{e}");
+    fn a_windows_rule_runs_as_a_self_deleting_script_with_literal_args() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("a $b;(x) 'q'.txt");
+        std::fs::write(&file, "x").unwrap();
+        let r = ext_rule(
+            &["txt"],
+            r"Set-Content -LiteralPath {dir}\out.txt -Value {name}",
+        );
+        let (argv, _) = plan_run(&r, &file, t.path(), "pwsh").unwrap();
+        assert_eq!(
+            argv[1..5],
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"].map(OsString::from)
+        );
+        let script = std::path::PathBuf::from(&argv[5]);
+        assert!(script.exists());
+        let status = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .status();
+        // the Windows gate has PowerShell: a failed start is a failure
+        let status = status.unwrap();
+        assert!(status.success());
+        let got = std::fs::read_to_string(t.path().join("out.txt")).unwrap();
+        assert_eq!(
+            got.trim_end(),
+            "a $b;(x) 'q'",
+            "the name stayed text, never code"
+        );
+        assert!(!script.exists(), "the script deleted itself");
+        assert_eq!(
+            system_opener_argv(&file).unwrap(),
+            vec![OsString::from("explorer.exe"), file.into_os_string()]
+        );
     }
 
     #[test]
@@ -727,5 +920,56 @@ name = "build"
                 OsString::from("/d/a b.png")
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod ps_tests {
+    use super::render_ps;
+
+    #[test]
+    fn placeholders_become_args_and_bare_words_stay_one_argument() {
+        assert_eq!(render_ps("code {}").unwrap(), r#"code "$($args[0])""#);
+        assert_eq!(
+            render_ps(r"Copy-Item {} {dir}\{name}.old").unwrap(),
+            r#"Copy-Item "$($args[0])" "$($args[1])\$($args[2]).old""#
+        );
+        assert_eq!(
+            render_ps(r#"Write-Host "file: {} in {dir}""#).unwrap(),
+            r#"Write-Host "file: $($args[0]) in $($args[1])""#
+        );
+        // literal text of a rewritten word keeps its meaning inside "..."
+        assert_eq!(
+            render_ps("echo $x{name}`").unwrap(),
+            r#"echo "`$x$($args[2])``""#
+        );
+        assert_eq!(render_ps("notepad").unwrap(), r#"notepad "$($args[0])""#);
+        assert_eq!(
+            render_ps("echo {{x}} {}").unwrap(),
+            r#"echo {x} "$($args[0])""#
+        );
+        assert_eq!(
+            render_ps("echo 'a b' {}").unwrap(),
+            r#"echo 'a b' "$($args[0])""#
+        );
+        // operators stay outside the quotes
+        assert_eq!(
+            render_ps("notepad {}; Write-Host done").unwrap(),
+            r#"notepad "$($args[0])"; Write-Host done"#
+        );
+        assert_eq!(render_ps("(type {})").unwrap(), r#"(type "$($args[0])")"#);
+        // doubled braces are text, not placeholders: the path is appended
+        assert_eq!(
+            render_ps("echo {{name}}").unwrap(),
+            r#"echo {name} "$($args[0])""#
+        );
+        assert_eq!(render_ps("echo {{}}").unwrap(), r#"echo {} "$($args[0])""#);
+    }
+
+    #[test]
+    fn placeholders_that_cannot_be_expressed_are_refused() {
+        for t in ["echo '{}'", r#"echo a"{}"b"#, r#"echo "x"'{}'"#] {
+            assert!(render_ps(t).is_err(), "{t}");
+        }
     }
 }

@@ -123,9 +123,11 @@ enum MenuKind {
         /// Set when `path` is on a remote host.
         session: Option<Arc<RemoteSession>>,
     },
-    /// Alt+F1/F2 location picker for `panel`: item 0 is local, then `servers`.
+    /// Alt+F1/F2 location picker for `panel`: item 0 is local, then the
+    /// drive roots (Windows), then `servers`.
     Location {
         panel: usize,
+        drives: Vec<PathBuf>,
         servers: Vec<Server>,
     },
 }
@@ -619,6 +621,8 @@ pub struct App {
     pub ssh_hosts: Vec<SshHost>,
     /// `~/.ssh/config` to read in `configure`.
     pub ssh_config_path: Option<PathBuf>,
+    /// Drive roots offered in the location menu (Windows; empty elsewhere).
+    pub drives: Vec<PathBuf>,
     /// Per panel: the local directory to return to with `:local`.
     local_cwds: [Option<PathBuf>; 2],
     /// Per panel: generation of the connect attempt in flight.
@@ -700,9 +704,11 @@ impl App {
             cmdline: None,
             cmd_history: History::default(),
             pending_shell: None,
-            shell_path: std::env::var_os("SHELL")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| OsString::from("/bin/sh")),
+            shell_path: cmdline::default_shell(
+                std::env::var_os("SHELL"),
+                std::env::var_os("PATH"),
+                cfg!(windows),
+            ),
             home_dir: dirs::home_dir(),
             prev_dirs: [None, None],
             cd_on_exit: true,
@@ -715,6 +721,7 @@ impl App {
             control_path: session::control_path(dirs::cache_dir().as_deref(), current_uid()),
             ssh_hosts: Vec::new(),
             ssh_config_path: None,
+            drives: crate::platform::drive_roots(),
             local_cwds: [None, None],
             connecting: [None, None],
             connect_gen: 0,
@@ -907,14 +914,23 @@ impl App {
         let theme_names = match &open.kind {
             MenuKind::Theme(names) => Some(names.clone()),
             MenuKind::Main => None,
-            MenuKind::Location { panel, servers } => {
-                let (panel, servers) = (*panel, servers.clone());
+            MenuKind::Location {
+                panel,
+                drives,
+                servers,
+            } => {
+                let (panel, drives, servers) = (*panel, drives.clone(), servers.clone());
                 match event {
                     MenuEvent::Chosen(i) => {
                         self.menu = None;
-                        match i.checked_sub(1).and_then(|n| servers.get(n)) {
-                            None => self.switch_local(panel),
-                            Some(sv) => self.connect_server(panel, sv.clone(), None),
+                        let n = i.checked_sub(1);
+                        if let Some(root) = n.and_then(|n| drives.get(n)) {
+                            self.go_local_dir(panel, root.clone());
+                        } else {
+                            match n.and_then(|n| servers.get(n - drives.len())) {
+                                None => self.switch_local(panel),
+                                Some(sv) => self.connect_server(panel, sv.clone(), None),
+                            }
                         }
                     }
                     MenuEvent::Cancelled => self.menu = None,
@@ -1140,10 +1156,6 @@ impl App {
             self.change_dir_to(&cwd, &target);
             return;
         }
-        if cfg!(windows) {
-            self.status = Some("셸 명령: Windows 지원 예정".into());
-            return;
-        }
         self.pending_shell = Some(ShellJob {
             cmd: cmd.to_string(),
             cwd,
@@ -1221,7 +1233,9 @@ impl App {
     /// Alt+F1/F2: choose local or a server for panel `idx`.
     fn open_location_menu(&mut self, idx: usize) {
         let servers = self.servers();
+        let drives = self.drives.clone();
         let mut items = vec!["로컬".to_string()];
+        items.extend(drives.iter().map(|d| format!("{}  드라이브", d.display())));
         items.extend(servers.iter().map(|s| {
             // ssh aliases show where they point (user@hostname) when known.
             let detail = self
@@ -1252,6 +1266,7 @@ impl App {
             menu: Menu::new(title, items, 0),
             kind: MenuKind::Location {
                 panel: idx,
+                drives,
                 servers,
             },
         });
@@ -1456,6 +1471,24 @@ impl App {
     }
 
     /// `:local` / picking "로컬": back to the last local directory.
+    /// Show the local folder `dir` in panel `idx` (leaving a server if it
+    /// showed one): a drive picked in the location menu.
+    fn go_local_dir(&mut self, idx: usize, dir: PathBuf) {
+        self.connecting[idx] = None;
+        self.pending_master.retain(|j| j.idx != idx);
+        self.invalidate_probe();
+        self.status = None;
+        if self.panels[idx].location.is_remote() {
+            self.prev_dirs[idx] = None;
+            self.panels[idx].set_location(Location::Local, dir);
+            self.reload_panel(idx, None);
+            return;
+        }
+        let id = self.next_id();
+        let req = self.panels[idx].begin_change_dir(id, dir, None, LoadKind::Enter);
+        self.dispatch(idx, req);
+    }
+
     fn switch_local(&mut self, idx: usize) {
         self.connecting[idx] = None;
         self.pending_master.retain(|j| j.idx != idx);
@@ -1521,11 +1554,7 @@ impl App {
                 PathBuf::from("."),
             ),
             None => (
-                vec![
-                    self.shell_path.clone(),
-                    OsString::from("-c"),
-                    OsString::from(&job.cmd),
-                ],
+                cmdline::shell_argv(&self.shell_path, &job.cmd),
                 job.cwd.clone(),
             ),
         };
@@ -1728,10 +1757,6 @@ impl App {
 
     /// Queue an edit of `path` (a file in the active panel's directory).
     fn queue_edit(&mut self, path: &std::path::Path) {
-        if cfg!(windows) {
-            self.status = Some("편집: Windows 지원 예정".into());
-            return;
-        }
         let Some(name) = path.file_name().map(OsString::from) else {
             return;
         };
@@ -4446,6 +4471,24 @@ mod tests {
     }
 
     #[test]
+    fn a_drive_picked_in_the_location_menu_opens_its_root() {
+        let (t, mut app) = fixture();
+        let (c, d) = (t.path().join("adir"), t.path().join("bdir"));
+        app.drives = vec![c.clone(), d.clone()];
+        press_mods(&mut app, KeyCode::F(2), KeyModifiers::ALT);
+        let items = app.menu.as_ref().expect("location menu").menu.items.clone();
+        assert_eq!(items[0], "로컬");
+        assert!(items[2].starts_with(&d.display().to_string()), "{items:?}");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(app.menu.is_none());
+        assert_eq!(app.panels[1].cwd, d);
+        assert_ne!(app.panels[0].cwd, d, "the other panel stays");
+    }
+
+    #[test]
     fn selected_or_current_variants() {
         let (_t, mut app) = fixture();
         assert!(app.selected_or_current().is_empty()); // on ..
@@ -6676,12 +6719,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f4_on_windows_says_support_is_coming() {
+    fn f4_on_windows_queues_an_edit() {
         let (_t, mut app) = fixture();
         cursor_to(&mut app, "f.txt");
         press(&mut app, KeyCode::F(4));
-        assert!(!app.has_pending_edit());
-        assert!(app.status.as_deref().unwrap().contains("Windows 지원 예정"));
+        assert!(app.has_pending_edit(), "{:?}", app.status);
     }
     // ---- HDIR-16: modes ----
 
@@ -7205,7 +7247,7 @@ mod tests {
             press(&mut e.app, KeyCode::Enter);
             let l = Arc::clone(&e.log);
             tick_until(&mut e.app, "spawn", move |a| {
-                !l.lock().unwrap().is_empty() || a.status.as_deref() == Some("Windows 지원 예정")
+                !l.lock().unwrap().is_empty() && a.status.is_some()
             });
             assert!(e.app.viewer.is_none());
         }
@@ -7270,22 +7312,27 @@ mod tests {
 
         #[cfg(windows)]
         #[test]
-        fn windows_rule_run_shows_the_planned_message() {
+        fn windows_rule_runs_through_powershell() {
             let mut e = env(CAT);
             press(&mut e.app, KeyCode::Enter);
-            assert_eq!(e.app.status.as_deref(), Some("Windows 지원 예정"));
-            assert!(!e.app.has_pending_run());
+            assert!(e.app.has_pending_run(), "{:?}", e.app.status);
         }
 
         #[cfg(windows)]
         #[test]
-        fn windows_system_opener_shows_the_planned_message() {
+        fn windows_system_opener_is_explorer() {
             let mut e = env("");
             e.app.text_probe = Arc::new(|_| Ok(false));
             press(&mut e.app, KeyCode::Enter);
-            tick_until(&mut e.app, "msg", |a| {
-                a.status.as_deref() == Some("Windows 지원 예정")
+            let l = Arc::clone(&e.log);
+            tick_until(&mut e.app, "spawn", move |a| {
+                !l.lock().unwrap().is_empty() && a.status.is_some()
             });
+            assert!(
+                log(&e)[0].starts_with("spawn explorer.exe|"),
+                "{:?}",
+                log(&e)
+            );
         }
 
         // ---- review fixes: stale probes, probe errors, special files, bg spawn ----
@@ -7625,7 +7672,6 @@ mod tests {
             f.log.lock().unwrap().clone()
         }
 
-        #[cfg(unix)]
         fn run_logged(app: &mut App, f: &Arc<ShellFake>) {
             let f = Arc::clone(f);
             app.run_shell(move |run| {
@@ -7788,13 +7834,19 @@ mod tests {
             assert!(log(&f).contains(&want), "{:?}", log(&f));
         }
 
-        #[cfg(windows)]
         #[test]
-        fn shell_commands_are_not_supported_on_windows_yet() {
-            let (_t, mut app, _f) = env();
-            submit(&mut app, "dir");
-            assert!(!app.has_pending_shell());
-            assert_eq!(app.status.as_deref(), Some("셸 명령: Windows 지원 예정"));
+        fn a_powershell_command_line_runs_with_dash_command() {
+            let (_t, mut app, f) = env();
+            app.shell_path = OsString::from("pwsh");
+            submit(&mut app, "Get-ChildItem");
+            assert!(app.has_pending_shell());
+            run_logged(&mut app, &f);
+            let got = log(&f);
+            assert!(
+                got.iter()
+                    .any(|l| l.starts_with("shell pwsh|-NoProfile|-Command|Get-ChildItem @")),
+                "{got:?}"
+            );
         }
 
         #[test]
@@ -9831,6 +9883,7 @@ mod tests {
     #[test]
     fn ssh_connect_on_windows_is_a_stub() {
         let (_t, mut app) = fixture();
+        app.drives.clear(); // the server is then item 1
         app.settings.config.servers = vec![crate::servers::ServerConfig {
             name: Some("prod".into()),
             host: Some("prod-web".into()),

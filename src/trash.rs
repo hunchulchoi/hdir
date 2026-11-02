@@ -428,7 +428,7 @@ impl TrashBackend for SystemTrash {
         )
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn list_items(&self) -> Result<Vec<TrashItem>, String> {
         trash::os_limited::list().map_err(|e| e.to_string())
     }
@@ -451,7 +451,24 @@ impl TrashBackend for SystemTrash {
         Ok(entries)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// Recycle Bin: size and kind come from the crate (a folder reports
+    /// its entry count, not bytes).
+    #[cfg(windows)]
+    fn list(&self) -> Result<Vec<TrashEntry>, String> {
+        let mut entries: Vec<TrashEntry> = self
+            .list_items()?
+            .into_iter()
+            .map(|item| {
+                let size = trash::os_limited::metadata(&item).ok().map(|m| m.size);
+                let is_dir = matches!(size, Some(trash::TrashItemSize::Entries(_)));
+                TrashEntry::new(item, size.and_then(|s| s.size()), is_dir)
+            })
+            .collect();
+        sort_newest_first(&mut entries);
+        Ok(entries)
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn list(&self) -> Result<Vec<TrashEntry>, String> {
         Err("이 OS는 휴지통 목록을 지원하지 않음".into())
     }
@@ -469,7 +486,14 @@ impl TrashBackend for SystemTrash {
         )
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    fn restore(&self, items: &[TrashEntry]) -> RestoreResult {
+        restore_with(items.iter().map(|e| e.item.clone()).collect(), |v| {
+            trash::os_limited::restore_all(v)
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn restore(&self, _items: &[TrashEntry]) -> RestoreResult {
         RestoreResult {
             errors: vec!["이 OS는 복원을 지원하지 않음".into()],
@@ -477,12 +501,12 @@ impl TrashBackend for SystemTrash {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn purge(&self, items: &[TrashEntry]) -> Result<(), String> {
         trash::os_limited::purge_all(items.iter().map(|e| &e.item)).map_err(|e| e.to_string())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     fn purge(&self, _items: &[TrashEntry]) -> Result<(), String> {
         Err("이 OS는 영구 삭제를 지원하지 않음".into())
     }
@@ -509,7 +533,7 @@ impl TrashBackend for SystemTrash {
     }
 
     fn supports_view(&self) -> bool {
-        cfg!(target_os = "linux")
+        cfg!(any(target_os = "linux", windows))
     }
 }
 
@@ -1472,7 +1496,10 @@ mod tests {
 
     #[test]
     fn system_trash_view_support_follows_the_os() {
-        assert_eq!(SystemTrash.supports_view(), cfg!(target_os = "linux"));
+        assert_eq!(
+            SystemTrash.supports_view(),
+            cfg!(any(target_os = "linux", windows))
+        );
     }
 
     #[cfg(windows)]
