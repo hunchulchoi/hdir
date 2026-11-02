@@ -4,6 +4,11 @@
 #
 # Install: add to your profile (`notepad $PROFILE`)
 #   . C:\path\to\hdir\shell\hdir.ps1
+
+# PowerShell ships `h` as an alias of Get-History, and aliases win over
+# functions: drop it so `h` runs hdir.
+if (Test-Path Alias:h) { Remove-Item Alias:h -Force }
+
 function h {
     $tmp = [System.IO.Path]::GetTempFileName()
     $dir = ''
