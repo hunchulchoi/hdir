@@ -55,7 +55,8 @@ fn run(e: &Env, fake_dir: Option<&str>, rc: i32, args: &str) -> (String, String)
         std::env::var("PATH").unwrap_or_default()
     );
     let code = format!(
-        "$ErrorActionPreference='Stop'; . '{}'; h {args}; \
+        "$ErrorActionPreference='Stop'; [Console]::OutputEncoding = [Text.Encoding]::UTF8; \
+         . '{}'; h {args}; \
          Write-Output (\"rc=\" + $LASTEXITCODE); Write-Output (Get-Location).ProviderPath",
         src.display()
     );
