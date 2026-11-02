@@ -15,7 +15,14 @@ fn delete_list_restore_and_purge_one_file() {
     std::fs::write(&file, "hello").unwrap();
     let store = system_store();
     assert!(store.supports_view());
-    let find = || store.list().unwrap().into_iter().find(|e| e.name() == name);
+    // by the full original path: never an older run's leftover
+    let find = || {
+        store
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.original_path().as_deref() == Some(file.as_path()))
+    };
     let r = store.delete(std::slice::from_ref(&file));
     assert!(r[0].1.is_ok(), "{r:?}");
     assert!(!file.exists());

@@ -348,25 +348,37 @@ pub fn render_ps(template: &str) -> Result<String, String> {
         }
         used = true;
         if !has_quotes {
-            // a bare word: the whole word becomes one "..." string
-            out.push('"');
-            let mut w = word;
-            while let Some(ch) = w.chars().next() {
-                if let Some((left, n)) = placeholder(w) {
-                    out.push_str(&format!("$($args[{n}])"));
-                    w = &w[w.len() - left..];
-                } else if w.starts_with("{{") || w.starts_with("}}") {
-                    out.push(ch);
-                    w = &w[2..];
-                } else {
-                    if matches!(ch, '`' | '"' | '$') {
-                        out.push('`');
+            // a bare word: each run between operators (`{}|more`) holding a
+            // placeholder becomes one "..." string; the operators stay bare
+            for piece in word.split_inclusive(|ch: char| OPS.contains(&ch)) {
+                let (text, op) = match piece.char_indices().last() {
+                    Some((i, ch)) if OPS.contains(&ch) => (&piece[..i], &piece[i..]),
+                    _ => (piece, ""),
+                };
+                if has_placeholder(text) {
+                    out.push('"');
+                    let mut w = text;
+                    while let Some(ch) = w.chars().next() {
+                        if let Some((left, n)) = placeholder(w) {
+                            out.push_str(&format!("$($args[{n}])"));
+                            w = &w[w.len() - left..];
+                        } else if w.starts_with("{{") || w.starts_with("}}") {
+                            out.push(ch);
+                            w = &w[2..];
+                        } else {
+                            if matches!(ch, '`' | '"' | '$') {
+                                out.push('`');
+                            }
+                            out.push(ch);
+                            w = &w[ch.len_utf8()..];
+                        }
                     }
-                    out.push(ch);
-                    w = &w[ch.len_utf8()..];
+                    out.push('"');
+                } else {
+                    out.push_str(&text.replace("{{", "{").replace("}}", "}"));
                 }
+                out.push_str(op);
             }
-            out.push('"');
             out.push_str(tail);
             continue;
         }
@@ -958,6 +970,14 @@ mod ps_tests {
             r#"notepad "$($args[0])"; Write-Host done"#
         );
         assert_eq!(render_ps("(type {})").unwrap(), r#"(type "$($args[0])")"#);
+        assert_eq!(
+            render_ps("Get-Content {}|more").unwrap(),
+            r#"Get-Content "$($args[0])"|more"#
+        );
+        assert_eq!(
+            render_ps(r"cp {}&echo {dir}\x").unwrap(),
+            r#"cp "$($args[0])"&echo "$($args[1])\x""#
+        );
         // doubled braces are text, not placeholders: the path is appended
         assert_eq!(
             render_ps("echo {{name}}").unwrap(),

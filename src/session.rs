@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::loader::Listing;
 use crate::panel::finish_listing;
-use crate::platform::{os_bytes, os_from_bytes};
+use crate::platform::{os_from_bytes, remote_bytes};
 use crate::remote::{
     RemoteEntry, RemoteOs, ScpMode, SshTarget, check_argv, exec_argv, list_cmd, master_argv,
     parse_listing, parse_uname, scp_mode_from_version, sh_quote,
@@ -98,6 +98,9 @@ pub fn run_cancellable(argv: &[OsString], limit: Duration, cancel: &AtomicBool) 
 }
 
 fn run_with(argv: &[OsString], limit: Duration, cancel: Option<&AtomicBool>) -> CmdOutput {
+    if cfg!(windows) {
+        return run_through_files(argv, None, limit, cancel, false).0;
+    }
     let Some((prog, args)) = argv.split_first() else {
         return spawn_failed("empty command");
     };
@@ -165,6 +168,9 @@ pub fn run_pipe_cancellable(
     limit: Duration,
     cancel: &AtomicBool,
 ) -> (CmdOutput, CmdOutput) {
+    if cfg!(windows) {
+        return run_pipe_through_file(from, to, limit, cancel);
+    }
     let (Some((pa, aa)), Some((pb, ab))) = (from.split_first(), to.split_first()) else {
         return (spawn_failed("empty command"), spawn_failed("empty command"));
     };
@@ -268,6 +274,128 @@ pub fn run_pipe_cancellable(
             stderr: err_b,
         },
     )
+}
+
+// ---- running through files (Windows OpenSSH) ----
+//
+// Win32-OpenSSH's ssh.exe does not exit when its stdout is a pipe, nor when
+// it is given data on stdin; with stdin empty and the output going to files
+// it behaves. On Windows every command therefore runs this way, and a
+// "pipe" becomes two runs through a temporary file. The code is portable
+// so it is tested everywhere.
+
+/// Run `argv` with `stdin` (empty when `None`), stdout and stderr captured
+/// in temporary files; stopped like [`run_cancellable`]. Returns the output
+/// (with `stdout` read back) and, when `keep_out`, the stdout file itself
+/// rewound instead (then `stdout` stays empty).
+pub fn run_through_files(
+    argv: &[OsString],
+    stdin: Option<std::fs::File>,
+    limit: Duration,
+    cancel: Option<&AtomicBool>,
+    keep_out: bool,
+) -> (CmdOutput, Option<std::fs::File>) {
+    use std::io::Seek;
+    let Some((prog, args)) = argv.split_first() else {
+        return (spawn_failed("empty command"), None);
+    };
+    let files = tempfile::tempfile().and_then(|o| Ok((o, tempfile::tempfile()?)));
+    let (mut out, mut err) = match files {
+        Ok(f) => f,
+        Err(e) => return (spawn_failed(&format!("임시 파일: {e}")), None),
+    };
+    let (o2, e2) = match (out.try_clone(), err.try_clone()) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return (spawn_failed(&format!("임시 파일: {e}")), None),
+    };
+    let mut command = Command::new(prog);
+    command.args(args).stdout(o2).stderr(e2);
+    match stdin {
+        Some(f) => command.stdin(Stdio::from(f)),
+        None => command.stdin(Stdio::null()),
+    };
+    #[cfg(unix)]
+    if cancel.is_some() {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                spawn_failed(&format!("{}: {e}", prog.to_string_lossy())),
+                None,
+            );
+        }
+    };
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Ok(st),
+            Ok(None) if Instant::now() >= deadline || cancel.is_some_and(is_set) => {
+                let cancelled = Instant::now() < deadline;
+                kill_tree(&mut child, cancel.is_some());
+                let _ = child.wait();
+                break Err(if cancelled {
+                    CANCELLED_MSG
+                } else {
+                    TIMEOUT_MSG
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(_) => break Err("실행 실패"),
+        }
+    };
+    let read_all = |f: &mut std::fs::File| -> Vec<u8> {
+        let mut v = Vec::new();
+        if f.rewind().is_ok() {
+            let _ = f.read_to_end(&mut v);
+        }
+        v
+    };
+    let stderr = read_all(&mut err);
+    match status {
+        Err(msg) => (spawn_failed(msg), None),
+        Ok(st) => {
+            if keep_out {
+                let kept = out.rewind().ok().map(|()| out);
+                (
+                    CmdOutput {
+                        code: st.code(),
+                        stdout: Vec::new(),
+                        stderr,
+                    },
+                    kept,
+                )
+            } else {
+                let stdout = read_all(&mut out);
+                (
+                    CmdOutput {
+                        code: st.code(),
+                        stdout,
+                        stderr,
+                    },
+                    None,
+                )
+            }
+        }
+    }
+}
+
+/// `from | to` as two runs through a temporary file ([`run_through_files`]):
+/// `to` starts only once `from` finished well.
+pub fn run_pipe_through_file(
+    from: &[OsString],
+    to: &[OsString],
+    limit: Duration,
+    cancel: &AtomicBool,
+) -> (CmdOutput, CmdOutput) {
+    let (a, file) = run_through_files(from, None, limit, Some(cancel), true);
+    let Some(file) = file.filter(|_| a.code == Some(0)) else {
+        return (a, CmdOutput::default());
+    };
+    let (b, _) = run_through_files(to, Some(file), limit, Some(cancel), false);
+    (a, b)
 }
 
 fn is_set(flag: &AtomicBool) -> bool {
@@ -516,6 +644,12 @@ impl RemoteSession {
         Ok(self.cmd.run_pipe(from, to, cancel))
     }
 
+    /// Run a *local* command (`tar` for a transfer) through this session's
+    /// runner, stopped when `cancel` is set.
+    pub fn run_local(&self, argv: &[OsString], cancel: &AtomicBool) -> CmdOutput {
+        self.cmd.run_cancellable(argv, cancel)
+    }
+
     /// Reconnect check: is the master alive again? Flips `alive` accordingly.
     pub fn revive(&self) -> bool {
         let up = master_alive(&*self.cmd, &self.target);
@@ -525,7 +659,7 @@ impl RemoteSession {
 
     /// List `dir` on the remote host (blocking; run on a worker).
     pub fn list(&self, dir: &Path, show_hidden: bool) -> Listing {
-        let bytes = os_bytes(dir.as_os_str());
+        let bytes = remote_bytes(dir.as_os_str());
         let out = self
             .exec(&list_cmd(&self.os, &bytes, show_hidden))
             .map_err(|e| e.message())?;
@@ -536,10 +670,18 @@ impl RemoteSession {
                 &format!("종료 코드 {}", out.code.unwrap_or(-1)),
             ));
         }
-        let (entries, bad) = parse_listing(&self.os, &out.stdout);
+        let (mut entries, bad) = parse_listing(&self.os, &out.stdout);
+        // On Windows a remote name that would not stay one plain path
+        // component once joined (a backslash, a `C:` prefix) is left out
+        // (and counted).
+        let before = entries.len();
+        if cfg!(windows) {
+            entries.retain(|e| crate::platform::plain_remote_name(&e.name));
+        }
+        let hidden = before - entries.len();
         let items = entries.iter().map(RemoteEntry::to_entry).collect();
         // A non-zero exit with output means find/stat skipped something.
-        let skipped = bad + usize::from(failed);
+        let skipped = bad + hidden + usize::from(failed);
         Ok((finish_listing(dir, items), skipped))
     }
 }
@@ -919,6 +1061,108 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(o.code, None);
+        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn running_through_files_works_on_windows() {
+        let no = AtomicBool::new(false);
+        let cmd = |c: &str| -> Vec<OsString> { vec!["cmd".into(), "/C".into(), c.into()] };
+        let (o, _) = run_through_files(
+            &cmd("echo hi& echo oops 1>&2& exit /b 3"),
+            None,
+            Duration::from_secs(10),
+            None,
+            false,
+        );
+        assert_eq!(o.code, Some(3));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "hi");
+        assert_eq!(first_line(&o.stderr, ""), "oops");
+        let (a, b) = run_pipe_through_file(
+            &cmd("echo abc"),
+            &cmd("findstr b"),
+            Duration::from_secs(10),
+            &no,
+        );
+        assert_eq!((a.code, b.code), (Some(0), Some(0)));
+        assert_eq!(String::from_utf8_lossy(&b.stdout).trim(), "abc");
+        let (a, b) = run_pipe_through_file(
+            &cmd("exit /b 2"),
+            &cmd("echo never"),
+            Duration::from_secs(10),
+            &no,
+        );
+        assert_eq!(
+            (a.code, b.code),
+            (Some(2), None),
+            "a failed writer never starts the reader"
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let (o, _) = run_through_files(
+            &cmd("ping -n 30 127.0.0.1 >NUL"),
+            None,
+            Duration::from_secs(60),
+            Some(&cancel),
+            false,
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_through_files_captures_output_and_pipes_in_two_steps() {
+        let no = AtomicBool::new(false);
+        let sh = |c: &str| -> Vec<OsString> { vec!["sh".into(), "-c".into(), c.into()] };
+        let (o, _) = run_through_files(
+            &sh("printf hi; echo oops >&2; exit 3"),
+            None,
+            Duration::from_secs(5),
+            None,
+            false,
+        );
+        assert_eq!((o.code, o.stdout.as_slice()), (Some(3), &b"hi"[..]));
+        assert_eq!(first_line(&o.stderr, ""), "oops");
+        let (a, b) = run_pipe_through_file(
+            &sh("printf 'a b'"),
+            &sh("tr a-z A-Z"),
+            Duration::from_secs(5),
+            &no,
+        );
+        assert_eq!(
+            (a.code, b.code, b.stdout.as_slice()),
+            (Some(0), Some(0), &b"A B"[..])
+        );
+        // a failed writer never starts the reader
+        let (a, b) = run_pipe_through_file(
+            &sh("exit 2"),
+            &sh("touch /nonexistent/x"),
+            Duration::from_secs(5),
+            &no,
+        );
+        assert_eq!((a.code, b.code), (Some(2), None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            c2.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let (o, _) = run_through_files(
+            &sh("sleep 30"),
+            None,
+            Duration::from_secs(60),
+            Some(&cancel),
+            false,
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
     }
 
