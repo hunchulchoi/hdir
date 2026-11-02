@@ -286,6 +286,22 @@ pub fn plan_run(
 /// word that also has quotes cannot be expressed and are refused. `{{`/`}}`
 /// are literal braces; without any placeholder ` "$($args[0])"` is appended.
 pub fn render_ps(template: &str) -> Result<String, String> {
+    const OPS: &[char] = &[';', '|', '&', '(', ')', ','];
+    // a real placeholder, not one written with doubled braces
+    fn has_placeholder(w: &str) -> bool {
+        let mut r = w;
+        while !r.is_empty() {
+            if r.starts_with("{{") || r.starts_with("}}") {
+                r = &r[2..];
+            } else if ["{}", "{dir}", "{name}"].iter().any(|p| r.starts_with(p)) {
+                return true;
+            } else {
+                let n = r.chars().next().map_or(1, char::len_utf8);
+                r = &r[n..];
+            }
+        }
+        false
+    }
     const PH: [(&str, usize); 3] = [("{}", 0), ("{dir}", 1), ("{name}", 2)];
     let refused = || "PowerShell: 작은따옴표나 따옴표가 섞인 단어 안의 {}는 쓸 수 없음".to_string();
     let placeholder = |s: &str| {
@@ -316,10 +332,18 @@ pub fn render_ps(template: &str) -> Result<String, String> {
         }
         let word = &rest[..end];
         rest = &rest[end..];
+        // operators around the word stay outside any quoting: `{};` is the
+        // path, then a statement separator
+        let core = word.trim_matches(|ch: char| OPS.contains(&ch));
+        let lead =
+            &word[..word.len() - word.trim_start_matches(|ch: char| OPS.contains(&ch)).len()];
+        let tail = &word[lead.len() + core.len()..];
+        out.push_str(lead);
+        let word = core;
         let has_quotes = word.contains(['"', '\'']);
-        let has_ph = PH.iter().any(|(p, _)| word.contains(p));
-        if !has_ph {
+        if !has_placeholder(word) {
             out.push_str(&word.replace("{{", "{").replace("}}", "}"));
+            out.push_str(tail);
             continue;
         }
         used = true;
@@ -343,6 +367,7 @@ pub fn render_ps(template: &str) -> Result<String, String> {
                 }
             }
             out.push('"');
+            out.push_str(tail);
             continue;
         }
         // quoted parts: only double quotes may hold a placeholder, and only
@@ -367,6 +392,7 @@ pub fn render_ps(template: &str) -> Result<String, String> {
             }
         }
         out.push('"');
+        out.push_str(tail);
     }
     if !used {
         out.push_str(" \"$($args[0])\"");
@@ -851,10 +877,8 @@ name = "build"
         let status = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .status();
-        let Ok(status) = status else {
-            eprintln!("skipped: no {}", argv[0].to_string_lossy());
-            return;
-        };
+        // the Windows gate has PowerShell: a failed start is a failure
+        let status = status.unwrap();
         assert!(status.success());
         let got = std::fs::read_to_string(t.path().join("out.txt")).unwrap();
         assert_eq!(
@@ -928,6 +952,18 @@ mod ps_tests {
             render_ps("echo 'a b' {}").unwrap(),
             r#"echo 'a b' "$($args[0])""#
         );
+        // operators stay outside the quotes
+        assert_eq!(
+            render_ps("notepad {}; Write-Host done").unwrap(),
+            r#"notepad "$($args[0])"; Write-Host done"#
+        );
+        assert_eq!(render_ps("(type {})").unwrap(), r#"(type "$($args[0])")"#);
+        // doubled braces are text, not placeholders: the path is appended
+        assert_eq!(
+            render_ps("echo {{name}}").unwrap(),
+            r#"echo {name} "$($args[0])""#
+        );
+        assert_eq!(render_ps("echo {{}}").unwrap(), r#"echo {} "$($args[0])""#);
     }
 
     #[test]
