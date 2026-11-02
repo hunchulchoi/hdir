@@ -1230,6 +1230,13 @@ pub fn plain_remote_name(name: &OsStr) -> bool {
     )
 }
 
+/// Whether a listed remote name can be acted on here: a plain component
+/// ([`plain_remote_name`]) and, on Windows, not one whose bytes were not
+/// UTF-8 (they show up as U+FFFD, which names a different file).
+pub fn usable_remote_name(name: &OsStr) -> bool {
+    plain_remote_name(name) && !(cfg!(windows) && name.to_string_lossy().contains('\u{FFFD}'))
+}
+
 #[cfg(test)]
 mod plain_name_tests {
     use super::*;
@@ -1247,5 +1254,89 @@ mod plain_name_tests {
                 assert!(!plain_remote_name(OsStr::new(bad)), "{bad}");
             }
         }
+    }
+    #[test]
+    fn a_name_that_was_not_utf8_is_not_usable_on_windows() {
+        // Windows turns bytes that are not UTF-8 into U+FFFD: that name
+        // would point at a different remote file.
+        let lossy = os_from_bytes(b"a\xffb".to_vec());
+        assert_eq!(usable_remote_name(&lossy), !cfg!(windows));
+        assert!(usable_remote_name(OsStr::new("a b")));
+        assert!(!usable_remote_name(OsStr::new("a/b")));
+    }
+}
+
+/// Windows: give `dst` the access rules (DACL) of `src`. A source whose
+/// rules do not inherit from its folder (protected) keeps exactly those;
+/// otherwise its own explicit rules are kept and the rest is inherited from
+/// the new folder, as a fresh file there would. Elsewhere: nothing.
+pub fn copy_dacl(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        };
+        use windows_sys::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+            PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+            UNPROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+        let (s, d) = (wide(src), wide(dst));
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: valid NUL-terminated wide strings and out pointers; the
+        // descriptor is freed with LocalFree below.
+        let r = unsafe {
+            GetNamedSecurityInfoW(
+                s.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if r != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(r as i32));
+        }
+        let mut control: u16 = 0;
+        let mut rev: u32 = 0;
+        // SAFETY: `sd` came from the call above.
+        let protected = unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut rev) } != 0
+            && control & SE_DACL_PROTECTED != 0;
+        let info = DACL_SECURITY_INFORMATION
+            | if protected {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+        // SAFETY: `dacl` points into `sd`, still alive.
+        let r = unsafe {
+            SetNamedSecurityInfoW(
+                d.as_ptr(),
+                SE_FILE_OBJECT,
+                info,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: allocated by GetNamedSecurityInfoW.
+        unsafe { LocalFree(sd as _) };
+        if r != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(r as i32));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (src, dst);
+        Ok(())
     }
 }

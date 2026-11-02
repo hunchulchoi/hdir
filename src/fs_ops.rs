@@ -360,6 +360,10 @@ fn copy_file_in(
         }
         // Before the mode: a read-only copy could not take them afterwards.
         xattr_err = crate::platform::copy_xattrs_fd(&input, &out).err();
+        // Windows access rules (nothing elsewhere)
+        if let Err(e) = crate::platform::copy_dacl(src, &tmp) {
+            xattr_err.get_or_insert(e);
+        }
         out.set_permissions(meta.permissions())?;
         out.set_modified(meta.modified()?)?;
         out.sync_all()?;
@@ -389,7 +393,10 @@ fn copy_file_in(
 }
 
 fn xattr_warning(dest: &Path, e: &io::Error) -> String {
-    format!("{}: 확장 속성 일부를 복사하지 못함 ({e})", dest.display())
+    format!(
+        "{}: 확장 속성·접근 권한 일부를 복사하지 못함 ({e})",
+        dest.display()
+    )
 }
 
 fn skip_changed(src: &Path, acc: &mut Acc) -> io::Result<Step> {
@@ -597,6 +604,10 @@ fn copy_dir(
             };
             if let Err(e) = copied {
                 xattr_err = Some(e);
+            }
+            // last, after the children: restrictive rules could block them
+            if let Err(e) = crate::platform::copy_dacl(src, dest) {
+                xattr_err.get_or_insert(e);
             }
             set_dir_modified(dest, meta.modified()?)?;
             fs::set_permissions(dest, meta.permissions())?;
@@ -2521,6 +2532,75 @@ mod tests {
             self.conflicts.push(d.to_path_buf());
             self.action
         }
+    }
+
+    /// HDIR-72: the ACL of a copy, as icacls prints it without the path.
+    #[cfg(windows)]
+    fn acl_of(p: &Path) -> Vec<String> {
+        let out = std::process::Command::new("icacls")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let shown = p.display().to_string();
+        text.lines()
+            .map(|l| l.replacen(&shown, "", 1).trim().to_string())
+            .filter(|l| l.contains(':') && l.contains('('))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copies_keep_their_windows_access_rules() {
+        let (_t, s, d) = two_dirs();
+        let user = std::env::var("USERNAME").unwrap();
+        let icacls = |args: &[&str]| {
+            let st = std::process::Command::new("icacls")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{st:?}");
+        };
+        // protected: no inheritance, only the user
+        let locked = s.join("locked.txt");
+        fs::write(&locked, "x").unwrap();
+        icacls(&[
+            locked.to_str().unwrap(),
+            "/inheritance:r",
+            "/grant:r",
+            &format!("{user}:(F)"),
+        ]);
+        // inheriting, plus one explicit rule
+        let open = s.join("open.txt");
+        fs::write(&open, "y").unwrap();
+        icacls(&[open.to_str().unwrap(), "/grant", "Everyone:(R)"]);
+        // a protected folder, with a file that inherits from it
+        let dir = s.join("vault");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("in.txt"), "z").unwrap();
+        let rule = format!("{user}:(OI)(CI)(F)");
+        icacls(&[dir.to_str().unwrap(), "/inheritance:r", "/grant:r", &rule]);
+        let all = [locked.clone(), open.clone(), dir.clone()];
+        let r = copy_items(&all, &d, &mut ctl());
+        assert_eq!(acl_of(&d.join("vault")), acl_of(&dir), "a folder too");
+        assert_eq!(
+            acl_of(&d.join("vault").join("in.txt")),
+            acl_of(&dir.join("in.txt")),
+            "inherited from the copied folder"
+        );
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(
+            acl_of(&d.join("locked.txt")),
+            acl_of(&locked),
+            "the same restricted rules"
+        );
+        let copied = acl_of(&d.join("open.txt"));
+        assert!(
+            copied.iter().any(|l| l.starts_with("Everyone:(R)")),
+            "{copied:?}"
+        );
     }
 
     /// HDIR-63: once a source folder is being copied, swapping it (or a

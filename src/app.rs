@@ -9648,6 +9648,9 @@ mod tests {
                 if c.contains("| cksum") {
                     return Some(out(0, "1 2\n"));
                 }
+                if c.contains("for f do printf .") {
+                    return Some(out(0, "1\n")); // the entry count
+                }
                 if let Some(rest) = c.strip_prefix("if [ -L '") {
                     let path = rest.split_once('\'').unwrap().0;
                     let hit = there.contains(&path);

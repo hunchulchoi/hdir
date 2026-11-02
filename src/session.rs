@@ -672,11 +672,11 @@ impl RemoteSession {
         }
         let (mut entries, bad) = parse_listing(&self.os, &out.stdout);
         // On Windows a remote name that would not stay one plain path
-        // component once joined (a backslash, a `C:` prefix) is left out
-        // (and counted).
+        // component once joined (a backslash, a `C:` prefix) or was not
+        // UTF-8 is left out (and counted).
         let before = entries.len();
         if cfg!(windows) {
-            entries.retain(|e| crate::platform::plain_remote_name(&e.name));
+            entries.retain(|e| crate::platform::usable_remote_name(&e.name));
         }
         let hidden = before - entries.len();
         let items = entries.iter().map(RemoteEntry::to_entry).collect();

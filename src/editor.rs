@@ -12,7 +12,14 @@ pub type EditorRunner = Arc<dyn Fn(&[OsString]) -> EditResult + Send + Sync>;
 
 /// Split `s` with POSIX shell-words rules: whitespace separates, `\` escapes
 /// outside quotes, `'...'` is literal, `"..."` honors `\"` `\\` `\$` `` \` ``.
+/// On Windows a `\` is always literal (see [`split_words`]).
 pub fn split_command(s: &str) -> Result<Vec<String>, String> {
+    split_words(s, !cfg!(windows))
+}
+
+/// [`split_command`]; without `escapes` (Windows) a `\` is an ordinary
+/// character, so `C:\Tools\vim.exe` stays a path.
+pub fn split_words(s: &str, escapes: bool) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     // A word has started (so `''` yields an empty argument).
@@ -26,7 +33,7 @@ pub fn split_command(s: &str) -> Result<Vec<String>, String> {
                     started = false;
                 }
             }
-            '\\' => {
+            '\\' if escapes => {
                 cur.push(chars.next().ok_or("끝에 남은 역슬래시")?);
                 started = true;
             }
@@ -45,7 +52,7 @@ pub fn split_command(s: &str) -> Result<Vec<String>, String> {
                 loop {
                     match chars.next() {
                         Some('"') => break,
-                        Some('\\') => match chars.next() {
+                        Some('\\') if escapes => match chars.next() {
                             Some(e @ ('"' | '\\' | '$' | '`')) => cur.push(e),
                             Some(e) => {
                                 cur.push('\\');
@@ -119,7 +126,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn words(s: &str) -> Vec<String> {
-        split_command(s).unwrap()
+        split_words(s, true).unwrap()
     }
 
     #[test]
@@ -147,10 +154,23 @@ mod tests {
     }
 
     #[test]
+    fn windows_paths_keep_their_backslashes() {
+        let w = |s: &str| split_words(s, false).unwrap();
+        assert_eq!(w(r"C:\Tools\vim.exe -n"), [r"C:\Tools\vim.exe", "-n"]);
+        assert_eq!(
+            w(r#""C:\Program Files\Ed\ed.exe" --wait"#),
+            [r"C:\Program Files\Ed\ed.exe", "--wait"]
+        );
+        assert_eq!(w(r"'D:\my ed\e.exe'"), [r"D:\my ed\e.exe"]);
+        assert_eq!(w(r"C:\"), [r"C:\"], "a trailing backslash is a path");
+        assert!(split_words(r#""C:\x"#, false).is_err());
+    }
+
+    #[test]
     fn rejects_unterminated_quotes_and_trailing_backslash() {
-        assert!(split_command("vim 'abc").is_err());
-        assert!(split_command("vim \"abc").is_err());
-        assert!(split_command("vim abc\\").is_err());
+        assert!(split_words("vim 'abc", true).is_err());
+        assert!(split_words("vim \"abc", true).is_err());
+        assert!(split_words("vim abc\\", true).is_err());
     }
 
     #[test]
