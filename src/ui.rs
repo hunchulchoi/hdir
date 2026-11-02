@@ -946,8 +946,11 @@ mod tests {
         let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
         let buf = render(&pa, &pb, 0, None, 250, 24);
         let top = row(&buf, 1);
-        assert!(top.contains(&a.path().display().to_string()));
-        assert!(top.contains(&b.path().display().to_string()));
+        // the home part may show as `~`
+        for d in [&a, &b] {
+            let name = d.path().file_name().unwrap().to_string_lossy();
+            assert!(top.contains(&*name), "{top}");
+        }
     }
 
     #[test]
