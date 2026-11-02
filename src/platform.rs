@@ -1219,3 +1219,33 @@ mod remote_bytes_tests {
         assert_eq!(b("/plain", true), b"/plain");
     }
 }
+
+/// Whether a remote `name` stays exactly one plain component when joined
+/// onto a path here (on Windows `a\\b` splits and `C:x` is a drive prefix).
+pub fn plain_remote_name(name: &OsStr) -> bool {
+    let mut c = Path::new(name).components();
+    matches!(
+        (c.next(), c.next()),
+        (Some(std::path::Component::Normal(n)), None) if n == name
+    )
+}
+
+#[cfg(test)]
+mod plain_name_tests {
+    use super::*;
+
+    #[test]
+    fn only_single_plain_components_pass() {
+        for ok in ["a", "a b", "한글", ".hidden"] {
+            assert!(plain_remote_name(OsStr::new(ok)), "{ok}");
+        }
+        for bad in ["a/b", "..", "."] {
+            assert!(!plain_remote_name(OsStr::new(bad)), "{bad}");
+        }
+        if cfg!(windows) {
+            for bad in ["a\\b", "C:foo", "C:"] {
+                assert!(!plain_remote_name(OsStr::new(bad)), "{bad}");
+            }
+        }
+    }
+}

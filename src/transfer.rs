@@ -1331,8 +1331,29 @@ fn local_stamp(path: &Path, cancel: &AtomicBool) -> Option<String> {
     Some(format!("{top_ctime} {:016x}:{}", h.finish(), all.len()))
 }
 
-/// Windows: no inodes or ctime; the tree's relative paths, kinds, sizes
-/// and modification times (100 ns) still change with any edit.
+/// Hash of a file's content (Windows move fingerprints); `None` when it
+/// cannot be read or the job was cancelled.
+#[cfg(not(unix))]
+fn content_hash(p: &Path, cancel: &AtomicBool) -> Option<u64> {
+    use std::hash::Hasher;
+    use std::io::Read;
+    let mut f = std::fs::File::open(p).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            return Some(h.finish());
+        }
+        h.write(&buf[..n]);
+    }
+}
+
+/// Windows: no inodes or ctime; the tree's relative paths, kinds, sizes,
+/// modification times (100 ns) and file contents.
 #[cfg(not(unix))]
 fn local_stamp(path: &Path, cancel: &AtomicBool) -> Option<String> {
     use std::hash::{Hash, Hasher};
@@ -1354,7 +1375,14 @@ fn local_stamp(path: &Path, cancel: &AtomicBool) -> Option<String> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let rel = q.strip_prefix(path).ok()?.to_string_lossy().into_owned();
-        all.push((rel, m.is_dir(), m.len(), mtime));
+        // no ctime here: the content itself is hashed, so a same-size edit
+        // with its mtime put back still shows
+        let content = if m.is_file() {
+            content_hash(&q, cancel)?
+        } else {
+            0
+        };
+        all.push((rel, m.is_dir(), m.len(), mtime, content));
     }
     all.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -4650,5 +4678,29 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(mode & 0o6000, 0, "{mode:o}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_stamp_tests {
+    use super::*;
+
+    #[test]
+    fn a_same_size_edit_with_its_mtime_put_back_is_seen() {
+        let t = tempfile::tempdir().unwrap();
+        let f = t.path().join("f");
+        std::fs::write(&f, "abc").unwrap();
+        let no = AtomicBool::new(false);
+        let name = OsString::from("f");
+        let before = stamp(&Side::Local, t.path(), &name, &no).unwrap();
+        let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+        std::fs::write(&f, "xyz").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert_ne!(stamp(&Side::Local, t.path(), &name, &no).unwrap(), before);
     }
 }

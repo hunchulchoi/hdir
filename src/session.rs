@@ -671,11 +671,12 @@ impl RemoteSession {
             ));
         }
         let (mut entries, bad) = parse_listing(&self.os, &out.stdout);
-        // On Windows a backslash in a remote name would read as a path
-        // separator once joined: such names are left out (and counted).
+        // On Windows a remote name that would not stay one plain path
+        // component once joined (a backslash, a `C:` prefix) is left out
+        // (and counted).
         let before = entries.len();
         if cfg!(windows) {
-            entries.retain(|e| !crate::platform::os_bytes(&e.name).contains(&b'\\'));
+            entries.retain(|e| crate::platform::plain_remote_name(&e.name));
         }
         let hidden = before - entries.len();
         let items = entries.iter().map(RemoteEntry::to_entry).collect();
@@ -1060,6 +1061,58 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(o.code, None);
+        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn running_through_files_works_on_windows() {
+        let no = AtomicBool::new(false);
+        let cmd = |c: &str| -> Vec<OsString> { vec!["cmd".into(), "/C".into(), c.into()] };
+        let (o, _) = run_through_files(
+            &cmd("echo hi& echo oops 1>&2& exit /b 3"),
+            None,
+            Duration::from_secs(10),
+            None,
+            false,
+        );
+        assert_eq!(o.code, Some(3));
+        assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "hi");
+        assert_eq!(first_line(&o.stderr, ""), "oops");
+        let (a, b) = run_pipe_through_file(
+            &cmd("echo abc"),
+            &cmd("findstr b"),
+            Duration::from_secs(10),
+            &no,
+        );
+        assert_eq!((a.code, b.code), (Some(0), Some(0)));
+        assert_eq!(String::from_utf8_lossy(&b.stdout).trim(), "abc");
+        let (a, b) = run_pipe_through_file(
+            &cmd("exit /b 2"),
+            &cmd("echo never"),
+            Duration::from_secs(10),
+            &no,
+        );
+        assert_eq!(
+            (a.code, b.code),
+            (Some(2), None),
+            "a failed writer never starts the reader"
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            c2.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let (o, _) = run_through_files(
+            &cmd("ping -n 30 127.0.0.1 >NUL"),
+            None,
+            Duration::from_secs(60),
+            Some(&cancel),
+            false,
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
         assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
     }
 

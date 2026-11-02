@@ -36,6 +36,10 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err("잘못된 이름".into());
     }
+    // joined on Windows, these would leave the current remote folder
+    if !crate::platform::plain_remote_name(std::ffi::OsStr::new(name)) {
+        return Err("잘못된 이름".into());
+    }
     Ok(())
 }
 
