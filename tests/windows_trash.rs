@@ -4,7 +4,7 @@
 //! `cargo test --test windows_trash -- --ignored`.
 #![cfg(windows)]
 
-use hdir::trash::{TrashBackend, system_store};
+use hdir::trash::system_store;
 
 #[test]
 #[ignore = "uses the real Recycle Bin"]
