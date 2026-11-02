@@ -1510,6 +1510,13 @@ mod tests {
         let harmless = fake_ls("drwxr-xr-x.", " 0: group:everyone deny delete\\n");
         assert_eq!(mktemp_with(0o700, &[("ls", &harmless)]), (Some(0), true));
         assert_eq!(mktemp_with(0o700, &[("ls", "exit 1")]), (Some(1), false));
+        // the macOS parse must not turn a failing grep into "no ACL"
+        if cfg!(target_os = "macos") {
+            let tools = [("ls", grants.as_str()), ("grep", "exit 2")];
+            assert_eq!(mktemp_with(0o700, &tools), (Some(1), false));
+            let tools = [("ls", grants.as_str()), ("sed", "exit 2")];
+            assert_eq!(mktemp_with(0o700, &tools), (Some(1), false));
+        }
     }
 
     #[test]

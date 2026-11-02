@@ -488,8 +488,9 @@ pub fn mktemp_cmd(os: &RemoteOs, dir: &[u8]) -> Vec<u8> {
     let acl = match os {
         RemoteOs::Bsd => {
             "if a=$(ls -lde -- \"$1\" 2>/dev/null); then \
-             case $(printf '%s\\n' \"$a\" | sed 1d | grep -E ' allow .*(add_file|add_subdirectory|delete_child|write)') in \
-             '') ;; *) exit {UNSAFE_DIR};; esac; \
+             l=$(printf '%s\\n' \"$a\" | sed 1d) || exit 1; \
+             m=$(printf '%s\\n' \"$l\" | grep -E ' allow .*(add_file|add_subdirectory|delete_child|write)'); \
+             [ $? -le 1 ] || exit 1; [ -z \"$m\" ] || exit {UNSAFE_DIR}; \
              else a=$(ls -ld -- \"$1\") || exit 1; case $a in ??????????+*) exit {UNSAFE_DIR};; esac; fi; "
         }
         RemoteOs::Linux | RemoteOs::Other(_) => {
