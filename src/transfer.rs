@@ -7,21 +7,31 @@
 //! - two different servers: `scp -3`.
 //!
 //! Every item lands in a fresh private staging directory inside the
-//! destination (`.hdir-xfer.XXXXXX`) and is renamed into place only once it
-//! arrived in full. So an interrupted transfer (Esc, lost link, full disk)
-//! never touches an existing target, and an existing symlink at the target
-//! is replaced as a link instead of being written through. Esc kills the
-//! running scp and the staging directory is removed.
+//! (physical, checked) destination (`.hdir-xfer.XXXXXX`) and is renamed into
+//! place only once it arrived in full. So an interrupted transfer (Esc, lost
+//! link, full disk) never touches an existing target, and an existing
+//! symlink at the target is replaced as a link instead of being written
+//! through. A name that was free when checked is placed without replacing
+//! anything (a file appearing meanwhile is kept). Esc kills the running scp
+//! and the staging directory is removed.
 //!
-//! Refused (skipped with a warning):
-//! - over scp, an item that is or contains a symlink: scp follows links,
-//!   which would copy data from outside the selection (`secret -> ~/.ssh`);
-//! - a conflict where either side is a directory: merging cannot be atomic.
+//! Refused:
+//! - a destination where someone else could swap the staging dir (the same
+//!   parent-by-parent check remote saves use);
+//! - over scp, an item that is or contains a symlink (skipped): scp follows
+//!   links, which would copy data from outside the selection. Checked up
+//!   front and again right before each scp; the short gap left between the
+//!   last check and scp opening the files is a known limit of scp;
+//! - a conflict where either side is a directory (skipped): merging cannot
+//!   be atomic.
 //!
-//! A move checks the copy is in place before the source goes (local sources
-//! to the trash, remote ones through [`remote_ops::delete`] with its home /
-//! `/` protections); on one server it is a plain `mv`. Progress is per item,
-//! sized up front (`du -sk` on the host, a walk locally).
+//! A move deletes the source only when the copy is in place and the source
+//! still has the identity, size and mtime it had before sending (so a file
+//! changed meanwhile, or the same file reached through two connections,
+//! stays). Local sources go to the trash, remote ones through
+//! [`remote_ops::delete`] with its home / `/` protections; on one server a
+//! move is a plain rename. Progress is per item, sized up front (`du -sk`
+//! on the host, a walk locally).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -42,11 +52,18 @@ pub const IS_DIR: i32 = 44;
 pub const IS_OTHER: i32 = 45;
 /// [`place_cmd`]: the item is in place but the staging dir could not go.
 pub const STAGE_LEFT: i32 = 46;
-/// [`rename_over_cmd`]: a real directory appeared at the target.
+/// [`place_cmd`]: a real directory appeared at an approved target.
 pub const DIR_APPEARED: i32 = 47;
+/// [`place_cmd`]: something appeared at a target that was free.
+pub const APPEARED: i32 = 48;
 
 /// Name prefix of staging directories.
 pub const STAGE_PREFIX: &str = ".hdir-xfer.";
+
+/// Shown when the destination (or a parent) could be tampered with.
+pub const UNSAFE_MSG: &str = "다른 사용자가 바꿀 수 있는 폴더라 보내지 않음";
+
+const APPEARED_MSG: &str = "대상에 같은 이름이 새로 생겨 건너뜀";
 
 /// Where one side of a transfer lives.
 #[derive(Clone)]
@@ -121,6 +138,10 @@ fn word_list(names: &[&[u8]]) -> Vec<u8> {
         .join(&b' ')
 }
 
+/// Shell fragment setting `l=1` when `./$f` is or contains a symlink.
+const LINK_TEST: &[u8] =
+    b"l=0; [ -z \"$(find \"./$f\" -type l 2>/dev/null | head -c 1)\" ] || l=1; ";
+
 /// For each of `names` in `dir`: its size in KiB and whether it is or
 /// contains a symlink (`1`/`0`), each NUL-terminated. Only the number before
 /// the first tab of `du` is kept, so a name with a newline cannot shift the
@@ -131,9 +152,23 @@ pub fn scan_cmd(dir: &[u8], names: &[&[u8]]) -> Vec<u8> {
         &sh_quote(dir),
         b" || exit 1; for f in ",
         &word_list(names),
-        b"; do k=$(du -sk -- \"$f\" 2>/dev/null | head -n 1 | cut -f 1); l=0; \
-          [ -z \"$(find \"./$f\" -type l 2>/dev/null | head -c 1)\" ] || l=1; \
-          printf '%s\\0%s\\0' \"${k:-0}\" \"$l\"; done",
+        b"; do k=$(du -sk -- \"$f\" 2>/dev/null | head -n 1 | cut -f 1); ",
+        LINK_TEST,
+        b"printf '%s\\0%s\\0' \"${k:-0}\" \"$l\"; done",
+    ])
+}
+
+/// Prints `1` when `dir/name` is or contains a symlink, else `0` (no
+/// sizes: the quick re-check right before sending).
+pub fn links_cmd(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"cd -- ",
+        &sh_quote(dir),
+        b" || exit 1; f=",
+        &sh_quote(name),
+        b"; ",
+        LINK_TEST,
+        b"printf '%s' \"$l\"",
     ])
 }
 
@@ -162,17 +197,20 @@ pub fn parse_scan(stdout: &[u8], n: usize) -> Option<Vec<Scanned>> {
                 .trim()
                 .parse::<u64>()
                 .unwrap_or(0);
-            let has_link = match c[1] {
-                b"0" => false,
-                b"1" => true,
-                _ => return None,
-            };
             Some(Scanned {
                 bytes: kib.saturating_mul(1024),
-                has_link,
+                has_link: flag(c[1])?,
             })
         })
         .collect()
+}
+
+fn flag(b: &[u8]) -> Option<bool> {
+    match b {
+        b"0" => Some(false),
+        b"1" => Some(true),
+        _ => None,
+    }
 }
 
 /// `dir` with exactly one trailing `/`.
@@ -220,45 +258,69 @@ pub fn parse_stage(stdout: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     (!rest.is_empty() && !rest.contains(&b'/')).then(|| (dir.to_vec(), stage.to_vec()))
 }
 
-/// Rename `from` onto `to` without ever following `to`: a symlink there
-/// (even one to a directory) is replaced as a link, a real directory that
-/// appeared meanwhile is refused ([`DIR_APPEARED`]).
-pub fn rename_over_cmd(from: &[u8], to: &[u8]) -> Vec<u8> {
-    let t = sh_quote(to);
-    cat(&[
-        b"if [ -L ",
-        &t,
-        b" ]; then if [ -d ",
-        &t,
-        b" ]; then rm -f -- ",
-        &t,
-        b" || exit 1; fi; elif [ -d ",
-        &t,
-        b" ]; then exit 47; fi; mv -f -- ",
-        &sh_quote(from),
-        b" ",
-        &t,
-    ])
+/// Rename `from` onto `to`, never following `to`, then remove the (empty)
+/// staging dir `stage` ([`STAGE_LEFT`] when that fails).
+///
+/// `replace` (the user approved overwriting): a symlink at `to`, even one to
+/// a directory, is set aside in the stage and replaced as a link (and put
+/// back if the rename fails); a real directory there is refused
+/// ([`DIR_APPEARED`]).
+///
+/// Not `replace` (`to` was free when checked): anything there now is kept
+/// ([`APPEARED`]). A regular file is placed with `ln` (which never
+/// replaces) and the staged name removed; other kinds are renamed after a
+/// last check (rename(2) cannot replace a file or a non-empty directory with
+/// a directory).
+pub fn place_cmd(from: &[u8], to: &[u8], stage: &[u8], replace: bool) -> Vec<u8> {
+    let (f, t, st) = (sh_quote(from), sh_quote(to), sh_quote(stage));
+    let aside = sh_quote(&cat(&[&into_dir(stage), b".hdir-old"]));
+    let there: &[u8] = b"if [ -e $T ] || [ -L $T ]; then exit 48; fi; ";
+    let body: Vec<u8> = if replace {
+        cat(&[
+            b"if [ -L $T ]; then if [ -d $T ]; then mv -f -- $T $A || exit 1; \
+              mv -f -- $F $T || { mv -f -- $A $T; exit 1; }; rm -f -- $A; \
+              else mv -f -- $F $T || exit 1; fi; \
+              elif [ -d $T ]; then exit 47; else mv -f -- $F $T || exit 1; fi; ",
+        ])
+    } else {
+        cat(&[
+            there,
+            b"if [ -f $F ] && [ ! -L $F ]; then \
+              if ln -- $F $T 2>/dev/null; then rm -f -- $F; \
+              else ",
+            there,
+            b"mv -- $F $T || exit 1; fi; \
+              else mv -- $F $T || exit 1; fi; ",
+        ])
+    };
+    let body = fill(&body, &[(b"$T", &t), (b"$F", &f), (b"$A", &aside)]);
+    cat(&[&body, b"rmdir -- ", &st, b" || exit 46"])
 }
 
-/// Rename `stage/name` onto `dir/name` ([`rename_over_cmd`]), then remove
-/// the empty staging dir ([`STAGE_LEFT`] when that fails).
-pub fn place_cmd(stage: &[u8], name: &[u8], dir: &[u8]) -> Vec<u8> {
-    let from = cat(&[&into_dir(stage), name]);
-    let to = cat(&[&into_dir(dir), name]);
-    cat(&[
-        &rename_over_cmd(&from, &to),
-        b" || exit $?; rmdir -- ",
-        &sh_quote(stage),
-        b" || exit 46",
-    ])
+/// `text` with every slot replaced by its bytes, in one pass (a path that
+/// itself contains `$F` is never substituted again).
+fn fill(text: &[u8], slots: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(text.len());
+    let mut i = 0;
+    'outer: while i < text.len() {
+        for (slot, with) in slots {
+            if text[i..].starts_with(slot) {
+                o.extend_from_slice(with);
+                i += slot.len();
+                continue 'outer;
+            }
+        }
+        o.push(text[i]);
+        i += 1;
+    }
+    o
 }
 
-/// `dev:inode` of `path` itself (not following a final symlink).
-pub fn identity_cmd(os: &RemoteOs, path: &[u8]) -> Vec<u8> {
+/// `dev:inode:size:mtime` of `path` itself (not following a final symlink).
+pub fn stamp_cmd(os: &RemoteOs, path: &[u8]) -> Vec<u8> {
     let fmt: &[u8] = match os {
-        RemoteOs::Bsd => b"stat -f '%d:%i' -- ",
-        RemoteOs::Linux | RemoteOs::Other(_) => b"stat -c '%d:%i' -- ",
+        RemoteOs::Bsd => b"stat -f '%d:%i:%z:%m' -- ",
+        RemoteOs::Linux | RemoteOs::Other(_) => b"stat -c '%d:%i:%s:%Y' -- ",
     };
     cat(&[fmt, &sh_quote(path)])
 }
@@ -349,23 +411,60 @@ fn kind(side: &Side, path: &Path) -> Result<Kind, String> {
     }
 }
 
-fn dest_dir_ok(side: &Side, dir: &Path) -> Result<(), String> {
-    let there = match side {
-        Side::Local => dir.is_dir(),
+/// Check the destination folder. A local one is resolved and checked for
+/// safety here, once; the physical path is what staging and placing use.
+fn dest_dir_ok(side: &Side, dir: &Path) -> Result<Option<PathBuf>, String> {
+    match side {
+        Side::Local => {
+            if !dir.is_dir() {
+                return Err("대상 폴더 없음".into());
+            }
+            let real = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+            local_dest_safe(&real)?;
+            Ok(Some(real))
+        }
         Side::Remote(s) => {
             let out = s.exec(&is_dir_cmd(&b(dir))).map_err(|e| e.message())?;
             match out.code {
-                Some(0) => true,
-                Some(NOT_THERE) => false,
-                _ => return Err(code_err(&out)),
+                Some(0) => Ok(None),
+                Some(NOT_THERE) => Err("대상 폴더 없음".into()),
+                _ => Err(code_err(&out)),
             }
         }
-    };
-    if there {
-        Ok(())
-    } else {
-        Err("대상 폴더 없음".into())
     }
+}
+
+/// The same parent-by-parent check remote saves use ([`safe_dirs_check`]:
+/// owner, write-granting ACLs, others / non-private group write unless
+/// sticky), run with the local `sh` on the physical path `real`.
+#[cfg(unix)]
+fn local_dest_safe(real: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let os = if cfg!(target_os = "linux") {
+        RemoteOs::Linux
+    } else {
+        RemoteOs::Bsd
+    };
+    let script = cat(&[&safe_dirs_check(&os, &sh_quote(&b(real))), b"exit 0"]);
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(std::ffi::OsStr::from_bytes(&script))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("대상 폴더를 확인할 수 없음: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(UNSAFE_DIR) => Err(UNSAFE_MSG.into()),
+        _ => Err(format!(
+            "대상 폴더를 확인할 수 없음: {}",
+            first_line(&out.stderr, "검사 실패")
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn local_dest_safe(_real: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 /// Size and symlink check of a local item; unreadable parts count as 0
@@ -430,9 +529,23 @@ fn scan(
     }
 }
 
+/// Symlink check of one item right before it is sent (the source may have
+/// changed while a conflict was being answered).
+fn has_link_now(spec: &TransferSpec, name: &OsString, cancel: &AtomicBool) -> Result<bool, String> {
+    match &spec.src {
+        Side::Local => Ok(scan_local(&spec.src_dir.join(name), cancel).is_none_or(|s| s.has_link)),
+        Side::Remote(s) => {
+            let cmd = links_cmd(&b(&spec.src_dir), &os_bytes(name));
+            let out = ran(s.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?)?;
+            flag(&out.stdout).ok_or_else(|| "원격 항목을 확인할 수 없음".into())
+        }
+    }
+}
+
 /// A staging directory inside the destination.
 enum Stage<'a> {
-    Local(tempfile::TempDir),
+    /// The staging dir and the physical destination dir.
+    Local(tempfile::TempDir, PathBuf),
     /// Session, physical destination dir, staging dir.
     Remote(&'a RemoteSession, Vec<u8>, Vec<u8>),
 }
@@ -440,55 +553,25 @@ enum Stage<'a> {
 impl Stage<'_> {
     fn endpoint(&self) -> Endpoint<'_> {
         match self {
-            Stage::Local(t) => Endpoint::Local(t.path()),
+            Stage::Local(t, _) => Endpoint::Local(t.path()),
             Stage::Remote(s, _, p) => Endpoint::Remote(&s.target, p),
         }
     }
 }
 
-/// Shown when the destination (or a parent) could be tampered with.
-pub const UNSAFE_MSG: &str = "다른 사용자가 바꿀 수 있는 폴더라 보내지 않음";
-
-/// Refuse a local destination where someone else could swap the staging
-/// dir: it or a parent is not owned by the user or root, or is writable by
-/// others or by a group other than the user's own private group (gid =
-/// uid), without being sticky.
-#[cfg(unix)]
-fn local_dest_safe(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let real = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
-    // SAFETY: plain id getters without preconditions.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    for a in real.ancestors() {
-        let m = std::fs::metadata(a).map_err(|e| e.to_string())?;
-        let mode = m.mode();
-        let unsafe_dir = if m.uid() != uid && m.uid() != 0 {
-            true
-        } else if mode & 0o1000 != 0 {
-            false
-        } else {
-            mode & 0o002 != 0 || (mode & 0o020 != 0 && !(m.gid() == gid && gid == uid))
-        };
-        if unsafe_dir {
-            return Err(UNSAFE_MSG.into());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn local_dest_safe(_dir: &Path) -> Result<(), String> {
-    Ok(())
-}
-
-fn make_stage<'a>(dst: &'a Side, dest_dir: &Path) -> Result<Stage<'a>, String> {
+/// `real`: the checked physical local destination from [`dest_dir_ok`].
+fn make_stage<'a>(
+    dst: &'a Side,
+    dest_dir: &Path,
+    real: Option<&Path>,
+) -> Result<Stage<'a>, String> {
     match dst {
         Side::Local => {
-            local_dest_safe(dest_dir)?;
+            let real = real.ok_or("대상 폴더를 확인하지 않음")?.to_path_buf();
             tempfile::Builder::new()
                 .prefix(STAGE_PREFIX)
-                .tempdir_in(dest_dir)
-                .map(Stage::Local)
+                .tempdir_in(&real)
+                .map(|t| Stage::Local(t, real))
                 .map_err(|e| format!("임시 폴더를 만들 수 없음: {e}"))
         }
         Side::Remote(s) => {
@@ -510,33 +593,73 @@ fn left_behind(path: &str) -> String {
     format!("임시 폴더가 남음: {path}")
 }
 
-/// Rename the staged item into place. `Ok(Some(warning))` when it is in
-/// place but the staging dir stayed. On error the stage is discarded.
-fn place(stage: Stage, name: &OsString, dest_dir: &Path) -> Result<Option<String>, String> {
+/// How placing went.
+enum Placed {
+    /// In place; maybe with a warning (the stage stayed).
+    Done(Option<String>),
+    /// The target was taken meanwhile; nothing was replaced.
+    Taken,
+}
+
+/// Put the staged item (or, `from` given, that path on the same host) onto
+/// `dest_dir/name`; see [`place_cmd`] for what `replace` allows. The stage
+/// is removed either way.
+fn place(
+    stage: Stage,
+    from: Option<&Path>,
+    name: &OsString,
+    replace: bool,
+) -> Result<Placed, String> {
     match stage {
-        Stage::Local(t) => {
-            // rename(2) replaces a file or symlink at the target, never
-            // following it; a real directory there makes it fail.
-            std::fs::rename(t.path().join(name), dest_dir.join(name)).map_err(|e| e.to_string())?;
+        Stage::Local(t, real) => {
+            let (src, to) = (t.path().join(name), real.join(name));
+            // rename(2) replaces a file or symlink at the target and never
+            // follows it; the no-replace form keeps anything there.
+            let res = if replace {
+                std::fs::rename(&src, &to)
+            } else {
+                crate::fs_ops::rename_noreplace(&src, &to)
+            };
             let path = t.path().to_string_lossy().into_owned();
-            Ok(t.close().err().map(|_| left_behind(&path)))
+            match res {
+                Ok(()) => Ok(Placed::Done(t.close().err().map(|_| left_behind(&path)))),
+                Err(e) => {
+                    let taken = e.kind() == std::io::ErrorKind::AlreadyExists;
+                    let left = t.close().err().map(|_| left_behind(&path));
+                    match (taken, left) {
+                        (true, None) => Ok(Placed::Taken),
+                        (_, Some(w)) => Err(format!("{e} · {w}")),
+                        (false, None) => Err(e.to_string()),
+                    }
+                }
+            }
         }
         Stage::Remote(s, dir, p) => {
-            let res = s.exec(&place_cmd(&p, &os_bytes(name), &dir));
-            let out = res.map_err(|e| e.message())?;
+            let to = cat(&[&into_dir(&dir), &os_bytes(name)]);
+            let from = match from {
+                Some(f) => b(f),
+                None => cat(&[&into_dir(&p), &os_bytes(name)]),
+            };
+            let out = s
+                .exec(&place_cmd(&from, &to, &p, replace))
+                .map_err(|e| e.message())?;
             match out.code {
-                Some(0) => Ok(None),
-                Some(STAGE_LEFT) => Ok(Some(left_behind(&String::from_utf8_lossy(&p)))),
+                Some(0) => Ok(Placed::Done(None)),
+                Some(STAGE_LEFT) => Ok(Placed::Done(Some(left_behind(&String::from_utf8_lossy(
+                    &p,
+                ))))),
                 c => {
-                    let e = if c == Some(DIR_APPEARED) {
-                        "대상에 폴더가 생겨 옮기지 않음".to_string()
-                    } else {
-                        code_err(&out)
+                    let left = discard(Stage::Remote(s, dir, p));
+                    let e = match c {
+                        Some(APPEARED) if left.is_none() => return Ok(Placed::Taken),
+                        Some(APPEARED) => APPEARED_MSG.to_string(),
+                        Some(DIR_APPEARED) => "대상에 폴더가 생겨 옮기지 않음".to_string(),
+                        _ => code_err(&out),
                     };
-                    match discard(Stage::Remote(s, dir, p)) {
-                        Some(w) => Err(format!("{e} · {w}")),
-                        None => Err(e),
-                    }
+                    Err(match left {
+                        Some(w) => format!("{e} · {w}"),
+                        None => e,
+                    })
                 }
             }
         }
@@ -546,7 +669,7 @@ fn place(stage: Stage, name: &OsString, dest_dir: &Path) -> Result<Option<String
 /// Remove a staging dir after a failed transfer; a warning when it stays.
 fn discard(stage: Stage) -> Option<String> {
     let (ok, path) = match stage {
-        Stage::Local(t) => {
+        Stage::Local(t, _) => {
             let p = t.path().to_string_lossy().into_owned();
             (t.close().is_ok(), p)
         }
@@ -578,16 +701,16 @@ fn send(route: &Route, src: &Path, into: Endpoint, cancel: &AtomicBool) -> Resul
     }
 }
 
-/// `dev:inode` of `path` on its side (unix only locally); `None` when it
-/// cannot be told.
-fn identity(side: &Side, path: &Path) -> Option<String> {
+/// `dev:inode:size:mtime` of `path` on its side (unix only locally);
+/// `None` when it cannot be told.
+fn stamp(side: &Side, path: &Path) -> Option<String> {
     match side {
         Side::Local => {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
                 let m = std::fs::symlink_metadata(path).ok()?;
-                Some(format!("{}:{}", m.dev(), m.ino()))
+                Some(format!("{}:{}:{}:{}", m.dev(), m.ino(), m.len(), m.mtime()))
             }
             #[cfg(not(unix))]
             {
@@ -596,27 +719,9 @@ fn identity(side: &Side, path: &Path) -> Option<String> {
             }
         }
         Side::Remote(s) => {
-            let out = s.exec(&identity_cmd(&s.os, &b(path))).ok()?;
+            let out = s.exec(&stamp_cmd(&s.os, &b(path))).ok()?;
             let id = String::from_utf8(out.stdout).ok()?.trim().to_string();
             (out.code == Some(0) && !id.is_empty()).then_some(id)
-        }
-    }
-}
-
-/// Symlink check of one item right before it is sent (the source may have
-/// changed while a conflict was being answered).
-fn has_link_now(spec: &TransferSpec, name: &OsString, cancel: &AtomicBool) -> Result<bool, String> {
-    match &spec.src {
-        Side::Local => Ok(scan_local(&spec.src_dir.join(name), cancel).is_none_or(|s| s.has_link)),
-        Side::Remote(s) => {
-            let n = os_bytes(name).into_owned();
-            let out = s
-                .exec_cancellable(&scan_cmd(&b(&spec.src_dir), &[&n]), cancel)
-                .map_err(|e| e.message())?;
-            let out = ran(out)?;
-            parse_scan(&out.stdout, 1)
-                .map(|v| v[0].has_link)
-                .ok_or_else(|| "원격 항목을 확인할 수 없음".into())
         }
     }
 }
@@ -655,23 +760,27 @@ fn lossy(n: &OsString) -> String {
     n.to_string_lossy().into_owned()
 }
 
-/// Transfer one item.
+/// Transfer one item. `real`: the checked local destination, if local.
 fn item(
     spec: &TransferSpec,
     route: &Route,
+    real: Option<&Path>,
     name: &OsString,
     scanned: Scanned,
     ctl: &mut dyn TransferCtl,
     r: &mut OpReport,
 ) -> Step {
     let fail = |m: String| Step::Stop(OpOutcome::Failed(format!("{}: {m}", lossy(name))));
+    let link_skip = || {
+        Step::Skipped(Some(format!(
+            "심볼릭 링크가 있어 건너뜀 (scp는 링크를 따라감): {}",
+            lossy(name)
+        )))
+    };
     let src = spec.src_dir.join(name);
     let dest = spec.dest_dir.join(name);
     if route.uses_scp() && scanned.has_link {
-        return Step::Skipped(Some(format!(
-            "심볼릭 링크가 있어 건너뜀 (scp는 링크를 따라감): {}",
-            lossy(name)
-        )));
+        return link_skip();
     }
     let mut overwrite = false;
     match kind(&spec.dst, &dest) {
@@ -696,41 +805,24 @@ fn item(
         Err(e) => return fail(e),
     }
     let is_move = spec.kind == JobKind::Move;
-    if let (true, Route::SameHost(s)) = (is_move, route) {
-        let cmd = rename_over_cmd(&b(&src), &b(&dest));
-        return match s.exec_cancellable(&cmd, ctl.cancel_flag()) {
-            Ok(o) if o.code == Some(0) => {
-                r.overwritten += usize::from(overwrite);
-                Step::Done
-            }
-            _ if ctl.is_cancelled() => Step::Stop(OpOutcome::Cancelled),
-            Ok(o) if o.code == Some(DIR_APPEARED) => fail("대상에 폴더가 생겨 옮기지 않음".into()),
-            Ok(o) => fail(code_err(&o)),
-            Err(e) => fail(e.message()),
-        };
-    }
+    let on_host_move = is_move && !route.uses_scp();
     if route.uses_scp() {
         match has_link_now(spec, name, ctl.cancel_flag()) {
             Ok(false) => {}
             _ if ctl.is_cancelled() => return Step::Stop(OpOutcome::Cancelled),
-            Ok(true) => {
-                return Step::Skipped(Some(format!(
-                    "심볼릭 링크가 있어 건너뜀 (scp는 링크를 따라감): {}",
-                    lossy(name)
-                )));
-            }
+            Ok(true) => return link_skip(),
             Err(e) => return fail(e),
         }
     }
-    // A move over an existing target: if both are the same file (one host
-    // reached twice, ssh to localhost), placing the copy replaces the
-    // source, and deleting "the source" would delete the only copy.
-    let src_id = (is_move && overwrite).then(|| identity(&spec.src, &src));
-    let stage = match make_stage(&spec.dst, &spec.dest_dir) {
+    // A move deletes the source only if it is still what was sent: not
+    // changed meanwhile, and not replaced by the copy (the same file reached
+    // through two connections, ssh to localhost).
+    let before = (is_move && !on_host_move).then(|| stamp(&spec.src, &src));
+    let stage = match make_stage(&spec.dst, &spec.dest_dir, real) {
         Ok(st) => st,
         Err(e) => return fail(e),
     };
-    if let Err(e) = send(route, &src, stage.endpoint(), ctl.cancel_flag()) {
+    if !on_host_move && let Err(e) = send(route, &src, stage.endpoint(), ctl.cancel_flag()) {
         let cancelled = ctl.is_cancelled();
         r.warnings.extend(discard(stage));
         return if cancelled {
@@ -739,24 +831,27 @@ fn item(
             fail(e)
         };
     }
-    match place(stage, name, &spec.dest_dir) {
-        Ok(w) => r.warnings.extend(w),
+    // On one server a move is a single rename of the source itself.
+    let from = on_host_move.then_some(src.as_path());
+    match place(stage, from, name, overwrite) {
+        Ok(Placed::Done(w)) => r.warnings.extend(w),
+        Ok(Placed::Taken) => {
+            return Step::Skipped(Some(format!("{APPEARED_MSG}: {}", lossy(name))));
+        }
         Err(e) => return fail(format!("제자리로 옮기지 못함: {e}")),
     }
     r.overwritten += usize::from(overwrite);
-    if !is_move {
+    let Some(before) = before else {
         return Step::Done;
-    }
+    };
     match kind(&spec.dst, &dest) {
         Ok(Kind::Missing) => return fail("전송 후 대상이 없어 원본을 지우지 않음".into()),
         Err(e) => return fail(format!("전송 확인 실패, 원본을 지우지 않음 ({e})")),
         Ok(_) => {}
     }
-    if let Some(before) = src_id
-        && (before.is_none() || identity(&spec.src, &src) != before)
-    {
+    if before.is_none() || stamp(&spec.src, &src) != before {
         return Step::Partial(format!(
-            "원본과 대상이 같은 파일일 수 있어 원본을 지우지 않음: {}",
+            "원본이 전송 중 바뀌었거나 대상과 같은 파일이라 원본을 지우지 않음: {}",
             lossy(name)
         ));
     }
@@ -780,21 +875,18 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
     if same_target && spec.dest_dir == spec.src_dir {
         return OpReport::failed("같은 폴더로는 보낼 수 없음");
     }
-    if matches!(route, Route::SameHost(_)) {
-        if spec.dest_dir == spec.src_dir {
-            return OpReport::failed("같은 폴더로는 보낼 수 없음");
-        }
-        if spec
+    if matches!(route, Route::SameHost(_))
+        && spec
             .names
             .iter()
             .any(|n| spec.dest_dir.starts_with(spec.src_dir.join(n)))
-        {
-            return OpReport::failed("폴더를 그 안으로 보낼 수 없음");
-        }
+    {
+        return OpReport::failed("폴더를 그 안으로 보낼 수 없음");
     }
-    if let Err(e) = dest_dir_ok(&spec.dst, &spec.dest_dir) {
-        return OpReport::failed(e);
-    }
+    let real = match dest_dir_ok(&spec.dst, &spec.dest_dir) {
+        Ok(r) => r,
+        Err(e) => return OpReport::failed(e),
+    };
     let scanned = match scan(spec, &route, ctl.cancel_flag()) {
         Ok(Some(v)) => v,
         Ok(None) => return report(OpOutcome::Cancelled),
@@ -812,7 +904,7 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
         }
         let src = spec.src_dir.join(name);
         ctl.on_progress(0, &src);
-        match item(spec, &route, name, sc, ctl, &mut r) {
+        match item(spec, &route, real.as_deref(), name, sc, ctl, &mut r) {
             Step::Done => {
                 r.copied += 1;
                 r.done_sources.push(src.clone());
@@ -880,21 +972,30 @@ mod tests {
             ),
             "{st}"
         );
-        let q = "'/d/a '\\''b'\\'''";
+        let pl = String::from_utf8(place_cmd(b"/d/S/x", b"/d/x", b"/d/S", true)).unwrap();
         assert_eq!(
-            String::from_utf8(rename_over_cmd(b"/s/a", b"/d/a 'b'")).unwrap(),
-            format!(
-                "if [ -L {q} ]; then if [ -d {q} ]; then rm -f -- {q} || exit 1; fi; \
-                 elif [ -d {q} ]; then exit 47; fi; mv -f -- '/s/a' {q}"
-            )
+            pl,
+            "if [ -L '/d/x' ]; then if [ -d '/d/x' ]; then mv -f -- '/d/x' '/d/S/.hdir-old' || exit 1; \
+             mv -f -- '/d/S/x' '/d/x' || { mv -f -- '/d/S/.hdir-old' '/d/x'; exit 1; }; \
+             rm -f -- '/d/S/.hdir-old'; else mv -f -- '/d/S/x' '/d/x' || exit 1; fi; \
+             elif [ -d '/d/x' ]; then exit 47; else mv -f -- '/d/S/x' '/d/x' || exit 1; fi; \
+             rmdir -- '/d/S' || exit 46"
         );
-        let pl = String::from_utf8(place_cmd(b"/d/.hdir-xfer.1", b"x", b"/d")).unwrap();
-        assert!(pl.starts_with("if [ -L '/d/x' ]"), "{pl}");
+        let pl = String::from_utf8(place_cmd(b"/d/S/x", b"/d/x", b"/d/S", false)).unwrap();
+        assert_eq!(
+            pl,
+            "if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; \
+             if [ -f '/d/S/x' ] && [ ! -L '/d/S/x' ]; then \
+             if ln -- '/d/S/x' '/d/x' 2>/dev/null; then rm -f -- '/d/S/x'; \
+             else if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; \
+             mv -- '/d/S/x' '/d/x' || exit 1; fi; \
+             else mv -- '/d/S/x' '/d/x' || exit 1; fi; rmdir -- '/d/S' || exit 46"
+        );
+        // paths are substituted once: a name containing a slot stays as is
+        let odd = String::from_utf8(place_cmd(b"/s/a$Tb", b"/d/$F", b"/d/S", false)).unwrap();
         assert!(
-            pl.ends_with(
-                "mv -f -- '/d/.hdir-xfer.1/x' '/d/x' || exit $?; rmdir -- '/d/.hdir-xfer.1' || exit 46"
-            ),
-            "{pl}"
+            odd.contains("'/s/a$Tb'") && odd.contains("'/d/$F'"),
+            "{odd}"
         );
         assert_eq!(
             unstage_cmd(b"/d/.hdir-xfer.1"),
@@ -905,12 +1006,16 @@ mod tests {
             b"cp -Rp -- '/a/x' '/dst/'".to_vec()
         );
         assert_eq!(
-            identity_cmd(&RemoteOs::Linux, b"/a b"),
-            b"stat -c '%d:%i' -- '/a b'".to_vec()
+            stamp_cmd(&RemoteOs::Linux, b"/a b"),
+            b"stat -c '%d:%i:%s:%Y' -- '/a b'".to_vec()
         );
         assert_eq!(
-            identity_cmd(&RemoteOs::Bsd, b"/a"),
-            b"stat -f '%d:%i' -- '/a'".to_vec()
+            stamp_cmd(&RemoteOs::Bsd, b"/a"),
+            b"stat -f '%d:%i:%z:%m' -- '/a'".to_vec()
+        );
+        assert_eq!(
+            links_cmd(b"/s", b"-x"),
+            b"cd -- '/s' || exit 1; f='-x'; l=0; [ -z \"$(find \"./$f\" -type l 2>/dev/null | head -c 1)\" ] || l=1; printf '%s' \"$l\"".to_vec()
         );
     }
 
@@ -1024,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn real_staging_replaces_links_instead_of_writing_through_them() {
+    fn real_placing_replaces_links_instead_of_writing_through_them() {
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let dest = private_dir(t.path(), "dest");
@@ -1040,7 +1145,9 @@ mod tests {
                 0o700
             );
             fs::write(sp.join(name), "new").unwrap();
-            let out = sh(&place_cmd(&stage, name.as_bytes(), &dir));
+            let to = cat(&[&dir, b"/", name.as_bytes()]);
+            let from = cat(&[&stage, b"/", name.as_bytes()]);
+            let out = sh(&place_cmd(&from, &to, &stage, true));
             assert!(out.status.success(), "{name}: {out:?}");
             let m = fs::symlink_metadata(dest.join(name)).unwrap();
             assert!(m.is_file(), "{name} is a plain file now");
@@ -1048,17 +1155,15 @@ mod tests {
             assert!(!sp.exists());
         }
         assert_eq!(fs::read(t.path().join("outside")).unwrap(), b"keep");
-        assert_eq!(
-            fs::read_dir(&outside_dir).unwrap().count(),
-            0,
-            "nothing moved into the linked dir"
-        );
+        assert_eq!(fs::read_dir(&outside_dir).unwrap().count(), 0);
         // a real directory at the target is never moved into
         fs::create_dir(dest.join("real")).unwrap();
         let (dir, stage, sp) = stage_in(&dest);
         fs::write(sp.join("real"), "new").unwrap();
+        let to = cat(&[&dir, b"/real"]);
+        let from = cat(&[&stage, b"/real"]);
         assert_eq!(
-            sh(&place_cmd(&stage, b"real", &dir)).status.code(),
+            sh(&place_cmd(&from, &to, &stage, true)).status.code(),
             Some(DIR_APPEARED)
         );
         assert_eq!(fs::read_dir(dest.join("real")).unwrap().count(), 0);
@@ -1067,6 +1172,69 @@ mod tests {
         fs::write(sp.join("half/x"), "x").unwrap();
         assert!(sh(&unstage_cmd(&stage)).status.success());
         assert!(!sp.exists());
+    }
+
+    #[test]
+    fn real_placing_puts_a_dir_link_back_when_the_rename_fails() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let outside_dir = private_dir(t.path(), "outside-dir");
+        std::os::unix::fs::symlink(&outside_dir, dest.join("l")).unwrap();
+        let (dir, stage, sp) = stage_in(&dest);
+        let to = cat(&[&dir, b"/l"]);
+        let missing = cat(&[&stage, b"/l"]); // nothing staged: mv fails
+        assert_eq!(
+            sh(&place_cmd(&missing, &to, &stage, true)).status.code(),
+            Some(1)
+        );
+        assert_eq!(fs::read_link(dest.join("l")).unwrap(), outside_dir);
+        assert_eq!(fs::read_dir(&sp).unwrap().count(), 0, "nothing left aside");
+    }
+
+    #[test]
+    fn real_placing_onto_a_free_name_never_replaces_what_appeared() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        // a file goes in with ln; a directory with mv
+        for (name, is_dir) in [("f $F", false), ("d", true)] {
+            let (dir, stage, sp) = stage_in(&dest);
+            if is_dir {
+                fs::create_dir(sp.join(name)).unwrap();
+                fs::write(sp.join(name).join("x"), "x").unwrap();
+            } else {
+                fs::write(sp.join(name), "new").unwrap();
+            }
+            let to = cat(&[&dir, b"/", name.as_bytes()]);
+            let from = cat(&[&stage, b"/", name.as_bytes()]);
+            let out = sh(&place_cmd(&from, &to, &stage, false));
+            assert!(out.status.success(), "{name}: {out:?}");
+            assert!(dest.join(name).exists() && !sp.exists(), "{name}");
+        }
+        // something appeared meanwhile: kept, refused with APPEARED
+        for appeared_dir in [false, true] {
+            let name = "taken";
+            let _ = fs::remove_file(dest.join(name));
+            let _ = fs::remove_dir(dest.join(name));
+            if appeared_dir {
+                fs::create_dir(dest.join(name)).unwrap();
+            } else {
+                fs::write(dest.join(name), "theirs").unwrap();
+            }
+            let (dir, stage, sp) = stage_in(&dest);
+            fs::write(sp.join(name), "mine").unwrap();
+            let to = cat(&[&dir, b"/", name.as_bytes()]);
+            let from = cat(&[&stage, b"/", name.as_bytes()]);
+            assert_eq!(
+                sh(&place_cmd(&from, &to, &stage, false)).status.code(),
+                Some(APPEARED)
+            );
+            if appeared_dir {
+                assert_eq!(fs::read_dir(dest.join(name)).unwrap().count(), 0);
+            } else {
+                assert_eq!(fs::read(dest.join(name)).unwrap(), b"theirs");
+            }
+            assert!(sh(&unstage_cmd(&stage)).status.success());
+        }
     }
 
     #[test]
@@ -1094,22 +1262,25 @@ mod tests {
     }
 
     #[test]
-    fn real_identity_tells_files_apart_and_does_not_follow_links() {
+    fn real_stamps_tell_files_apart_and_see_changes() {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join("a"), "x").unwrap();
         fs::write(t.path().join("b"), "x").unwrap();
         std::os::unix::fs::symlink(t.path().join("a"), t.path().join("l")).unwrap();
-        let id = |n: &str| {
-            let out = sh(&identity_cmd(
+        let st = |n: &str| {
+            let out = sh(&stamp_cmd(
                 &crate::testutil::local_os(),
                 &b(&t.path().join(n)),
             ));
             assert!(out.status.success(), "{out:?}");
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
-        assert_ne!(id("a"), id("b"));
-        assert_ne!(id("a"), id("l"));
-        assert_eq!(Some(id("a")), identity(&Side::Local, &t.path().join("a")));
+        assert_ne!(st("a"), st("b"));
+        assert_ne!(st("a"), st("l"));
+        assert_eq!(Some(st("a")), stamp(&Side::Local, &t.path().join("a")));
+        let before = st("a");
+        fs::write(t.path().join("a"), "xy").unwrap();
+        assert_ne!(st("a"), before, "a size change shows");
     }
 
     #[test]
@@ -1233,7 +1404,7 @@ mod tests {
     /// Remote answers: `dirs` / `files` exist (as directory / file), the
     /// destination folders `/dst` and `/srv` exist, the scan answers `scan`.
     fn answer(c: &str, dirs: &[&str], files: &[&str], scan: &str) -> CmdOutput {
-        if c.starts_with("if [ -d '") || c.contains("; mv -f -- ") {
+        if c.starts_with("if [ -d '") || c.ends_with("|| exit 46") {
             return code(0); // destination dir check, rename into place
         }
         if let Some(path) = quoted_after(c, "if [ -L '") {
@@ -1247,6 +1418,14 @@ mod tests {
         }
         if let Some(o) = fake_mktemp(c) {
             return o;
+        }
+        if c.starts_with("stat -c ") {
+            return ok("1:2:3:4\n");
+        }
+        if c.starts_with("cd -- ") && c.contains("; f='") {
+            // the re-check before sending: the first record's link flag
+            let recs: Vec<&str> = scan.split_terminator('\0').collect();
+            return ok(recs.get(1).copied().unwrap_or("0"));
         }
         if c.starts_with("cd -- ") && c.contains("du -sk") {
             // the up-front scan has every name, the re-check before sending one
@@ -1319,7 +1498,14 @@ mod tests {
         let to = format!("prod-web:{STAGE}");
         assert_eq!(scp_pairs(&f), vec![(a, to.clone()), (d, to)]);
         assert!(f.scp_calls()[0].contains(&"-rp".to_string()));
-        let place = String::from_utf8(place_cmd(STAGE.as_bytes(), b"a", b"/dst")).unwrap();
+        let from = format!("{STAGE}/a");
+        let place = String::from_utf8(place_cmd(
+            from.as_bytes(),
+            b"/dst/a",
+            STAGE.as_bytes(),
+            false,
+        ));
+        let place = place.unwrap();
         assert!(f.remote_cmds().contains(&place), "{:?}", f.remote_cmds());
     }
 
@@ -1646,9 +1832,10 @@ mod tests {
             .filter(|c| !c.starts_with("cd -- "))
             .collect();
         let cp = format!("cp -Rp -- '/srv/a' '{STAGE}/'");
-        let mv = String::from_utf8(rename_over_cmd(b"/srv/b", b"/dst/b")).unwrap();
-        assert_eq!(long, vec![cp, mv]);
+        assert_eq!(long, vec![cp], "a move on one host is a rename, not a copy");
         let moved: Vec<String> = f.remote_cmds()[before..].to_vec();
+        let mv = String::from_utf8(place_cmd(b"/srv/b", b"/dst/b", STAGE.as_bytes(), false));
+        assert!(moved.contains(&mv.unwrap()), "{moved:?}");
         assert!(!moved.iter().any(|c| c.contains("du -sk")), "{moved:?}");
         assert!(!moved.iter().any(|c| c.contains("rm -rf")), "{moved:?}");
     }
@@ -1683,7 +1870,14 @@ mod tests {
             scp_pairs(&fs_),
             vec![("prod-web:/srv/a".into(), format!("other-host:{STAGE}"))]
         );
-        let place = String::from_utf8(place_cmd(STAGE.as_bytes(), b"a", b"/dst")).unwrap();
+        let from = format!("{STAGE}/a");
+        let place = String::from_utf8(place_cmd(
+            from.as_bytes(),
+            b"/dst/a",
+            STAGE.as_bytes(),
+            false,
+        ));
+        let place = place.unwrap();
         assert!(fd.remote_cmds().contains(&place));
     }
 
@@ -1848,7 +2042,7 @@ mod tests {
                 return fake_scp(a);
             }
             let c = remote_cmd(a).unwrap_or_default();
-            if c.starts_with("if [ -L '") && !c.contains("; mv -f -- ") {
+            if c.starts_with("if [ -L '") && !c.ends_with("|| exit 46") {
                 return code(if sent.load(Ordering::SeqCst) {
                     IS_OTHER
                 } else {
@@ -1978,10 +2172,12 @@ mod tests {
                 return ok("");
             }
             let c = remote_cmd(a).unwrap_or_default();
-            if c.contains("; mv -f -- ") {
-                // renaming the copy into place replaces the source itself
-                fs::remove_file(&src2).unwrap();
-                fs::write(&src2, "only copy").unwrap();
+            if c.ends_with("|| exit 46") {
+                // renaming the (already written) copy into place replaces
+                // the source itself, like the real `mv` would
+                let staged = src2.with_file_name("staged");
+                fs::write(&staged, "only copy").unwrap();
+                fs::rename(&staged, &src2).unwrap();
                 return code(0);
             }
             answer(c, &[], &["/dst/a"], "")
@@ -2000,7 +2196,9 @@ mod tests {
         assert_eq!((r.outcome, r.partial, r.copied), (OpOutcome::Done, 1, 0));
         assert_eq!(
             r.warnings,
-            vec!["원본과 대상이 같은 파일일 수 있어 원본을 지우지 않음: a".to_string()]
+            vec![
+                "원본이 전송 중 바뀌었거나 대상과 같은 파일이라 원본을 지우지 않음: a".to_string()
+            ]
         );
         assert!(trash.trashed.lock().unwrap().is_empty());
         assert_eq!(fs::read(&src).unwrap(), b"only copy");
@@ -2017,7 +2215,7 @@ mod tests {
                 return fake_scp(a);
             }
             let c = remote_cmd(a).unwrap_or_default();
-            if c.starts_with("stat -c '%d:%i' -- '/srv/a'") {
+            if c.starts_with("stat -c '%d:%i:%s:%Y' -- '/srv/a'") {
                 return ok(i2.lock().unwrap().remove(0));
             }
             answer(c, &[], &[], "0\x000\x00")
@@ -2107,7 +2305,7 @@ mod tests {
                 return ok("");
             }
             let c = remote_cmd(a).unwrap_or_default();
-            if c.contains("; mv -f -- ") {
+            if c.ends_with("|| exit 46") {
                 return fail(1, "mv: Permission denied\n");
             }
             answer(c, &[], &[], "")
@@ -2171,7 +2369,129 @@ mod tests {
             open.path(),
         );
         let r = run(&s, &mut Ctl::new());
-        assert_eq!(r.outcome, OpOutcome::Failed(format!("a: {UNSAFE_MSG}")));
+        assert_eq!(
+            r.outcome,
+            OpOutcome::Failed(UNSAFE_MSG.into()),
+            "checked once, up front"
+        );
         assert!(f.scp_calls().is_empty());
+    }
+
+    #[test]
+    fn a_local_file_that_appears_during_the_download_is_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().to_path_buf();
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "scp" {
+                fs::write(dest.join("a"), "theirs").unwrap(); // someone else
+                return fake_scp(a);
+            }
+            answer(remote_cmd(a).unwrap_or_default(), &[], &[], "0\x000\x00")
+        });
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let mut c = Ctl::new();
+        let r = run(&s, &mut c);
+        assert_eq!((r.outcome, r.copied, r.skipped), (OpOutcome::Done, 0, 1));
+        assert!(c.conflicts.is_empty(), "it was free when checked");
+        assert_eq!(r.warnings, vec![format!("{APPEARED_MSG}: a")]);
+        assert_eq!(fs::read(t.path().join("a")).unwrap(), b"theirs");
+        assert_eq!(stages_in(t.path()), 0);
+    }
+
+    #[test]
+    fn a_remote_name_that_appears_during_the_upload_is_kept() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "x").unwrap();
+        let f = FakeCmd::new(|a| {
+            if a[0] == "scp" {
+                return ok("");
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.ends_with("|| exit 46") {
+                return code(APPEARED);
+            }
+            answer(c, &[], &[], "")
+        });
+        let s = spec(
+            JobKind::Move,
+            Side::Local,
+            t.path(),
+            &["a"],
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!((r.outcome, r.skipped), (OpOutcome::Done, 1));
+        assert_eq!(r.warnings, vec![format!("{APPEARED_MSG}: a")]);
+        assert!(t.path().join("a").exists(), "source kept");
+        let unstage = String::from_utf8(unstage_cmd(STAGE.as_bytes())).unwrap();
+        assert_eq!(f.remote_cmds().last(), Some(&unstage));
+    }
+
+    #[test]
+    fn a_source_changed_during_a_move_is_kept() {
+        let t = tempfile::tempdir().unwrap();
+        let stamps = Arc::new(Mutex::new(vec!["1:2:3:4\n", "1:2:9:5\n"]));
+        let s2 = Arc::clone(&stamps);
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "scp" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.starts_with("stat -c ") {
+                return ok(s2.lock().unwrap().remove(0));
+            }
+            answer(c, &[], &[], "0\x000\x00")
+        });
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!((r.outcome, r.partial), (OpOutcome::Done, 1));
+        assert!(r.warnings[0].contains("바뀌었거나"), "{:?}", r.warnings);
+        assert!(
+            !f.remote_cmds().iter().any(|c| c.contains("rm -rf")),
+            "source kept"
+        );
+        assert_eq!(
+            fs::read(t.path().join("a")).unwrap(),
+            b"new",
+            "copy in place"
+        );
+    }
+
+    #[test]
+    fn a_local_destination_reached_through_a_link_is_used_by_its_real_path() {
+        let t = tempfile::tempdir().unwrap();
+        let real = private_dir(t.path(), "real");
+        std::os::unix::fs::symlink(&real, t.path().join("via")).unwrap();
+        let f = host(&[], &[], "0\x000\x00");
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            &t.path().join("via"),
+        );
+        assert_eq!(run(&s, &mut Ctl::new()).outcome, OpOutcome::Done);
+        let staged = PathBuf::from(&scp_pairs(&f)[0].1);
+        assert_eq!(
+            staged.parent(),
+            Some(fs::canonicalize(&real).unwrap().as_path())
+        );
+        assert_eq!(fs::read(real.join("a")).unwrap(), b"new");
     }
 }

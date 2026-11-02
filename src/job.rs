@@ -807,7 +807,7 @@ mod transfer_tests {
             if let Some(o) = fake_mktemp(c) {
                 return o;
             }
-            if c.contains("; mv -f -- ") {
+            if c.ends_with("|| exit 46") {
                 return code(0);
             }
             if c.starts_with("if [ -L '/dst/a'") {

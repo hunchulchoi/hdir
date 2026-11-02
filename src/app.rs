@@ -9559,10 +9559,10 @@ mod tests {
                     return Some(out(0, ""));
                 }
                 let c = crate::testutil::remote_cmd(a)?;
-                if c.contains("; mv -f -- ") {
+                if c.ends_with("|| exit 46") {
                     return Some(out(0, "")); // rename into place
                 }
-                if c.starts_with("stat -c '%d:%i'") {
+                if c.starts_with("stat -c ") {
                     return Some(out(0, "1:2\n"));
                 }
                 if let Some(rest) = c.strip_prefix("if [ -L '") {
@@ -9579,6 +9579,9 @@ mod tests {
                 }
                 if let Some(o) = crate::testutil::fake_mktemp(c) {
                     return Some(o);
+                }
+                if c.contains(" || exit 1; f='") {
+                    return Some(out(0, "0")); // link re-check: none
                 }
                 if c.contains("; do k=$(du -sk") {
                     return Some(out(0, "0\x000\x00"));

@@ -789,6 +789,8 @@ fn transfers_round_trip() {
     let watch = sink.path().to_path_buf();
     let cancelled_at = Arc::new(std::sync::Mutex::new(None));
     let at = Arc::clone(&cancelled_at);
+    let saw_bytes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw = Arc::clone(&saw_bytes);
     // Cancel as soon as the first bytes land in the stage.
     let stopper = std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
@@ -799,6 +801,7 @@ fn transfers_round_trip() {
                 .flatten()
                 .any(|e| std::fs::metadata(e.path().join("big")).is_ok_and(|m| m.len() > 0));
             if started {
+                saw.store(true, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -823,6 +826,10 @@ fn transfers_round_trip() {
     stopper.join().unwrap();
     let took = start.elapsed();
     assert_eq!(r.outcome, OpOutcome::Cancelled, "took {took:?}");
+    assert!(
+        saw_bytes.load(std::sync::atomic::Ordering::SeqCst),
+        "Esc came while bytes were arriving"
+    );
     let at = cancelled_at.lock().unwrap().expect("cancel was requested");
     let after = done.saturating_duration_since(at);
     assert!(
