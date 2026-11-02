@@ -565,7 +565,8 @@ fn fill(text: &[u8], slots: &[(&[u8], &[u8])]) -> Vec<u8> {
 
 /// A checksum over `dev:inode:size:mtime:ctime:name` (nanoseconds) of
 /// `dir/name` and everything under it, links not followed: any change to
-/// the tree (content, a rename, a new file) changes it.
+/// the tree (content, a rename, a new file) changes it. Printed as
+/// `<top ctime> <crc> <bytes> <number of entries>`.
 pub fn stamp_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
     // The top entry leaves out its ctime: setting it aside before deletion
     // (a rename) changes that, and nothing else.
@@ -594,8 +595,11 @@ pub fn stamp_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
         &n,
         b" -mindepth 1 -exec ",
         fmt,
-        b" {} +) || exit 1; printf '%s ' \"$c\"; \
-          printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum",
+        b" {} +) || exit 1; n=$(find ",
+        &n,
+        b" -exec sh -c 'for f do printf .; done' sh {} + | wc -c) || exit 1; \
+          k=$(printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum) || exit 1; \
+          printf '%s %s %s\\n' \"$c\" \"$k\" $((n))",
     ])
 }
 
@@ -1292,6 +1296,31 @@ fn stamp(side: &Side, dir: &Path, name: &OsString, cancel: &AtomicBool) -> Optio
     }
 }
 
+/// Entries in the local tree at `path` (itself included, links not
+/// followed); `None` when it cannot be read or on Esc.
+fn local_count(path: &Path, cancel: &AtomicBool) -> Option<u64> {
+    let mut n = 0;
+    let mut todo = vec![path.to_path_buf()];
+    while let Some(q) = todo.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        n += 1;
+        if std::fs::symlink_metadata(&q).ok()?.is_dir() {
+            for e in std::fs::read_dir(&q).ok()? {
+                todo.push(e.ok()?.path());
+            }
+        }
+    }
+    Some(n)
+}
+
+/// The entry count at the end of a remote stamp ([`stamp_cmd`]).
+fn stamp_count(stamp: &str) -> Option<u64> {
+    let f: Vec<&str> = stamp.split_whitespace().collect();
+    (f.len() == 4).then(|| f[3].parse().ok()).flatten()
+}
+
 #[cfg(unix)]
 fn local_stamp(path: &Path, cancel: &AtomicBool) -> Option<String> {
     use std::hash::{Hash, Hasher};
@@ -1590,6 +1619,17 @@ fn item(
     // private dir next to it: whatever is checked below is exactly what
     // gets deleted, even if someone recreates the name meanwhile.
     if let Side::Remote(s) = &spec.src {
+        // Names that differ only in case (`a`, `A`) become one on a local
+        // disk that ignores case: fewer entries arrive than were sent.
+        if matches!(spec.dst, Side::Local) {
+            let sent = before.as_deref().and_then(stamp_count);
+            if sent.is_some() && local_count(&dest, ctl.cancel_flag()) != sent {
+                return Step::Partial(format!(
+                    "받은 항목 수가 원본과 달라(대소문자만 다른 이름 등) 원본을 지우지 않음: {}",
+                    lossy(name)
+                ));
+            }
+        }
         return delete_remote_source(s, spec, name, before, ctl);
     }
     let after = stamp(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
@@ -1946,7 +1986,9 @@ mod tests {
             "cd -- '/s' || exit 1; c=$(stat -c %.9Z -- ./'a b') || exit 1; \
              t=$(stat -c '%d:%i:%s:%.9Y:%n' -- ./'a b') || exit 1; \
              s=$(find ./'a b' -mindepth 1 -exec stat -c '%d:%i:%s:%.9Y:%.9Z:%n' {} +) || exit 1; \
-             printf '%s ' \"$c\"; printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum"
+             n=$(find ./'a b' -exec sh -c 'for f do printf .; done' sh {} + | wc -c) || exit 1; \
+             k=$(printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum) || exit 1; \
+             printf '%s %s %s\\n' \"$c\" \"$k\" $((n))"
         );
         let bsd = String::from_utf8(stamp_cmd(&RemoteOs::Bsd, b"/s", b"a")).unwrap();
         assert!(
@@ -3593,6 +3635,84 @@ mod tests {
             b"new",
             "copy in place"
         );
+    }
+
+    #[test]
+    fn a_move_that_arrives_with_fewer_entries_keeps_the_remote_source() {
+        // `a` and `A` in one remote folder land as one file on a disk that
+        // ignores case: the remote tree has 3 entries, 1 arrived.
+        let t = tempfile::tempdir().unwrap();
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("| cksum") {
+                return ok("7.1 11 2 3\n");
+            }
+            answer(c, &[], &[], "0\x000\x00")
+        });
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!((r.outcome, r.partial), (OpOutcome::Done, 1));
+        assert!(r.warnings[0].contains("대소문자"), "{:?}", r.warnings);
+        let cmds = f.remote_cmds();
+        assert!(!cmds.iter().any(|c| c.contains("rm -rf")), "source kept");
+        assert!(
+            !cmds.iter().any(|c| c.contains(QUARANTINE_PREFIX)),
+            "not even set aside: {cmds:?}"
+        );
+        assert_eq!(fs::read(t.path().join("a")).unwrap(), b"new");
+        // the same move with every entry there goes ahead
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("| cksum") {
+                return ok("7.1 11 2 1\n");
+            }
+            answer(c, &[], &[], "0\x000\x00")
+        });
+        let t = tempfile::tempdir().unwrap();
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            (r.outcome, r.partial),
+            (OpOutcome::Done, 0),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn real_stamp_ends_with_the_number_of_entries() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("d/sub")).unwrap();
+        fs::write(t.path().join("d/sub/f"), "abc").unwrap();
+        fs::write(t.path().join("d/two\nlines"), "x").unwrap();
+        let os = crate::testutil::local_os();
+        let out = sh(&stamp_cmd(&os, &b(t.path()), b"d"));
+        assert!(out.status.success(), "{out:?}");
+        let s = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(s.split_whitespace().last(), Some("4"), "{s:?}");
+        assert_eq!(s.split_whitespace().count(), 4, "{s:?}");
+        let no = AtomicBool::new(false);
+        assert_eq!(local_count(&t.path().join("d"), &no), Some(4));
     }
 
     #[test]

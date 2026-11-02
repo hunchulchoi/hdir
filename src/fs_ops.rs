@@ -2575,7 +2575,20 @@ mod tests {
         let open = s.join("open.txt");
         fs::write(&open, "y").unwrap();
         icacls(&[open.to_str().unwrap(), "/grant", "Everyone:(R)"]);
-        let r = copy_items(&[locked.clone(), open.clone()], &d, &mut ctl());
+        // a protected folder, with a file that inherits from it
+        let dir = s.join("vault");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("in.txt"), "z").unwrap();
+        let rule = format!("{user}:(OI)(CI)(F)");
+        icacls(&[dir.to_str().unwrap(), "/inheritance:r", "/grant:r", &rule]);
+        let all = [locked.clone(), open.clone(), dir.clone()];
+        let r = copy_items(&all, &d, &mut ctl());
+        assert_eq!(acl_of(&d.join("vault")), acl_of(&dir), "a folder too");
+        assert_eq!(
+            acl_of(&d.join("vault").join("in.txt")),
+            acl_of(&dir.join("in.txt")),
+            "inherited from the copied folder"
+        );
         assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert_eq!(
