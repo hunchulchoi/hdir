@@ -1,6 +1,7 @@
 //! Background copy/move worker so the UI thread never blocks.
 
 use crate::fs_ops::{self, ConflictAction, OpControl, OpOutcome, OpReport};
+use crate::transfer::{self, TransferCtl, TransferSpec};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -178,6 +179,15 @@ impl OpControl for Worker {
     }
 }
 
+impl TransferCtl for Worker {
+    fn started(&mut self, totals: fs_ops::Totals) {
+        let _ = self.events.send(JobEvent::Started { totals });
+    }
+    fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+}
+
 fn run(spec: &JobSpec, w: &mut Worker) -> OpReport {
     // Checked here (not on the UI thread): the path may sit on a slow mount.
     if !spec.dest_dir.is_dir() {
@@ -235,6 +245,24 @@ impl JobHandle {
 
     /// Like [`spawn`](Self::spawn) with an optional per-chunk hook (for deterministic tests).
     pub fn spawn_with(spec: JobSpec, on_chunk: Option<ChunkHook>) -> JobHandle {
+        let by_items = spec.kind == JobKind::Move;
+        Self::spawn_worker(by_items, on_chunk, move |w| run(&spec, w))
+    }
+
+    /// Copy / move with a remote side ([`transfer::run`]); progress is per item.
+    pub fn spawn_transfer(spec: TransferSpec) -> JobHandle {
+        Self::spawn_worker(true, None, move |w| {
+            let report = transfer::run(&spec, w);
+            w.send_progress();
+            report
+        })
+    }
+
+    fn spawn_worker(
+        by_items: bool,
+        on_chunk: Option<ChunkHook>,
+        job: impl FnOnce(&mut Worker) -> OpReport + Send + 'static,
+    ) -> JobHandle {
         let (etx, erx) = mpsc::channel();
         let (atx, arx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -245,13 +273,13 @@ impl JobHandle {
             policy: ConflictPolicy::default(),
             files_done: 0,
             bytes_done: 0,
-            by_items: spec.kind == JobKind::Move,
+            by_items,
             current: PathBuf::new(),
             last_sent: Instant::now(),
             on_chunk,
         };
         let thread = std::thread::spawn(move || {
-            let report = catch_unwind(AssertUnwindSafe(|| run(&spec, &mut worker)))
+            let report = catch_unwind(AssertUnwindSafe(|| job(&mut worker)))
                 .unwrap_or_else(|_| OpReport::failed("worker panicked"));
             let _ = etx.send(JobEvent::Finished { report });
         });
@@ -721,5 +749,93 @@ mod tests {
             assert_eq!(outcome(&ev), OpOutcome::Failed("대상 폴더 없음".into()));
         }
         assert!(!d.join("nope").exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod transfer_tests {
+    use super::*;
+    use crate::testutil::{FakeCmd, code, ok, remote_cmd, session};
+    use crate::transfer::{NOT_THERE, Side, TransferSpec};
+    use crate::trash::FakeTrash;
+
+    fn spec(f: &Arc<FakeCmd>, dir: &Path, names: &[&str]) -> TransferSpec {
+        TransferSpec {
+            kind: JobKind::Copy,
+            src: Side::Local,
+            src_dir: dir.to_path_buf(),
+            names: names.iter().map(std::ffi::OsString::from).collect(),
+            dst: Side::Remote(session(Arc::clone(f))),
+            dest_dir: PathBuf::from("/dst"),
+            trash: Arc::new(FakeTrash::new()),
+        }
+    }
+
+    fn until(h: &JobHandle, stop: impl Fn(&JobEvent) -> bool) -> Vec<JobEvent> {
+        let mut all = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            for e in h.try_events() {
+                let hit = stop(&e);
+                all.push(e);
+                if hit {
+                    return all;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timeout: {all:?}");
+    }
+
+    #[test]
+    fn a_transfer_job_asks_through_the_handle_and_reports_per_item() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("a"), "123").unwrap();
+        std::fs::write(t.path().join("b"), "45").unwrap();
+        let f = FakeCmd::new(|a| {
+            if a[0] == "scp" {
+                return ok("");
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            code(if c.starts_with("if [ -d") || c.contains("'/dst/a'") {
+                0
+            } else {
+                NOT_THERE
+            })
+        });
+        let h = JobHandle::spawn_transfer(spec(&f, t.path(), &["a", "b"]));
+        let ev = until(&h, |e| matches!(e, JobEvent::Conflict { .. }));
+        assert!(ev.iter().any(
+            |e| matches!(e, JobEvent::Started { totals } if totals.files == 2 && totals.bytes == 5)
+        ));
+        h.answer(ConflictAnswer::Overwrite);
+        let ev = until(&h, |e| matches!(e, JobEvent::Finished { .. }));
+        let Some(JobEvent::Finished { report }) = ev.last() else {
+            unreachable!()
+        };
+        assert_eq!((report.copied, report.overwritten), (2, 1));
+        let last = ev.iter().rev().find_map(|e| match e {
+            JobEvent::Progress {
+                files_done,
+                bytes_done,
+                ..
+            } => Some((*files_done, *bytes_done)),
+            _ => None,
+        });
+        assert_eq!(last, Some((2, 5)));
+    }
+
+    #[test]
+    fn cancelling_a_transfer_job_releases_a_pending_conflict() {
+        let t = tempfile::tempdir().unwrap();
+        let f = FakeCmd::new(|a| if a[0] == "scp" { ok("") } else { code(0) });
+        let h = JobHandle::spawn_transfer(spec(&f, t.path(), &["a"]));
+        until(&h, |e| matches!(e, JobEvent::Conflict { .. }));
+        h.cancel();
+        let ev = until(&h, |e| matches!(e, JobEvent::Finished { .. }));
+        assert!(
+            matches!(ev.last(), Some(JobEvent::Finished { report }) if report.outcome == OpOutcome::Cancelled)
+        );
+        assert!(f.scp_calls().is_empty());
     }
 }

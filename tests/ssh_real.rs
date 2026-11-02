@@ -17,6 +17,9 @@ struct Cleanup {
     target: SshTarget,
     dir: PathBuf,
     owned_dir: bool,
+    /// Holds the socket's parent dir; fields drop after `drop` ran, so the
+    /// socket is still there for `ssh -O exit`.
+    _tmp: Option<tempfile::TempDir>,
 }
 
 impl Drop for Cleanup {
@@ -52,6 +55,7 @@ fn controlmaster_connect_list_and_exit() {
         target: target.clone(),
         dir,
         owned_dir: true,
+        _tmp: None,
     };
 
     let cmd: Arc<dyn Cmd> = Arc::new(SystemCmd);
@@ -89,7 +93,7 @@ fn controlmaster_connect_list_and_exit() {
 /// socket dir under /tmp: the session's shared fallback (/tmp/hdir-<uid>,
 /// used when $TMPDIR is too long, as on macOS) would hand every test the same
 /// master, and the first test to finish would close it under the others.
-fn connect(host: String) -> (Cleanup, Arc<dyn Cmd>, Established, tempfile::TempDir) {
+fn connect(host: String) -> (Cleanup, Arc<dyn Cmd>, Established) {
     let tmp = tempfile::Builder::new()
         .prefix("hdir-it-")
         .tempdir_in("/tmp")
@@ -109,11 +113,12 @@ fn connect(host: String) -> (Cleanup, Arc<dyn Cmd>, Established, tempfile::TempD
         target: target.clone(),
         dir,
         owned_dir,
+        _tmp: Some(tmp),
     };
     let cmd: Arc<dyn Cmd> = Arc::new(SystemCmd);
     session::start_master(&*cmd, &target).expect("ssh -fN");
     let est = session::establish(&cmd, "it", target, Some("/tmp")).expect("establish");
-    (cleanup, cmd, est, tmp)
+    (cleanup, cmd, est)
 }
 
 fn remote(cmd: &Arc<dyn Cmd>, target: &SshTarget, script: &[u8]) -> session::CmdOutput {
@@ -146,7 +151,7 @@ impl Drop for RemoteTmp {
 #[ignore = "needs HDIR_SSH_HOST and a reachable ssh server"]
 fn lists_real_remote_files_with_odd_names() {
     let host = std::env::var("HDIR_SSH_HOST").expect("set HDIR_SSH_HOST=user@host");
-    let (_cleanup, cmd, est, _tmp) = connect(host);
+    let (_cleanup, cmd, est) = connect(host);
     let target = est.session.target.clone();
 
     let made = remote(&cmd, &target, b"mktemp -d");
@@ -202,8 +207,11 @@ fn lists_real_remote_files_with_odd_names() {
 }
 
 /// Names the file operations test creates (and the cleanup removes by name).
-const OPS_NAMES: [&str; 16] = [
+const OPS_NAMES: [&str; 19] = [
     "open-dir",
+    "race.txt",
+    "tw",
+    "tw\n",
     "mode600.txt",
     "hl-a",
     "hl-b",
@@ -251,7 +259,7 @@ fn remote_file_operations_round_trip() {
     use std::path::Path;
 
     let host = std::env::var("HDIR_SSH_HOST").expect("set HDIR_SSH_HOST=user@host");
-    let (_cleanup, cmd, est, _tmp) = connect(host);
+    let (_cleanup, cmd, est) = connect(host);
     let s = Arc::clone(&est.session);
     let target = s.target.clone();
 
@@ -493,4 +501,245 @@ fn remote_file_operations_round_trip() {
         );
     }
     assert!(ops::delete(&s, Path::new("/"), &[OsString::from("..")]).is_err());
+}
+
+/// Answers every conflict with Overwrite and records progress.
+struct Ctl {
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    conflicts: usize,
+    bytes: u64,
+}
+
+impl hdir::fs_ops::OpControl for Ctl {
+    fn on_progress(&mut self, delta: u64, _current: &std::path::Path) {
+        self.bytes += delta;
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn on_conflict(&mut self, _dest: &std::path::Path) -> hdir::fs_ops::ConflictAction {
+        self.conflicts += 1;
+        hdir::fs_ops::ConflictAction::Overwrite
+    }
+}
+
+impl hdir::transfer::TransferCtl for Ctl {
+    fn started(&mut self, _totals: hdir::fs_ops::Totals) {}
+    fn cancel_flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.cancel
+    }
+}
+
+fn ctl() -> Ctl {
+    Ctl {
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        conflicts: 0,
+        bytes: 0,
+    }
+}
+
+/// Removes the transfer test's fixed names, then the (empty) directory.
+struct XferTmp {
+    cmd: Arc<dyn Cmd>,
+    target: SshTarget,
+    dir: String,
+}
+
+impl Drop for XferTmp {
+    fn drop(&mut self) {
+        let q = String::from_utf8(sh_quote(self.dir.as_bytes())).unwrap();
+        let script = format!("cd -- {q} && rm -rf -- in out big; cd / && rmdir -- {q}");
+        let _ = remote(&self.cmd, &self.target, script.as_bytes());
+    }
+}
+
+#[test]
+#[ignore = "needs HDIR_SSH_HOST and a reachable ssh server"]
+fn transfers_round_trip() {
+    use hdir::fs_ops::OpOutcome;
+    use hdir::job::JobKind;
+    use hdir::transfer::{Side, TransferSpec, run};
+    use std::path::Path;
+
+    let host = std::env::var("HDIR_SSH_HOST").expect("set HDIR_SSH_HOST=user@host");
+    let (_cleanup, cmd, est) = connect(host);
+    let s = Arc::clone(&est.session);
+    let target = s.target.clone();
+    let made = remote(&cmd, &target, b"mktemp -d");
+    assert_eq!(made.code, Some(0));
+    let dir = String::from_utf8(made.stdout)
+        .unwrap()
+        .trim_end()
+        .to_string();
+    assert!(dir.starts_with('/') && !dir.contains('\n'), "{dir:?}");
+    let _x = XferTmp {
+        cmd: Arc::clone(&cmd),
+        target: target.clone(),
+        dir: dir.clone(),
+    };
+    let q = |p: &str| String::from_utf8(sh_quote(p.as_bytes())).unwrap();
+    assert_eq!(
+        remote(
+            &cmd,
+            &target,
+            format!("cd -- {} && mkdir in out", q(&dir)).as_bytes()
+        )
+        .code,
+        Some(0)
+    );
+    let rdir = PathBuf::from(&dir);
+    let local = tempfile::tempdir().unwrap();
+    let odd = "up file 'q' [1].txt";
+    std::fs::write(local.path().join(odd), "hello").unwrap();
+    std::fs::create_dir(local.path().join("updir")).unwrap();
+    std::fs::write(local.path().join("updir/x"), "xyz").unwrap();
+    let spec =
+        |kind, src: Side, src_dir: &Path, names: &[&str], dst: Side, dest: &Path| TransferSpec {
+            kind,
+            src,
+            src_dir: src_dir.to_path_buf(),
+            names: names.iter().map(OsString::from).collect(),
+            dst,
+            dest_dir: dest.to_path_buf(),
+            trash: hdir::trash::system_store(),
+        };
+    let remote_s = || Side::Remote(Arc::clone(&s));
+
+    // up: a file with glob characters and a directory
+    let r = run(
+        &spec(
+            JobKind::Copy,
+            Side::Local,
+            local.path(),
+            &[odd, "updir"],
+            remote_s(),
+            &rdir.join("in"),
+        ),
+        &mut ctl(),
+    );
+    assert_eq!((r.outcome, r.copied), (OpOutcome::Done, 2));
+    let cat = |p: &str| remote(&cmd, &target, format!("cat -- {}", q(p)).as_bytes());
+    assert_eq!(cat(&format!("{dir}/in/{odd}")).stdout, b"hello");
+    assert_eq!(cat(&format!("{dir}/in/updir/x")).stdout, b"xyz");
+
+    // up again: both exist now and are overwritten
+    let mut c = ctl();
+    let r = run(
+        &spec(
+            JobKind::Copy,
+            Side::Local,
+            local.path(),
+            &[odd, "updir"],
+            remote_s(),
+            &rdir.join("in"),
+        ),
+        &mut c,
+    );
+    assert_eq!(
+        (r.outcome, r.overwritten, c.conflicts),
+        (OpOutcome::Done, 2, 2)
+    );
+
+    // down
+    let back = tempfile::tempdir().unwrap();
+    let r = run(
+        &spec(
+            JobKind::Copy,
+            remote_s(),
+            &rdir.join("in"),
+            &[odd, "updir"],
+            Side::Local,
+            back.path(),
+        ),
+        &mut ctl(),
+    );
+    assert_eq!((r.outcome, r.copied), (OpOutcome::Done, 2));
+    assert_eq!(std::fs::read(back.path().join(odd)).unwrap(), b"hello");
+    assert_eq!(std::fs::read(back.path().join("updir/x")).unwrap(), b"xyz");
+
+    // on the server: copy, then move (a rename, the source goes)
+    let r = run(
+        &spec(
+            JobKind::Copy,
+            remote_s(),
+            &rdir.join("in"),
+            &["updir"],
+            remote_s(),
+            &rdir.join("out"),
+        ),
+        &mut ctl(),
+    );
+    assert_eq!(r.outcome, OpOutcome::Done);
+    assert_eq!(cat(&format!("{dir}/out/updir/x")).stdout, b"xyz");
+    let r = run(
+        &spec(
+            JobKind::Move,
+            remote_s(),
+            &rdir.join("in"),
+            &[odd],
+            remote_s(),
+            &rdir.join("out"),
+        ),
+        &mut ctl(),
+    );
+    assert_eq!((r.outcome, r.copied), (OpOutcome::Done, 1));
+    assert_eq!(cat(&format!("{dir}/out/{odd}")).stdout, b"hello");
+    assert_ne!(cat(&format!("{dir}/in/{odd}")).code, Some(0), "moved away");
+
+    // move down: the remote source is deleted after the copy is checked
+    let down = tempfile::tempdir().unwrap();
+    let r = run(
+        &spec(
+            JobKind::Move,
+            remote_s(),
+            &rdir.join("out"),
+            &["updir"],
+            Side::Local,
+            down.path(),
+        ),
+        &mut ctl(),
+    );
+    assert_eq!(
+        (r.outcome, r.copied),
+        (OpOutcome::Done, 1),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(std::fs::read(down.path().join("updir/x")).unwrap(), b"xyz");
+    assert_ne!(
+        cat(&format!("{dir}/out/updir/x")).code,
+        Some(0),
+        "remote source gone"
+    );
+
+    // Esc during a big download stops scp quickly and names the partial file
+    let big = format!("cd -- {} && head -c 400000000 /dev/zero > big", q(&dir));
+    assert_eq!(remote(&cmd, &target, big.as_bytes()).code, Some(0));
+    let c = ctl();
+    let flag = Arc::clone(&c.cancel);
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let mut c = c;
+    let start = std::time::Instant::now();
+    let sink = tempfile::tempdir().unwrap();
+    let r = run(
+        &spec(
+            JobKind::Copy,
+            remote_s(),
+            &rdir,
+            &["big"],
+            Side::Local,
+            sink.path(),
+        ),
+        &mut c,
+    );
+    stopper.join().unwrap();
+    let took = start.elapsed();
+    assert_eq!(r.outcome, OpOutcome::Cancelled, "took {took:?}");
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    assert!(r.warnings[0].contains("부분 파일"), "{:?}", r.warnings);
+    assert!(s.is_alive(), "cancelling scp keeps the connection");
+    assert!(s.list(&rdir, true).is_ok(), "the master still works");
 }

@@ -25,6 +25,7 @@ pub mod term;
 #[cfg(test)]
 pub mod testutil;
 pub mod theme;
+pub mod transfer;
 pub mod trash;
 pub mod ui;
 pub mod undo;
