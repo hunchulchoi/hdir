@@ -1311,6 +1311,8 @@ mod tests {
     fn mktemp_with(mode: u32, fakes: &[(&str, &str)]) -> (Option<i32>, bool) {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
+        // a private parent whatever the umask (002 makes it group-writable)
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let bin = root.join("bin");
         std::fs::create_dir(&bin).unwrap();
         let d = root.join("d");
