@@ -195,3 +195,7 @@ scripts/ssh-docker-test.sh
 ```
 
 - [구현 계획](docs/plan.md) · [초기 구상](docs/mvp계획.md) · [개발 룰](CLAUDE.md) · [인수인계](docs/HANDOFF.md)
+
+## 라이선스
+
+[MIT](LICENSE)

@@ -8,7 +8,7 @@ Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 원 구상 `
 
 - 끝난 모듈: M1 코어 TUI, M2 파일 작업 + 휴지통, M3 뷰어·미리보기·모드, M4 설정·테마·키, M5 확장자 연결, M6 셸 통합, M7 SSH 원격 패널, M8 원격 전송, M9 문서·릴리스.
 - 원격 전송은 tar 스트림(HDIR-81, PR #19). 낮은 우선순위였던 HDIR-56(터미널 실패 경로 테스트), 59(xattr 보존), 63(폴더 핸들 순회)도 완료(PR #20~#22).
-- 남은 일: Windows Backlog(HDIR-66~72, 요청 시에만). 라이선스 미정(LICENSE 없음).
+- 남은 일: Windows Backlog(HDIR-66~72, 요청 시에만).
 - 테스트 (PR #22 기준): macOS 1024, Linux 1024, Windows 723 통과. 셸 통합 6, 실제 ssh 4(`#[ignore]`, stage 서버와 `scripts/ssh-docker-test.sh`), README 예시 검사 1.
 - 최소 Rust 1.88 (`rust-version`, 1.87은 의존성이 거부함을 Docker로 확인).
 

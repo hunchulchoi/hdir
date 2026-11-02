@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Mdir-style dual-panel TUI file manager"
+license = "MIT"
 repository = "https://github.com/hunchulchoi/hdir"
 
 [dependencies]
