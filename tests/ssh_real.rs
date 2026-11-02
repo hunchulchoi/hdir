@@ -85,10 +85,15 @@ fn controlmaster_connect_list_and_exit() {
     assert!(!session::master_alive(&*cmd, &target), "master closed");
 }
 
-/// Master + control socket dir for the listing test. The socket dir is a fresh
-/// temp dir when its path is short enough, else the session's fallback.
+/// Master + control socket dir for one test. Each test gets its own short
+/// socket dir under /tmp: the session's shared fallback (/tmp/hdir-<uid>,
+/// used when $TMPDIR is too long, as on macOS) would hand every test the same
+/// master, and the first test to finish would close it under the others.
 fn connect(host: String) -> (Cleanup, Arc<dyn Cmd>, Established, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("hdir-it-")
+        .tempdir_in("/tmp")
+        .unwrap();
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
     let target = SshTarget {
@@ -99,6 +104,7 @@ fn connect(host: String) -> (Cleanup, Arc<dyn Cmd>, Established, tempfile::TempD
     session::ensure_control_dir(&target.control_path).unwrap();
     let dir = target.control_path.parent().unwrap().to_path_buf();
     let owned_dir = dir.starts_with(tmp.path());
+    assert!(owned_dir, "tests must not share a control socket: {dir:?}");
     let cleanup = Cleanup {
         target: target.clone(),
         dir,
