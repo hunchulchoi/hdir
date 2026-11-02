@@ -99,7 +99,8 @@ impl Cmd for FakeCmd {
         self.run_transfer(argv)
     }
     /// A pipe is answered as one argv: `["pipe", <from...>, "|", <to...>]`;
-    /// the reply is the `to` side's (the `from` side succeeds).
+    /// the reply is the `to` side's (the `from` side succeeds), unless its
+    /// stderr starts with `from:`: then it is the sending side's.
     fn run_pipe(
         &self,
         from: &[OsString],
@@ -111,6 +112,10 @@ impl Cmd for FakeCmd {
         all.push(OsString::from("|"));
         all.extend(to.iter().cloned());
         let out = self.run_transfer(&all);
+        // a reply whose stderr starts with "from:" is the sending side's
+        if out.stderr.starts_with(b"from:") {
+            return (out, fail(141, "broken pipe\n"));
+        }
         (ok(""), out)
     }
 }

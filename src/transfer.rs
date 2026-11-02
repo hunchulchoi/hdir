@@ -4085,4 +4085,83 @@ mod tests {
             .expect("deleted");
         assert!(q < rm);
     }
+
+    #[test]
+    fn a_failing_sender_keeps_source_and_target_and_drops_the_stage() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "old").unwrap();
+        let f = FakeCmd::new(|a| {
+            if a[0] == "pipe" {
+                return fail(2, "from: tar: ./a: Cannot open: Permission denied\n");
+            }
+            answer(remote_cmd(a).unwrap_or_default(), &[], &[], "0\x00")
+        });
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let r = run(&s, &mut Ctl::answering(&[ConflictAnswer::Overwrite]));
+        assert_eq!(
+            r.outcome,
+            OpOutcome::Failed("a: from: tar: ./a: Cannot open: Permission denied".into())
+        );
+        assert_eq!(fs::read(t.path().join("a")).unwrap(), b"old");
+        assert_eq!(stages_in(t.path()), 0);
+        assert!(
+            !f.remote_cmds()
+                .iter()
+                .any(|c| c.contains("rm -rf") || c.contains(".hdir-del."))
+        );
+    }
+
+    #[test]
+    fn a_download_through_run_strips_setuid_and_setgid() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let f = FakeCmd::new(|a| {
+            if a[0] == "pipe" {
+                let (_, dst) = pipe_ends(a);
+                let d = Path::new(&dst).join("d");
+                fs::create_dir(&d).unwrap();
+                for (n, m) in [
+                    ("u", 0o4755),
+                    ("g", 0o2755),
+                    ("ug", 0o6750),
+                    ("plain", 0o640),
+                ] {
+                    fs::write(d.join(n), "x").unwrap();
+                    fs::set_permissions(d.join(n), fs::Permissions::from_mode(m)).unwrap();
+                }
+                return ok("");
+            }
+            answer(remote_cmd(a).unwrap_or_default(), &[], &[], "0\x00")
+        });
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["d"],
+            Side::Local,
+            t.path(),
+        );
+        assert_eq!(run(&s, &mut Ctl::new()).outcome, OpOutcome::Done);
+        let mode = |n: &str| {
+            fs::metadata(t.path().join("d").join(n))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        if mode("plain") != 0o640 {
+            return;
+        }
+        assert_eq!(
+            [mode("u"), mode("g"), mode("ug"), mode("plain")],
+            [0o755, 0o755, 0o750, 0o640]
+        );
+    }
 }
