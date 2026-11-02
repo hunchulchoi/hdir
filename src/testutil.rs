@@ -206,3 +206,12 @@ pub fn local_session(home: &std::path::Path) -> Arc<RemoteSession> {
         }),
     ))
 }
+
+/// Answer a `mktemp -d '<dir>/<prefix>XXXXXX'` command (as built by
+/// `transfer::stage_cmd`) with the template's X's replaced by `ABC123`.
+pub fn fake_mktemp(cmd: &str) -> Option<CmdOutput> {
+    let rest = cmd.split_once("mktemp -d '")?.1;
+    let template = rest.split_once('\'')?.0;
+    let path = template.strip_suffix("XXXXXX")?;
+    Some(ok(&format!("{path}ABC123\0")))
+}

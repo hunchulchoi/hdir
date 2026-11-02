@@ -724,7 +724,9 @@ mod tests {
         for i in 0..500 {
             fs::write(tree.join(format!("f{i}")), "x").unwrap();
         }
+        let start = Instant::now();
         let ev = run_answering(spec(JobKind::Copy, vec![tree], &d), ConflictAnswer::Cancel);
+        let took = start.elapsed();
         assert_eq!(outcome(&ev), JobOutcome::Done);
         let progress: Vec<u64> = ev
             .iter()
@@ -733,7 +735,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(progress.len() < 100, "{} progress events", progress.len());
+        // At most one event per interval (plus the first and the last), so a
+        // slow, loaded machine gets a proportionally higher bound; without
+        // coalescing it would be one event per file.
+        let bound = took.as_millis() / PROGRESS_INTERVAL.as_millis() + 3;
+        let n = progress.len() as u128;
+        assert!(n <= bound && n < 500, "{n} progress events in {took:?}");
         assert_eq!(progress.last(), Some(&500));
     }
 
@@ -755,8 +762,8 @@ mod tests {
 #[cfg(all(test, unix))]
 mod transfer_tests {
     use super::*;
-    use crate::testutil::{FakeCmd, code, ok, remote_cmd, session};
-    use crate::transfer::{NOT_THERE, Side, TransferSpec};
+    use crate::testutil::{FakeCmd, code, fake_mktemp, ok, remote_cmd, session};
+    use crate::transfer::{IS_OTHER, NOT_THERE, Side, TransferSpec};
     use crate::trash::FakeTrash;
 
     fn spec(f: &Arc<FakeCmd>, dir: &Path, names: &[&str]) -> TransferSpec {
@@ -797,10 +804,16 @@ mod transfer_tests {
                 return ok("");
             }
             let c = remote_cmd(a).unwrap_or_default();
-            code(if c.starts_with("if [ -d") || c.contains("'/dst/a'") {
-                0
-            } else {
+            if let Some(o) = fake_mktemp(c) {
+                return o;
+            }
+            if c.starts_with("if [ -L '/dst/a'") {
+                return code(IS_OTHER);
+            }
+            code(if c.starts_with("if [ -L") {
                 NOT_THERE
+            } else {
+                0
             })
         });
         let h = JobHandle::spawn_transfer(spec(&f, t.path(), &["a", "b"]));
@@ -828,7 +841,14 @@ mod transfer_tests {
     #[test]
     fn cancelling_a_transfer_job_releases_a_pending_conflict() {
         let t = tempfile::tempdir().unwrap();
-        let f = FakeCmd::new(|a| if a[0] == "scp" { ok("") } else { code(0) });
+        let f = FakeCmd::new(|a| {
+            let c = remote_cmd(a).unwrap_or_default();
+            code(if c.starts_with("if [ -L") {
+                IS_OTHER
+            } else {
+                0
+            })
+        });
         let h = JobHandle::spawn_transfer(spec(&f, t.path(), &["a"]));
         until(&h, |e| matches!(e, JobEvent::Conflict { .. }));
         h.cancel();

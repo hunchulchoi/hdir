@@ -622,7 +622,9 @@ fn transfers_round_trip() {
     assert_eq!(cat(&format!("{dir}/in/{odd}")).stdout, b"hello");
     assert_eq!(cat(&format!("{dir}/in/updir/x")).stdout, b"xyz");
 
-    // up again: both exist now and are overwritten
+    // up again with new content: the file is replaced (asked once); the
+    // folder conflict is skipped, never merged
+    std::fs::write(local.path().join(odd), "hello v2").unwrap();
     let mut c = ctl();
     let r = run(
         &spec(
@@ -636,8 +638,73 @@ fn transfers_round_trip() {
         &mut c,
     );
     assert_eq!(
-        (r.outcome, r.overwritten, c.conflicts),
-        (OpOutcome::Done, 2, 2)
+        (r.outcome, r.overwritten, r.skipped, c.conflicts),
+        (OpOutcome::Done, 1, 1, 1)
+    );
+    assert_eq!(cat(&format!("{dir}/in/{odd}")).stdout, b"hello v2");
+    assert!(
+        r.warnings[0].contains("폴더는 덮어쓸 수 없어"),
+        "{:?}",
+        r.warnings
+    );
+    let staged = remote(
+        &cmd,
+        &target,
+        format!(
+            "cd -- {} && ls -A | grep -c hdir-xfer || true",
+            q(&format!("{dir}/in"))
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&staged.stdout).trim(),
+        "0",
+        "no stage left"
+    );
+
+    // a link at the target is replaced, not written through; a link in the
+    // source is never followed by scp
+    let link = format!(
+        "cd -- {} && printf keep > big && ln -s ../big in/lnk",
+        q(&dir)
+    );
+    assert_eq!(remote(&cmd, &target, link.as_bytes()).code, Some(0));
+    std::fs::write(local.path().join("lnk"), "mine").unwrap();
+    std::os::unix::fs::symlink("/etc", local.path().join("updir/etc-link")).unwrap();
+    let r = run(
+        &spec(
+            JobKind::Copy,
+            Side::Local,
+            local.path(),
+            &["lnk", "updir"],
+            remote_s(),
+            &rdir.join("in"),
+        ),
+        &mut ctl(),
+    );
+    assert_eq!((r.outcome, r.copied, r.skipped), (OpOutcome::Done, 1, 1));
+    assert!(r.warnings[0].contains("심볼릭 링크"), "{:?}", r.warnings);
+    assert_eq!(
+        cat(&format!("{dir}/big")).stdout,
+        b"keep",
+        "link target untouched"
+    );
+    assert_eq!(cat(&format!("{dir}/in/lnk")).stdout, b"mine");
+    let still_link = remote(
+        &cmd,
+        &target,
+        format!("[ -L {} ]", q(&format!("{dir}/in/lnk"))).as_bytes(),
+    );
+    assert_ne!(still_link.code, Some(0), "the link itself was replaced");
+    std::fs::remove_file(local.path().join("updir/etc-link")).unwrap();
+    assert_eq!(
+        remote(
+            &cmd,
+            &target,
+            format!("rm -f -- {}", q(&format!("{dir}/in/lnk"))).as_bytes()
+        )
+        .code,
+        Some(0)
     );
 
     // down
@@ -654,7 +721,7 @@ fn transfers_round_trip() {
         &mut ctl(),
     );
     assert_eq!((r.outcome, r.copied), (OpOutcome::Done, 2));
-    assert_eq!(std::fs::read(back.path().join(odd)).unwrap(), b"hello");
+    assert_eq!(std::fs::read(back.path().join(odd)).unwrap(), b"hello v2");
     assert_eq!(std::fs::read(back.path().join("updir/x")).unwrap(), b"xyz");
 
     // on the server: copy, then move (a rename, the source goes)
@@ -683,7 +750,7 @@ fn transfers_round_trip() {
         &mut ctl(),
     );
     assert_eq!((r.outcome, r.copied), (OpOutcome::Done, 1));
-    assert_eq!(cat(&format!("{dir}/out/{odd}")).stdout, b"hello");
+    assert_eq!(cat(&format!("{dir}/out/{odd}")).stdout, b"hello v2");
     assert_ne!(cat(&format!("{dir}/in/{odd}")).code, Some(0), "moved away");
 
     // move down: the remote source is deleted after the copy is checked
@@ -712,18 +779,31 @@ fn transfers_round_trip() {
         "remote source gone"
     );
 
-    // Esc during a big download stops scp quickly and names the partial file
+    // Esc during a big download stops scp quickly and leaves nothing behind
     let big = format!("cd -- {} && head -c 400000000 /dev/zero > big", q(&dir));
     assert_eq!(remote(&cmd, &target, big.as_bytes()).code, Some(0));
     let c = ctl();
     let flag = Arc::clone(&c.cancel);
+    let sink = tempfile::tempdir().unwrap();
+    let watch = sink.path().to_path_buf();
+    // Cancel as soon as the first bytes land in the stage.
     let stopper = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(700));
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(30) {
+            let started = std::fs::read_dir(&watch)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| std::fs::metadata(e.path().join("big")).is_ok_and(|m| m.len() > 0));
+            if started {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     });
     let mut c = c;
     let start = std::time::Instant::now();
-    let sink = tempfile::tempdir().unwrap();
     let r = run(
         &spec(
             JobKind::Copy,
@@ -739,7 +819,12 @@ fn transfers_round_trip() {
     let took = start.elapsed();
     assert_eq!(r.outcome, OpOutcome::Cancelled, "took {took:?}");
     assert!(took < std::time::Duration::from_secs(10), "{took:?}");
-    assert!(r.warnings[0].contains("부분 파일"), "{:?}", r.warnings);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    assert_eq!(
+        std::fs::read_dir(sink.path()).unwrap().count(),
+        0,
+        "stage removed"
+    );
     assert!(s.is_alive(), "cancelling scp keeps the connection");
     assert!(s.list(&rdir, true).is_ok(), "the master still works");
 }

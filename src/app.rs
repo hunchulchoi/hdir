@@ -9544,15 +9544,38 @@ mod tests {
             assert!(!got[0].starts_with("shell ssh"), "{got:?}");
         }
 
-        /// Remote `[ -e` checks answer "missing" unless the path is in `there`.
+        /// Answers for transfers: remote kind checks say "missing" unless
+        /// the path is in `there` (then a file), staging dirs are made, the
+        /// scan reports one small item without links, and a download writes
+        /// `new` into the local target dir.
         fn remote_has(f: &FakeSsh, there: &'static [&'static str]) {
             script(f, move |a| {
+                if a[0] == "scp" {
+                    let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
+                    if !dst.starts_with("prod-web:") {
+                        let name = Path::new(src).file_name().unwrap().to_owned();
+                        fs::write(Path::new(dst).join(name), "new").unwrap();
+                    }
+                    return Some(out(0, ""));
+                }
                 let c = crate::testutil::remote_cmd(a)?;
-                if c.starts_with("if [ -e ") {
-                    let hit = there
-                        .iter()
-                        .any(|t| c.starts_with(&format!("if [ -e '{t}' ]")));
-                    return Some(out(if hit { 0 } else { transfer::NOT_THERE }, ""));
+                if let Some(rest) = c.strip_prefix("if [ -L '") {
+                    let path = rest.split_once('\'').unwrap().0;
+                    let hit = there.contains(&path);
+                    return Some(out(
+                        if hit {
+                            transfer::IS_OTHER
+                        } else {
+                            transfer::NOT_THERE
+                        },
+                        "",
+                    ));
+                }
+                if let Some(o) = crate::testutil::fake_mktemp(c) {
+                    return Some(o);
+                }
+                if c.contains("; do k=$(du -sk") {
+                    return Some(out(0, "0\x000\x00"));
                 }
                 None
             });
@@ -9595,13 +9618,20 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             wait_job(&mut app);
             assert_eq!(app.status.as_deref(), Some("복사 완료: 1개"));
-            assert_eq!(
-                scps(&f),
-                vec![(
-                    "prod-web:/srv/data/a.txt".to_string(),
-                    app.panels[0].cwd.to_string_lossy().into_owned()
-                )]
+            let sent = scps(&f);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].0, "prod-web:/srv/data/a.txt");
+            let stage = Path::new(&sent[0].1);
+            assert_eq!(stage.parent(), Some(app.panels[0].cwd.as_path()));
+            assert!(
+                stage
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".hdir-xfer.")
             );
+            assert_eq!(fs::read(app.panels[0].cwd.join("a.txt")).unwrap(), b"new");
+            assert!(!stage.exists(), "the stage is gone");
         }
 
         #[test]
@@ -9623,7 +9653,7 @@ mod tests {
                         .join("f.txt")
                         .to_string_lossy()
                         .into_owned(),
-                    "prod-web:/srv/data".to_string()
+                    "prod-web:/srv/data/.hdir-xfer.ABC123".to_string()
                 )]
             );
         }
@@ -9642,7 +9672,7 @@ mod tests {
             }
             press(&mut app, KeyCode::Enter);
             wait_job(&mut app);
-            assert_eq!(scps(&f)[0].1, "prod-web:/srv/data/sub");
+            assert_eq!(scps(&f)[0].1, "prod-web:/srv/data/sub/.hdir-xfer.ABC123");
         }
 
         #[test]
@@ -9650,8 +9680,8 @@ mod tests {
             let (t, mut app, f) = env();
             remote_has(&f, &[]);
             connect_prod(&mut app);
-            // The fake scp does not write; put the copy where the check looks.
-            fs::write(t.path().join("a.txt"), "x").unwrap();
+            // An older local copy: the conflict is answered Overwrite.
+            fs::write(t.path().join("a.txt"), "old").unwrap();
             cursor_to(&mut app, "a.txt");
             press(&mut app, KeyCode::F(6));
             press(&mut app, KeyCode::Enter);
@@ -9674,6 +9704,7 @@ mod tests {
                 app.status.as_deref(),
                 Some("이동 완료: 1개 · 덮어쓴 파일 1개는 되돌릴 수 없음")
             );
+            assert_eq!(fs::read(t.path().join("a.txt")).unwrap(), b"new");
             let rm: Vec<String> = cmds(&f)
                 .into_iter()
                 .filter(|c| c.contains("rm -rf"))
