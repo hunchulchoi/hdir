@@ -85,7 +85,7 @@ pub struct Panel {
 impl Panel {
     pub fn new(path: impl Into<PathBuf>) -> Panel {
         let path = path.into();
-        let cwd = fs::canonicalize(&path).unwrap_or(path);
+        let cwd = crate::platform::canonicalize(&path).unwrap_or(path);
         let mut panel = Panel {
             location: Location::Local,
             cwd,
@@ -824,7 +824,7 @@ mod tests {
         let mut p = Panel::new(t.path().join("sub"));
         assert_eq!(p.current().unwrap().kind, EntryKind::Parent);
         assert_eq!(p.enter(), EnterResult::Entered);
-        assert_eq!(p.cwd, t.path().canonicalize().unwrap());
+        assert_eq!(p.cwd, crate::platform::canonicalize(t.path()).unwrap());
         assert_eq!(p.current().unwrap().name, "sub");
     }
 
@@ -842,7 +842,10 @@ mod tests {
         let top = if cfg!(windows) { r"C:\" } else { "/" };
         let mut root = Panel::new(top);
         assert!(!root.go_parent());
-        assert_eq!(root.cwd, PathBuf::from(top).canonicalize().unwrap());
+        assert_eq!(
+            root.cwd,
+            crate::platform::canonicalize(Path::new(top)).unwrap()
+        );
     }
 
     #[test]
@@ -1025,11 +1028,19 @@ mod tests {
     }
 
     #[test]
+    fn a_panel_shows_a_plain_path() {
+        // Windows: no `\\?\` prefix from canonicalizing
+        let t = tempfile::tempdir().unwrap();
+        let p = Panel::new(t.path());
+        assert!(!p.cwd.to_string_lossy().starts_with(r"\\?\"), "{:?}", p.cwd);
+    }
+
+    #[test]
     fn new_canonicalizes_relative_path() {
         let p = Panel::new(".");
         assert_eq!(
             p.cwd,
-            std::env::current_dir().unwrap().canonicalize().unwrap()
+            crate::platform::canonicalize(&std::env::current_dir().unwrap()).unwrap()
         );
         assert!(p.cwd.is_absolute());
     }

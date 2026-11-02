@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn start_dir_resolves_symlink_before_dotdot_and_validates_the_result() {
         let d = tempfile::tempdir().unwrap();
-        let base = fs::canonicalize(d.path()).unwrap();
+        let base = crate::platform::canonicalize(d.path()).unwrap();
         // Path::join folds `..` textually on Windows verbatim paths: append raw.
         let raw = |b: &Path, rel: &str| PathBuf::from(format!("{}/{rel}", b.display()));
         fs::create_dir_all(base.join("real/inner")).unwrap();

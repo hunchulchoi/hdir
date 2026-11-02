@@ -168,7 +168,7 @@ pub fn canonical_dir(p: &Path) -> std::io::Result<PathBuf> {
     }
     // Windows has no physical `..` (and verbatim paths reject `.`/`..`):
     // use the folded, existence-checked path there.
-    let c = std::fs::canonicalize(if cfg!(windows) { acc.as_path() } else { p })?;
+    let c = crate::platform::canonicalize(if cfg!(windows) { acc.as_path() } else { p })?;
     if !c.is_dir() {
         return Err(std::io::Error::other("디렉터리가 아님"));
     }
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn resolve_relative_home_prev() {
         let d = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(d.path()).unwrap();
+        let base = crate::platform::canonicalize(d.path()).unwrap();
         std::fs::create_dir_all(base.join("b/c")).unwrap();
         std::fs::create_dir_all(base.join("x/y")).unwrap();
         let cwd = base.join("b");
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn cd_never_drops_a_missing_component_before_dotdot() {
         let d = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(d.path()).unwrap();
+        let base = crate::platform::canonicalize(d.path()).unwrap();
         let r = |p: &str| resolve_cd(&base, &CdTarget::Path(p.into()), None, None);
         assert!(r("missing/..").is_err());
         assert!(r("missing/../..").is_err());
@@ -498,7 +498,7 @@ mod tests {
     #[test]
     fn cd_follows_symlinks_physically_like_cd_dash_p() {
         let d = tempfile::tempdir().unwrap();
-        let base = std::fs::canonicalize(d.path()).unwrap();
+        let base = crate::platform::canonicalize(d.path()).unwrap();
         std::fs::create_dir_all(base.join("real/inner")).unwrap();
         std::os::unix::fs::symlink(base.join("real/inner"), base.join("link")).unwrap();
         let r = resolve_cd(&base, &CdTarget::Path("link/..".into()), None, None);

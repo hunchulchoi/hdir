@@ -1340,3 +1340,87 @@ pub fn copy_dacl(src: &Path, dst: &Path) -> io::Result<()> {
         Ok(())
     }
 }
+
+/// `fs::canonicalize`, but on Windows without the `\\?\` prefix when the
+/// plain path names the same thing ([`simplify_verbatim`]): that is what
+/// people type, see, and hand to a shell.
+pub fn canonicalize(p: &Path) -> io::Result<std::path::PathBuf> {
+    let c = fs::canonicalize(p)?;
+    if cfg!(windows)
+        && let Some(text) = c.to_str()
+    {
+        return Ok(std::path::PathBuf::from(simplify_verbatim(text)));
+    }
+    Ok(c)
+}
+
+/// `\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share`; anything
+/// else, or a path whose plain form would be read differently (a device
+/// name like `CON`, a name ending in `.` or space, a `/`, 260+ characters),
+/// is returned as is.
+pub fn simplify_verbatim(p: &str) -> String {
+    let (plain, rest) = if let Some(r) = p.strip_prefix(r"\\?\UNC\") {
+        (format!(r"\\{r}"), r)
+    } else if let Some(r) = p.strip_prefix(r"\\?\") {
+        let b = r.as_bytes();
+        let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+        if !drive || (b.len() > 2 && b[2] != b'\\') {
+            return p.to_string();
+        }
+        (r.to_string(), &r[2..])
+    } else {
+        return p.to_string();
+    };
+    const DEVICES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let odd = |c: &str| {
+        let stem = c.split('.').next().unwrap_or(c).trim_end();
+        c.ends_with('.') || c.ends_with(' ') || DEVICES.iter().any(|d| d.eq_ignore_ascii_case(stem))
+    };
+    if plain.chars().count() >= 260 || rest.contains('/') || rest.split('\\').any(odd) {
+        return p.to_string();
+    }
+    plain
+}
+
+#[cfg(test)]
+mod verbatim_tests {
+    use super::*;
+
+    #[test]
+    fn verbatim_prefixes_are_dropped_when_the_plain_form_means_the_same() {
+        let s = |p: &str| simplify_verbatim(p);
+        assert_eq!(s(r"\\?\C:\Users\a b\한글"), r"C:\Users\a b\한글");
+        assert_eq!(s(r"\\?\D:\"), r"D:\");
+        assert_eq!(s(r"\\?\UNC\server\share\x"), r"\\server\share\x");
+        // already plain, or not a path the plain form can name
+        assert_eq!(s(r"C:\x"), r"C:\x");
+        assert_eq!(s("/usr/local"), "/usr/local");
+        for keep in [
+            r"\\?\C:\a\CON",
+            r"\\?\C:\a\nul.txt",
+            r"\\?\C:\a\dot.",
+            r"\\?\C:\a\space ",
+            r"\\?\C:\a/b",
+            r"\\?\Volume{1234}\x",
+            r"\\?\GLOBALROOT\Device\x",
+        ] {
+            assert_eq!(s(keep), keep, "{keep}");
+        }
+        let long = format!(r"\\?\C:\{}", "a".repeat(260));
+        assert_eq!(s(&long), long, "too long for a plain path");
+    }
+
+    #[test]
+    fn canonical_paths_are_plain() {
+        let t = tempfile::tempdir().unwrap();
+        let c = canonicalize(t.path()).unwrap();
+        assert!(!c.to_string_lossy().starts_with(r"\\?\"), "{c:?}");
+        assert_eq!(
+            fs::canonicalize(&c).unwrap(),
+            fs::canonicalize(t.path()).unwrap()
+        );
+    }
+}
