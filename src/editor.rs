@@ -83,7 +83,7 @@ pub fn editor_argv(
     let (name, spec) = match (pick(visual), pick(editor)) {
         (Some(v), _) => ("VISUAL", v),
         (None, Some(e)) => ("EDITOR", e),
-        (None, None) => ("EDITOR", "vi"),
+        (None, None) => ("EDITOR", if cfg!(windows) { "notepad" } else { "vi" }),
     };
     let words = split_command(spec).map_err(|e| format!("${name} 해석 실패: {e}"))?;
     let mut argv: Vec<OsString> = words.into_iter().map(OsString::from).collect();
@@ -161,8 +161,9 @@ mod tests {
         assert_eq!(a(None, Some("vim")), ["vim", "/tmp/a.txt"]);
         assert_eq!(a(Some(""), Some("vim")), ["vim", "/tmp/a.txt"]);
         assert_eq!(a(Some("  "), Some("vim")), ["vim", "/tmp/a.txt"]);
-        assert_eq!(a(None, None), ["vi", "/tmp/a.txt"]);
-        assert_eq!(a(Some(""), Some("")), ["vi", "/tmp/a.txt"]);
+        let def = if cfg!(windows) { "notepad" } else { "vi" };
+        assert_eq!(a(None, None), [def, "/tmp/a.txt"]);
+        assert_eq!(a(Some(""), Some("")), [def, "/tmp/a.txt"]);
     }
 
     #[test]

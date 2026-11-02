@@ -1722,10 +1722,6 @@ impl App {
 
     /// Queue an edit of `path` (a file in the active panel's directory).
     fn queue_edit(&mut self, path: &std::path::Path) {
-        if cfg!(windows) {
-            self.status = Some("편집: Windows 지원 예정".into());
-            return;
-        }
         let Some(name) = path.file_name().map(OsString::from) else {
             return;
         };
@@ -6670,12 +6666,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn f4_on_windows_says_support_is_coming() {
+    fn f4_on_windows_queues_an_edit() {
         let (_t, mut app) = fixture();
         cursor_to(&mut app, "f.txt");
         press(&mut app, KeyCode::F(4));
-        assert!(!app.has_pending_edit());
-        assert!(app.status.as_deref().unwrap().contains("Windows 지원 예정"));
+        assert!(app.has_pending_edit(), "{:?}", app.status);
     }
     // ---- HDIR-16: modes ----
 
@@ -7199,7 +7194,7 @@ mod tests {
             press(&mut e.app, KeyCode::Enter);
             let l = Arc::clone(&e.log);
             tick_until(&mut e.app, "spawn", move |a| {
-                !l.lock().unwrap().is_empty() || a.status.as_deref() == Some("Windows 지원 예정")
+                !l.lock().unwrap().is_empty() && a.status.is_some()
             });
             assert!(e.app.viewer.is_none());
         }
@@ -7264,22 +7259,27 @@ mod tests {
 
         #[cfg(windows)]
         #[test]
-        fn windows_rule_run_shows_the_planned_message() {
+        fn windows_rule_runs_through_powershell() {
             let mut e = env(CAT);
             press(&mut e.app, KeyCode::Enter);
-            assert_eq!(e.app.status.as_deref(), Some("Windows 지원 예정"));
-            assert!(!e.app.has_pending_run());
+            assert!(e.app.has_pending_run(), "{:?}", e.app.status);
         }
 
         #[cfg(windows)]
         #[test]
-        fn windows_system_opener_shows_the_planned_message() {
+        fn windows_system_opener_is_explorer() {
             let mut e = env("");
             e.app.text_probe = Arc::new(|_| Ok(false));
             press(&mut e.app, KeyCode::Enter);
-            tick_until(&mut e.app, "msg", |a| {
-                a.status.as_deref() == Some("Windows 지원 예정")
+            let l = Arc::clone(&e.log);
+            tick_until(&mut e.app, "spawn", move |a| {
+                !l.lock().unwrap().is_empty() && a.status.is_some()
             });
+            assert!(
+                log(&e)[0].starts_with("spawn explorer.exe|"),
+                "{:?}",
+                log(&e)
+            );
         }
 
         // ---- review fixes: stale probes, probe errors, special files, bg spawn ----
