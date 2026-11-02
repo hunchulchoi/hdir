@@ -3141,12 +3141,12 @@ mod tests {
         assert_eq!(r.outcome, OpOutcome::Cancelled);
         assert!(f.scp_calls().is_empty());
         assert!(
-            f.transfers
+            f.cancellable
                 .lock()
                 .unwrap()
                 .iter()
                 .any(|a| remote_cmd(a).is_some_and(|c| c.contains("| cksum"))),
-            "cancellable"
+            "the source check goes through the cancellable runner"
         );
     }
 
