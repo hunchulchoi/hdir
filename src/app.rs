@@ -8769,7 +8769,7 @@ mod tests {
                         let q = r.split_once("; n=0\n").unwrap().0;
                         return Some(out(0, &format!("{}\0", unq(q))));
                     }
-                    if let Some(r) = c.strip_prefix("t=$(mktemp ") {
+                    if let Some(r) = c.split_once("t=$(mktemp ").map(|(_, r)| r) {
                         let q = r.split_once(") || exit 1").unwrap().0;
                         return Some(out(0, &format!("{}\0", unq(q).replace("XXXXXX", "Ab12Cd"))));
                     }

@@ -202,7 +202,8 @@ fn lists_real_remote_files_with_odd_names() {
 }
 
 /// Names the file operations test creates (and the cleanup removes by name).
-const OPS_NAMES: [&str; 15] = [
+const OPS_NAMES: [&str; 16] = [
+    "open-dir",
     "mode600.txt",
     "hl-a",
     "hl-b",
@@ -422,6 +423,18 @@ fn remote_file_operations_round_trip() {
     assert!(e.contains("원격 파일이 바뀌어"), "{e}");
     assert_eq!(run("cat race.txt"), "v2");
     assert_eq!(run("ls -A | grep -c hdir-edit || true").trim(), "0");
+
+    // a directory anyone may write (not sticky): saving is refused up front
+    run("mkdir open-dir && printf old > open-dir/f && chmod 777 open-dir");
+    let copy = ops::fetch(&s, &d.join("open-dir/f"), true).unwrap();
+    std::fs::write(&copy.local, "secret").unwrap();
+    let e = ops::upload_replace(&s, &copy.local, &d.join("open-dir/f"), &copy.remote).unwrap_err();
+    assert!(e.contains("다른 사용자가 쓸 수 있는"), "{e}");
+    assert_eq!(run("cat open-dir/f"), "old");
+    assert_eq!(
+        run("ls -A open-dir | grep -c hdir-edit || true").trim(),
+        "0"
+    );
 
     // a directory whose name ends in a newline vs. its twin without it
     // (`$n` = "tw\n"; a bare `$(printf ...)` would drop the newline)

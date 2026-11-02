@@ -11,9 +11,9 @@ use crate::preview::{self, Limits, Preview};
 use crate::remote::{
     DELETE_NO_CWD, DELETE_NO_HOME, DELETE_PROTECTED, PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING,
     PREVIEW_SPECIAL, REMOTE_DIR_CAP, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_CHANGED,
-    REPLACE_GROUP, REPLACE_NOT_OWNER, REPLACE_RESTORED, REPLACE_SIZE, delete_cmd, mkdir_cmd,
-    mktemp_cmd, preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd,
-    stamp_cmd,
+    REPLACE_GROUP, REPLACE_NOT_OWNER, REPLACE_RESTORED, REPLACE_SIZE, UNSAFE_DIR, delete_cmd,
+    mkdir_cmd, mktemp_cmd, preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd,
+    rmdir_cmd, stamp_cmd,
 };
 use crate::remote::{Endpoint, scp_argv};
 use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
@@ -354,7 +354,11 @@ pub fn upload_replace(
         .iter()
         .rposition(|&b| b == b'/')
         .map_or(&b"/"[..], |i| if i == 0 { &b"/"[..] } else { &phys[..i] });
-    let tmp_b = nul_path(&run_ok(s, &mktemp_cmd(dir))?)?;
+    let made = s.exec(&mktemp_cmd(dir)).map_err(|e| e.message())?;
+    if made.code == Some(UNSAFE_DIR) {
+        return Err("다른 사용자가 쓸 수 있는 디렉터리라 저장하지 않음 (sticky 아님)".into());
+    }
+    let tmp_b = nul_path(&ok_or_stderr(made)?)?;
     let argv = scp_argv(
         &Endpoint::Local(local),
         &Endpoint::Remote(&s.target, &tmp_b),
@@ -935,7 +939,7 @@ mod tests {
             if c.starts_with("f=") {
                 return ok(std::str::from_utf8(STAMP).unwrap());
             }
-            if let Some(rest) = c.strip_prefix("t=$(mktemp ") {
+            if let Some(rest) = c.split_once("t=$(mktemp ").map(|(_, r)| r) {
                 let q = rest.split_once(") || exit 1").unwrap().0;
                 return ok(&format!("{}\0", unquote(q).replace("XXXXXX", "Ab12Cd")));
             }
@@ -1174,7 +1178,7 @@ mod tests {
         std::fs::write(&local, "x").unwrap();
         for (starts, err) in [
             ("p=", "not a regular file"),
-            ("t=$(mktemp", "Permission denied"),
+            ("[ -z \"$(find ", "Permission denied"),
         ] {
             let f = FakeCmd::new(move |a| {
                 if crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with(starts)) {
@@ -1257,6 +1261,62 @@ mod tests {
             assert_eq!(mode_of(&target), mode, "{mode:o}");
             no_temp_left(&dir);
         }
+    }
+
+    #[test]
+    fn real_upload_refuses_a_directory_others_can_write_without_sticky() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        let target = open.join("f.txt");
+        std::fs::write(&target, "old").unwrap();
+        // the link lives in a safe dir; the real file's dir decides
+        symlink(&target, root.join("link")).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let local = edited(&root, "secret edit");
+        let s = local_session(&root);
+        for remote in [target.clone(), root.join("link")] {
+            let e = upload_fresh(&s, &local, &remote).unwrap_err();
+            assert!(e.contains("다른 사용자가 쓸 수 있는"), "{e}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+            no_temp_left(&open);
+        }
+        assert!(local.exists(), "the edited copy stays local");
+    }
+
+    #[test]
+    fn real_upload_works_in_sticky_and_group_writable_directories() {
+        for mode in [0o1777, 0o1733, 0o775, 0o2770] {
+            let t = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(t.path()).unwrap();
+            let d = root.join("d");
+            std::fs::create_dir(&d).unwrap();
+            let target = d.join("f.txt");
+            std::fs::write(&target, "old").unwrap();
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+            let local = edited(&root, "new");
+            upload_fresh(&local_session(&root), &local, &target)
+                .unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "new", "{mode:o}");
+            no_temp_left(&d);
+        }
+    }
+
+    #[test]
+    fn unsafe_directory_refusal_happens_before_any_temp_or_scp() {
+        let t = tempfile::tempdir().unwrap();
+        let local = t.path().join("a");
+        std::fs::write(&local, "x").unwrap();
+        let f = FakeCmd::new(|a| match crate::testutil::remote_cmd(a) {
+            Some(c) if c.starts_with("p=") => ok("/srv/a\0"),
+            Some(c) if c.contains("mktemp") => code(crate::remote::UNSAFE_DIR),
+            _ => ok(""),
+        });
+        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a"), STAMP).unwrap_err();
+        assert!(e.contains("다른 사용자가 쓸 수 있는 디렉터리"), "{e}");
+        assert!(f.scp_calls().is_empty());
+        assert!(f.remote_cmds().iter().all(|c| !c.starts_with("rm ")));
     }
 
     #[test]
@@ -1592,7 +1652,7 @@ mod tests {
         assert!(
             !long
                 .iter()
-                .any(|c| c.starts_with("p=") || c.starts_with("t=$(mktemp")),
+                .any(|c| c.starts_with("p=") || c.contains("t=$(mktemp")),
             "quick commands keep the short timeout: {long:?}"
         );
     }

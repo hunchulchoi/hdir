@@ -448,18 +448,29 @@ pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
     ])
 }
 
+/// [`mktemp_cmd`] exit code: the directory is writable by other users and
+/// not sticky, so they could swap the temp file for a symlink before scp
+/// writes through it. Nothing is created.
+pub const UNSAFE_DIR: i32 = 37;
+
 /// Creates an exclusive (mode 600) temp file `<dir>/.hdir-edit.XXXXXX` with
-/// `mktemp` and prints its path, NUL-terminated.
+/// `mktemp` and prints its path, NUL-terminated. Refuses ([`UNSAFE_DIR`]) a
+/// directory others can write without the sticky bit; group-writable shared
+/// directories are allowed (group members can already replace the file).
 pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
-    let mut template = dir.to_vec();
-    while template.len() > 1 && template.ends_with(b"/") {
-        template.pop();
+    let mut d = dir.to_vec();
+    while d.len() > 1 && d.ends_with(b"/") {
+        d.pop();
     }
+    let mut template = d.clone();
     if template != b"/" {
         template.push(b'/');
     }
     template.extend_from_slice(b".hdir-edit.XXXXXX");
     cat(&[
+        b"[ -z \"$(find ",
+        &sh_quote(&d),
+        format!(" -prune -perm -0002 ! -perm -1000)\" ] || exit {UNSAFE_DIR}; ").as_bytes(),
         b"t=$(mktemp ",
         &sh_quote(&template),
         b") || exit 1; printf '%s\\0' \"$t\"",
@@ -1278,12 +1289,15 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         assert!(c.ends_with("printf '%s\\0' \"$p\""), "{c}");
         assert_eq!(
             s(mktemp_cmd(b"/srv/it's")),
-            "t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+            "[ -z \"$(find '/srv/it'\\''s' -prune -perm -0002 ! -perm -1000)\" ] || exit 37; \
+             t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
         );
         assert_eq!(
             s(mktemp_cmd(b"/")),
-            "t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+            "[ -z \"$(find '/' -prune -perm -0002 ! -perm -1000)\" ] || exit 37; \
+             t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
         );
+        assert_eq!(UNSAFE_DIR, 37);
     }
 
     #[test]
