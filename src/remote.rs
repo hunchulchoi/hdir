@@ -457,9 +457,11 @@ pub const UNSAFE_DIR: i32 = 37;
 
 /// Creates an exclusive (mode 600) temp file `<dir>/.hdir-edit.XXXXXX` with
 /// `mktemp` and prints its path, NUL-terminated. Refuses ([`UNSAFE_DIR`]) a
-/// directory the group or others can write without the sticky bit, and stops
-/// when the check itself fails.
-pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
+/// non-sticky directory that others can write, or that its group can write
+/// unless that group is the user's own private group (primary group named
+/// after the user, the default on Debian/Ubuntu with umask 002). A failing
+/// check stops too.
+pub fn mktemp_cmd(os: &RemoteOs, dir: &[u8]) -> Vec<u8> {
     let mut d = dir.to_vec();
     while d.len() > 1 && d.ends_with(b"/") {
         d.pop();
@@ -469,12 +471,25 @@ pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
         template.push(b'/');
     }
     template.extend_from_slice(b".hdir-edit.XXXXXX");
+    let q = sh_quote(&d);
     cat(&[
-        b"u=$(find ",
-        &sh_quote(&d),
+        b"w=$(find ",
+        &q,
         format!(
-            " -prune \\( -perm -0020 -o -perm -0002 \\) ! -perm -1000) || exit 1; \
-             [ -z \"$u\" ] || exit {UNSAFE_DIR}; "
+            " -prune -perm -0002 ! -perm -1000) || exit 1; [ -z \"$w\" ] || exit {UNSAFE_DIR}; "
+        )
+        .as_bytes(),
+        b"w=$(find ",
+        &q,
+        format!(
+            " -prune -perm -0020 ! -perm -1000) || exit 1; if [ -n \"$w\" ]; then g=$({} ",
+            stat_gid_args(os)
+        )
+        .as_bytes(),
+        &q,
+        format!(
+            ") || exit 1; [ \"$g\" = \"$(id -g)\" ] && [ \"$(id -gn)\" = \"$(id -un)\" ] \
+             || exit {UNSAFE_DIR}; fi; "
         )
         .as_bytes(),
         b"t=$(mktemp ",
@@ -1295,17 +1310,23 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             "{c}"
         );
         assert!(c.ends_with("printf '%s\\0' \"$p\""), "{c}");
+        let q = "'/srv/it'\\''s'";
         assert_eq!(
-            s(mktemp_cmd(b"/srv/it's")),
-            "u=$(find '/srv/it'\\''s' -prune \\( -perm -0020 -o -perm -0002 \\) ! -perm -1000) || exit 1; \
-             [ -z \"$u\" ] || exit 37; \
-             t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+            s(mktemp_cmd(&RemoteOs::Linux, b"/srv/it's")),
+            format!(
+                "w=$(find {q} -prune -perm -0002 ! -perm -1000) || exit 1; \
+                 [ -z \"$w\" ] || exit 37; \
+                 w=$(find {q} -prune -perm -0020 ! -perm -1000) || exit 1; \
+                 if [ -n \"$w\" ]; then g=$(stat -c %g -- {q}) || exit 1; \
+                 [ \"$g\" = \"$(id -g)\" ] && [ \"$(id -gn)\" = \"$(id -un)\" ] || exit 37; fi; \
+                 t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+            )
         );
-        assert_eq!(
-            s(mktemp_cmd(b"/")),
-            "u=$(find '/' -prune \\( -perm -0020 -o -perm -0002 \\) ! -perm -1000) || exit 1; \
-             [ -z \"$u\" ] || exit 37; \
-             t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+        let root = s(mktemp_cmd(&RemoteOs::Bsd, b"/"));
+        assert!(root.contains("find '/' -prune -perm -0002"), "{root}");
+        assert!(root.contains("g=$(stat -f %g -- '/')"), "{root}");
+        assert!(
+            root.ends_with("t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\"")
         );
         assert_eq!(UNSAFE_DIR, 37);
     }

@@ -354,7 +354,7 @@ pub fn upload_replace(
         .iter()
         .rposition(|&b| b == b'/')
         .map_or(&b"/"[..], |i| if i == 0 { &b"/"[..] } else { &phys[..i] });
-    let made = s.exec(&mktemp_cmd(dir)).map_err(|e| e.message())?;
+    let made = s.exec(&mktemp_cmd(&s.os, dir)).map_err(|e| e.message())?;
     if made.code == Some(UNSAFE_DIR) {
         return Err("다른 사용자가 쓸 수 있는 디렉터리라 저장하지 않음 (sticky 아님)".into());
     }
@@ -1088,7 +1088,7 @@ mod tests {
             f.remote_cmds(),
             vec![
                 u(resolve_cmd(b"/srv/it's/a b.txt")),
-                u(mktemp_cmd(b"/srv/it's")),
+                u(mktemp_cmd(&crate::remote::RemoteOs::Linux, b"/srv/it's")),
                 u(replace_cmd(
                     &crate::remote::RemoteOs::Linux,
                     b"/srv/it's/.hdir-edit.Ab12Cd",
@@ -1178,7 +1178,7 @@ mod tests {
         std::fs::write(&local, "x").unwrap();
         for (starts, err) in [
             ("p=", "not a regular file"),
-            ("u=$(find ", "Permission denied"),
+            ("w=$(find ", "Permission denied"),
         ] {
             let f = FakeCmd::new(move |a| {
                 if crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with(starts)) {
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn real_upload_refuses_a_directory_others_or_the_group_can_write_without_sticky() {
+    fn real_upload_refuses_a_directory_others_can_write_without_sticky() {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
         let open = root.join("open");
@@ -1275,8 +1275,8 @@ mod tests {
         symlink(&target, root.join("link")).unwrap();
         let local = edited(&root, "secret edit");
         let s = local_session(&root);
-        // others or group members could swap the temp: both refused
-        for mode in [0o777, 0o773, 0o775, 0o770, 0o2770] {
+        // others could swap the temp (g+w: see the mktemp group tests)
+        for mode in [0o777, 0o773, 0o707, 0o2777] {
             std::fs::set_permissions(&open, std::fs::Permissions::from_mode(mode)).unwrap();
             for remote in [target.clone(), root.join("link")] {
                 let e = upload_fresh(&s, &local, &remote).unwrap_err();
@@ -1306,25 +1306,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_failing_permission_check_stops_before_mktemp() {
+    /// Runs the real `mktemp_cmd` on dir `d` (mode `mode`) with fake tools
+    /// first on PATH; returns the exit code and whether a temp was made.
+    fn mktemp_with(mode: u32, fakes: &[(&str, &str)]) -> (Option<i32>, bool) {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
         let bin = root.join("bin");
         std::fs::create_dir(&bin).unwrap();
-        std::fs::write(bin.join("find"), "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(bin.join("find"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let d = root.join("d");
         std::fs::create_dir(&d).unwrap();
+        let gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&d).unwrap());
+        for (name, body) in fakes {
+            let p = bin.join(name);
+            let body = body.replace("GID", &gid.to_string());
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
         let mut script = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
-        script.extend(crate::remote::mktemp_cmd(d.as_os_str().as_encoded_bytes()));
+        script.extend(crate::remote::mktemp_cmd(
+            &crate::testutil::local_os(),
+            d.as_os_str().as_encoded_bytes(),
+        ));
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&script))
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(1), "an unknown mode is not safe");
-        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "no temp made");
+        let made = std::fs::read_dir(&d).unwrap().count() > 0;
+        (out.status.code(), made)
+    }
+
+    /// `id` of an account whose primary group (`gid`, named `gname`) is or
+    /// is not its own user-private group.
+    fn fake_id(gid: &str, gname: &str) -> String {
+        format!(
+            "case \"$1\" in -g) echo {gid};; -gn) echo {gname};; -un) echo me;; *) exit 1;; esac"
+        )
+    }
+
+    #[test]
+    fn a_failing_permission_check_stops_before_mktemp() {
+        assert_eq!(mktemp_with(0o700, &[("find", "exit 1")]), (Some(1), false));
+        let id = fake_id("GID", "me");
+        let stat = [("id", id.as_str()), ("stat", "exit 1")];
+        assert_eq!(mktemp_with(0o770, &stat), (Some(1), false), "gid unknown");
+    }
+
+    #[test]
+    fn group_writable_dirs_are_fine_only_for_the_users_private_group() {
+        let own = fake_id("GID", "me");
+        assert_eq!(mktemp_with(0o775, &[("id", &own)]), (Some(0), true), "UPG");
+        assert_eq!(mktemp_with(0o2770, &[("id", &own)]), (Some(0), true), "UPG");
+        // a shared group (name differs from the user) or another group
+        let shared = fake_id("GID", "staff");
+        assert_eq!(
+            mktemp_with(0o775, &[("id", &shared)]),
+            (Some(UNSAFE_DIR), false)
+        );
+        let other = fake_id("999999", "me");
+        assert_eq!(
+            mktemp_with(0o770, &[("id", &other)]),
+            (Some(UNSAFE_DIR), false)
+        );
+        // others can write: refused whatever the group
+        assert_eq!(
+            mktemp_with(0o777, &[("id", &own)]),
+            (Some(UNSAFE_DIR), false)
+        );
+        // sticky: fine
+        assert_eq!(mktemp_with(0o1777, &[("id", &shared)]), (Some(0), true));
     }
 
     #[test]
