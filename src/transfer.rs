@@ -565,8 +565,7 @@ fn fill(text: &[u8], slots: &[(&[u8], &[u8])]) -> Vec<u8> {
 
 /// A checksum over `dev:inode:size:mtime:ctime:name` (nanoseconds) of
 /// `dir/name` and everything under it, links not followed: any change to
-/// the tree (content, a rename, a new file) changes it. Printed as
-/// `<top ctime> <crc> <bytes> <number of entries>`.
+/// the tree (content, a rename, a new file) changes it.
 pub fn stamp_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
     // The top entry leaves out its ctime: setting it aside before deletion
     // (a rename) changes that, and nothing else.
@@ -595,11 +594,25 @@ pub fn stamp_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
         &n,
         b" -mindepth 1 -exec ",
         fmt,
-        b" {} +) || exit 1; n=$(find ",
+        b" {} +) || exit 1; printf '%s ' \"$c\"; \
+          printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum",
+    ])
+}
+
+/// Print how many entries the tree at `dir/name` has (itself included,
+/// links not followed); names with newlines count once.
+pub fn count_cmd(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let n = cat(&[b"./", &sh_quote(name)]);
+    cat(&[
+        b"cd -- ",
+        &sh_quote(dir),
+        b" || exit 1; [ -e ",
         &n,
-        b" -exec sh -c 'for f do printf .; done' sh {} + | wc -c) || exit 1; \
-          k=$(printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum) || exit 1; \
-          printf '%s %s %s\\n' \"$c\" \"$k\" $((n))",
+        b" ] || [ -L ",
+        &n,
+        b" ] || exit 1; n=$(find ",
+        &n,
+        b" -exec sh -c 'for f do printf .; done' sh {} + | wc -c) || exit 1; echo $((n))",
     ])
 }
 
@@ -1315,10 +1328,19 @@ fn local_count(path: &Path, cancel: &AtomicBool) -> Option<u64> {
     Some(n)
 }
 
-/// The entry count at the end of a remote stamp ([`stamp_cmd`]).
-fn stamp_count(stamp: &str) -> Option<u64> {
-    let f: Vec<&str> = stamp.split_whitespace().collect();
-    (f.len() == 4).then(|| f[3].parse().ok()).flatten()
+/// Entries in the tree at `dir/name` on its side ([`local_count`],
+/// [`count_cmd`]); `None` when it cannot be told.
+fn count(side: &Side, dir: &Path, name: &OsString, cancel: &AtomicBool) -> Option<u64> {
+    match side {
+        Side::Local => local_count(&dir.join(name), cancel),
+        Side::Remote(s) => {
+            let out = s
+                .exec_cancellable(&count_cmd(&b(dir), &os_bytes(name)), cancel)
+                .ok()?;
+            (out.code == Some(0)).then_some(())?;
+            String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1618,18 +1640,21 @@ fn item(
     // A remote source is deleted for good, so it is first set aside in a
     // private dir next to it: whatever is checked below is exactly what
     // gets deleted, even if someone recreates the name meanwhile.
+    // Names that differ only in case (`a`, `A`) become one on a disk that
+    // ignores case: then fewer entries arrived than were sent. (A change to
+    // the source meanwhile is caught by its fingerprint below.)
+    let sent = count(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
+    let got = count(&spec.dst, &spec.dest_dir, name, ctl.cancel_flag());
+    if ctl.is_cancelled() {
+        return Step::Partial(format!("취소되어 원본을 지우지 않음: {}", lossy(name)));
+    }
+    if sent.is_none() || got != sent {
+        return Step::Partial(format!(
+            "받은 항목 수를 원본과 맞춰 보지 못해(대소문자만 다른 이름 등) 원본을 지우지 않음: {}",
+            lossy(name)
+        ));
+    }
     if let Side::Remote(s) = &spec.src {
-        // Names that differ only in case (`a`, `A`) become one on a local
-        // disk that ignores case: fewer entries arrive than were sent.
-        if matches!(spec.dst, Side::Local) {
-            let sent = before.as_deref().and_then(stamp_count);
-            if sent.is_some() && local_count(&dest, ctl.cancel_flag()) != sent {
-                return Step::Partial(format!(
-                    "받은 항목 수가 원본과 달라(대소문자만 다른 이름 등) 원본을 지우지 않음: {}",
-                    lossy(name)
-                ));
-            }
-        }
         return delete_remote_source(s, spec, name, before, ctl);
     }
     let after = stamp(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
@@ -1986,9 +2011,7 @@ mod tests {
             "cd -- '/s' || exit 1; c=$(stat -c %.9Z -- ./'a b') || exit 1; \
              t=$(stat -c '%d:%i:%s:%.9Y:%n' -- ./'a b') || exit 1; \
              s=$(find ./'a b' -mindepth 1 -exec stat -c '%d:%i:%s:%.9Y:%.9Z:%n' {} +) || exit 1; \
-             n=$(find ./'a b' -exec sh -c 'for f do printf .; done' sh {} + | wc -c) || exit 1; \
-             k=$(printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum) || exit 1; \
-             printf '%s %s %s\\n' \"$c\" \"$k\" $((n))"
+             printf '%s ' \"$c\"; printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum"
         );
         let bsd = String::from_utf8(stamp_cmd(&RemoteOs::Bsd, b"/s", b"a")).unwrap();
         assert!(
@@ -2595,6 +2618,9 @@ mod tests {
         }
         if c.contains("| cksum") {
             return ok("1 2\n");
+        }
+        if c.contains("for f do printf .") {
+            return ok("1\n"); // the entry count
         }
         if c.starts_with("cd -- ") && c.contains("du -sk") {
             // the up-front scan has every name, the re-check before sending one
@@ -3637,21 +3663,31 @@ mod tests {
         );
     }
 
+    /// A remote that answers the entry count with `n` and the rest like
+    /// [`answer`].
+    fn counting(n: &'static str) -> Arc<FakeCmd> {
+        counting_with(n, &[])
+    }
+
+    fn counting_with(n: &'static str, dirs: &'static [&'static str]) -> Arc<FakeCmd> {
+        FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("for f do printf .") {
+                return ok(n);
+            }
+            answer(c, dirs, &[], "0\x000\x00")
+        })
+    }
+
     #[test]
     fn a_move_that_arrives_with_fewer_entries_keeps_the_remote_source() {
         // `a` and `A` in one remote folder land as one file on a disk that
         // ignores case: the remote tree has 3 entries, 1 arrived.
         let t = tempfile::tempdir().unwrap();
-        let f = FakeCmd::new(move |a| {
-            if a[0] == "pipe" {
-                return fake_scp(a);
-            }
-            let c = remote_cmd(a).unwrap_or_default();
-            if c.contains("| cksum") {
-                return ok("7.1 11 2 3\n");
-            }
-            answer(c, &[], &[], "0\x000\x00")
-        });
+        let f = counting("3\n");
         let s = spec(
             JobKind::Move,
             Side::Remote(session(Arc::clone(&f))),
@@ -3670,18 +3706,21 @@ mod tests {
             "not even set aside: {cmds:?}"
         );
         assert_eq!(fs::read(t.path().join("a")).unwrap(), b"new");
-        // the same move with every entry there goes ahead
-        let f = FakeCmd::new(move |a| {
-            if a[0] == "pipe" {
-                return fake_scp(a);
-            }
-            let c = remote_cmd(a).unwrap_or_default();
-            if c.contains("| cksum") {
-                return ok("7.1 11 2 1\n");
-            }
-            answer(c, &[], &[], "0\x000\x00")
-        });
+        // a count that cannot be told keeps it too
         let t = tempfile::tempdir().unwrap();
+        let f = counting("");
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        assert_eq!(run(&s, &mut Ctl::new()).partial, 1);
+        // the same move with every entry there goes ahead
+        let t = tempfile::tempdir().unwrap();
+        let f = counting("1\n");
         let s = spec(
             JobKind::Move,
             Side::Remote(session(Arc::clone(&f))),
@@ -3697,22 +3736,87 @@ mod tests {
             "{:?}",
             r.warnings
         );
+        assert!(f.remote_cmds().iter().any(|c| c.contains("rm -rf")));
     }
 
     #[test]
-    fn real_stamp_ends_with_the_number_of_entries() {
+    fn an_upload_that_arrives_with_fewer_entries_keeps_the_local_source() {
+        // a remote disk that ignores case (macOS) merges `a` and `A`
+        fn up(n: &'static str) -> Arc<FakeCmd> {
+            let sent = Arc::new(AtomicBool::new(false));
+            FakeCmd::new(move |a| {
+                if a[0] == "pipe" {
+                    sent.store(true, Ordering::SeqCst);
+                    return ok("");
+                }
+                let c = remote_cmd(a).unwrap_or_default();
+                if c.contains("for f do printf .") {
+                    return ok(n);
+                }
+                if c.starts_with("if [ -L '") && !c.ends_with("|| exit 46") {
+                    // there once it was sent
+                    return code(if sent.load(Ordering::SeqCst) {
+                        IS_DIR
+                    } else {
+                        NOT_THERE
+                    });
+                }
+                answer(c, &[], &[], "")
+            })
+        }
         let t = tempfile::tempdir().unwrap();
-        fs::create_dir_all(t.path().join("d/sub")).unwrap();
-        fs::write(t.path().join("d/sub/f"), "abc").unwrap();
-        fs::write(t.path().join("d/two\nlines"), "x").unwrap();
-        let os = crate::testutil::local_os();
-        let out = sh(&stamp_cmd(&os, &b(t.path()), b"d"));
+        fs::create_dir(t.path().join("d")).unwrap();
+        fs::write(t.path().join("d/a"), "1").unwrap();
+        fs::write(t.path().join("d/b"), "2").unwrap();
+        let s = spec(
+            JobKind::Move,
+            Side::Local,
+            t.path(),
+            &["d"],
+            Side::Remote(session(up("2\n"))),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            (r.outcome, r.partial),
+            (OpOutcome::Done, 1),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.warnings[0].contains("대소문자"), "{:?}", r.warnings);
+        assert!(t.path().join("d/b").exists(), "source kept");
+        let trash = Arc::new(FakeTrash::new());
+        let mut s = spec(
+            JobKind::Move,
+            Side::Local,
+            t.path(),
+            &["d"],
+            Side::Remote(session(up("3\n"))),
+            &p("/dst"),
+        );
+        s.trash = Arc::clone(&trash) as Arc<dyn TrashBackend>;
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            (r.outcome, r.partial),
+            (OpOutcome::Done, 0),
+            "{:?}",
+            r.warnings
+        );
+        assert_eq!(trash.trashed.lock().unwrap().len(), 1, "moved to the trash");
+    }
+
+    #[test]
+    fn real_count_has_every_entry_once() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("d it's/sub")).unwrap();
+        fs::write(t.path().join("d it's/sub/f"), "abc").unwrap();
+        fs::write(t.path().join("d it's/two\nlines"), "x").unwrap();
+        let out = sh(&count_cmd(&b(t.path()), b"d it's"));
         assert!(out.status.success(), "{out:?}");
-        let s = String::from_utf8(out.stdout).unwrap();
-        assert_eq!(s.split_whitespace().last(), Some("4"), "{s:?}");
-        assert_eq!(s.split_whitespace().count(), 4, "{s:?}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "4\n");
         let no = AtomicBool::new(false);
-        assert_eq!(local_count(&t.path().join("d"), &no), Some(4));
+        assert_eq!(local_count(&t.path().join("d it's"), &no), Some(4));
+        assert!(!sh(&count_cmd(&b(t.path()), b"gone")).status.success());
     }
 
     #[test]
@@ -3753,6 +3857,9 @@ mod tests {
                 return ok("");
             }
             let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("for f do printf .") {
+                return ok("3\n"); // all arrived
+            }
             if c.starts_with("if [ -L '") && !c.ends_with("|| exit 46") {
                 return code(if s2.load(Ordering::SeqCst) {
                     IS_DIR

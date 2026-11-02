@@ -136,4 +136,34 @@ fn every_command_logs_in_on_its_own() {
         )
         .unwrap();
     assert_eq!(up.stdout, b"from here");
+    // a move down: checked (fingerprint, entry count), then deleted there
+    let moved = tempfile::tempdir().unwrap();
+    let mut m = spec(
+        Side::Remote(Arc::clone(&s)),
+        dir.clone().into(),
+        "up.txt",
+        Side::Local,
+        moved.path().into(),
+    );
+    m.kind = JobKind::Move;
+    let r = run(&m, &mut ctl());
+    assert_eq!(
+        (r.outcome, r.copied, r.partial),
+        (OpOutcome::Done, 1, 0),
+        "{:?}",
+        r.warnings
+    );
+    assert_eq!(
+        std::fs::read(moved.path().join("up.txt")).unwrap(),
+        b"from here"
+    );
+    let gone = format!(
+        "[ ! -e {}/up.txt ]",
+        String::from_utf8(sh_quote(dir.as_bytes())).unwrap()
+    );
+    assert_eq!(
+        s.exec(gone.as_bytes()).unwrap().code,
+        Some(0),
+        "deleted there"
+    );
 }

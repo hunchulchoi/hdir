@@ -1230,6 +1230,13 @@ pub fn plain_remote_name(name: &OsStr) -> bool {
     )
 }
 
+/// Whether a listed remote name can be acted on here: a plain component
+/// ([`plain_remote_name`]) and, on Windows, not one whose bytes were not
+/// UTF-8 (they show up as U+FFFD, which names a different file).
+pub fn usable_remote_name(name: &OsStr) -> bool {
+    plain_remote_name(name) && !(cfg!(windows) && name.to_string_lossy().contains('\u{FFFD}'))
+}
+
 #[cfg(test)]
 mod plain_name_tests {
     use super::*;
@@ -1247,6 +1254,15 @@ mod plain_name_tests {
                 assert!(!plain_remote_name(OsStr::new(bad)), "{bad}");
             }
         }
+    }
+    #[test]
+    fn a_name_that_was_not_utf8_is_not_usable_on_windows() {
+        // Windows turns bytes that are not UTF-8 into U+FFFD: that name
+        // would point at a different remote file.
+        let lossy = os_from_bytes(b"a\xffb".to_vec());
+        assert_eq!(usable_remote_name(&lossy), !cfg!(windows));
+        assert!(usable_remote_name(OsStr::new("a b")));
+        assert!(!usable_remote_name(OsStr::new("a/b")));
     }
 }
 
