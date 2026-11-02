@@ -1391,7 +1391,7 @@ mod tests {
     #[test]
     fn the_permission_check_names_the_raw_directory_bytes() {
         let c = crate::remote::mktemp_cmd(&crate::remote::RemoteOs::Linux, b"/srv/bad\xff");
-        let raw = b"find '/srv/bad\xff' -prune";
+        let raw = b"c='/srv/bad\xff'; while :; do chk \"$c\"";
         assert!(
             c.windows(raw.len()).any(|w| w == raw),
             "raw bytes in every check"
@@ -1475,6 +1475,100 @@ mod tests {
         refused(&[("id", &own), ("getent", &primary)], "bob's primary group");
         // others can write: refused whatever the group
         assert_eq!(mktemp_with(0o777, &ok_tools), (Some(UNSAFE_DIR), false));
+    }
+
+    #[test]
+    fn dirs_owned_by_someone_else_are_refused_even_when_private() {
+        if unsafe { libc::getuid() } == 0 {
+            return; // root owns everything here and is trusted
+        }
+        let stranger = fake_id("999999", "GID", "staff");
+        assert_eq!(
+            mktemp_with(0o700, &[("id", &stranger)]),
+            (Some(UNSAFE_DIR), false)
+        );
+    }
+
+    /// `ls` answering `-ld` (Linux) and `-lde` (macOS) for any path.
+    fn fake_ls(linux_mode: &str, mac_acl: &str) -> String {
+        format!(
+            "case \"$1\" in -ld) printf '%s 2 me me 64 Jan 1 %s\\n' '{linux_mode}' \"$3\";; \
+             -lde) printf 'drwxr-xr-x+ 2 me me 64 Jan 1 %s\\n{mac_acl}' \"$3\";; *) exit 2;; esac"
+        )
+    }
+
+    #[test]
+    fn dirs_with_an_acl_that_may_grant_writes_are_refused() {
+        let grants = fake_ls("drwxr-xr-x+", " 0: user:bob allow add_file,delete_child\\n");
+        assert_eq!(
+            mktemp_with(0o700, &[("ls", &grants)]),
+            (Some(UNSAFE_DIR), false)
+        );
+        // a deny-only ACL (macOS homes) or an SELinux context ('.') is fine
+        let harmless = fake_ls("drwxr-xr-x.", " 0: group:everyone deny delete\\n");
+        assert_eq!(mktemp_with(0o700, &[("ls", &harmless)]), (Some(0), true));
+        assert_eq!(mktemp_with(0o700, &[("ls", "exit 1")]), (Some(1), false));
+    }
+
+    #[test]
+    fn real_upload_refuses_when_a_parent_directory_can_be_swapped() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let s = local_session(&root);
+        for (mode, safe) in [(0o777, false), (0o1777, true), (0o755, true)] {
+            let up = root.join(format!("up{mode:o}"));
+            let inner = up.join("inner");
+            std::fs::create_dir_all(&inner).unwrap();
+            let target = inner.join("f");
+            std::fs::write(&target, "old").unwrap();
+            std::fs::set_permissions(&up, std::fs::Permissions::from_mode(mode)).unwrap();
+            let local = edited(&root, "new");
+            let got = upload_fresh(&s, &local, &target);
+            if safe {
+                got.unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+            } else {
+                let e = got.unwrap_err();
+                assert!(e.contains("다른 사용자가 쓸 수 있는"), "{e}");
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+            }
+            no_temp_left(&inner);
+        }
+    }
+
+    #[test]
+    fn a_count_cut_off_by_sigpipe_is_still_a_count() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // an endless listing: only SIGPIPE from `head` stops it
+        std::fs::write(
+            bin.join("find"),
+            "#!/bin/sh\nwhile :; do printf 'x\\0'; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("find"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = root.join("d");
+        std::fs::create_dir(&d).unwrap();
+        let mut script = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
+        script.extend(crate::remote::preview_cmd_capped(
+            &crate::testutil::local_os(),
+            d.as_os_str().as_encoded_bytes(),
+            10,
+            20,
+        ));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&script))
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(crate::remote::PREVIEW_DIR),
+            "{out:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "21");
     }
 
     #[test]
