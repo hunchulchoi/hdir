@@ -1496,7 +1496,10 @@ mod tests {
 
     #[test]
     fn system_trash_view_support_follows_the_os() {
-        assert_eq!(SystemTrash.supports_view(), cfg!(target_os = "linux"));
+        assert_eq!(
+            SystemTrash.supports_view(),
+            cfg!(any(target_os = "linux", windows))
+        );
     }
 
     #[cfg(windows)]
