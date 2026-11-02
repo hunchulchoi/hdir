@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::loader::Listing;
 use crate::panel::finish_listing;
-use crate::platform::{os_bytes, os_from_bytes};
+use crate::platform::{os_from_bytes, remote_bytes};
 use crate::remote::{
     RemoteEntry, RemoteOs, ScpMode, SshTarget, check_argv, exec_argv, list_cmd, master_argv,
     parse_listing, parse_uname, scp_mode_from_version, sh_quote,
@@ -525,7 +525,7 @@ impl RemoteSession {
 
     /// List `dir` on the remote host (blocking; run on a worker).
     pub fn list(&self, dir: &Path, show_hidden: bool) -> Listing {
-        let bytes = os_bytes(dir.as_os_str());
+        let bytes = remote_bytes(dir.as_os_str());
         let out = self
             .exec(&list_cmd(&self.os, &bytes, show_hidden))
             .map_err(|e| e.message())?;
@@ -536,10 +536,17 @@ impl RemoteSession {
                 &format!("종료 코드 {}", out.code.unwrap_or(-1)),
             ));
         }
-        let (entries, bad) = parse_listing(&self.os, &out.stdout);
+        let (mut entries, bad) = parse_listing(&self.os, &out.stdout);
+        // On Windows a backslash in a remote name would read as a path
+        // separator once joined: such names are left out (and counted).
+        let before = entries.len();
+        if cfg!(windows) {
+            entries.retain(|e| !crate::platform::os_bytes(&e.name).contains(&b'\\'));
+        }
+        let hidden = before - entries.len();
         let items = entries.iter().map(RemoteEntry::to_entry).collect();
         // A non-zero exit with output means find/stat skipped something.
-        let skipped = bad + usize::from(failed);
+        let skipped = bad + hidden + usize::from(failed);
         Ok((finish_listing(dir, items), skipped))
     }
 }

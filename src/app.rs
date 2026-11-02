@@ -24,7 +24,7 @@ use crate::launcher::{self, SharedLauncher};
 use crate::loader::Loader;
 use crate::menu::{self, Menu, MenuEvent};
 use crate::panel::{AsyncEnter, EntryKind, LoadKind, LoadRequest, Panel};
-use crate::platform::os_bytes;
+
 use crate::preview::{self, Preview};
 use crate::remote::{self, SshTarget};
 use crate::remote_ops::{self, EditCopy};
@@ -1563,7 +1563,11 @@ impl App {
         // has no meaningful cwd of its own.
         let (argv, run_cwd) = match &job.session {
             Some(s) => (
-                remote::remote_shell_argv(&s.target, &os_bytes(job.cwd.as_os_str()), &job.cmd),
+                remote::remote_shell_argv(
+                    &s.target,
+                    &crate::platform::remote_bytes(job.cwd.as_os_str()),
+                    &job.cmd,
+                ),
                 PathBuf::from("."),
             ),
             None => (

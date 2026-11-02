@@ -732,8 +732,9 @@ fn route(spec: &TransferSpec) -> Result<Route<'_>, String> {
     })
 }
 
+/// A remote path as bytes (see [`crate::platform::remote_bytes`]).
 fn b(p: &Path) -> Vec<u8> {
-    os_bytes(p.as_os_str()).into_owned()
+    crate::platform::remote_bytes(p.as_os_str()).into_owned()
 }
 
 fn code_err(out: &CmdOutput) -> String {
@@ -1262,9 +1263,35 @@ fn local_stamp(path: &Path, cancel: &AtomicBool) -> Option<String> {
     Some(format!("{top_ctime} {:016x}:{}", h.finish(), all.len()))
 }
 
+/// Windows: no inodes or ctime; the tree's relative paths, kinds, sizes
+/// and modification times (100 ns) still change with any edit.
 #[cfg(not(unix))]
-fn local_stamp(_path: &Path, _cancel: &AtomicBool) -> Option<String> {
-    None
+fn local_stamp(path: &Path, cancel: &AtomicBool) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut all = Vec::new();
+    let mut todo = vec![path.to_path_buf()];
+    while let Some(q) = todo.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let m = std::fs::symlink_metadata(&q).ok()?;
+        if m.is_dir() {
+            for e in std::fs::read_dir(&q).ok()? {
+                todo.push(e.ok()?.path());
+            }
+        }
+        let mtime = m
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let rel = q.strip_prefix(path).ok()?.to_string_lossy().into_owned();
+        all.push((rel, m.is_dir(), m.len(), mtime));
+    }
+    all.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    all.hash(&mut h);
+    Some(format!("- {:016x}:{}", h.finish(), all.len()))
 }
 
 /// Remove a moved source once its copy is in place.

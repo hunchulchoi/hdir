@@ -1186,3 +1186,36 @@ mod drive_tests {
         assert_eq!(drive_roots_from_mask(1 << 25), vec![PathBuf::from("Z:\\")]);
     }
 }
+
+/// Bytes of a *remote* (POSIX) path. Remote paths live in `PathBuf`s, and on
+/// Windows `join` adds `\\`: it is turned back into `/` here. (A remote name
+/// that itself holds a backslash cannot be reached from Windows; listings
+/// there leave such names out.)
+pub fn remote_bytes(p: &OsStr) -> Cow<'_, [u8]> {
+    to_slashes(os_bytes(p), cfg!(windows))
+}
+
+fn to_slashes(b: Cow<'_, [u8]>, windows: bool) -> Cow<'_, [u8]> {
+    if windows && b.contains(&b'\\') {
+        Cow::Owned(
+            b.iter()
+                .map(|&c| if c == b'\\' { b'/' } else { c })
+                .collect(),
+        )
+    } else {
+        b
+    }
+}
+
+#[cfg(test)]
+mod remote_bytes_tests {
+    use super::*;
+
+    #[test]
+    fn windows_joins_become_slashes_only_on_windows() {
+        let b = |s: &str, w: bool| to_slashes(Cow::Borrowed(s.as_bytes()), w).into_owned();
+        assert_eq!(b("/home/u\\sub\\x", true), b"/home/u/sub/x");
+        assert_eq!(b("/home/u\\sub", false), b"/home/u\\sub");
+        assert_eq!(b("/plain", true), b"/plain");
+    }
+}

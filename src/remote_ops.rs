@@ -6,7 +6,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::platform::{os_bytes, os_from_bytes};
+use crate::platform::{os_bytes, os_from_bytes, remote_bytes};
 use crate::preview::{self, Limits, Preview};
 use crate::remote::{
     DELETE_NO_CWD, DELETE_NO_HOME, DELETE_PROTECTED, PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING,
@@ -20,7 +20,7 @@ use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
 
 /// Resolve `target` (as typed after `cd`) against `cwd` on the host.
 pub fn resolve_cd(s: &RemoteSession, cwd: &Path, target: &str) -> Result<PathBuf, String> {
-    let out = run_ok(s, &cd_cmd(&os_bytes(cwd.as_os_str()), target))?;
+    let out = run_ok(s, &cd_cmd(&remote_bytes(cwd.as_os_str()), target))?;
     let end = out.stdout.iter().position(|&b| b == 0).unwrap_or(0);
     if end == 0 || out.stdout[0] != b'/' {
         return Err("원격 경로를 알 수 없음".into());
@@ -58,7 +58,7 @@ fn ok_or_stderr(out: CmdOutput) -> Result<CmdOutput, String> {
 pub fn mkdir(s: &RemoteSession, parent: &Path, name: &str) -> Result<PathBuf, String> {
     validate_name(name)?;
     let path = parent.join(name);
-    run_ok(s, &mkdir_cmd(&os_bytes(path.as_os_str())))?;
+    run_ok(s, &mkdir_cmd(&remote_bytes(path.as_os_str())))?;
     Ok(path)
 }
 
@@ -66,7 +66,10 @@ pub fn mkdir(s: &RemoteSession, parent: &Path, name: &str) -> Result<PathBuf, St
 pub fn rename(s: &RemoteSession, from: &Path, new_name: &str) -> Result<PathBuf, String> {
     validate_name(new_name)?;
     let to = from.with_file_name(new_name);
-    let cmd = rename_cmd(&os_bytes(from.as_os_str()), &os_bytes(to.as_os_str()));
+    let cmd = rename_cmd(
+        &remote_bytes(from.as_os_str()),
+        &remote_bytes(to.as_os_str()),
+    );
     let out = s.exec(&cmd).map_err(|e| e.message())?;
     match out.code {
         Some(0) => Ok(to),
@@ -80,13 +83,13 @@ pub fn rename(s: &RemoteSession, from: &Path, new_name: &str) -> Result<PathBuf,
 
 /// `rmdir` (only an empty directory goes away).
 pub fn rmdir(s: &RemoteSession, path: &Path) -> Result<(), String> {
-    run_ok(s, &rmdir_cmd(&os_bytes(path.as_os_str()))).map(|_| ())
+    run_ok(s, &rmdir_cmd(&remote_bytes(path.as_os_str()))).map(|_| ())
 }
 
 /// `cwd` as bytes and `names` as bytes, refusing anything that is not a
 /// plain child name (empty, `.`, `..`, containing `/`) or a relative `cwd`.
 fn delete_args(cwd: &Path, names: &[OsString]) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    let base = os_bytes(cwd.as_os_str()).into_owned();
+    let base = remote_bytes(cwd.as_os_str()).into_owned();
     if base.first() != Some(&b'/') {
         return Err("삭제 거부: 절대 경로가 아님".into());
     }
@@ -133,7 +136,7 @@ pub fn delete(s: &RemoteSession, cwd: &Path, names: &[OsString]) -> Result<(), S
 /// preview does: at most `limits.max_bytes` (+3 so a split character can be
 /// completed) cross the wire, then [`preview::classify_with`] decides.
 pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
-    let bytes = os_bytes(path.as_os_str());
+    let bytes = remote_bytes(path.as_os_str());
     let out = match s.exec(&preview_cmd(&s.os, &bytes, limits.max_bytes + 3)) {
         Ok(o) => o,
         Err(e) => return Preview::Error(e.message()),
@@ -270,7 +273,7 @@ fn scp_run(s: &RemoteSession, argv: Result<Vec<OsString>, String>) -> Result<(),
 
 /// Fingerprint of the remote file `path` (see [`stamp_cmd`]).
 pub fn remote_stamp(s: &RemoteSession, path: &Path) -> Result<Vec<u8>, String> {
-    let cmd = stamp_cmd(&s.os, &os_bytes(path.as_os_str()));
+    let cmd = stamp_cmd(&s.os, &remote_bytes(path.as_os_str()));
     let out = ok_or_stderr(s.exec_long(&cmd).map_err(|e| e.message())?)?;
     if out.stdout.is_empty() {
         return Err("원격 파일 상태를 알 수 없음".into());
@@ -301,7 +304,7 @@ pub fn fetch(s: &RemoteSession, remote: &Path, for_edit: bool) -> Result<EditCop
         Vec::new()
     };
     let argv = scp_argv(
-        &Endpoint::Remote(&s.target, &os_bytes(remote.as_os_str())),
+        &Endpoint::Remote(&s.target, &remote_bytes(remote.as_os_str())),
         &Endpoint::Local(dir.path()),
         s.scp_mode,
     );
@@ -349,7 +352,7 @@ pub fn upload_replace(
     let size = std::fs::metadata(local)
         .map_err(|e| format!("편집한 파일을 읽을 수 없음: {e}"))?
         .len();
-    let phys = nul_path(&run_ok(s, &resolve_cmd(&os_bytes(remote.as_os_str())))?)?;
+    let phys = nul_path(&run_ok(s, &resolve_cmd(&remote_bytes(remote.as_os_str())))?)?;
     let dir = phys
         .iter()
         .rposition(|&b| b == b'/')
