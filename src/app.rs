@@ -9562,7 +9562,7 @@ mod tests {
                 if c.ends_with("|| exit 46") {
                     return Some(out(0, "")); // rename into place
                 }
-                if c.starts_with("stat -c ") {
+                if c.contains("| cksum") {
                     return Some(out(0, "1:2\n"));
                 }
                 if let Some(rest) = c.strip_prefix("if [ -L '") {
