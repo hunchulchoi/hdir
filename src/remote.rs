@@ -320,6 +320,12 @@ fn stat_size_args(os: &RemoteOs) -> &'static str {
 /// which would read the whole file) and a newline, then the first `max`
 /// bytes (`head -c`). Symlinks are followed.
 pub fn preview_cmd(os: &RemoteOs, path: &[u8], max: usize) -> Vec<u8> {
+    preview_cmd_capped(os, path, max, REMOTE_DIR_CAP)
+}
+
+/// [`preview_cmd`] counting at most `cap` directory entries (tests use a
+/// small cap).
+pub(crate) fn preview_cmd_capped(os: &RemoteOs, path: &[u8], max: usize, cap: usize) -> Vec<u8> {
     let q = sh_quote(path);
     cat(&[
         b"if [ -d ",
@@ -332,7 +338,7 @@ pub fn preview_cmd(os: &RemoteOs, path: &[u8], max: usize) -> Vec<u8> {
              | LC_ALL=C tr -dc '\\000' | head -c {} | wc -c >&4; }} 3>&1 ); }} 4>&1; \
              case $s in 0|141|269) exit {PREVIEW_DIR};; esac; \
              echo 'cannot list the directory' >&2; exit 1; elif [ -f ",
-            REMOTE_DIR_CAP + 1
+            cap + 1
         )
         .as_bytes(),
         &q,

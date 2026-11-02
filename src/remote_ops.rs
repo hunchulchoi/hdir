@@ -1408,16 +1408,16 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let d = t.path().join("big");
         std::fs::create_dir(&d).unwrap();
-        let cap = crate::remote::REMOTE_DIR_CAP;
-        let count = || {
+        let count = |cap: usize| {
             let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(
                     <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
-                        &crate::remote::preview_cmd(
+                        &crate::remote::preview_cmd_capped(
                             &crate::testutil::local_os(),
                             d.as_os_str().as_encoded_bytes(),
                             10,
+                            cap,
                         ),
                     ),
                 )
@@ -1433,24 +1433,16 @@ mod tests {
                 .parse::<usize>()
                 .unwrap()
         };
-        for i in 0..cap {
-            std::fs::File::create(d.join(format!("f{i}"))).unwrap();
+        // 1000 names of ~100 bytes: more than a pipe buffer, so with a small
+        // cap `head` quits early and find is cut off (SIGPIPE)
+        let pad = "x".repeat(100);
+        for i in 0..1000 {
+            std::fs::File::create(d.join(format!("{pad}\n{i}"))).unwrap();
         }
-        assert_eq!(count(), cap);
-        let s = local_session(t.path());
-        assert_eq!(
-            preview(&s, &d, Limits::PREVIEW),
-            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개"))
-        );
-        // "./fNNNN\0" x 10000+ is more than a pipe buffer: find is cut off
-        for i in 0..50 {
-            std::fs::File::create(d.join(format!("more\n{i}"))).unwrap();
-        }
-        assert_eq!(count(), cap + 1);
-        assert_eq!(
-            preview(&s, &d, Limits::PREVIEW),
-            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개 이상"))
-        );
+        assert_eq!(count(20), 21, "one past the cap, then stop");
+        assert_eq!(count(1000), 1000, "exactly the cap");
+        assert_eq!(count(999), 1000);
+        assert_eq!(count(5000), 1000, "under the cap: all of them");
     }
 
     #[test]
