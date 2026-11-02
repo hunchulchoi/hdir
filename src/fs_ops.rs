@@ -1192,6 +1192,10 @@ mod tests {
         let tag = b"bplist00\xa1\x01UGreen\n2";
         let set = |p: &Path, v: &[u8]| crate::platform::xattr_set_path(p, XATTR, v);
         if let Err(e) = set(&src.join("sub"), tag) {
+            // only a filesystem without xattrs may skip the test
+            let unsupported =
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP);
+            assert!(unsupported, "{e}");
             eprintln!("skipped: no xattr support here ({e})");
             return;
         }

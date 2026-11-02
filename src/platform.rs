@@ -629,10 +629,13 @@ mod xattr_sys {
             let len = read(std::ptr::null_mut(), 0)?;
             let mut buf = vec![0u8; len];
             match read(buf.as_mut_ptr(), len) {
-                Ok(n) => {
+                // with a 0-length buffer the call is a size query again: a
+                // value that grew in between must be read anew
+                Ok(n) if n <= len && (len > 0 || n == 0) => {
                     buf.truncate(n);
                     return Ok(buf);
                 }
+                Ok(_) => continue,
                 Err(e) if e.raw_os_error() == Some(libc::ERANGE) => continue,
                 Err(e) => return Err(e),
             }
