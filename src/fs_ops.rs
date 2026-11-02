@@ -6,11 +6,13 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use crate::platform::open_src_dir;
 use crate::platform::{
     DirFd, SrcKind, create_private_dir, create_private_file, create_symlink, is_cross_device,
-    is_link_refused, is_symlink_privilege_error, is_unsupported, open_src_dir, open_src_file,
-    read_src_link, remove_link, rename_noreplace_os, rename_replace, same_file, set_dir_modified,
-    src_kind, truncated_name,
+    is_link_refused, is_symlink_privilege_error, is_unsupported, open_src_file, read_src_link,
+    remove_link, rename_noreplace_os, rename_replace, same_file, set_dir_modified, src_kind,
+    truncated_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1151,6 +1153,8 @@ pub fn rename(path: &Path, new_name: &str) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::platform::open_source;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

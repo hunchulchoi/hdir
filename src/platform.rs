@@ -766,10 +766,24 @@ pub enum SrcKind {
 #[derive(Debug)]
 pub struct DirFd(std::os::fd::OwnedFd);
 
-/// Never constructed off unix: copies there are path based.
+/// Never constructed off unix (it has no values): copies there are path
+/// based.
 #[cfg(not(unix))]
 #[derive(Debug)]
-pub struct DirFd(());
+pub enum DirFd {}
+
+#[cfg(not(unix))]
+impl DirFd {
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        match *self {}
+    }
+    pub fn entries(&self) -> io::Result<Vec<OsString>> {
+        match *self {}
+    }
+    pub fn copy_xattrs_to(&self, _to: &Path) -> io::Result<()> {
+        match *self {}
+    }
+}
 
 #[cfg(unix)]
 fn name_cstr(name: &OsStr) -> io::Result<std::ffi::CString> {
