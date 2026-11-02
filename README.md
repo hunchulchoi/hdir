@@ -14,7 +14,7 @@ DOS 시절 Mdir의 키보드 조작감과 현대 셸 기능을 합친 개발자�
 | | 상태 |
 |---|---|
 | macOS, Linux | 지원 |
-| Windows | 빌드·기본 탐색만. 휴지통 보기, PowerShell 셸 통합, 확장자 실행, SSH 등은 **지원 예정** (화면에 안내) |
+| Windows | 탐색·파일 작업·휴지통 보기·PowerShell 셸 통합·확장자 연결·기본 앱 열기·드라이브 이동. SSH 원격 패널은 **지원 예정** (화면에 안내) |
 
 ## 설치
 
@@ -49,7 +49,12 @@ source /path/to/hdir/shell/hdir.bash
 source /path/to/hdir/shell/hdir.fish
 ```
 
-`:`를 누르면 명령줄이 열립니다. `cd <경로>`, `cd -`, `cd`는 hdir 안에서 처리하고, 그 밖의 명령은 `$SHELL -c`로 실행합니다(원격 패널에서는 그 서버에서 실행).
+```powershell
+# PowerShell ($PROFILE): 기본 별칭 h(Get-History)를 hdir로 바꿉니다
+. C:\path\to\hdir\shell\hdir.ps1
+```
+
+`:`를 누르면 명령줄이 열립니다. `cd <경로>`, `cd -`, `cd`는 hdir 안에서 처리하고, 그 밖의 명령은 `$SHELL -c`로 실행합니다. Windows에서는 `pwsh -NoProfile -Command`로 실행하고, `cd D:`는 그 드라이브의 루트로 갑니다. 원격 패널에서는 그 서버에서 실행합니다.
 
 ## 기본 키 (`mdir` 프리셋)
 
@@ -103,6 +108,7 @@ search = "/"
 # 확장자 연결: Enter로 실행할 명령. 위에서부터 먼저 맞는 규칙.
 # {} = 파일 경로, {dir} = 폴더, {name} = 확장자를 뺀 이름.
 # 자리표시자를 하나도 안 쓰면 경로가 끝에 붙는다.
+# Windows에서는 PowerShell 스크립트로 실행된다(파일 이름은 코드로 해석되지 않음).
 [[assoc]]
 ext = ["md", "txt"]
 cmd = "less {}"
