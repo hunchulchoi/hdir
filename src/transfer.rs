@@ -515,13 +515,15 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
               else exit 49; fi; ",
         ]),
         // Without -T, `ln` and `mv` go into a directory that appeared
-        // meanwhile: that is detected afterwards (`-ef`, `-L`, the inode),
-        // undone and refused.
+        // meanwhile: that is detected afterwards (`-ef`, the link's own
+        // target, the inode), undone and refused; `ln -n` never follows a
+        // link that appeared there.
         (false, false) => cat(&[
             there,
             b"if [ -L $F ]; then l=$(readlink -- $F && echo x) || exit 1; l=${l%?x}; \
-              if ln -s -- \"$l\" $T 2>/dev/null; then \
-              if [ -L $T ]; then rm -f -- $F; else exit 48; fi; else ",
+              if ln -sn -- \"$l\" $T 2>/dev/null; then \
+              r=$(readlink -- $T && echo x) || exit 48; \
+              if [ -L $T ] && [ \"${r%?x}\" = \"$l\" ]; then rm -f -- $F; else exit 48; fi; else ",
             there,
             b"exit 1; fi; \
               elif [ -f $F ]; then \
@@ -1860,8 +1862,9 @@ mod tests {
         .unwrap();
         for part in [
             "if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; ",
-            "if ln -s -- \"$l\" '/d/x' 2>/dev/null; then if [ -L '/d/x' ]; then rm -f -- '/d/S/x'; \
-             else exit 48; fi;",
+            "if ln -sn -- \"$l\" '/d/x' 2>/dev/null; then \
+             r=$(readlink -- '/d/x' && echo x) || exit 48; \
+             if [ -L '/d/x' ] && [ \"${r%?x}\" = \"$l\" ]; then rm -f -- '/d/S/x'; else exit 48; fi;",
             "if ln -- '/d/S/x' '/d/x' 2>/dev/null; then \
              if [ '/d/x' -ef '/d/S/x' ]; then rm -f -- '/d/S/x'; else rm -f -- '/d/x/x'; exit 48; fi;",
             "elif [ -d '/d/S/x' ]; then set -- $(ls -di -- '/d/S/x') || exit 1; i=$1; \
@@ -4678,6 +4681,38 @@ mod tests {
             .mode()
             & 0o7777;
         assert_eq!(mode & 0o6000, 0, "{mode:o}");
+    }
+
+    #[test]
+    fn real_a_link_appearing_as_a_folder_link_gets_nothing_inside_it() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let elsewhere = private_dir(t.path(), "elsewhere");
+        let (dir, stage, sp) = stage_in(&dest);
+        std::os::unix::fs::symlink("target", sp.join("ln")).unwrap();
+        let to = cat(&[&dir, b"/ln"]);
+        let from = cat(&[&stage, b"/ln"]);
+        // right before ln, the name becomes a link to another folder
+        let script = cat(&[
+            b"ln() { command ln -s ",
+            &sh_quote(&b(&elsewhere)),
+            b" ",
+            &sh_quote(&to),
+            b"; command ln \"$@\"; }; ",
+            &place_cmd(&RemoteOs::Bsd, &from, &to, &stage, false),
+        ]);
+        assert_eq!(sh(&script).status.code(), Some(APPEARED));
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing inside"
+        );
+        assert_eq!(
+            fs::read_link(dest.join("ln")).unwrap(),
+            elsewhere,
+            "theirs kept"
+        );
+        assert!(sp.join("ln").exists() || fs::symlink_metadata(sp.join("ln")).is_ok());
     }
 }
 
