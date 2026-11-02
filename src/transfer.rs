@@ -432,7 +432,8 @@ pub const QUARANTINE_PREFIX: &str = ".hdir-del.";
 /// (the physical `dir` and its parents fail [`safe_dirs_check`]:
 /// [`UNSAFE_DIR`]), and when the item's ctime is no longer `ctime` (its
 /// fingerprint's top entry, which the rename itself would change:
-/// [`SOURCE_CHANGED`]).
+/// [`SOURCE_CHANGED`]), and for the home, or a directory containing it
+/// ([`crate::remote::DELETE_PROTECTED`]), before anything moves.
 pub fn quarantine_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], ctime: &[u8]) -> Vec<u8> {
     cat(&[
         b"cd -- ",
@@ -445,7 +446,18 @@ pub fn quarantine_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], ctime: &[u8]) -> V
         &sh_quote(name),
         b") || exit 1; [ \"$c\" = ",
         &sh_quote(ctime),
-        b" ] || exit 50; q=$(mktemp -d ",
+        b" ] || exit 50; ",
+        // never set aside the home, `/` or a parent of the home: the delete
+        // would refuse it and leave it in the quarantine
+        b"h=$(cd -- \"$HOME\" && pwd -P && echo x) || exit 42; h=${h%?x}; \
+          if [ -d ./",
+        &sh_quote(name),
+        b" ] && [ ! -L ./",
+        &sh_quote(name),
+        b" ]; then p=$(cd -- ./",
+        &sh_quote(name),
+        b" && pwd -P && echo x) || exit 1; p=${p%?x}; \
+          case \"$h/\" in \"$p\"/*) exit 42;; esac; fi; q=$(mktemp -d ",
         QUARANTINE_PREFIX.as_bytes(),
         b"XXXXXX) || exit 1; mv -- ./",
         &sh_quote(name),
@@ -1248,6 +1260,31 @@ fn item(
     }
 }
 
+/// Move a quarantined source back to where it was, never replacing
+/// anything there; `why`, plus where it stayed when that did not work.
+fn put_back(
+    s: &RemoteSession,
+    spec: &TransferSpec,
+    qdir: &Path,
+    name: &OsString,
+    why: String,
+) -> String {
+    let back = place_cmd(
+        &s.os,
+        &b(&qdir.join(name)),
+        &b(&spec.src_dir.join(name)),
+        &b(qdir),
+        false,
+    );
+    match s.exec(&back) {
+        Ok(o) if o.code == Some(0) => why,
+        _ => format!(
+            "{why} · 원본이 격리 폴더에 남음: {}",
+            qdir.join(name).to_string_lossy()
+        ),
+    }
+}
+
 fn changed_msg(name: &OsString) -> String {
     format!(
         "원본이 전송 중 바뀌었거나 대상과 같은 파일이라 원본을 지우지 않음: {}",
@@ -1275,6 +1312,12 @@ fn delete_remote_source(
     let out = match s.exec(&cmd) {
         Ok(o) if o.code == Some(0) => o,
         Ok(o) if o.code == Some(SOURCE_CHANGED) => return keep(changed_msg(name)),
+        Ok(o) if o.code == Some(crate::remote::DELETE_PROTECTED) => {
+            return keep(format!(
+                "삭제 거부: 홈 디렉터리 또는 그 상위라 원본을 지우지 않음: {}",
+                lossy(name)
+            ));
+        }
         Ok(o) if o.code == Some(UNSAFE_DIR) => {
             return keep(format!(
                 "다른 사용자가 바꿀 수 있는 폴더라 원본을 지우지 않음: {}",
@@ -1314,27 +1357,11 @@ fn delete_remote_source(
         } else {
             changed_msg(name)
         };
-        let back = place_cmd(
-            &s.os,
-            &b(&qdir.join(name)),
-            &b(&spec.src_dir.join(name)),
-            &b(&qdir),
-            false,
-        );
-        return match s.exec(&back) {
-            Ok(o) if o.code == Some(0) => keep(why),
-            _ => keep(format!(
-                "{why} · 원본이 격리 폴더에 남음: {}",
-                qdir.join(name).to_string_lossy()
-            )),
-        };
+        return keep(put_back(s, spec, &qdir, name, why));
     }
     if let Err(e) = remote_ops::delete(s, &qdir, std::slice::from_ref(name)) {
-        return keep(format!(
-            "원본을 지우지 못함: {} ({e}) · 격리 폴더: {}",
-            lossy(name),
-            qdir.to_string_lossy()
-        ));
+        let why = format!("원본을 지우지 못함: {} ({e})", lossy(name));
+        return keep(put_back(s, spec, &qdir, name, why));
     }
     // The item is gone; an empty dir left behind is only cosmetic.
     let _ = remote_ops::rmdir(s, &qdir);
@@ -3806,5 +3833,89 @@ mod tests {
         assert_eq!(out.stdout, b"e");
         assert_eq!(flag(&out.stdout), None, "refused, not 'no links'");
         assert_eq!(parse_scan(&scan.stdout, 1), None);
+    }
+
+    #[test]
+    fn real_the_home_or_a_parent_of_it_is_never_set_aside() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        fs::create_dir_all(src.join("top/me")).unwrap();
+        fs::create_dir(src.join("other")).unwrap();
+        let os = crate::testutil::local_os();
+        let home = fs::canonicalize(src.join("top/me")).unwrap();
+        let run_q = |name: &[u8]| {
+            let st = sh(&stamp_cmd(&os, &b(&src), name));
+            let c0 = String::from_utf8(st.stdout)
+                .unwrap()
+                .split_once(' ')
+                .unwrap()
+                .0
+                .to_string();
+            let script = cat(&[
+                b"HOME=",
+                &sh_quote(&b(&home)),
+                b"; export HOME; ",
+                &quarantine_cmd(&os, &b(&src), name, c0.as_bytes()),
+            ]);
+            sh(&script)
+        };
+        let protected = crate::remote::DELETE_PROTECTED;
+        assert_eq!(
+            run_q(b"top").status.code(),
+            Some(protected),
+            "a parent of the home"
+        );
+        assert_eq!(
+            run_q(b"top/me").status.code(),
+            Some(protected),
+            "the home itself"
+        );
+        assert!(src.join("top/me").is_dir(), "nothing moved");
+        assert!(
+            run_q(b"other").status.success(),
+            "an unrelated folder is fine"
+        );
+    }
+
+    #[test]
+    fn a_source_whose_delete_is_refused_goes_back_or_is_named() {
+        for put_back_ok in [true, false] {
+            let t = tempfile::tempdir().unwrap();
+            let f = FakeCmd::new(move |a| {
+                if a[0] == "scp" {
+                    return fake_scp(a);
+                }
+                let c = remote_cmd(a).unwrap_or_default();
+                if c.contains("rm -rf") {
+                    return fail(1, "rm: busy\n");
+                }
+                if c.starts_with("if [ -e '/srv/a' ]") {
+                    return code(if put_back_ok { 0 } else { APPEARED });
+                }
+                answer(c, &[], &[], "0\x000\x00")
+            });
+            let s = spec(
+                JobKind::Move,
+                Side::Remote(session(Arc::clone(&f))),
+                &p("/srv"),
+                &["a"],
+                Side::Local,
+                t.path(),
+            );
+            let r = run(&s, &mut Ctl::new());
+            assert_eq!((r.outcome, r.partial), (OpOutcome::Done, 1));
+            let w = &r.warnings[0];
+            assert!(w.starts_with("원본을 지우지 못함: a"), "{w}");
+            assert_eq!(
+                w.contains("원본이 격리 폴더에 남음: /srv/.hdir-del.Q1/a"),
+                !put_back_ok,
+                "{w}"
+            );
+            let cmds = f.remote_cmds();
+            assert!(
+                cmds.iter().any(|c| c.starts_with("if [ -e '/srv/a' ]")),
+                "{cmds:?}"
+            );
+        }
     }
 }
