@@ -312,7 +312,7 @@ fn sibling_named(dest: &Path, kind: &str) -> PathBuf {
 ///
 /// Unless the caller already `approved` replacing `dest`, the final rename never
 /// clobbers: a file that appeared meanwhile goes through `on_conflict` again.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn copy_file(
     src: &Path,
     dest: &Path,
