@@ -1,4 +1,7 @@
 //! Terminal setup/teardown helpers.
+//!
+//! The raw operations sit behind `TermOps` so the failure and recovery paths
+//! can be tested with a recording fake.
 
 use std::io::{self, Stdout};
 
@@ -10,16 +13,60 @@ use ratatui::crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-/// Enter raw mode and the alternate screen, hide the cursor.
-pub fn init() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen, Hide) {
-        let _ = restore();
+/// Raw terminal steps. Each one is a single side effect.
+trait TermOps {
+    fn enable_raw(&mut self) -> io::Result<()>;
+    fn disable_raw(&mut self) -> io::Result<()>;
+    /// Enter the alternate screen and hide the cursor.
+    fn enter_screen(&mut self) -> io::Result<()>;
+    /// Leave the alternate screen and show the cursor.
+    fn leave_screen(&mut self) -> io::Result<()>;
+    fn clear_all(&mut self) -> io::Result<()>;
+}
+
+/// The real terminal on stdout.
+struct CrosstermOps;
+
+impl TermOps for CrosstermOps {
+    fn enable_raw(&mut self) -> io::Result<()> {
+        enable_raw_mode()
+    }
+    fn disable_raw(&mut self) -> io::Result<()> {
+        disable_raw_mode()
+    }
+    fn enter_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnterAlternateScreen, Hide)
+    }
+    fn leave_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen, Show)
+    }
+    fn clear_all(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), Clear(ClearType::All))
+    }
+}
+
+fn restore_with(ops: &mut impl TermOps) -> io::Result<()> {
+    let _ = ops.disable_raw();
+    ops.leave_screen()
+}
+
+/// Enter raw mode and the alternate screen, then build the terminal. Anything
+/// already entered is undone if a later step fails.
+fn init_with<O: TermOps, T>(ops: &mut O, make: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    ops.enable_raw()?;
+    if let Err(e) = ops.enter_screen() {
+        let _ = restore_with(ops);
         return Err(e);
     }
-    Terminal::new(CrosstermBackend::new(stdout)).inspect_err(|_| {
-        let _ = restore();
+    make().inspect_err(|_| {
+        let _ = restore_with(ops);
+    })
+}
+
+/// Enter raw mode and the alternate screen, hide the cursor.
+pub fn init() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    init_with(&mut CrosstermOps, || {
+        Terminal::new(CrosstermBackend::new(io::stdout()))
     })
 }
 
@@ -28,17 +75,54 @@ pub fn init() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// Idempotent: safe to call repeatedly or without a prior `init`. Raw-mode
 /// disable failures (e.g. no tty) are ignored as this is best-effort cleanup.
 pub fn restore() -> io::Result<()> {
-    let _ = disable_raw_mode();
-    execute!(io::stdout(), LeaveAlternateScreen, Show)
+    restore_with(&mut CrosstermOps)
+}
+
+/// Run `restore` first, then `previous`.
+fn run_hook(restore: impl FnOnce(), previous: impl FnOnce()) {
+    restore();
+    previous();
 }
 
 /// Install a panic hook that restores the terminal before the previous hook runs.
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = restore();
-        previous(info);
+        run_hook(
+            || {
+                let _ = restore();
+            },
+            || previous(info),
+        );
     }));
+}
+
+/// Re-enter raw mode and the alternate screen, then rebuild the terminal.
+/// On failure the terminal is put back to cooked mode.
+fn reenter_with<O: TermOps, T>(ops: &mut O, make: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let entered = ops
+        .enable_raw()
+        .and_then(|_| ops.enter_screen())
+        .and_then(|_| ops.clear_all());
+    if let Err(e) = entered {
+        let _ = restore_with(ops);
+        return Err(e);
+    }
+    make().inspect_err(|_| {
+        let _ = restore_with(ops);
+    })
+}
+
+/// Leave the TUI, run `f`, then re-enter. `f` always runs in cooked mode.
+fn suspend_with<O: TermOps, T, R>(
+    ops: &mut O,
+    f: impl FnOnce() -> R,
+    make: impl FnOnce() -> io::Result<T>,
+) -> io::Result<(R, T)> {
+    restore_with(ops)?;
+    let result = f();
+    let fresh = reenter_with(ops, make)?;
+    Ok((result, fresh))
 }
 
 /// Temporarily leave the TUI, run `f` (e.g. `$EDITOR`), then re-enter and clear.
@@ -46,18 +130,10 @@ pub fn suspend<T>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     f: impl FnOnce() -> T,
 ) -> io::Result<T> {
-    restore()?;
-    let result = f();
-    enable_raw_mode()?;
-    execute!(
-        io::stdout(),
-        EnterAlternateScreen,
-        Hide,
-        Clear(ClearType::All)
-    )?;
-    reenter(terminal, || {
+    let (result, fresh) = suspend_with(&mut CrosstermOps, f, || {
         Terminal::new(CrosstermBackend::new(io::stdout()))
     })?;
+    reenter(terminal, || Ok::<_, io::Error>(fresh))?;
     Ok(result)
 }
 
@@ -83,6 +159,10 @@ mod tests {
     use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
     use ratatui::buffer::Cell;
     use ratatui::layout::{Position, Size};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Log = Rc<RefCell<Vec<&'static str>>>;
 
     /// A backend that fails any cursor-position query, like a terminal that
     /// never answers the DSR request (slow ssh, tmux, `script`).
@@ -125,6 +205,51 @@ mod tests {
         }
     }
 
+    /// Records every step; fails the step named in `fail_at`.
+    struct Fake {
+        log: Log,
+        fail_at: Option<&'static str>,
+    }
+
+    impl Fake {
+        fn new(fail_at: Option<&'static str>) -> (Self, Log) {
+            let log = Log::default();
+            (
+                Fake {
+                    log: log.clone(),
+                    fail_at,
+                },
+                log,
+            )
+        }
+        fn step(&mut self, name: &'static str) -> io::Result<()> {
+            self.log.borrow_mut().push(name);
+            if self.fail_at == Some(name) {
+                Err(io::Error::other(name))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl TermOps for Fake {
+        fn enable_raw(&mut self) -> io::Result<()> {
+            self.step("enable_raw")
+        }
+        fn disable_raw(&mut self) -> io::Result<()> {
+            self.step("disable_raw")
+        }
+        fn enter_screen(&mut self) -> io::Result<()> {
+            self.step("enter_screen")
+        }
+        fn leave_screen(&mut self) -> io::Result<()> {
+            self.step("leave_screen")
+        }
+        fn clear_all(&mut self) -> io::Result<()> {
+            self.step("clear_all")
+        }
+    }
+
     #[test]
     fn reenter_never_queries_the_cursor_position() {
         let mut terminal = Terminal::new(NoCursorQuery(TestBackend::new(20, 4))).unwrap();
@@ -139,5 +264,147 @@ mod tests {
     fn restore_is_idempotent_without_init() {
         assert!(restore().is_ok());
         assert!(restore().is_ok());
+    }
+
+    #[test]
+    fn init_success_enters_raw_then_screen_then_builds() {
+        let (mut ops, log) = Fake::new(None);
+        let log2 = log.clone();
+        let v = init_with(&mut ops, || {
+            log2.borrow_mut().push("make");
+            Ok(1)
+        })
+        .unwrap();
+        assert_eq!(v, 1);
+        assert_eq!(*log.borrow(), ["enable_raw", "enter_screen", "make"]);
+    }
+
+    #[test]
+    fn init_fails_on_raw_mode_enters_nothing() {
+        let (mut ops, log) = Fake::new(Some("enable_raw"));
+        assert!(init_with(&mut ops, || Ok(())).is_err());
+        assert_eq!(*log.borrow(), ["enable_raw"]);
+    }
+
+    #[test]
+    fn init_alt_screen_failure_undoes_raw_mode() {
+        let (mut ops, log) = Fake::new(Some("enter_screen"));
+        let err = init_with(&mut ops, || Ok(())).unwrap_err();
+        assert_eq!(err.to_string(), "enter_screen");
+        assert_eq!(
+            *log.borrow(),
+            ["enable_raw", "enter_screen", "disable_raw", "leave_screen"]
+        );
+    }
+
+    #[test]
+    fn init_terminal_creation_failure_undoes_everything() {
+        let (mut ops, log) = Fake::new(None);
+        let err = init_with::<_, ()>(&mut ops, || Err(io::Error::other("make"))).unwrap_err();
+        assert_eq!(err.to_string(), "make");
+        assert_eq!(
+            *log.borrow(),
+            ["enable_raw", "enter_screen", "disable_raw", "leave_screen"]
+        );
+    }
+
+    #[test]
+    fn restore_ignores_raw_failure_and_still_leaves_screen() {
+        let (mut ops, log) = Fake::new(Some("disable_raw"));
+        assert!(restore_with(&mut ops).is_ok());
+        assert_eq!(*log.borrow(), ["disable_raw", "leave_screen"]);
+    }
+
+    #[test]
+    fn panic_hook_restores_before_previous_hook() {
+        let log = Log::default();
+        let (l1, l2) = (log.clone(), log.clone());
+        run_hook(
+            move || l1.borrow_mut().push("restore"),
+            move || l2.borrow_mut().push("previous"),
+        );
+        assert_eq!(*log.borrow(), ["restore", "previous"]);
+    }
+
+    #[test]
+    fn suspend_runs_closure_in_cooked_mode_then_reenters() {
+        let (mut ops, log) = Fake::new(None);
+        let (l1, l2) = (log.clone(), log.clone());
+        let (r, _) = suspend_with(
+            &mut ops,
+            move || {
+                l1.borrow_mut().push("child");
+                7
+            },
+            move || {
+                l2.borrow_mut().push("make");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(r, 7);
+        assert_eq!(
+            *log.borrow(),
+            [
+                "disable_raw",
+                "leave_screen",
+                "child",
+                "enable_raw",
+                "enter_screen",
+                "clear_all",
+                "make"
+            ]
+        );
+    }
+
+    #[test]
+    fn suspend_reenters_when_closure_returns_error() {
+        let (mut ops, log) = Fake::new(None);
+        let (res, _) = suspend_with(
+            &mut ops,
+            || Err::<(), _>(io::Error::other("child failed")),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(res.is_err());
+        assert!(log.borrow().contains(&"enter_screen"));
+        assert_eq!(log.borrow().last(), Some(&"clear_all"));
+    }
+
+    #[test]
+    fn suspend_reenter_failure_leaves_cooked_mode() {
+        let (mut ops, log) = Fake::new(None);
+        ops.fail_at = Some("clear_all");
+        assert!(suspend_with(&mut ops, || (), || Ok(())).is_err());
+        assert_eq!(
+            *log.borrow(),
+            [
+                "disable_raw",
+                "leave_screen",
+                "enable_raw",
+                "enter_screen",
+                "clear_all",
+                "disable_raw",
+                "leave_screen"
+            ]
+        );
+    }
+
+    #[test]
+    fn suspend_terminal_rebuild_failure_leaves_cooked_mode() {
+        let (mut ops, log) = Fake::new(None);
+        let r = suspend_with::<_, (), _>(&mut ops, || (), || Err(io::Error::other("make")));
+        assert!(r.is_err());
+        let l = log.borrow();
+        assert_eq!(l[l.len() - 2..], ["disable_raw", "leave_screen"]);
+    }
+
+    #[test]
+    fn suspend_first_restore_failure_skips_closure() {
+        let (mut ops, log) = Fake::new(Some("leave_screen"));
+        let ran = std::cell::Cell::new(false);
+        assert!(suspend_with(&mut ops, || ran.set(true), || Ok(())).is_err());
+        assert!(!ran.get());
+        assert!(!log.borrow().contains(&"enable_raw"));
     }
 }
