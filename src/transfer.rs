@@ -66,6 +66,8 @@ pub const STAGE_PREFIX: &str = ".hdir-xfer.";
 /// Shown when the destination (or a parent) could be tampered with.
 pub const UNSAFE_MSG: &str = "다른 사용자가 바꿀 수 있는 폴더라 보내지 않음";
 
+const SPECIAL_MSG: &str = "특수 파일은 옮기지 않음";
+
 const APPEARED_MSG: &str = "대상에 같은 이름이 새로 생겨 건너뜀";
 
 /// Where one side of a transfer lives.
@@ -653,12 +655,50 @@ pub fn unstage_cmd(stage: &[u8]) -> Vec<u8> {
 }
 
 /// Copy `src` into `dir` on the same host.
-pub fn cp_cmd(src: &[u8], dir: &[u8]) -> Vec<u8> {
+pub fn cp_cmd(os: &RemoteOs, src_dir: &[u8], name: &[u8], id: &[u8], dir: &[u8]) -> Vec<u8> {
     cat(&[
-        b"cp -Rp -- ",
-        &sh_quote(src),
+        &in_src_dir(os, src_dir, id),
+        b"cp -Rp -- ./",
+        &sh_quote(name),
         b" ",
         &sh_quote(&into_dir(dir)),
+    ])
+}
+
+/// Enter `src_dir` and make sure it is still the folder `id` names
+/// ([`SRC_MOVED`]), so what follows works relative to exactly that folder.
+fn in_src_dir(os: &RemoteOs, src_dir: &[u8], id: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"cd -- ",
+        &sh_quote(src_dir),
+        b" || exit 1; i=$(",
+        dir_id_fmt(os),
+        b".) || exit 1; [ \"$i\" = ",
+        &sh_quote(id),
+        b" ] || exit 51; ",
+    ])
+}
+
+/// [`host_mv_cmd`]: not a file, folder or link (a FIFO, a device).
+pub const SPECIAL: i32 = 52;
+
+/// Rename `src_dir/name` to `into` on the same server, relative to the
+/// checked source folder; special files are refused ([`SPECIAL`]) before
+/// anything moves, as the place step could not put them anywhere.
+pub fn host_mv_cmd(os: &RemoteOs, src_dir: &[u8], name: &[u8], id: &[u8], into: &[u8]) -> Vec<u8> {
+    let n = cat(&[b"./", &sh_quote(name)]);
+    cat(&[
+        &in_src_dir(os, src_dir, id),
+        b"if [ -L ",
+        &n,
+        b" ] || [ -f ",
+        &n,
+        b" ] || [ -d ",
+        &n,
+        b" ]; then :; else exit 52; fi; mv -- ",
+        &n,
+        b" ",
+        &sh_quote(into),
     ])
 }
 
@@ -1120,8 +1160,12 @@ fn send(
             let Stage::Remote(_, _, p) = stage else {
                 return Err("임시 폴더가 원격이 아님".into());
             };
-            let cmd = cp_cmd(&b(&src_dir.join(name)), p);
-            return ran(s.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?).map(drop);
+            let cmd = cp_cmd(&s.os, &b(src_dir), &os_bytes(name), src_id.as_bytes(), p);
+            let out = s.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?;
+            if out.code == Some(SRC_MOVED) {
+                return Err("원본 폴더가 바뀌어 보내지 않음".into());
+            }
+            return ran(out).map(drop);
         }
     };
     let (oa, ob) = runner.pipe(&from, &to, cancel).map_err(|e| e.message())?;
@@ -1323,13 +1367,21 @@ fn item(
             return fail("임시 폴더가 원격이 아님".into());
         };
         let into = cat(&[&into_dir(p), &os_bytes(name)]);
-        let cmd = cat(&[b"mv -- ", &sh_quote(&b(&src)), b" ", &sh_quote(&into)]);
+        let cmd = host_mv_cmd(
+            &s.os,
+            &b(&spec.src_dir),
+            &os_bytes(name),
+            src_id.as_bytes(),
+            &into,
+        );
         // Not cancellable: a killed client could leave the server's mv
         // running while the stage is cleaned up.
-        s.exec_long(&cmd)
-            .map_err(|e| e.message())
-            .and_then(ran)
-            .map(drop)
+        match s.exec_long(&cmd).map_err(|e| e.message()) {
+            Ok(o) if o.code == Some(SPECIAL) => Err(SPECIAL_MSG.to_string()),
+            Ok(o) if o.code == Some(SRC_MOVED) => Err("원본 폴더가 바뀌어 보내지 않음".into()),
+            Ok(o) => ran(o).map(drop),
+            Err(e) => Err(e),
+        }
     } else {
         send(
             route,
@@ -1357,6 +1409,8 @@ fn item(
         });
         return if cancelled {
             Step::Stop(OpOutcome::Cancelled)
+        } else if e == SPECIAL_MSG {
+            Step::Skipped(Some(format!("{SPECIAL_MSG}: {}", lossy(name))))
         } else {
             fail(e)
         };
@@ -1739,8 +1793,16 @@ mod tests {
             b"rm -rf -- '/d/.hdir-xfer.1'".to_vec()
         );
         assert_eq!(
-            cp_cmd(b"/a/x", b"/dst//"),
-            b"cp -Rp -- '/a/x' '/dst/'".to_vec()
+            cp_cmd(&RemoteOs::Linux, b"/a", b"x", b"5:6", b"/dst//"),
+            b"cd -- '/a' || exit 1; i=$(stat -c %d:%i -- .) || exit 1; \
+              [ \"$i\" = '5:6' ] || exit 51; cp -Rp -- ./'x' '/dst/'"
+                .to_vec()
+        );
+        let mv =
+            String::from_utf8(host_mv_cmd(&RemoteOs::Linux, b"/a", b"x", b"5:6", b"/S/x")).unwrap();
+        assert!(
+            mv.ends_with("if [ -L ./'x' ] || [ -f ./'x' ] || [ -d ./'x' ]; then :; else exit 52; fi; mv -- ./'x' '/S/x'"),
+            "{mv}"
         );
         assert_eq!(
             String::from_utf8(stamp_cmd(&RemoteOs::Linux, b"/s", b"a b")).unwrap(),
@@ -2211,7 +2273,13 @@ mod tests {
         std::os::unix::fs::symlink("/etc", src.join("d/ln")).unwrap();
         let st = t.path().join("st");
         fs::create_dir(&st).unwrap();
-        assert!(sh(&cp_cmd(&b(&src.join("d")), &b(&st))).status.success());
+        let id = src_dir_id(&Side::Local, &src).unwrap();
+        let os = crate::testutil::local_os();
+        assert!(
+            sh(&cp_cmd(&os, &b(&src), b"d", id.as_bytes(), &b(&st)))
+                .status
+                .success()
+        );
         let m = fs::symlink_metadata(st.join("d/ln")).unwrap();
         assert!(m.file_type().is_symlink());
     }
@@ -2732,10 +2800,24 @@ mod tests {
         let long: Vec<String> = f
             .long_cmds()
             .into_iter()
-            .filter(|c| !c.starts_with("cd -- "))
+            .filter(|c| !c.contains("du -sk"))
             .collect();
-        let cp = format!("cp -Rp -- '/srv/a' '{STAGE}/'");
-        let into_stage = format!("mv -- '/srv/b' '{STAGE}/b'");
+        let cp = String::from_utf8(cp_cmd(
+            &RemoteOs::Linux,
+            b"/srv",
+            b"a",
+            b"5:6",
+            STAGE.as_bytes(),
+        ));
+        let into = format!("{STAGE}/b");
+        let into_stage = String::from_utf8(host_mv_cmd(
+            &RemoteOs::Linux,
+            b"/srv",
+            b"b",
+            b"5:6",
+            into.as_bytes(),
+        ));
+        let (cp, into_stage) = (cp.unwrap(), into_stage.unwrap());
         assert_eq!(
             long,
             vec![cp, into_stage],
@@ -3506,7 +3588,7 @@ mod tests {
     fn a_same_server_move_that_fails_never_removes_the_stage_recursively() {
         let f = FakeCmd::new(|a| {
             let c = remote_cmd(a).unwrap_or_default();
-            if c.starts_with("mv -- '/srv/b'") {
+            if c.contains("; mv -- ./'b' ") {
                 return code(255); // connection lost mid-move
             }
             answer(c, &[], &[], "")
@@ -4199,10 +4281,13 @@ mod tests {
         );
         let cmds = f.remote_cmds();
         assert!(
-            !cmds.iter().any(|c| c.starts_with("mv -- '/srv/b'")),
+            !cmds
+                .iter()
+                .any(|c| c.contains("else exit 52; fi; mv -- ./'b' ")),
             "no cross-filesystem mv: {cmds:?}"
         );
-        assert!(cmds.contains(&format!("cp -Rp -- '/srv/b' '{STAGE}/'")));
+        let cp = cp_cmd(&RemoteOs::Linux, b"/srv", b"b", b"5:6", STAGE.as_bytes());
+        assert!(cmds.contains(&String::from_utf8(cp).unwrap()), "{cmds:?}");
         let q = cmds
             .iter()
             .position(|c| c.contains("mktemp -d .hdir-del."))
@@ -4299,7 +4384,7 @@ mod tests {
         let flag = Arc::clone(&c.cancel);
         let f = FakeCmd::new(move |a| {
             let cm = remote_cmd(a).unwrap_or_default();
-            if cm.starts_with("mv -- '/srv/b'") {
+            if cm.contains("; mv -- ./'b' ") {
                 flag.store(true, Ordering::SeqCst); // Esc while it ran
                 return ok("");
             }
@@ -4363,5 +4448,35 @@ mod tests {
         ));
         assert_eq!(out.status.code(), Some(SRC_MOVED));
         assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn real_same_server_copy_and_move_check_the_source_folder_and_kinds() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        let st = private_dir(t.path(), "stage");
+        let secret = private_dir(t.path(), "secret");
+        fs::write(src.join("f"), "mine").unwrap();
+        fs::write(secret.join("f"), "SECRET").unwrap();
+        let fifo = std::ffi::CString::new(src.join("p").to_str().unwrap()).unwrap();
+        // SAFETY: valid path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let os = crate::testutil::local_os();
+        let id = src_dir_id(&Side::Local, &src).unwrap();
+        // a special file never moves
+        let into = b(&st.join("p"));
+        let out = sh(&host_mv_cmd(&os, &b(&src), b"p", id.as_bytes(), &into));
+        assert_eq!(out.status.code(), Some(SPECIAL));
+        assert!(src.join("p").exists() && !st.join("p").exists());
+        // the folder swapped for a link: nothing copied or moved
+        fs::rename(&src, t.path().join("src.old")).unwrap();
+        std::os::unix::fs::symlink(&secret, &src).unwrap();
+        let out = sh(&cp_cmd(&os, &b(&src), b"f", id.as_bytes(), &b(&st)));
+        assert_eq!(out.status.code(), Some(SRC_MOVED));
+        let into = b(&st.join("f"));
+        let out = sh(&host_mv_cmd(&os, &b(&src), b"f", id.as_bytes(), &into));
+        assert_eq!(out.status.code(), Some(SRC_MOVED));
+        assert_eq!(fs::read_dir(&st).unwrap().count(), 0);
+        assert_eq!(fs::read(secret.join("f")).unwrap(), b"SECRET");
     }
 }
