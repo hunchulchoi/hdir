@@ -298,6 +298,8 @@ pub fn head_cmd(path: &[u8], max: usize) -> Vec<u8> {
 }
 
 /// Exit codes of [`preview_cmd`] for things that are not regular files.
+/// A directory preview counts at most this many entries (like the local one).
+pub const REMOTE_DIR_CAP: usize = 10_000;
 pub const PREVIEW_DIR: i32 = 20;
 pub const PREVIEW_SPECIAL: i32 = 21;
 pub const PREVIEW_MISSING: i32 = 22;
@@ -318,11 +320,27 @@ fn stat_size_args(os: &RemoteOs) -> &'static str {
 /// which would read the whole file) and a newline, then the first `max`
 /// bytes (`head -c`). Symlinks are followed.
 pub fn preview_cmd(os: &RemoteOs, path: &[u8], max: usize) -> Vec<u8> {
+    preview_cmd_capped(os, path, max, REMOTE_DIR_CAP)
+}
+
+/// [`preview_cmd`] counting at most `cap` directory entries (tests use a
+/// small cap).
+pub(crate) fn preview_cmd_capped(os: &RemoteOs, path: &[u8], max: usize, cap: usize) -> Vec<u8> {
     let q = sh_quote(path);
     cat(&[
         b"if [ -d ",
         &q,
-        format!(" ]; then exit {PREVIEW_DIR}; elif [ -f ").as_bytes(),
+        b" ]; then cd -- ",
+        &q,
+        b" || exit 1; [ -r . ] || { echo 'permission denied' >&2; exit 1; }; ",
+        format!(
+            "{{ s=$( {{ {{ find . ! -name . -prune -print0; echo $? >&3; }} \
+             | LC_ALL=C tr -dc '\\000' | head -c {} | wc -c >&4; }} 3>&1 ); }} 4>&1; \
+             case $s in 0|141|269) exit {PREVIEW_DIR};; esac; \
+             echo 'cannot list the directory' >&2; exit 1; elif [ -f ",
+            cap + 1
+        )
+        .as_bytes(),
         &q,
         format!(" ]; then n=$({} ", stat_size_args(os)).as_bytes(),
         &q,
@@ -439,22 +457,92 @@ pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
     ])
 }
 
+/// [`mktemp_cmd`] exit code: the directory is writable by other users (group
+/// or others) and
+/// not sticky, so they could swap the temp file for a symlink before scp
+/// writes through it. Nothing is created.
+pub const UNSAFE_DIR: i32 = 37;
+
 /// Creates an exclusive (mode 600) temp file `<dir>/.hdir-edit.XXXXXX` with
-/// `mktemp` and prints its path, NUL-terminated.
-pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
-    let mut template = dir.to_vec();
-    while template.len() > 1 && template.ends_with(b"/") {
-        template.pop();
+/// `mktemp` and prints its path, NUL-terminated. Unless the directory is
+/// sticky and owned by the user or root, it refuses ([`UNSAFE_DIR`]) one that
+/// others can write, or that its group can write unless that group is the
+/// user's exclusive private group (primary group named after the user, no
+/// members, nobody else's primary group: the Debian/Ubuntu default with
+/// umask 002). Anything that cannot be checked is refused too.
+pub fn mktemp_cmd(os: &RemoteOs, dir: &[u8]) -> Vec<u8> {
+    let mut d = dir.to_vec();
+    while d.len() > 1 && d.ends_with(b"/") {
+        d.pop();
     }
+    let mut template = d.clone();
     if template != b"/" {
         template.push(b'/');
     }
     template.extend_from_slice(b".hdir-edit.XXXXXX");
+    let gid = stat_gid_args(os);
+    // An ACL that may grant writes: Linux shows any ACL as a trailing '+'
+    // (the group bits are then only the mask); macOS lists the entries with
+    // `ls -lde`, and only "allow" entries that add or delete names count.
+    // Other BSDs (no `-e`) fall back to the '+' check.
+    let acl = match os {
+        RemoteOs::Bsd => {
+            "if a=$(ls -lde -- \"$1\" 2>/dev/null); then \
+             l=$(printf '%s\\n' \"$a\" | sed 1d) || exit 1; \
+             m=$(printf '%s\\n' \"$l\" | grep -E ' allow .*(add_file|add_subdirectory|delete_child|write)'); \
+             [ $? -le 1 ] || exit 1; [ -z \"$m\" ] || exit {UNSAFE_DIR}; \
+             else a=$(ls -ld -- \"$1\") || exit 1; case $a in ??????????+*) exit {UNSAFE_DIR};; esac; fi; "
+        }
+        RemoteOs::Linux | RemoteOs::Other(_) => {
+            "a=$(ls -ld -- \"$1\") || exit 1; case $a in ??????????+*) exit {UNSAFE_DIR};; esac; "
+        }
+    }
+    .replace("{UNSAFE_DIR}", &UNSAFE_DIR.to_string());
+    // `chk DIR` exits UNSAFE_DIR when someone else could swap entries of DIR:
+    // it must be owned by the user or root, carry no write-granting ACL, and
+    // be sticky, or else not writable by others nor by a group other than
+    // the user's exclusive private group. Every directory up to / is checked
+    // (OpenSSH StrictModes style), since swapping a parent redirects the path.
+    let check = format!(
+        "me=$(id -u) && [ -n \"$me\" ] || exit 1; \
+         chk() {{ \
+         o=$(find \"$1\" -prune \\( -user 0 -o -user \"$me\" \\)) || exit 1; \
+         [ -n \"$o\" ] || exit {UNSAFE_DIR}; \
+         {acl}\
+         k=$(find \"$1\" -prune -perm -1000) || exit 1; [ -z \"$k\" ] || return 0; \
+         w=$(find \"$1\" -prune -perm -0002) || exit 1; [ -z \"$w\" ] || exit {UNSAFE_DIR}; \
+         w=$(find \"$1\" -prune -perm -0020) || exit 1; [ -n \"$w\" ] || return 0; \
+         g=$({gid} \"$1\") || exit {UNSAFE_DIR}; \
+         u=$(id -un) && [ -n \"$u\" ] && [ \"$g\" = \"$(id -g)\" ] && [ \"$(id -gn)\" = \"$u\" ] \
+         || exit {UNSAFE_DIR}; \
+         e=$(getent group \"$g\") || exit {UNSAFE_DIR}; case $e in *:) ;; *) exit {UNSAFE_DIR};; esac; \
+         p=$(getent passwd) && [ -n \"$p\" ] || exit {UNSAFE_DIR}; \
+         o=$(printf '%s\\n' \"$p\" | awk -F: -v g=\"$g\" -v u=\"$u\" '$4 == g && $1 != u') \
+         || exit {UNSAFE_DIR}; [ -z \"$o\" ] || exit {UNSAFE_DIR}; }}; \
+         c={{q}}; while :; do chk \"$c\"; [ \"$c\" = / ] && break; c=${{c%/*}}; \
+         [ -n \"$c\" ] || c=/; done; "
+    );
+    let check = fill_slot(&check, "{q}", &sh_quote(&d));
     cat(&[
+        &check,
         b"t=$(mktemp ",
         &sh_quote(&template),
         b") || exit 1; printf '%s\\0' \"$t\"",
     ])
+}
+
+/// `text` with every `slot` replaced by `bytes`.
+fn fill_slot(text: &str, slot: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(text.len());
+    let mut parts = text.split(slot);
+    if let Some(first) = parts.next() {
+        o.extend_from_slice(first.as_bytes());
+    }
+    for p in parts {
+        o.extend_from_slice(bytes);
+        o.extend_from_slice(p.as_bytes());
+    }
+    o
 }
 
 /// Exit codes of [`replace_cmd`]. On [`REPLACE_NOT_OWNER`] the temp file is
@@ -1186,7 +1274,11 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     fn preview_cmd_classifies_then_prints_size_and_head() {
         assert_eq!(
             s(preview_cmd(&RemoteOs::Linux, b"/d/it's -x", 65539)),
-            "if [ -d '/d/it'\\''s -x' ]; then exit 20; \
+            "if [ -d '/d/it'\\''s -x' ]; then cd -- '/d/it'\\''s -x' || exit 1; \
+             [ -r . ] || { echo 'permission denied' >&2; exit 1; }; \
+             { s=$( { { find . ! -name . -prune -print0; echo $? >&3; } \
+             | LC_ALL=C tr -dc '\\000' | head -c 10001 | wc -c >&4; } 3>&1 ); } 4>&1; \
+             case $s in 0|141|269) exit 20;; esac; echo 'cannot list the directory' >&2; exit 1; \
              elif [ -f '/d/it'\\''s -x' ]; then n=$(stat -L -c %s -- '/d/it'\\''s -x') || exit 1; \
              printf '%s\\n' $n; head -c 65539 -- '/d/it'\\''s -x'; \
              elif [ -e '/d/it'\\''s -x' ]; then exit 21; \
@@ -1202,6 +1294,7 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             ),
             (20, 21, 22, 23)
         );
+        assert_eq!(REMOTE_DIR_CAP, 10_000);
     }
 
     #[test]
@@ -1210,7 +1303,9 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         let b = s(preview_cmd(&RemoteOs::Bsd, b"/a", 10));
         assert!(l.contains("n=$(stat -L -c %s -- '/a')"), "{l}");
         assert!(b.contains("n=$(stat -L -f %z -- '/a')"), "{b}");
-        assert!(!l.contains("wc -c") && !b.contains("wc -c"));
+        // (the directory branch counts entries with `wc -c`; the file one never)
+        let file_part = |c: &str| c[c.find("elif [ -f").unwrap()..].to_string();
+        assert!(!file_part(&l).contains("wc -c") && !file_part(&b).contains("wc -c"));
     }
 
     #[test]
@@ -1264,14 +1359,43 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             "{c}"
         );
         assert!(c.ends_with("printf '%s\\0' \"$p\""), "{c}");
-        assert_eq!(
-            s(mktemp_cmd(b"/srv/it's")),
-            "t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+        let l = s(mktemp_cmd(&RemoteOs::Linux, b"/srv/it's"));
+        for part in [
+            "me=$(id -u) && [ -n \"$me\" ] || exit 1; chk() { ",
+            "o=$(find \"$1\" -prune \\( -user 0 -o -user \"$me\" \\)) || exit 1; [ -n \"$o\" ] || exit 37; ",
+            "a=$(ls -ld -- \"$1\") || exit 1; case $a in ??????????+*) exit 37;; esac; ",
+            "k=$(find \"$1\" -prune -perm -1000) || exit 1; [ -z \"$k\" ] || return 0; ",
+            "w=$(find \"$1\" -prune -perm -0002) || exit 1; [ -z \"$w\" ] || exit 37; ",
+            "w=$(find \"$1\" -prune -perm -0020) || exit 1; [ -n \"$w\" ] || return 0; ",
+            "g=$(stat -c %g -- \"$1\") || exit 37; ",
+            "u=$(id -un) && [ -n \"$u\" ] && [ \"$g\" = \"$(id -g)\" ] && [ \"$(id -gn)\" = \"$u\" ]",
+            "e=$(getent group \"$g\") || exit 37; case $e in *:) ;; *) exit 37;; esac; ",
+            "p=$(getent passwd) && [ -n \"$p\" ] || exit 37; ",
+            "o=$(printf '%s\\n' \"$p\" | awk -F: -v g=\"$g\" -v u=\"$u\" '$4 == g && $1 != u') \
+             || exit 37; [ -z \"$o\" ] || exit 37; }; ",
+            "c='/srv/it'\\''s'; while :; do chk \"$c\"; [ \"$c\" = / ] && break; c=${c%/*}; \
+             [ -n \"$c\" ] || c=/; done; ",
+        ] {
+            assert!(l.contains(part), "missing {part}\nin {l}");
+        }
+        let b = s(mktemp_cmd(&RemoteOs::Bsd, b"/srv"));
+        assert!(
+            b.contains("if a=$(ls -lde -- \"$1\" 2>/dev/null); then"),
+            "{b}"
         );
-        assert_eq!(
-            s(mktemp_cmd(b"/")),
-            "t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+        assert!(b.contains("g=$(stat -f %g -- \"$1\")"), "{b}");
+        assert!(
+            l.ends_with(
+                "t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
+            ),
+            "{l}"
         );
+        let root = s(mktemp_cmd(&RemoteOs::Bsd, b"/"));
+        assert!(root.contains("c='/'; while :;"), "{root}");
+        assert!(
+            root.ends_with("t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\"")
+        );
+        assert_eq!(UNSAFE_DIR, 37);
     }
 
     #[test]

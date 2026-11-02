@@ -85,10 +85,15 @@ fn controlmaster_connect_list_and_exit() {
     assert!(!session::master_alive(&*cmd, &target), "master closed");
 }
 
-/// Master + control socket dir for the listing test. The socket dir is a fresh
-/// temp dir when its path is short enough, else the session's fallback.
+/// Master + control socket dir for one test. Each test gets its own short
+/// socket dir under /tmp: the session's shared fallback (/tmp/hdir-<uid>,
+/// used when $TMPDIR is too long, as on macOS) would hand every test the same
+/// master, and the first test to finish would close it under the others.
 fn connect(host: String) -> (Cleanup, Arc<dyn Cmd>, Established, tempfile::TempDir) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("hdir-it-")
+        .tempdir_in("/tmp")
+        .unwrap();
     // SAFETY: getuid has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
     let target = SshTarget {
@@ -99,6 +104,7 @@ fn connect(host: String) -> (Cleanup, Arc<dyn Cmd>, Established, tempfile::TempD
     session::ensure_control_dir(&target.control_path).unwrap();
     let dir = target.control_path.parent().unwrap().to_path_buf();
     let owned_dir = dir.starts_with(tmp.path());
+    assert!(owned_dir, "tests must not share a control socket: {dir:?}");
     let cleanup = Cleanup {
         target: target.clone(),
         dir,
@@ -196,7 +202,8 @@ fn lists_real_remote_files_with_odd_names() {
 }
 
 /// Names the file operations test creates (and the cleanup removes by name).
-const OPS_NAMES: [&str; 15] = [
+const OPS_NAMES: [&str; 16] = [
+    "open-dir",
     "mode600.txt",
     "hl-a",
     "hl-b",
@@ -416,6 +423,18 @@ fn remote_file_operations_round_trip() {
     assert!(e.contains("원격 파일이 바뀌어"), "{e}");
     assert_eq!(run("cat race.txt"), "v2");
     assert_eq!(run("ls -A | grep -c hdir-edit || true").trim(), "0");
+
+    // a directory anyone may write (not sticky): saving is refused up front
+    run("mkdir open-dir && printf old > open-dir/f && chmod 777 open-dir");
+    let copy = ops::fetch(&s, &d.join("open-dir/f"), true).unwrap();
+    std::fs::write(&copy.local, "secret").unwrap();
+    let e = ops::upload_replace(&s, &copy.local, &d.join("open-dir/f"), &copy.remote).unwrap_err();
+    assert!(e.contains("다른 사용자가 쓸 수 있는"), "{e}");
+    assert_eq!(run("cat open-dir/f"), "old");
+    assert_eq!(
+        run("ls -A open-dir | grep -c hdir-edit || true").trim(),
+        "0"
+    );
 
     // a directory whose name ends in a newline vs. its twin without it
     // (`$n` = "tw\n"; a bare `$(printf ...)` would drop the newline)

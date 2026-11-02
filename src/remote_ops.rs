@@ -10,9 +10,10 @@ use crate::platform::{os_bytes, os_from_bytes};
 use crate::preview::{self, Limits, Preview};
 use crate::remote::{
     DELETE_NO_CWD, DELETE_NO_HOME, DELETE_PROTECTED, PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING,
-    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_CHANGED, REPLACE_GROUP,
-    REPLACE_NOT_OWNER, REPLACE_RESTORED, REPLACE_SIZE, delete_cmd, mkdir_cmd, mktemp_cmd,
-    preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd, stamp_cmd,
+    PREVIEW_SPECIAL, REMOTE_DIR_CAP, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_CHANGED,
+    REPLACE_GROUP, REPLACE_NOT_OWNER, REPLACE_RESTORED, REPLACE_SIZE, UNSAFE_DIR, delete_cmd,
+    mkdir_cmd, mktemp_cmd, preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd,
+    rmdir_cmd, stamp_cmd,
 };
 use crate::remote::{Endpoint, scp_argv};
 use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
@@ -139,7 +140,7 @@ pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
     };
     match out.code {
         Some(0) => {}
-        Some(PREVIEW_DIR) => return remote_dir_info(s, path),
+        Some(PREVIEW_DIR) => return remote_dir_info(&out.stdout),
         Some(PREVIEW_SPECIAL) => {
             return Preview::Binary {
                 size: 0,
@@ -165,14 +166,19 @@ pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
     preview::classify_with(&out.stdout[nl + 1..], size, limits)
 }
 
-fn remote_dir_info(s: &RemoteSession, path: &Path) -> Preview {
-    match s.list(path, true) {
-        // The listing starts with "..", which is not an entry of the directory.
-        Ok((entries, _)) => {
-            let n = entries.iter().filter(|e| e.name != "..").count();
-            Preview::Info(format!("원격 디렉터리 · 항목 {n}개"))
+/// The preview script counts a directory's entries on the server (unsorted
+/// `find -print0`, one NUL per entry whatever the name), capped one past
+/// [`REMOTE_DIR_CAP`], so a huge directory never crosses the wire.
+fn remote_dir_info(stdout: &[u8]) -> Preview {
+    let n = std::str::from_utf8(stdout)
+        .ok()
+        .and_then(|t| t.trim().parse::<usize>().ok());
+    match n {
+        Some(n) if n > REMOTE_DIR_CAP => {
+            Preview::Info(format!("원격 디렉터리 · 항목 {REMOTE_DIR_CAP}개 이상"))
         }
-        Err(e) => Preview::Error(e),
+        Some(n) => Preview::Info(format!("원격 디렉터리 · 항목 {n}개")),
+        None => Preview::Error("원격 응답을 해석할 수 없음".into()),
     }
 }
 
@@ -348,7 +354,11 @@ pub fn upload_replace(
         .iter()
         .rposition(|&b| b == b'/')
         .map_or(&b"/"[..], |i| if i == 0 { &b"/"[..] } else { &phys[..i] });
-    let tmp_b = nul_path(&run_ok(s, &mktemp_cmd(dir))?)?;
+    let made = s.exec(&mktemp_cmd(&s.os, dir)).map_err(|e| e.message())?;
+    if made.code == Some(UNSAFE_DIR) {
+        return Err("다른 사용자가 쓸 수 있는 디렉터리라 저장하지 않음 (sticky 아님)".into());
+    }
+    let tmp_b = nul_path(&ok_or_stderr(made)?)?;
     let argv = scp_argv(
         &Endpoint::Local(local),
         &Endpoint::Remote(&s.target, &tmp_b),
@@ -556,8 +566,8 @@ mod tests {
     use crate::testutil::local_session;
     use std::os::unix::fs::symlink;
 
-    /// root/a/home/u (= $HOME, with a file), root/work/{link -> a/home,
-    /// up -> a, homelink -> a/home/u, plain}.
+    /// root/a/home/u (= $HOME, with a file), root/a/plain, root/work/{link ->
+    /// a/home, up -> a, homelink -> a/home/u, plain}.
     fn home_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
@@ -566,6 +576,7 @@ mod tests {
         std::fs::write(home.join("keep.txt"), "x").unwrap();
         let work = root.join("work");
         std::fs::create_dir_all(work.join("plain")).unwrap();
+        std::fs::create_dir_all(root.join("a/plain")).unwrap(); // = work/up/plain
         symlink(root.join("a/home"), work.join("link")).unwrap();
         symlink(root.join("a"), work.join("up")).unwrap();
         symlink(&home, work.join("homelink")).unwrap();
@@ -590,7 +601,10 @@ mod tests {
         // ... including among other, harmless names
         let names = vec![OsString::from("plain"), OsString::from("home")];
         assert!(delete(&s, &work.join("up"), &names).is_err());
-        assert!(work.join("plain").exists(), "nothing is removed on refusal");
+        assert!(
+            work.join("up/plain").exists(),
+            "nothing is removed on refusal"
+        );
         assert!(home.join("keep.txt").exists());
     }
 
@@ -771,19 +785,81 @@ mod tests {
     }
 
     #[test]
-    fn preview_of_a_remote_dir_counts_entries() {
-        let f = FakeCmd::new(|a| {
-            let c = crate::testutil::remote_cmd(a).unwrap_or("");
-            if c.starts_with("if [ -d") {
-                code(20)
-            } else {
-                ok("f\t5\t1700000000.0\t644\t\ta\0d\t5\t1700000000.0\t755\t\tb\0")
-            }
+    fn preview_of_a_remote_dir_counts_entries_on_the_server() {
+        let f = FakeCmd::new(|_| CmdOutput {
+            code: Some(20),
+            stdout: b"       2\n".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            preview(&session(Arc::clone(&f)), &p("/srv/d"), Limits::PREVIEW),
+            Preview::Info("원격 디렉터리 · 항목 2개".into())
+        );
+        assert_eq!(f.remote_cmds().len(), 1, "no listing round trip");
+    }
+
+    #[test]
+    fn preview_of_a_huge_remote_dir_stops_at_the_cap() {
+        let over = format!("{}\n", crate::remote::REMOTE_DIR_CAP + 1);
+        let f = FakeCmd::new(move |_| CmdOutput {
+            code: Some(20),
+            stdout: over.clone().into_bytes(),
+            stderr: Vec::new(),
         });
         assert_eq!(
             preview(&session(f), &p("/srv/d"), Limits::PREVIEW),
-            Preview::Info("원격 디렉터리 · 항목 2개".into())
+            Preview::Info("원격 디렉터리 · 항목 10000개 이상".into())
         );
+        let bad = FakeCmd::new(|_| CmdOutput {
+            code: Some(20),
+            stdout: b"?\n".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            preview(&session(bad), &p("/srv/d"), Limits::PREVIEW),
+            Preview::Error("원격 응답을 해석할 수 없음".into())
+        );
+    }
+
+    #[test]
+    fn real_dir_preview_counts_odd_names_once_and_hidden_ones_too() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        for n in ["a b", "two\nlines", ".hidden", "한글"] {
+            std::fs::write(d.join(n), "x").unwrap();
+        }
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let s = local_session(t.path());
+        assert_eq!(
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info("원격 디렉터리 · 항목 5개".into())
+        );
+        let empty = t.path().join("e");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            preview(&s, &empty, Limits::PREVIEW),
+            Preview::Info("원격 디렉터리 · 항목 0개".into())
+        );
+    }
+
+    #[test]
+    fn real_dir_preview_of_an_unreadable_dir_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("locked");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f"), "x").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let readable = std::fs::read_dir(&d).is_ok(); // root reads anything
+        let got = preview(&local_session(t.path()), &d, Limits::PREVIEW);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !readable {
+            assert!(
+                matches!(got, Preview::Error(ref e) if e.contains("permission denied")),
+                "{got:?}"
+            );
+        }
     }
 
     #[test]
@@ -863,7 +939,7 @@ mod tests {
             if c.starts_with("f=") {
                 return ok(std::str::from_utf8(STAMP).unwrap());
             }
-            if let Some(rest) = c.strip_prefix("t=$(mktemp ") {
+            if let Some(rest) = c.split_once("t=$(mktemp ").map(|(_, r)| r) {
                 let q = rest.split_once(") || exit 1").unwrap().0;
                 return ok(&format!("{}\0", unquote(q).replace("XXXXXX", "Ab12Cd")));
             }
@@ -1012,7 +1088,7 @@ mod tests {
             f.remote_cmds(),
             vec![
                 u(resolve_cmd(b"/srv/it's/a b.txt")),
-                u(mktemp_cmd(b"/srv/it's")),
+                u(mktemp_cmd(&crate::remote::RemoteOs::Linux, b"/srv/it's")),
                 u(replace_cmd(
                     &crate::remote::RemoteOs::Linux,
                     b"/srv/it's/.hdir-edit.Ab12Cd",
@@ -1102,7 +1178,7 @@ mod tests {
         std::fs::write(&local, "x").unwrap();
         for (starts, err) in [
             ("p=", "not a regular file"),
-            ("t=$(mktemp", "Permission denied"),
+            ("me=$(id -u)", "Permission denied"),
         ] {
             let f = FakeCmd::new(move |a| {
                 if crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with(starts)) {
@@ -1185,6 +1261,403 @@ mod tests {
             assert_eq!(mode_of(&target), mode, "{mode:o}");
             no_temp_left(&dir);
         }
+    }
+
+    #[test]
+    fn real_upload_refuses_a_directory_others_can_write_without_sticky() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        let target = open.join("f.txt");
+        std::fs::write(&target, "old").unwrap();
+        // the link lives in a safe dir; the real file's dir decides
+        symlink(&target, root.join("link")).unwrap();
+        let local = edited(&root, "secret edit");
+        let s = local_session(&root);
+        // others could swap the temp (g+w: see the mktemp group tests)
+        for mode in [0o777, 0o773, 0o707, 0o2777] {
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(mode)).unwrap();
+            for remote in [target.clone(), root.join("link")] {
+                let e = upload_fresh(&s, &local, &remote).unwrap_err();
+                assert!(e.contains("다른 사용자가 쓸 수 있는"), "{mode:o}: {e}");
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+                no_temp_left(&open);
+            }
+        }
+        assert!(local.exists(), "the edited copy stays local");
+    }
+
+    #[test]
+    fn real_upload_works_in_private_and_sticky_directories() {
+        for mode in [0o700, 0o755, 0o1777, 0o1733, 0o1770] {
+            let t = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(t.path()).unwrap();
+            let d = root.join("d");
+            std::fs::create_dir(&d).unwrap();
+            let target = d.join("f.txt");
+            std::fs::write(&target, "old").unwrap();
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+            let local = edited(&root, "new");
+            upload_fresh(&local_session(&root), &local, &target)
+                .unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "new", "{mode:o}");
+            no_temp_left(&d);
+        }
+    }
+
+    /// Runs the real `mktemp_cmd` on dir `d` (mode `mode`) with fake tools
+    /// first on PATH; returns the exit code and whether a temp was made.
+    fn mktemp_with(mode: u32, fakes: &[(&str, &str)]) -> (Option<i32>, bool) {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        // a private parent whatever the umask (002 makes it group-writable)
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let d = root.join("d");
+        std::fs::create_dir(&d).unwrap();
+        let gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&d).unwrap());
+        for (name, body) in fakes {
+            let p = bin.join(name);
+            let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&d).unwrap());
+            let body = body
+                .replace("GID", &gid.to_string())
+                .replace("UID", &uid.to_string());
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode)).unwrap();
+        let mut script = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
+        script.extend(crate::remote::mktemp_cmd(
+            &crate::testutil::local_os(),
+            d.as_os_str().as_encoded_bytes(),
+        ));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&script))
+            .output()
+            .unwrap();
+        let made = std::fs::read_dir(&d).unwrap().count() > 0;
+        (out.status.code(), made)
+    }
+
+    /// `id` of an account with uid `uid` whose primary group (`gid`, named
+    /// `gname`) is or is not its own user-private group.
+    fn fake_id(uid: &str, gid: &str, gname: &str) -> String {
+        format!(
+            "case \"$1\" in -u) echo {uid};; -g) echo {gid};; -gn) echo {gname};; \
+             -un) echo me;; *) exit 1;; esac"
+        )
+    }
+
+    /// `getent` whose group `GID` has `members`, and whose passwd lists `me`
+    /// plus `extra` lines.
+    fn fake_getent(members: &str, extra: &str) -> String {
+        format!(
+            "case \"$1\" in group) echo \"me:x:GID:{members}\";; \
+             passwd) printf 'me:x:UID:GID::/:/bin/sh\\n{extra}';; *) exit 2;; esac"
+        )
+    }
+
+    #[test]
+    fn a_failing_permission_check_stops_before_mktemp() {
+        assert_eq!(mktemp_with(0o700, &[("find", "exit 1")]), (Some(1), false));
+        assert_eq!(mktemp_with(0o700, &[("id", "exit 1")]), (Some(1), false));
+        let id = fake_id("UID", "GID", "me");
+        let get = fake_getent("", "");
+        let stat = [("id", id.as_str()), ("getent", &get), ("stat", "exit 1")];
+        assert_eq!(
+            mktemp_with(0o770, &stat),
+            (Some(UNSAFE_DIR), false),
+            "gid unknown"
+        );
+        // names that cannot be looked up are never "equal"
+        let blank = "case \"$1\" in -u) echo UID;; -g) echo GID;; *) exit 1;; esac";
+        let tools = [("id", blank), ("getent", &get)];
+        assert_eq!(mktemp_with(0o770, &tools), (Some(UNSAFE_DIR), false));
+        let no_getent = [("id", id.as_str()), ("getent", "exit 127")];
+        assert_eq!(mktemp_with(0o770, &no_getent), (Some(UNSAFE_DIR), false));
+    }
+
+    #[test]
+    fn a_failing_account_list_refuses_group_writable_dirs() {
+        let own = fake_id("UID", "GID", "me");
+        let get = "case \"$1\" in group) echo 'me:x:GID:';; *) exit 2;; esac";
+        assert_eq!(
+            mktemp_with(0o775, &[("id", &own), ("getent", get)]),
+            (Some(UNSAFE_DIR), false)
+        );
+    }
+
+    #[test]
+    fn the_permission_check_names_the_raw_directory_bytes() {
+        let c = crate::remote::mktemp_cmd(&crate::remote::RemoteOs::Linux, b"/srv/bad\xff");
+        let raw = b"c='/srv/bad\xff'; while :; do chk \"$c\"";
+        assert!(
+            c.windows(raw.len()).any(|w| w == raw),
+            "raw bytes in every check"
+        );
+        let replacement = "\u{FFFD}".as_bytes();
+        assert!(
+            !c.windows(3).any(|w| w == replacement),
+            "nothing decoded lossily"
+        );
+    }
+
+    #[test]
+    fn real_dir_count_stops_at_the_cap_even_when_find_is_cut_off() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("big");
+        std::fs::create_dir(&d).unwrap();
+        let count = |cap: usize| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(
+                    <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+                        &crate::remote::preview_cmd_capped(
+                            &crate::testutil::local_os(),
+                            d.as_os_str().as_encoded_bytes(),
+                            10,
+                            cap,
+                        ),
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(crate::remote::PREVIEW_DIR),
+                "{out:?}"
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<usize>()
+                .unwrap()
+        };
+        // 1000 names of ~100 bytes: more than a pipe buffer, so with a small
+        // cap `head` quits early and find is cut off (SIGPIPE)
+        let pad = "x".repeat(100);
+        for i in 0..1000 {
+            std::fs::File::create(d.join(format!("{pad}\n{i}"))).unwrap();
+        }
+        assert_eq!(count(20), 21, "one past the cap, then stop");
+        assert_eq!(count(1000), 1000, "exactly the cap");
+        assert_eq!(count(999), 1000);
+        assert_eq!(count(5000), 1000, "under the cap: all of them");
+    }
+
+    #[test]
+    fn group_writable_dirs_are_fine_only_for_an_exclusive_private_group() {
+        let own = fake_id("UID", "GID", "me");
+        let alone = fake_getent("", "");
+        let ok_tools = [("id", own.as_str()), ("getent", &alone)];
+        assert_eq!(mktemp_with(0o775, &ok_tools), (Some(0), true), "UPG");
+        assert_eq!(mktemp_with(0o2770, &ok_tools), (Some(0), true), "UPG");
+        let refused = |tools: &[(&str, &str)], why: &str| {
+            assert_eq!(
+                mktemp_with(0o775, tools),
+                (Some(UNSAFE_DIR), false),
+                "{why}"
+            );
+        };
+        let shared = fake_id("UID", "GID", "staff");
+        refused(
+            &[("id", &shared), ("getent", &alone)],
+            "group named otherwise",
+        );
+        let other = fake_id("UID", "999999", "me");
+        refused(
+            &[("id", &other), ("getent", &alone)],
+            "not my primary group",
+        );
+        let member = fake_getent("bob", "");
+        refused(&[("id", &own), ("getent", &member)], "bob is a member");
+        let primary = fake_getent("", "bob:x:1234:GID::/:/bin/sh\\n");
+        refused(&[("id", &own), ("getent", &primary)], "bob's primary group");
+        // others can write: refused whatever the group
+        assert_eq!(mktemp_with(0o777, &ok_tools), (Some(UNSAFE_DIR), false));
+    }
+
+    #[test]
+    fn dirs_owned_by_someone_else_are_refused_even_when_private() {
+        if unsafe { libc::getuid() } == 0 {
+            return; // root owns everything here and is trusted
+        }
+        let stranger = fake_id("999999", "GID", "staff");
+        assert_eq!(
+            mktemp_with(0o700, &[("id", &stranger)]),
+            (Some(UNSAFE_DIR), false)
+        );
+    }
+
+    /// `ls` answering `-ld` (Linux) and `-lde` (macOS) for any path.
+    fn fake_ls(linux_mode: &str, mac_acl: &str) -> String {
+        format!(
+            "case \"$1\" in -ld) printf '%s 2 me me 64 Jan 1 %s\\n' '{linux_mode}' \"$3\";; \
+             -lde) printf 'drwxr-xr-x+ 2 me me 64 Jan 1 %s\\n{mac_acl}' \"$3\";; *) exit 2;; esac"
+        )
+    }
+
+    #[test]
+    fn dirs_with_an_acl_that_may_grant_writes_are_refused() {
+        let grants = fake_ls("drwxr-xr-x+", " 0: user:bob allow add_file,delete_child\\n");
+        assert_eq!(
+            mktemp_with(0o700, &[("ls", &grants)]),
+            (Some(UNSAFE_DIR), false)
+        );
+        // a deny-only ACL (macOS homes) or an SELinux context ('.') is fine
+        let harmless = fake_ls("drwxr-xr-x.", " 0: group:everyone deny delete\\n");
+        assert_eq!(mktemp_with(0o700, &[("ls", &harmless)]), (Some(0), true));
+        assert_eq!(mktemp_with(0o700, &[("ls", "exit 1")]), (Some(1), false));
+        // the macOS parse must not turn a failing grep into "no ACL"
+        if cfg!(target_os = "macos") {
+            let tools = [("ls", grants.as_str()), ("grep", "exit 2")];
+            assert_eq!(mktemp_with(0o700, &tools), (Some(1), false));
+            let tools = [("ls", grants.as_str()), ("sed", "exit 2")];
+            assert_eq!(mktemp_with(0o700, &tools), (Some(1), false));
+        }
+    }
+
+    #[test]
+    fn real_upload_refuses_when_a_parent_directory_can_be_swapped() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let s = local_session(&root);
+        for (mode, safe) in [(0o777, false), (0o1777, true), (0o755, true)] {
+            let up = root.join(format!("up{mode:o}"));
+            let inner = up.join("inner");
+            std::fs::create_dir_all(&inner).unwrap();
+            let target = inner.join("f");
+            std::fs::write(&target, "old").unwrap();
+            std::fs::set_permissions(&up, std::fs::Permissions::from_mode(mode)).unwrap();
+            let local = edited(&root, "new");
+            let got = upload_fresh(&s, &local, &target);
+            if safe {
+                got.unwrap_or_else(|e| panic!("{mode:o}: {e}"));
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+            } else {
+                let e = got.unwrap_err();
+                assert!(e.contains("다른 사용자가 쓸 수 있는"), "{e}");
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+            }
+            no_temp_left(&inner);
+        }
+    }
+
+    #[test]
+    fn a_count_cut_off_by_sigpipe_is_still_a_count() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // an endless listing: only SIGPIPE from `head` stops it
+        std::fs::write(
+            bin.join("find"),
+            "#!/bin/sh\nwhile :; do printf 'x\\0'; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("find"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = root.join("d");
+        std::fs::create_dir(&d).unwrap();
+        let mut script = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
+        script.extend(crate::remote::preview_cmd_capped(
+            &crate::testutil::local_os(),
+            d.as_os_str().as_encoded_bytes(),
+            10,
+            20,
+        ));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&script))
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(crate::remote::PREVIEW_DIR),
+            "{out:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "21");
+    }
+
+    #[test]
+    fn sticky_dirs_are_fine_only_when_owned_by_the_user_or_root() {
+        let me = fake_id("UID", "GID", "staff");
+        assert_eq!(mktemp_with(0o1777, &[("id", &me)]), (Some(0), true));
+        assert_eq!(mktemp_with(0o1770, &[("id", &me)]), (Some(0), true));
+        // owned by someone else (as far as `id -u` says): they could swap it
+        // (root owns the test dir when run as root, and root is trusted)
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
+        let stranger = fake_id("999999", "GID", "staff");
+        assert_eq!(
+            mktemp_with(0o1777, &[("id", &stranger)]),
+            (Some(UNSAFE_DIR), false)
+        );
+    }
+
+    #[test]
+    fn real_dir_preview_reports_a_failing_listing() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let d = root.join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f"), "x").unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("find"), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(bin.join("find"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut script = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
+        script.extend(crate::remote::preview_cmd(
+            &crate::testutil::local_os(),
+            d.as_os_str().as_encoded_bytes(),
+            10,
+        ));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&script))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot list"));
+    }
+
+    #[test]
+    fn real_dir_preview_counts_names_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("ok"), "x").unwrap();
+        // APFS refuses invalid UTF-8 names; skip the bad one there
+        let bad = d.join(std::ffi::OsStr::from_bytes(b"bad\xff\xfe"));
+        let n = if std::fs::write(&bad, "x").is_ok() {
+            2
+        } else {
+            1
+        };
+        let s = crate::testutil::local_session(t.path());
+        assert_eq!(
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info(format!("원격 디렉터리 · 항목 {n}개"))
+        );
+    }
+
+    #[test]
+    fn unsafe_directory_refusal_happens_before_any_temp_or_scp() {
+        let t = tempfile::tempdir().unwrap();
+        let local = t.path().join("a");
+        std::fs::write(&local, "x").unwrap();
+        let f = FakeCmd::new(|a| match crate::testutil::remote_cmd(a) {
+            Some(c) if c.starts_with("p=") => ok("/srv/a\0"),
+            Some(c) if c.contains("mktemp") => code(crate::remote::UNSAFE_DIR),
+            _ => ok(""),
+        });
+        let e = upload_replace(&session(Arc::clone(&f)), &local, &p("/srv/a"), STAMP).unwrap_err();
+        assert!(e.contains("다른 사용자가 쓸 수 있는 디렉터리"), "{e}");
+        assert!(f.scp_calls().is_empty());
+        assert!(f.remote_cmds().iter().all(|c| !c.starts_with("rm ")));
     }
 
     #[test]
@@ -1520,7 +1993,7 @@ mod tests {
         assert!(
             !long
                 .iter()
-                .any(|c| c.starts_with("p=") || c.starts_with("t=$(mktemp")),
+                .any(|c| c.starts_with("p=") || c.contains("t=$(mktemp")),
             "quick commands keep the short timeout: {long:?}"
         );
     }
