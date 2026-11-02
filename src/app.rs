@@ -700,9 +700,11 @@ impl App {
             cmdline: None,
             cmd_history: History::default(),
             pending_shell: None,
-            shell_path: std::env::var_os("SHELL")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| OsString::from("/bin/sh")),
+            shell_path: cmdline::default_shell(
+                std::env::var_os("SHELL"),
+                std::env::var_os("PATH"),
+                cfg!(windows),
+            ),
             home_dir: dirs::home_dir(),
             prev_dirs: [None, None],
             cd_on_exit: true,
@@ -1140,10 +1142,6 @@ impl App {
             self.change_dir_to(&cwd, &target);
             return;
         }
-        if cfg!(windows) {
-            self.status = Some("셸 명령: Windows 지원 예정".into());
-            return;
-        }
         self.pending_shell = Some(ShellJob {
             cmd: cmd.to_string(),
             cwd,
@@ -1521,11 +1519,7 @@ impl App {
                 PathBuf::from("."),
             ),
             None => (
-                vec![
-                    self.shell_path.clone(),
-                    OsString::from("-c"),
-                    OsString::from(&job.cmd),
-                ],
+                cmdline::shell_argv(&self.shell_path, &job.cmd),
                 job.cwd.clone(),
             ),
         };
@@ -7788,13 +7782,19 @@ mod tests {
             assert!(log(&f).contains(&want), "{:?}", log(&f));
         }
 
-        #[cfg(windows)]
         #[test]
-        fn shell_commands_are_not_supported_on_windows_yet() {
-            let (_t, mut app, _f) = env();
-            submit(&mut app, "dir");
-            assert!(!app.has_pending_shell());
-            assert_eq!(app.status.as_deref(), Some("셸 명령: Windows 지원 예정"));
+        fn a_powershell_command_line_runs_with_dash_command() {
+            let (_t, mut app, f) = env();
+            app.shell_path = OsString::from("pwsh");
+            submit(&mut app, "Get-ChildItem");
+            assert!(app.has_pending_shell());
+            run_logged(&mut app, &f);
+            let got = log(&f);
+            assert!(
+                got.iter()
+                    .any(|l| l.starts_with("shell pwsh|-NoProfile|-Command|Get-ChildItem @")),
+                "{got:?}"
+            );
         }
 
         #[test]

@@ -31,10 +31,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut cwd_file = opts.cwd_file;
-    if cfg!(windows) && cwd_file.take().is_some() {
-        eprintln!("hdir: --cwd-file: Windows 지원 예정 (무시함)");
-    }
+    let cwd_file = opts.cwd_file;
 
     let mut app = App::new(start.clone(), start);
     app.ssh_config_path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));

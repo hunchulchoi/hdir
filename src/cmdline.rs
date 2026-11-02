@@ -1,6 +1,7 @@
 //! Command line (`:`): pure parsing of the internal `cd`, path resolution,
 //! input history and the editable line state. No IO.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 use ratatui::crossterm::event::KeyEvent;
@@ -583,5 +584,90 @@ mod tests {
         let mut l = CmdLine::default();
         l.key(k(KeyCode::Up), &h);
         assert_eq!(l.value, "");
+    }
+}
+
+/// Argv running the command line `cmd` with `shell`: PowerShell gets
+/// `-NoProfile -Command`, cmd.exe `/C`, anything else POSIX `-c`.
+pub fn shell_argv(shell: &OsStr, cmd: &str) -> Vec<OsString> {
+    // last component by either separator (a Windows path read on unix too)
+    let name = shell.to_string_lossy().to_ascii_lowercase();
+    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let stem = base.strip_suffix(".exe").unwrap_or(base);
+    let mut v = vec![shell.to_os_string()];
+    match stem {
+        "pwsh" | "powershell" => v.extend(["-NoProfile", "-Command"].map(OsString::from)),
+        "cmd" => v.push(OsString::from("/C")),
+        _ => v.push(OsString::from("-c")),
+    }
+    v.push(OsString::from(cmd));
+    v
+}
+
+/// The shell for command line commands: `$SHELL` when set; otherwise on
+/// Windows PowerShell 7 (`pwsh`) when it is on `path`, else Windows
+/// PowerShell, and `/bin/sh` elsewhere.
+pub fn default_shell(
+    shell_var: Option<OsString>,
+    path: Option<OsString>,
+    windows: bool,
+) -> OsString {
+    if let Some(s) = shell_var.filter(|s| !s.is_empty()) {
+        return s;
+    }
+    if !windows {
+        return OsString::from("/bin/sh");
+    }
+    let has_pwsh = path.is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| d.join("pwsh.exe").is_file() || d.join("pwsh").is_file())
+    });
+    OsString::from(if has_pwsh { "pwsh" } else { "powershell" })
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    fn s(v: &[OsString]) -> Vec<String> {
+        v.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn each_shell_gets_its_own_command_flag() {
+        assert_eq!(
+            s(&shell_argv(OsStr::new("/bin/zsh"), "ls")),
+            ["/bin/zsh", "-c", "ls"]
+        );
+        assert_eq!(
+            s(&shell_argv(OsStr::new("pwsh"), "Get-ChildItem")),
+            ["pwsh", "-NoProfile", "-Command", "Get-ChildItem"]
+        );
+        assert_eq!(
+            s(&shell_argv(
+                OsStr::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\PowerShell.exe"),
+                "dir"
+            ))[1..],
+            ["-NoProfile", "-Command", "dir"]
+        );
+        assert_eq!(
+            s(&shell_argv(OsStr::new("cmd.exe"), "dir"))[1..],
+            ["/C", "dir"]
+        );
+    }
+
+    #[test]
+    fn the_default_shell_prefers_shell_then_pwsh() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            default_shell(Some("/bin/fish".into()), None, true),
+            "/bin/fish"
+        );
+        assert_eq!(default_shell(Some("".into()), None, false), "/bin/sh");
+        assert_eq!(
+            default_shell(None, Some(d.path().into()), true),
+            "powershell"
+        );
+        std::fs::write(d.path().join("pwsh.exe"), "").unwrap();
+        assert_eq!(default_shell(None, Some(d.path().into()), true), "pwsh");
     }
 }
