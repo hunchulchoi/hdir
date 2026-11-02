@@ -410,6 +410,40 @@ pub fn unmove_cmd(os: &RemoteOs, stage: &[u8], name: &[u8], src: &[u8]) -> Vec<u
     ])
 }
 
+fn id_fmt(os: &RemoteOs) -> &'static [u8] {
+    match os {
+        RemoteOs::Bsd => b"stat -f '%d:%i' -- ",
+        RemoteOs::Linux | RemoteOs::Other(_) => b"stat -c '%d:%i' -- ",
+    }
+}
+
+/// `dev:inode` of the physical `dir` and of every parent up to `/`, one
+/// per line.
+pub fn chain_cmd(os: &RemoteOs, dir: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"cd -- ",
+        &sh_quote(dir),
+        b" || exit 1; c=$(pwd -P && echo x) || exit 1; c=${c%?x}; while :; do ",
+        id_fmt(os),
+        b"\"$c\" || exit 1; [ \"$c\" = / ] && break; c=${c%/*}; [ -n \"$c\" ] || c=/; done",
+    ])
+}
+
+/// `dev:inode` of `path` when it is a real directory, else nothing.
+pub fn dir_id_cmd(os: &RemoteOs, path: &[u8]) -> Vec<u8> {
+    let q = sh_quote(path);
+    cat(&[
+        b"if [ -d ",
+        &q,
+        b" ] && [ ! -L ",
+        &q,
+        b" ]; then ",
+        id_fmt(os),
+        &q,
+        b"; fi",
+    ])
+}
+
 /// Remove a staging dir and whatever a failed transfer left in it.
 pub fn unstage_cmd(stage: &[u8]) -> Vec<u8> {
     cat(&[b"rm -rf -- ", &sh_quote(stage)])
@@ -550,6 +584,71 @@ fn local_dest_safe(real: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn local_dest_safe(_real: &Path) -> Result<(), String> {
     Ok(())
+}
+
+/// `dev:inode` of the destination and all its parents, on its side.
+fn dest_chain(side: &Side, dir: &Path) -> Result<Vec<String>, String> {
+    let err = |e: String| format!("대상 폴더를 확인할 수 없음: {e}");
+    match side {
+        Side::Local => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let real = std::fs::canonicalize(dir).map_err(|e| err(e.to_string()))?;
+                real.ancestors()
+                    .map(|a| {
+                        std::fs::metadata(a)
+                            .map(|m| format!("{}:{}", m.dev(), m.ino()))
+                            .map_err(|e| err(e.to_string()))
+                    })
+                    .collect()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = dir;
+                Ok(Vec::new())
+            }
+        }
+        Side::Remote(s) => {
+            let out = s
+                .exec(&chain_cmd(&s.os, &b(dir)))
+                .map_err(|e| err(e.message()))?;
+            let out = ran(out).map_err(err)?;
+            Ok(String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect())
+        }
+    }
+}
+
+/// `dev:inode` of `path` if it is a real directory.
+fn dir_id(side: &Side, path: &Path) -> Result<Option<String>, String> {
+    match side {
+        Side::Local => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                Ok(std::fs::symlink_metadata(path)
+                    .ok()
+                    .filter(|m| m.is_dir())
+                    .map(|m| format!("{}:{}", m.dev(), m.ino())))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Ok(None)
+            }
+        }
+        Side::Remote(s) => {
+            let out = ran(s
+                .exec(&dir_id_cmd(&s.os, &b(path)))
+                .map_err(|e| e.message())?)?;
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok((!id.is_empty()).then_some(id))
+        }
+    }
 }
 
 /// Size and symlink check of a local item; unreadable parts count as 0
@@ -731,7 +830,13 @@ fn place(
                 Err(e) if restore.is_some() => {
                     return Err(unmove_or_name(s, &p, name, restore, e.message()));
                 }
-                Err(e) => return Err(e.message()),
+                Err(e) => {
+                    let left = discard(Stage::Remote(s, dir, p));
+                    return Err(match left {
+                        Some(w) => format!("{} · {w}", e.message()),
+                        None => e.message(),
+                    });
+                }
             };
             match out.code {
                 Some(0) => return Ok(Placed::Done(None)),
@@ -909,10 +1014,12 @@ fn lossy(n: &OsString) -> String {
 }
 
 /// Transfer one item. `real`: the checked local destination, if local.
+#[allow(clippy::too_many_arguments)]
 fn item(
     spec: &TransferSpec,
     route: &Route,
     real: Option<&Path>,
+    chain: &[String],
     name: &OsString,
     scanned: Scanned,
     ctl: &mut dyn TransferCtl,
@@ -961,6 +1068,13 @@ fn item(
             Ok(true) => return link_skip(),
             Err(e) => return fail(e),
         }
+    }
+    // A folder sent into itself (one machine seen through two names, ssh
+    // to localhost): the copy would keep copying its own stage.
+    match dir_id(&spec.src, &src) {
+        Ok(Some(id)) if chain.contains(&id) => return fail("폴더를 그 안으로 보낼 수 없음".into()),
+        Ok(_) => {}
+        Err(e) => return fail(e),
     }
     // A move deletes the source only if it is still what was sent: not
     // changed meanwhile, and not replaced by the copy (the same file reached
@@ -1072,6 +1186,10 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
         Ok(r) => r,
         Err(e) => return OpReport::failed(e),
     };
+    let chain = match dest_chain(&spec.dst, &spec.dest_dir) {
+        Ok(c) => c,
+        Err(e) => return OpReport::failed(e),
+    };
     let scanned = match scan(spec, &route, ctl.cancel_flag()) {
         Ok(Some(v)) => v,
         Ok(None) => return report(OpOutcome::Cancelled),
@@ -1089,7 +1207,7 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
         }
         let src = spec.src_dir.join(name);
         ctl.on_progress(0, &src);
-        match item(spec, &route, real.as_deref(), name, sc, ctl, &mut r) {
+        match item(spec, &route, real.as_deref(), &chain, name, sc, ctl, &mut r) {
             Step::Done => {
                 r.copied += 1;
                 r.done_sources.push(src.clone());
@@ -3210,5 +3328,72 @@ mod tests {
             let out = sh(&stage_cmd(&RemoteOs::Linux, &b(&shared)));
             assert!(out.status.success(), "-T makes sticky dirs fine: {out:?}");
         }
+    }
+
+    #[test]
+    fn a_folder_sent_into_itself_through_another_name_is_refused() {
+        // "ssh localhost": the remote destination is inside the local source
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        fs::create_dir_all(d.join("inner")).unwrap();
+        let id = {
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::metadata(&d).unwrap();
+            format!("{}:{}", m.dev(), m.ino())
+        };
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "scp" {
+                return ok("");
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("; c=$(pwd -P && echo x)") {
+                return ok(&format!("7:7\n{id}\n2:2\n"));
+            }
+            answer(c, &[], &[], "")
+        });
+        let s = spec(
+            JobKind::Copy,
+            Side::Local,
+            t.path(),
+            &["d"],
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/alias/d/inner"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            r.outcome,
+            OpOutcome::Failed("d: 폴더를 그 안으로 보낼 수 없음".into())
+        );
+        assert!(f.scp_calls().is_empty());
+    }
+
+    #[test]
+    fn real_destination_parents_and_folder_ids_line_up() {
+        let t = tempfile::tempdir().unwrap();
+        let inner = t.path().join("d/inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(t.path().join("f"), "x").unwrap();
+        let os = crate::testutil::local_os();
+        let out = sh(&chain_cmd(&os, &b(&inner)));
+        assert!(out.status.success(), "{out:?}");
+        let remote: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(remote, dest_chain(&Side::Local, &inner).unwrap());
+        let out = sh(&dir_id_cmd(&os, &b(&t.path().join("d"))));
+        let did = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert!(remote.contains(&did), "d is a parent of d/inner");
+        assert_eq!(
+            Some(did),
+            dir_id(&Side::Local, &t.path().join("d")).unwrap()
+        );
+        assert!(
+            sh(&dir_id_cmd(&os, &b(&t.path().join("f"))))
+                .stdout
+                .is_empty()
+        );
+        assert_eq!(dir_id(&Side::Local, &t.path().join("f")).unwrap(), None);
     }
 }
