@@ -1178,7 +1178,7 @@ mod tests {
         std::fs::write(&local, "x").unwrap();
         for (starts, err) in [
             ("p=", "not a regular file"),
-            ("w=$(find ", "Permission denied"),
+            ("me=$(id -u)", "Permission denied"),
         ] {
             let f = FakeCmd::new(move |a| {
                 if crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with(starts)) {
@@ -1318,7 +1318,10 @@ mod tests {
         let gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&d).unwrap());
         for (name, body) in fakes {
             let p = bin.join(name);
-            let body = body.replace("GID", &gid.to_string());
+            let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&d).unwrap());
+            let body = body
+                .replace("GID", &gid.to_string())
+                .replace("UID", &uid.to_string());
             std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -1337,45 +1340,134 @@ mod tests {
         (out.status.code(), made)
     }
 
-    /// `id` of an account whose primary group (`gid`, named `gname`) is or
-    /// is not its own user-private group.
-    fn fake_id(gid: &str, gname: &str) -> String {
+    /// `id` of an account with uid `uid` whose primary group (`gid`, named
+    /// `gname`) is or is not its own user-private group.
+    fn fake_id(uid: &str, gid: &str, gname: &str) -> String {
         format!(
-            "case \"$1\" in -g) echo {gid};; -gn) echo {gname};; -un) echo me;; *) exit 1;; esac"
+            "case \"$1\" in -u) echo {uid};; -g) echo {gid};; -gn) echo {gname};; \
+             -un) echo me;; *) exit 1;; esac"
+        )
+    }
+
+    /// `getent` whose group `GID` has `members`, and whose passwd lists `me`
+    /// plus `extra` lines.
+    fn fake_getent(members: &str, extra: &str) -> String {
+        format!(
+            "case \"$1\" in group) echo \"me:x:GID:{members}\";; \
+             passwd) printf 'me:x:UID:GID::/:/bin/sh\\n{extra}';; *) exit 2;; esac"
         )
     }
 
     #[test]
     fn a_failing_permission_check_stops_before_mktemp() {
         assert_eq!(mktemp_with(0o700, &[("find", "exit 1")]), (Some(1), false));
-        let id = fake_id("GID", "me");
-        let stat = [("id", id.as_str()), ("stat", "exit 1")];
-        assert_eq!(mktemp_with(0o770, &stat), (Some(1), false), "gid unknown");
+        assert_eq!(mktemp_with(0o700, &[("id", "exit 1")]), (Some(1), false));
+        let id = fake_id("UID", "GID", "me");
+        let get = fake_getent("", "");
+        let stat = [("id", id.as_str()), ("getent", &get), ("stat", "exit 1")];
+        assert_eq!(
+            mktemp_with(0o770, &stat),
+            (Some(UNSAFE_DIR), false),
+            "gid unknown"
+        );
+        // names that cannot be looked up are never "equal"
+        let blank = "case \"$1\" in -u) echo UID;; -g) echo GID;; *) exit 1;; esac";
+        let tools = [("id", blank), ("getent", &get)];
+        assert_eq!(mktemp_with(0o770, &tools), (Some(UNSAFE_DIR), false));
+        let no_getent = [("id", id.as_str()), ("getent", "exit 127")];
+        assert_eq!(mktemp_with(0o770, &no_getent), (Some(UNSAFE_DIR), false));
     }
 
     #[test]
-    fn group_writable_dirs_are_fine_only_for_the_users_private_group() {
-        let own = fake_id("GID", "me");
-        assert_eq!(mktemp_with(0o775, &[("id", &own)]), (Some(0), true), "UPG");
-        assert_eq!(mktemp_with(0o2770, &[("id", &own)]), (Some(0), true), "UPG");
-        // a shared group (name differs from the user) or another group
-        let shared = fake_id("GID", "staff");
-        assert_eq!(
-            mktemp_with(0o775, &[("id", &shared)]),
-            (Some(UNSAFE_DIR), false)
+    fn group_writable_dirs_are_fine_only_for_an_exclusive_private_group() {
+        let own = fake_id("UID", "GID", "me");
+        let alone = fake_getent("", "");
+        let ok_tools = [("id", own.as_str()), ("getent", &alone)];
+        assert_eq!(mktemp_with(0o775, &ok_tools), (Some(0), true), "UPG");
+        assert_eq!(mktemp_with(0o2770, &ok_tools), (Some(0), true), "UPG");
+        let refused = |tools: &[(&str, &str)], why: &str| {
+            assert_eq!(
+                mktemp_with(0o775, tools),
+                (Some(UNSAFE_DIR), false),
+                "{why}"
+            );
+        };
+        let shared = fake_id("UID", "GID", "staff");
+        refused(
+            &[("id", &shared), ("getent", &alone)],
+            "group named otherwise",
         );
-        let other = fake_id("999999", "me");
-        assert_eq!(
-            mktemp_with(0o770, &[("id", &other)]),
-            (Some(UNSAFE_DIR), false)
+        let other = fake_id("UID", "999999", "me");
+        refused(
+            &[("id", &other), ("getent", &alone)],
+            "not my primary group",
         );
+        let member = fake_getent("bob", "");
+        refused(&[("id", &own), ("getent", &member)], "bob is a member");
+        let primary = fake_getent("", "bob:x:1234:GID::/:/bin/sh\\n");
+        refused(&[("id", &own), ("getent", &primary)], "bob's primary group");
         // others can write: refused whatever the group
+        assert_eq!(mktemp_with(0o777, &ok_tools), (Some(UNSAFE_DIR), false));
+    }
+
+    #[test]
+    fn sticky_dirs_are_fine_only_when_owned_by_the_user_or_root() {
+        let me = fake_id("UID", "GID", "staff");
+        assert_eq!(mktemp_with(0o1777, &[("id", &me)]), (Some(0), true));
+        assert_eq!(mktemp_with(0o1770, &[("id", &me)]), (Some(0), true));
+        // owned by someone else (as far as `id -u` says): they could swap it
+        let stranger = fake_id("999999", "GID", "staff");
         assert_eq!(
-            mktemp_with(0o777, &[("id", &own)]),
+            mktemp_with(0o1777, &[("id", &stranger)]),
             (Some(UNSAFE_DIR), false)
         );
-        // sticky: fine
-        assert_eq!(mktemp_with(0o1777, &[("id", &shared)]), (Some(0), true));
+    }
+
+    #[test]
+    fn real_dir_preview_reports_a_failing_listing() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let d = root.join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f"), "x").unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("find"), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(bin.join("find"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut script = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
+        script.extend(crate::remote::preview_cmd(
+            &crate::testutil::local_os(),
+            d.as_os_str().as_encoded_bytes(),
+            10,
+        ));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&script))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot list"));
+    }
+
+    #[test]
+    fn real_dir_preview_counts_names_that_are_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("ok"), "x").unwrap();
+        // APFS refuses invalid UTF-8 names; skip the bad one there
+        let bad = d.join(std::ffi::OsStr::from_bytes(b"bad\xff\xfe"));
+        let n = if std::fs::write(&bad, "x").is_ok() {
+            2
+        } else {
+            1
+        };
+        let s = crate::testutil::local_session(t.path());
+        assert_eq!(
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info(format!("원격 디렉터리 · 항목 {n}개"))
+        );
     }
 
     #[test]
