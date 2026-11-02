@@ -7619,7 +7619,6 @@ mod tests {
             f.log.lock().unwrap().clone()
         }
 
-        #[cfg(unix)]
         fn run_logged(app: &mut App, f: &Arc<ShellFake>) {
             let f = Arc::clone(f);
             app.run_shell(move |run| {
