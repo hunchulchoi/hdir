@@ -2,6 +2,9 @@
 name = "hdir"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Mdir-style dual-panel TUI file manager"
+repository = "https://github.com/hunchulchoi/hdir"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -22,3 +25,8 @@ libc = "0.2.191"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Time"] }
 
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

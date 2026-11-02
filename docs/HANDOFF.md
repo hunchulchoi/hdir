@@ -1,16 +1,16 @@
 # hdir 핸드오프
 
-작성: 2026-10-30 · 기준 커밋: `main` (PR #12 merge 직후)
+작성: 2026-11-02 · 기준 커밋: `main` (PR #16 merge 직후, M9 PR 진행 중)
 
 Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 원 구상 `docs/mvp계획.md`, 전체 설계 `docs/plan.md`, 개발 룰 `CLAUDE.md`.
 
 ## 1. 한눈에 보는 상태
 
-- 이슈 79개 중 **Done 54**, Todo 18, Backlog 7 (Windows 지원 예정).
-- 끝난 모듈: M1 코어 TUI, M2 파일 작업 + 휴지통, M3 뷰어·미리보기·모드, M4 설정·테마·키, M5 확장자 연결, M6 셸 통합, M7 SSH 원격 패널(파트 A·B).
-- **다음 작업: M7 남은 High 4개(HDIR-73~76) → M8 scp 전송 → M9 문서·릴리스.**
-- 열린 PR 없음. 모든 작업은 `main`에 merge됨. 진행 중인 브랜치·stash·worktree 없음.
-- 테스트 (PR #12 기준): macOS 876, Linux 876, Windows 709 통과. 셸 통합 테스트 6, 실제 ssh 테스트 3(`#[ignore]`).
+- 끝난 모듈: M1 코어 TUI, M2 파일 작업 + 휴지통, M3 뷰어·미리보기·모드, M4 설정·테마·키, M5 확장자 연결, M6 셸 통합, M7 SSH 원격 패널, M8 scp 전송.
+- M9 문서·릴리스(HDIR-52 README, HDIR-53 release 빌드)는 브랜치 `m9-docs`.
+- 남은 일: 낮은 우선순위 Todo(HDIR-56, 59, 63), 후속 HDIR-81(tar 스트림 전송), Windows Backlog(HDIR-66~72, 요청 시에만).
+- 테스트 (PR #16 기준): macOS 991, Linux 991, Windows 712 통과. 셸 통합 6, 실제 ssh 4(`#[ignore]`, stage 서버와 `scripts/ssh-docker-test.sh`), README 예시 검사 1.
+- 최소 Rust 1.88 (`rust-version`, 1.87은 의존성이 거부함을 Docker로 확인).
 
 ## 2. 새 서버 준비
 
@@ -50,31 +50,15 @@ ssh -o BatchMode=yes choi@stage.devfor.link true && ssh -o BatchMode=yes win11.d
 
 ## 4. 남은 작업 (우선순위 순)
 
-### M7 SSH — 리뷰 3차에서 넘어온 High (먼저 처리)
+### M8 후속
 | 이슈 | 내용 |
 |---|---|
-| HDIR-73 | 원격 삭제·편집 시 `pwd` 끝 개행 보존 (센티널). 이름이 개행으로 끝나는 디렉터리에서 다른 경로를 건드릴 수 있음 |
-| HDIR-74 | 하드링크 파일 제자리 쓰기 전 백업, 실패 시 복원 |
-| HDIR-75 | 편집 중 원격 파일 동시 변경 감지 → 교체 중단, 로컬 편집본 보존 |
-| HDIR-76 | 원격 편집 교체 시 원본 GID 보존 |
-| HDIR-77 | 원격 디렉터리 미리보기 경량화, 다중 삭제 거부 테스트 보강 (medium) |
-| HDIR-78 | `tests/ssh_real.rs` 병렬 실행 시 간헐 exit 255 (`--test-threads=1`이면 통과) (medium) |
+| HDIR-81 | 원격 전송을 링크를 보존하는 tar 스트림으로 교체 (지금은 scp가 링크를 따라가서 링크가 든 항목은 건너뜀, 마지막 검사와 scp 사이 짧은 경쟁 남음). 폴더 이동 중 깊은 변경은 이제 트리 지문으로 잡음 |
 
-### M8 scp 전송
-| 이슈 | 내용 |
-|---|---|
-| HDIR-45 | F5/F6 라우팅 4종: 로컬↔로컬(fs_ops, 이미 동작), 로컬→원격, 원격→로컬, 원격↔원격(`scp -3`). 현재 원격이 끼면 "원격: 다음 단계에서 지원" |
-| HDIR-46 | 이동 = 전송 성공 확인 후 원본 삭제 (원격 `rm`, 로컬 휴지통) |
-| HDIR-47 | 진행률 (원격 `du`로 총량, 항목별) |
-| HDIR-48 | 전송 전 대상 충돌 확인 → 기존 충돌 dialog 재사용 |
-| HDIR-49 | Esc 취소 (scp kill), 부분 파일 안내 |
-| HDIR-51 | Docker openssh 통합 테스트 환경 (low) |
-
-### M9 문서·릴리스
-HDIR-52 README 설치·설정 예시 전체, HDIR-53 release 빌드.
+M8 설계 요지(`src/transfer.rs` 모듈 문서): 대상 안 비공개 임시 폴더(`.hdir-xfer.*`)로 받고 no-replace로 배치, 링크 따라가지 않음, 대상 폴더 안전 검사(`remote::safe_dirs_check` 공용), 이동은 트리 지문이 같을 때만 원본 삭제, 자기 안으로 보내기는 dev:inode 체인으로 차단, BSD 원격은 sticky 대상 거부. Codex 리뷰 9회 이력은 PR #16 본문.
 
 ### 낮은 우선순위
-HDIR-56 term 테스트 구조, HDIR-59 xattr 보존, HDIR-63 fd 기반 순회 TOCTOU, HDIR-79 job 진행률 테스트 간헐 실패.
+HDIR-56 term 테스트 구조, HDIR-59 xattr 보존, HDIR-63 fd 기반 순회 TOCTOU.
 
 ### Windows (Backlog, 지원 예정)
 HDIR-66~72. 사용자 결정으로 보류. 착수하지 말 것 (요청이 오면 진행).
@@ -91,10 +75,10 @@ HDIR-66~72. 사용자 결정으로 보류. 착수하지 말 것 (요청이 오�
 | `ui.rs`, `dialog.rs`, `menu.rs`, `screen.rs`, `viewer.rs` | 렌더링, dialog, F9 메뉴, F1 도움말 등 화면, F3 뷰어 |
 | `config.rs`, `theme.rs`, `keymap.rs` | config.toml(toml_edit 저장), 테마(기본 mdir), 키맵(mdir/vim 프리셋) |
 | `preview.rs`, `assoc.rs`, `launcher.rs`, `editor.rs`, `cmdline.rs` | 미리보기, 확장자 연결, 프로세스 실행, $EDITOR, `:` 명령줄 |
-| `servers.rs`, `session.rs`, `remote.rs`, `remote_ops.rs` | ssh config·서버 목록, ControlMaster 세션, 원격 명령·scp argv·파서, 원격 파일 작업 |
+| `servers.rs`, `session.rs`, `remote.rs`, `remote_ops.rs`, `transfer.rs` | ssh config·서버 목록, ControlMaster 세션(취소 가능한 실행), 원격 명령·scp argv·파서, 원격 파일 작업, 원격이 낀 F5/F6 |
 | `shell/hdir.{zsh,bash,fish}` | `h` 함수 (종료 시 cd) |
 | `themes/*.toml` | 내장 테마 |
-| `tests/` | smoke, shell(셸 함수 E2E), linux_trash(XDG 격리 실제 휴지통), ssh_real(`HDIR_SSH_HOST`) |
+| `tests/` | smoke, shell(셸 함수 E2E), linux_trash(XDG 격리 실제 휴지통), ssh_real(`HDIR_SSH_HOST`, 또는 `scripts/ssh-docker-test.sh`), readme(README 설정 예시가 경고 없이 읽히는지) |
 
 ## 6. 꼭 알아야 할 결정·함정
 
