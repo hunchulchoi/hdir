@@ -667,6 +667,57 @@ mod xattr_sys {
     pub fn is_unsupported(e: &io::Error) -> bool {
         matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP)
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A reader answering size queries and reads from a script of
+        /// (size, value) steps, like a value that changes between calls.
+        fn scripted(
+            steps: Vec<io::Result<Vec<u8>>>,
+        ) -> impl FnMut(*mut u8, usize) -> io::Result<usize> {
+            let mut steps = steps.into_iter();
+            move |buf, len| {
+                let v = steps.next().expect("no more calls")?;
+                if len > 0 && v.len() <= len {
+                    // SAFETY: the caller's buffer holds `len` bytes.
+                    unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), buf, v.len()) };
+                }
+                Ok(v.len())
+            }
+        }
+
+        #[test]
+        fn a_value_that_grows_from_zero_is_read_again() {
+            // size 0, then (buffer of 0) it is now 3 long, size 3, read 3
+            let r = read_sized(scripted(vec![
+                Ok(vec![]),
+                Ok(b"abc".to_vec()),
+                Ok(b"abc".to_vec()),
+                Ok(b"abc".to_vec()),
+            ]));
+            assert_eq!(r.unwrap(), b"abc");
+        }
+
+        #[test]
+        fn erange_retries_and_then_gives_up() {
+            let erange = || Err(io::Error::from_raw_os_error(libc::ERANGE));
+            let r = read_sized(scripted(vec![
+                Ok(b"ab".to_vec()),
+                erange(),
+                Ok(b"abcd".to_vec()),
+                Ok(b"abcd".to_vec()),
+            ]));
+            assert_eq!(r.unwrap(), b"abcd");
+            let mut steps = Vec::new();
+            for _ in 0..4 {
+                steps.push(Ok(b"ab".to_vec()));
+                steps.push(erange());
+            }
+            let e = read_sized(scripted(steps)).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ERANGE));
+        }
+    }
 }
 
 /// Copy every extended attribute from `from` to `to`. Attributes the target
