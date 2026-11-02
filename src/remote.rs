@@ -92,6 +92,21 @@ fn os(s: &str) -> OsString {
     OsString::from(s)
 }
 
+/// Whether `t` goes through a ControlMaster. An empty control path means
+/// none (Windows OpenSSH has no ControlMaster): every command is its own
+/// connection then, so key authentication (ssh-agent) is needed.
+pub fn uses_master(t: &SshTarget) -> bool {
+    !t.control_path.as_os_str().is_empty()
+}
+
+/// `-o ControlPath=...`, when `t` uses a master.
+fn control_args(t: &SshTarget, v: &mut Vec<OsString>) {
+    if uses_master(t) {
+        v.push(os("-o"));
+        v.push(control_opt(t));
+    }
+}
+
 fn control_opt(t: &SshTarget) -> OsString {
     let mut o = OsString::from("ControlPath=");
     o.push(&t.control_path);
@@ -117,8 +132,18 @@ fn net_opts(v: &mut Vec<OsString>) {
     }
 }
 
-/// `ssh` argv that starts the persistent master connection.
+/// `ssh` argv that starts the persistent master connection. Without a
+/// master: one interactive login (host key, agent) that just exits.
 pub fn master_argv(t: &SshTarget) -> Vec<OsString> {
+    if !uses_master(t) {
+        let mut v = vec![os("ssh")];
+        net_opts(&mut v);
+        port_args(t.port, "-p", &mut v);
+        v.push(os("--"));
+        v.push(os(&t.host));
+        v.push(os("exit 0"));
+        return v;
+    }
     let mut v = vec![
         os("ssh"),
         os("-o"),
@@ -136,8 +161,12 @@ pub fn master_argv(t: &SshTarget) -> Vec<OsString> {
     v
 }
 
-/// `ssh -O check` argv (is the master alive?).
+/// `ssh -O check` argv (is the master alive?). Without a master: can a
+/// non-interactive login run a command?
 pub fn check_argv(t: &SshTarget) -> Vec<OsString> {
+    if !uses_master(t) {
+        return exec_argv(t, b"exit 0");
+    }
     let mut v = vec![os("ssh"), os("-O"), os("check"), os("-o"), control_opt(t)];
     net_opts(&mut v);
     port_args(t.port, "-p", &mut v);
@@ -151,7 +180,8 @@ pub fn check_argv(t: &SshTarget) -> Vec<OsString> {
 /// comment in it cannot escape the `cd` guard. Unlike [`exec_argv`] there is
 /// no `BatchMode`: the command itself may prompt.
 pub fn remote_shell_argv(t: &SshTarget, cwd: &[u8], cmd: &str) -> Vec<OsString> {
-    let mut v = vec![os("ssh"), os("-o"), control_opt(t)];
+    let mut v = vec![os("ssh")];
+    control_args(t, &mut v);
     net_opts(&mut v);
     port_args(t.port, "-p", &mut v);
     v.push(os("-t"));
@@ -170,13 +200,10 @@ pub fn remote_shell_argv(t: &SshTarget, cwd: &[u8], cmd: &str) -> Vec<OsString> 
 
 /// Run one remote command over the master; the command is a single argv item.
 pub fn exec_argv(t: &SshTarget, remote_cmd: &[u8]) -> Vec<OsString> {
-    let mut v = vec![
-        os("ssh"),
-        os("-o"),
-        control_opt(t),
-        os("-o"),
-        os("BatchMode=yes"),
-    ];
+    let mut v = vec![os("ssh")];
+    control_args(t, &mut v);
+    v.push(os("-o"));
+    v.push(os("BatchMode=yes"));
     net_opts(&mut v);
     port_args(t.port, "-p", &mut v);
     v.push(os("--"));
@@ -850,8 +877,7 @@ pub fn scp_argv(
     };
     v.push(os("-rp"));
     if let Some(t) = ctrl {
-        v.push(os("-o"));
-        v.push(control_opt(t));
+        control_args(t, &mut v);
     }
     // Never prompt (the TUI owns the terminal) and never hang on a dead link.
     v.push(os("-o"));
@@ -1535,6 +1561,45 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     #[test]
     fn rmdir_cmd_quotes() {
         assert_eq!(s(rmdir_cmd(b"/d/-x y")), "rmdir -- '/d/-x y'");
+    }
+
+    #[test]
+    fn without_a_master_no_control_options_and_checks_are_real_logins() {
+        let t = SshTarget {
+            host: "web".into(),
+            port: Some(2222),
+            control_path: PathBuf::new(),
+        };
+        assert!(!uses_master(&t));
+        let s = |v: Vec<OsString>| -> Vec<String> {
+            v.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        let ex = s(exec_argv(&t, b"ls"));
+        assert!(!ex.iter().any(|a| a.starts_with("ControlPath")), "{ex:?}");
+        assert_eq!(ex[..3], ["ssh", "-o", "BatchMode=yes"]);
+        assert_eq!(s(check_argv(&t)), s(exec_argv(&t, b"exit 0")));
+        let m = s(master_argv(&t));
+        assert!(
+            !m.iter().any(|a| a.contains("Control") || a == "-fN"),
+            "{m:?}"
+        );
+        assert_eq!(m[m.len() - 3..], ["--", "web", "exit 0"]);
+        let sh = s(remote_shell_argv(&t, b"/x", "ls"));
+        assert!(!sh.iter().any(|a| a.starts_with("ControlPath")), "{sh:?}");
+        let up = s(scp_argv(
+            &Endpoint::Local(std::path::Path::new("/a")),
+            &Endpoint::Remote(&t, b"/b"),
+            ScpMode::Sftp,
+        )
+        .unwrap());
+        assert!(!up.iter().any(|a| a.starts_with("ControlPath")), "{up:?}");
+        // with a master nothing changed
+        let m = SshTarget {
+            control_path: PathBuf::from("/tmp/cm-%C"),
+            ..t
+        };
+        assert!(uses_master(&m));
+        assert!(s(exec_argv(&m, b"ls")).contains(&"ControlPath=/tmp/cm-%C".to_string()));
     }
 
     #[test]

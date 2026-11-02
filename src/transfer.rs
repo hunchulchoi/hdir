@@ -310,6 +310,17 @@ pub fn same_fs_cmd(os: &RemoteOs, a: &[u8], b: &[u8]) -> Vec<u8> {
 /// folder `id` names and then runs tar there; the paths travel as arguments
 /// (`$1` folder, `$2` id, `$3` name), never inside the script.
 pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str) -> Vec<OsString> {
+    if cfg!(windows) {
+        // no POSIX shell: Windows' own tar.exe, path based like local
+        // copies there
+        let _ = id;
+        let mut item = OsString::from("./");
+        item.push(name);
+        let mut v: Vec<OsString> = ["tar", "-cf", "-", "-C"].map(OsString::from).to_vec();
+        v.push(dir.as_os_str().to_os_string());
+        v.push(item);
+        return v;
+    }
     let (stat, tar) = if cfg!(target_os = "linux") {
         ("stat -c %d:%i -- .", "tar")
     } else if cfg!(target_os = "macos") {

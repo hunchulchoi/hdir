@@ -718,7 +718,13 @@ impl App {
             spawn_tx,
             spawn_rx,
             cmd: Arc::new(SystemCmd),
-            control_path: session::control_path(dirs::cache_dir().as_deref(), current_uid()),
+            // Windows OpenSSH has no ControlMaster: an empty path means
+            // one connection per command (see remote::uses_master)
+            control_path: if cfg!(windows) {
+                PathBuf::new()
+            } else {
+                session::control_path(dirs::cache_dir().as_deref(), current_uid())
+            },
             ssh_hosts: Vec::new(),
             ssh_config_path: None,
             drives: crate::platform::drive_roots(),
@@ -1300,10 +1306,6 @@ impl App {
     }
 
     fn start_connect(&mut self, idx: usize, kind: ConnectKind, target: SshTarget) {
-        if cfg!(windows) {
-            self.status = Some("SSH: Windows 지원 예정".into());
-            return;
-        }
         self.connect_gen += 1;
         let job = ConnectJob {
             idx,
@@ -1352,6 +1354,17 @@ impl App {
                     }
                 }
             };
+            // Without a master every command logs in again on its own, which
+            // only works with keys: say so when that is what failed.
+            let result = result.map_err(|e| {
+                if remote::uses_master(&job.target) {
+                    e
+                } else {
+                    format!(
+                        "{e} · 이 OS의 ssh는 연결 유지를 지원하지 않아 키 인증(ssh-agent)이 필요함"
+                    )
+                }
+            });
             let _ = tx.send(ConnectMsg::Done {
                 idx,
                 attempt,
@@ -9881,9 +9894,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn ssh_connect_on_windows_is_a_stub() {
+    fn ssh_connect_on_windows_starts_without_a_master() {
         let (_t, mut app) = fixture();
         app.drives.clear(); // the server is then item 1
+        assert!(
+            app.control_path.as_os_str().is_empty(),
+            "no ControlMaster here"
+        );
         app.settings.config.servers = vec![crate::servers::ServerConfig {
             name: Some("prod".into()),
             host: Some("prod-web".into()),
@@ -9892,12 +9909,6 @@ mod tests {
         press_mods(&mut app, KeyCode::F(2), KeyModifiers::ALT);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
-        assert!(
-            app.status
-                .as_deref()
-                .unwrap_or("")
-                .contains("Windows 지원 예정")
-        );
-        assert!(!app.panels[1].location.is_remote());
+        assert!(app.is_connecting(), "{:?}", app.status);
     }
 }
