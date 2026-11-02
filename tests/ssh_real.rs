@@ -780,12 +780,15 @@ fn transfers_round_trip() {
     );
 
     // Esc during a big download stops scp quickly and leaves nothing behind
-    let big = format!("cd -- {} && head -c 400000000 /dev/zero > big", q(&dir));
+    // 4 GiB sparse: no disk on the server, long enough to be cut off anywhere
+    let big = format!("cd -- {} && truncate -s 4G big", q(&dir));
     assert_eq!(remote(&cmd, &target, big.as_bytes()).code, Some(0));
     let c = ctl();
     let flag = Arc::clone(&c.cancel);
     let sink = tempfile::tempdir().unwrap();
     let watch = sink.path().to_path_buf();
+    let cancelled_at = Arc::new(std::sync::Mutex::new(None));
+    let at = Arc::clone(&cancelled_at);
     // Cancel as soon as the first bytes land in the stage.
     let stopper = std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
@@ -800,6 +803,7 @@ fn transfers_round_trip() {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        *at.lock().unwrap() = Some(std::time::Instant::now());
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
     });
     let mut c = c;
@@ -815,10 +819,16 @@ fn transfers_round_trip() {
         ),
         &mut c,
     );
+    let done = std::time::Instant::now();
     stopper.join().unwrap();
     let took = start.elapsed();
     assert_eq!(r.outcome, OpOutcome::Cancelled, "took {took:?}");
-    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    let at = cancelled_at.lock().unwrap().expect("cancel was requested");
+    let after = done.saturating_duration_since(at);
+    assert!(
+        after < std::time::Duration::from_secs(5),
+        "stopped {after:?} after Esc"
+    );
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     assert_eq!(
         std::fs::read_dir(sink.path()).unwrap().count(),

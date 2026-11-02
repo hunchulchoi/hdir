@@ -25,7 +25,7 @@ services:
         install -m 600 /keys/id ~/.ssh/id_ed25519
         n=0
         until ssh-keyscan -T 2 sshd > ~/.ssh/known_hosts 2>/dev/null && [ -s ~/.ssh/known_hosts ]; do
-          n=$((n + 1)); [ "$n" -lt 30 ] || { echo 'sshd did not come up' >&2; exit 1; }
+          n=$$((n + 1)); [ "$$n" -lt 30 ] || { echo 'sshd did not come up' >&2; exit 1; }
           sleep 1
         done
         cargo test --locked --test ssh_real -- --ignored

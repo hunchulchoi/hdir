@@ -9559,6 +9559,12 @@ mod tests {
                     return Some(out(0, ""));
                 }
                 let c = crate::testutil::remote_cmd(a)?;
+                if c.contains("; mv -f -- ") {
+                    return Some(out(0, "")); // rename into place
+                }
+                if c.starts_with("stat -c '%d:%i'") {
+                    return Some(out(0, "1:2\n"));
+                }
                 if let Some(rest) = c.strip_prefix("if [ -L '") {
                     let path = rest.split_once('\'').unwrap().0;
                     let hit = there.contains(&path);
