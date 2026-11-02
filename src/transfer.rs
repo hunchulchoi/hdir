@@ -179,13 +179,69 @@ pub fn parse_scan(stdout: &[u8], n: usize) -> Option<Vec<u64>> {
 /// Remote side of a transfer stream: a tar of `dir/name` on stdout. Links
 /// are stored as links, never followed; `./` keeps a leading `-` from being
 /// an option.
-pub fn tar_out_cmd(dir: &[u8], name: &[u8]) -> Vec<u8> {
+///
+/// `id` is the `dev:inode` the folder had when the job started: right after
+/// the `cd`, the folder now current must still be that one ([`SRC_MOVED`]
+/// otherwise), and tar reads relative to it, so swapping the folder for a
+/// link can never make it read elsewhere.
+pub fn tar_out_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], id: &[u8]) -> Vec<u8> {
     cat(&[
         b"cd -- ",
         &sh_quote(dir),
-        b" || exit 1; tar -cf - ./",
+        b" || exit 1; i=$(",
+        dir_id_fmt(os),
+        b".) || exit 1; [ \"$i\" = ",
+        &sh_quote(id),
+        b" ] || exit 51; tar -cf - ./",
         &sh_quote(name),
     ])
+}
+
+/// Exit code of a tar sender whose source folder is no longer the one the
+/// job started with.
+pub const SRC_MOVED: i32 = 51;
+
+/// `stat` printing `dev:inode` of the path that follows.
+fn dir_id_fmt(os: &RemoteOs) -> &'static [u8] {
+    match os {
+        RemoteOs::Bsd => b"stat -f %d:%i -- ",
+        RemoteOs::Linux | RemoteOs::Other(_) => b"stat -c %d:%i -- ",
+    }
+}
+
+/// `dev:inode` of the folder `dir` itself (followed), on its side.
+fn src_dir_id(side: &Side, dir: &Path) -> Result<String, String> {
+    let err = |e: String| format!("원본 폴더를 확인할 수 없음: {e}");
+    match side {
+        Side::Local => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let m = std::fs::metadata(dir).map_err(|e| err(e.to_string()))?;
+                Ok(format!("{}:{}", m.dev(), m.ino()))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = dir;
+                Ok(String::new())
+            }
+        }
+        Side::Remote(s) => {
+            let cmd = cat(&[
+                b"cd -- ",
+                &sh_quote(&b(dir)),
+                b" && ",
+                dir_id_fmt(&s.os),
+                b".",
+            ]);
+            let out = ran(s.exec(&cmd).map_err(|e| err(e.message()))?).map_err(err)?;
+            let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if id.is_empty() {
+                return Err(err("빈 응답".into()));
+            }
+            Ok(id)
+        }
+    }
 }
 
 /// Remote side of a transfer stream: unpack stdin into `stage`, keeping
@@ -247,25 +303,32 @@ pub fn same_fs_cmd(os: &RemoteOs, a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// Local `tar` writing `dir/name` to stdout. On macOS without AppleDouble
 /// files or extended attributes, which other tars would warn about.
-pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr) -> Vec<OsString> {
-    let mut v: Vec<OsString> = if cfg!(target_os = "macos") {
-        [
-            "env",
-            "COPYFILE_DISABLE=1",
-            "tar",
-            "--no-mac-metadata",
-            "--no-xattrs",
-        ]
-        .map(OsString::from)
-        .to_vec()
+///
+/// Like [`tar_out_cmd`], a shell first enters `dir`, checks it is still the
+/// folder `id` names and then runs tar there; the paths travel as arguments
+/// (`$1` folder, `$2` id, `$3` name), never inside the script.
+pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str) -> Vec<OsString> {
+    let (stat, tar) = if cfg!(target_os = "linux") {
+        ("stat -c %d:%i -- .", "tar")
+    } else if cfg!(target_os = "macos") {
+        (
+            "stat -f %d:%i -- .",
+            "COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs",
+        )
     } else {
-        vec![OsString::from("tar")]
+        ("stat -f %d:%i -- .", "tar")
     };
-    let mut item = OsString::from("./");
-    item.push(name);
-    v.extend(["-cf", "-", "-C"].map(OsString::from));
+    let script = format!(
+        "cd -- \"$1\" || exit 1; i=$({stat}) || exit 1; \
+         [ \"$i\" = \"$2\" ] || {{ echo '원본 폴더가 바뀌어 보내지 않음' >&2; exit 51; }}; \
+         exec env {tar} -cf - \"./$3\""
+    );
+    let mut v: Vec<OsString> = ["sh", "-c"].map(OsString::from).to_vec();
+    v.push(script.into());
+    v.push("sh".into());
     v.push(dir.as_os_str().to_os_string());
-    v.push(item);
+    v.push(id.into());
+    v.push(name.to_os_string());
     v
 }
 
@@ -1026,6 +1089,7 @@ fn discard(stage: Stage) -> Option<String> {
 fn send(
     route: &Route,
     src_dir: &Path,
+    src_id: &str,
     name: &OsString,
     stage: &Stage,
     cancel: &AtomicBool,
@@ -1039,12 +1103,13 @@ fn send(
         Stage::Local(t, _) => Ok(local_tar_in(t.path())),
         Stage::Remote(..) => Err("임시 폴더가 로컬이 아님".to_string()),
     };
-    let remote_out = |s: &RemoteSession| exec_argv(&s.target, &tar_out_cmd(&sd, &n));
+    let remote_out =
+        |s: &RemoteSession| exec_argv(&s.target, &tar_out_cmd(&s.os, &sd, &n, src_id.as_bytes()));
     // (runner, from argv, the ssh session behind `from`, to argv, ... `to`)
     let (runner, from, from_s, to, to_s) = match route {
         Route::Up(d) => (
             *d,
-            local_tar_out(src_dir, name),
+            local_tar_out(src_dir, name, src_id),
             None,
             remote_in(d)?,
             Some(*d),
@@ -1066,6 +1131,9 @@ fn send(
             s.set_alive(false);
             return Err(SessionError::Disconnected.message());
         }
+    }
+    if oa.code == Some(SRC_MOVED) {
+        return Err("원본 폴더가 바뀌어 보내지 않음".into());
     }
     match (oa.code, ob.code) {
         (Some(0), Some(0)) => match stage {
@@ -1185,6 +1253,7 @@ fn item(
     route: &Route,
     real: Option<&Path>,
     chain: &[String],
+    src_id: &str,
     name: &OsString,
     ctl: &mut dyn TransferCtl,
     r: &mut OpReport,
@@ -1262,7 +1331,14 @@ fn item(
             .and_then(ran)
             .map(drop)
     } else {
-        send(route, &spec.src_dir, name, &stage, ctl.cancel_flag())
+        send(
+            route,
+            &spec.src_dir,
+            src_id,
+            name,
+            &stage,
+            ctl.cancel_flag(),
+        )
     };
     if let Err(e) = sent {
         let cancelled = ctl.is_cancelled();
@@ -1473,6 +1549,11 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
         Ok(r) => r,
         Err(e) => return OpReport::failed(e),
     };
+    // Senders check the source folder is still this one before reading.
+    let src_id = match src_dir_id(&spec.src, &spec.src_dir) {
+        Ok(i) => i,
+        Err(e) => return OpReport::failed(e),
+    };
     let chain = match dest_chain(&spec.dst, &spec.dest_dir) {
         Ok(c) => c,
         Err(e) => return OpReport::failed(e),
@@ -1494,7 +1575,16 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
         }
         let src = spec.src_dir.join(name);
         ctl.on_progress(0, &src);
-        match item(spec, &route, real.as_deref(), &chain, name, ctl, &mut r) {
+        match item(
+            spec,
+            &route,
+            real.as_deref(),
+            &chain,
+            &src_id,
+            name,
+            ctl,
+            &mut r,
+        ) {
             Step::Done => {
                 r.copied += 1;
                 r.done_sources.push(src.clone());
@@ -1669,8 +1759,10 @@ mod tests {
             .unwrap();
         assert!(o.contains("'/d/S/p'") && !o.contains("'/d/S/o' ||"), "{o}");
         assert_eq!(
-            tar_out_cmd(b"/s it's", b"-x"),
-            b"cd -- '/s it'\\''s' || exit 1; tar -cf - ./'-x'".to_vec()
+            tar_out_cmd(&RemoteOs::Linux, b"/s it's", b"-x", b"5:6"),
+            b"cd -- '/s it'\\''s' || exit 1; i=$(stat -c %d:%i -- .) || exit 1; \
+              [ \"$i\" = '5:6' ] || exit 51; tar -cf - ./'-x'"
+                .to_vec()
         );
         assert_eq!(
             tar_in_cmd(b"/d/.hdir-xfer.1"),
@@ -1678,18 +1770,11 @@ mod tests {
               find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +"
                 .to_vec()
         );
-        let out = local_tar_out(Path::new("/s"), std::ffi::OsStr::new("-x"));
-        let tail: Vec<&str> = out[out.len() - 5..]
-            .iter()
-            .map(|a| a.to_str().unwrap())
-            .collect();
-        assert_eq!(tail, ["-cf", "-", "-C", "/s", "./-x"]);
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                out[..2],
-                [OsString::from("env"), OsString::from("COPYFILE_DISABLE=1")]
-            );
-        }
+        // the paths are arguments, never part of the script
+        let out = local_tar_out(Path::new("/s 'x'"), std::ffi::OsStr::new("-x"), "5:6");
+        let tail: Vec<&str> = out[3..].iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(tail, ["sh", "/s 'x'", "5:6", "-x"]);
+        assert!(!out[2].to_str().unwrap().contains("/s"), "{:?}", out[2]);
         assert_eq!(
             local_tar_in(Path::new("/st")),
             ["tar", "-xpof", "-", "-C", "/st"]
@@ -1769,7 +1854,13 @@ mod tests {
         fs::set_permissions(d.join("sub/f\nx"), fs::Permissions::from_mode(0o640)).unwrap();
         let from: Vec<OsString> = vec!["sh".into(), "-c".into(), {
             use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(&tar_out_cmd(&b(&src), b"-d it's")).to_os_string()
+            std::ffi::OsStr::from_bytes(&tar_out_cmd(
+                &crate::testutil::local_os(),
+                &b(&src),
+                b"-d it's",
+                src_dir_id(&Side::Local, &src).unwrap().as_bytes(),
+            ))
+            .to_os_string()
         }];
         let no = AtomicBool::new(false);
         let (oa, ob) = crate::session::run_pipe_cancellable(
@@ -1800,7 +1891,11 @@ mod tests {
             std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&back))).to_os_string()
         }];
         let (oa, ob) = crate::session::run_pipe_cancellable(
-            &local_tar_out(&src, std::ffi::OsStr::new("-d it's")),
+            &local_tar_out(
+                &src,
+                std::ffi::OsStr::new("-d it's"),
+                &src_dir_id(&Side::Local, &src).unwrap(),
+            ),
             &to,
             std::time::Duration::from_secs(30),
             &no,
@@ -2247,6 +2342,9 @@ mod tests {
         }
         if let Some(o) = crate::testutil::fake_quarantine(c) {
             return o;
+        }
+        if c.ends_with("&& stat -c %d:%i -- .") {
+            return ok("5:6\n"); // the source folder's dev:inode
         }
         if c.contains("| cksum") {
             return ok("1 2\n");
@@ -4036,7 +4134,11 @@ mod tests {
             std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&shell_in))).to_os_string()
         }];
         let (oa, ob) = crate::session::run_pipe_cancellable(
-            &local_tar_out(&src, std::ffi::OsStr::new("d")),
+            &local_tar_out(
+                &src,
+                std::ffi::OsStr::new("d"),
+                &src_dir_id(&Side::Local, &src).unwrap(),
+            ),
             &to,
             std::time::Duration::from_secs(30),
             &no,
@@ -4047,7 +4149,11 @@ mod tests {
         // local receiver
         let local_in = private_dir(t.path(), "local-in");
         let (oa, ob) = crate::session::run_pipe_cancellable(
-            &local_tar_out(&src, std::ffi::OsStr::new("d")),
+            &local_tar_out(
+                &src,
+                std::ffi::OsStr::new("d"),
+                &src_dir_id(&Side::Local, &src).unwrap(),
+            ),
             &local_tar_in(&local_in),
             std::time::Duration::from_secs(30),
             &no,
@@ -4225,5 +4331,37 @@ mod tests {
                 .any(|c| c.ends_with("|| exit 46") && c.contains("'/dst/b'")),
             "not placed"
         );
+    }
+
+    #[test]
+    fn real_a_source_folder_swapped_after_the_start_sends_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        let secret = private_dir(t.path(), "secret");
+        fs::write(src.join("f"), "mine").unwrap();
+        fs::write(secret.join("f"), "SECRET").unwrap();
+        let id = src_dir_id(&Side::Local, &src).unwrap();
+        // the folder becomes a link to another folder with the same names
+        fs::rename(&src, t.path().join("src.old")).unwrap();
+        std::os::unix::fs::symlink(&secret, &src).unwrap();
+        let no = AtomicBool::new(false);
+        let sink: Vec<OsString> = vec!["sh".into(), "-c".into(), "cat".into()];
+        let (oa, ob) = crate::session::run_pipe_cancellable(
+            &local_tar_out(&src, std::ffi::OsStr::new("f"), &id),
+            &sink,
+            std::time::Duration::from_secs(30),
+            &no,
+        );
+        assert_eq!(oa.code, Some(SRC_MOVED), "{oa:?}");
+        assert!(ob.stdout.is_empty(), "nothing read");
+        // the remote sender checks the same way
+        let out = sh(&tar_out_cmd(
+            &crate::testutil::local_os(),
+            &b(&src),
+            b"f",
+            id.as_bytes(),
+        ));
+        assert_eq!(out.status.code(), Some(SRC_MOVED));
+        assert!(out.stdout.is_empty());
     }
 }
