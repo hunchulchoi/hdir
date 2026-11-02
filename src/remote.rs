@@ -298,6 +298,8 @@ pub fn head_cmd(path: &[u8], max: usize) -> Vec<u8> {
 }
 
 /// Exit codes of [`preview_cmd`] for things that are not regular files.
+/// A directory preview counts at most this many entries (like the local one).
+pub const REMOTE_DIR_CAP: usize = 10_000;
 pub const PREVIEW_DIR: i32 = 20;
 pub const PREVIEW_SPECIAL: i32 = 21;
 pub const PREVIEW_MISSING: i32 = 22;
@@ -322,7 +324,14 @@ pub fn preview_cmd(os: &RemoteOs, path: &[u8], max: usize) -> Vec<u8> {
     cat(&[
         b"if [ -d ",
         &q,
-        format!(" ]; then exit {PREVIEW_DIR}; elif [ -f ").as_bytes(),
+        b" ]; then cd -- ",
+        &q,
+        b" || exit 1; [ -r . ] || { echo 'permission denied' >&2; exit 1; }; ",
+        format!(
+            "ls -Aq | head -n {} | wc -l; exit {PREVIEW_DIR}; elif [ -f ",
+            REMOTE_DIR_CAP + 1
+        )
+        .as_bytes(),
         &q,
         format!(" ]; then n=$({} ", stat_size_args(os)).as_bytes(),
         &q,
@@ -1186,7 +1195,9 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
     fn preview_cmd_classifies_then_prints_size_and_head() {
         assert_eq!(
             s(preview_cmd(&RemoteOs::Linux, b"/d/it's -x", 65539)),
-            "if [ -d '/d/it'\\''s -x' ]; then exit 20; \
+            "if [ -d '/d/it'\\''s -x' ]; then cd -- '/d/it'\\''s -x' || exit 1; \
+             [ -r . ] || { echo 'permission denied' >&2; exit 1; }; \
+             ls -Aq | head -n 10001 | wc -l; exit 20; \
              elif [ -f '/d/it'\\''s -x' ]; then n=$(stat -L -c %s -- '/d/it'\\''s -x') || exit 1; \
              printf '%s\\n' $n; head -c 65539 -- '/d/it'\\''s -x'; \
              elif [ -e '/d/it'\\''s -x' ]; then exit 21; \
@@ -1202,6 +1213,7 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             ),
             (20, 21, 22, 23)
         );
+        assert_eq!(REMOTE_DIR_CAP, 10_000);
     }
 
     #[test]

@@ -8639,12 +8639,12 @@ mod tests {
             script(&f, |a| {
                 crate::testutil::remote_cmd(a)
                     .filter(|c| c.starts_with("if [ -d "))
-                    .map(|_| out(crate::remote::PREVIEW_DIR, ""))
+                    .map(|_| out(crate::remote::PREVIEW_DIR, "1\n"))
             });
             app.preview_debounce = Duration::ZERO;
             app.set_mode(Mode::Dev);
             connect_prod(&mut app);
-            press(&mut app, KeyCode::Down); // sub (1 entry)
+            press(&mut app, KeyCode::Down); // sub (counted remotely)
             wait_preview(&mut app);
             assert_eq!(
                 app.preview_shown(),

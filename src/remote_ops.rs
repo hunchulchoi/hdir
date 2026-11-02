@@ -10,9 +10,10 @@ use crate::platform::{os_bytes, os_from_bytes};
 use crate::preview::{self, Limits, Preview};
 use crate::remote::{
     DELETE_NO_CWD, DELETE_NO_HOME, DELETE_PROTECTED, PREVIEW_BROKEN, PREVIEW_DIR, PREVIEW_MISSING,
-    PREVIEW_SPECIAL, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_CHANGED, REPLACE_GROUP,
-    REPLACE_NOT_OWNER, REPLACE_RESTORED, REPLACE_SIZE, delete_cmd, mkdir_cmd, mktemp_cmd,
-    preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd, stamp_cmd,
+    PREVIEW_SPECIAL, REMOTE_DIR_CAP, RENAME_EXISTS, REPLACE_BACKUP_KEPT, REPLACE_CHANGED,
+    REPLACE_GROUP, REPLACE_NOT_OWNER, REPLACE_RESTORED, REPLACE_SIZE, delete_cmd, mkdir_cmd,
+    mktemp_cmd, preview_cmd, rename_cmd, replace_cmd, resolve_cmd, rm_file_cmd, rmdir_cmd,
+    stamp_cmd,
 };
 use crate::remote::{Endpoint, scp_argv};
 use crate::session::{CmdOutput, RemoteSession, cd_cmd, first_line};
@@ -139,7 +140,7 @@ pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
     };
     match out.code {
         Some(0) => {}
-        Some(PREVIEW_DIR) => return remote_dir_info(s, path),
+        Some(PREVIEW_DIR) => return remote_dir_info(&out.stdout),
         Some(PREVIEW_SPECIAL) => {
             return Preview::Binary {
                 size: 0,
@@ -165,14 +166,19 @@ pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
     preview::classify_with(&out.stdout[nl + 1..], size, limits)
 }
 
-fn remote_dir_info(s: &RemoteSession, path: &Path) -> Preview {
-    match s.list(path, true) {
-        // The listing starts with "..", which is not an entry of the directory.
-        Ok((entries, _)) => {
-            let n = entries.iter().filter(|e| e.name != "..").count();
-            Preview::Info(format!("원격 디렉터리 · 항목 {n}개"))
+/// The preview script counts a directory's entries on the server (`ls -Aq`,
+/// one line per entry even for names with newlines), capped one past
+/// [`REMOTE_DIR_CAP`], so a huge directory never crosses the wire.
+fn remote_dir_info(stdout: &[u8]) -> Preview {
+    let n = std::str::from_utf8(stdout)
+        .ok()
+        .and_then(|t| t.trim().parse::<usize>().ok());
+    match n {
+        Some(n) if n > REMOTE_DIR_CAP => {
+            Preview::Info(format!("원격 디렉터리 · 항목 {REMOTE_DIR_CAP}개 이상"))
         }
-        Err(e) => Preview::Error(e),
+        Some(n) => Preview::Info(format!("원격 디렉터리 · 항목 {n}개")),
+        None => Preview::Error("원격 응답을 해석할 수 없음".into()),
     }
 }
 
@@ -556,8 +562,8 @@ mod tests {
     use crate::testutil::local_session;
     use std::os::unix::fs::symlink;
 
-    /// root/a/home/u (= $HOME, with a file), root/work/{link -> a/home,
-    /// up -> a, homelink -> a/home/u, plain}.
+    /// root/a/home/u (= $HOME, with a file), root/a/plain, root/work/{link ->
+    /// a/home, up -> a, homelink -> a/home/u, plain}.
     fn home_tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
@@ -566,6 +572,7 @@ mod tests {
         std::fs::write(home.join("keep.txt"), "x").unwrap();
         let work = root.join("work");
         std::fs::create_dir_all(work.join("plain")).unwrap();
+        std::fs::create_dir_all(root.join("a/plain")).unwrap(); // = work/up/plain
         symlink(root.join("a/home"), work.join("link")).unwrap();
         symlink(root.join("a"), work.join("up")).unwrap();
         symlink(&home, work.join("homelink")).unwrap();
@@ -590,7 +597,10 @@ mod tests {
         // ... including among other, harmless names
         let names = vec![OsString::from("plain"), OsString::from("home")];
         assert!(delete(&s, &work.join("up"), &names).is_err());
-        assert!(work.join("plain").exists(), "nothing is removed on refusal");
+        assert!(
+            work.join("up/plain").exists(),
+            "nothing is removed on refusal"
+        );
         assert!(home.join("keep.txt").exists());
     }
 
@@ -771,19 +781,81 @@ mod tests {
     }
 
     #[test]
-    fn preview_of_a_remote_dir_counts_entries() {
-        let f = FakeCmd::new(|a| {
-            let c = crate::testutil::remote_cmd(a).unwrap_or("");
-            if c.starts_with("if [ -d") {
-                code(20)
-            } else {
-                ok("f\t5\t1700000000.0\t644\t\ta\0d\t5\t1700000000.0\t755\t\tb\0")
-            }
+    fn preview_of_a_remote_dir_counts_entries_on_the_server() {
+        let f = FakeCmd::new(|_| CmdOutput {
+            code: Some(20),
+            stdout: b"       2\n".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            preview(&session(Arc::clone(&f)), &p("/srv/d"), Limits::PREVIEW),
+            Preview::Info("원격 디렉터리 · 항목 2개".into())
+        );
+        assert_eq!(f.remote_cmds().len(), 1, "no listing round trip");
+    }
+
+    #[test]
+    fn preview_of_a_huge_remote_dir_stops_at_the_cap() {
+        let over = format!("{}\n", crate::remote::REMOTE_DIR_CAP + 1);
+        let f = FakeCmd::new(move |_| CmdOutput {
+            code: Some(20),
+            stdout: over.clone().into_bytes(),
+            stderr: Vec::new(),
         });
         assert_eq!(
             preview(&session(f), &p("/srv/d"), Limits::PREVIEW),
-            Preview::Info("원격 디렉터리 · 항목 2개".into())
+            Preview::Info("원격 디렉터리 · 항목 10000개 이상".into())
         );
+        let bad = FakeCmd::new(|_| CmdOutput {
+            code: Some(20),
+            stdout: b"?\n".to_vec(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(
+            preview(&session(bad), &p("/srv/d"), Limits::PREVIEW),
+            Preview::Error("원격 응답을 해석할 수 없음".into())
+        );
+    }
+
+    #[test]
+    fn real_dir_preview_counts_odd_names_once_and_hidden_ones_too() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        for n in ["a b", "two\nlines", ".hidden", "한글"] {
+            std::fs::write(d.join(n), "x").unwrap();
+        }
+        std::fs::create_dir(d.join("sub")).unwrap();
+        let s = local_session(t.path());
+        assert_eq!(
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info("원격 디렉터리 · 항목 5개".into())
+        );
+        let empty = t.path().join("e");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(
+            preview(&s, &empty, Limits::PREVIEW),
+            Preview::Info("원격 디렉터리 · 항목 0개".into())
+        );
+    }
+
+    #[test]
+    fn real_dir_preview_of_an_unreadable_dir_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("locked");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("f"), "x").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let readable = std::fs::read_dir(&d).is_ok(); // root reads anything
+        let got = preview(&local_session(t.path()), &d, Limits::PREVIEW);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !readable {
+            assert!(
+                matches!(got, Preview::Error(ref e) if e.contains("permission denied")),
+                "{got:?}"
+            );
+        }
     }
 
     #[test]
