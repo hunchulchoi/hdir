@@ -209,17 +209,17 @@ pub(crate) fn human_size(size: u64) -> String {
 
 /// `path` with a leading home directory shortened to `~`.
 fn tilde(path: &std::path::Path) -> String {
-    let s = path.display().to_string();
-    if let Some(home) = dirs::home_dir() {
-        let h = home.display().to_string();
-        if s == h {
-            return "~".into();
-        }
-        if let Some(rest) = s.strip_prefix(&format!("{h}/")) {
-            return format!("~/{rest}");
-        }
+    tilde_with(path, dirs::home_dir().as_deref())
+}
+
+/// [`tilde`] against `home`, by whole path components (so `C:\\Users\\a`
+/// is home but `C:\\Users\\ab` is not), keeping the platform separator.
+fn tilde_with(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
+        None => path.display().to_string(),
     }
-    s
 }
 
 fn title_for(panel: &Panel, width: usize) -> String {
@@ -1920,5 +1920,23 @@ mod tests {
         );
         let r = rows_of(&buf);
         assert!(r[20].contains('…'), "cut with an ellipsis: {:?}", r[20]);
+    }
+}
+
+#[cfg(test)]
+mod tilde_tests {
+    use super::tilde_with;
+    use std::path::{MAIN_SEPARATOR as S, Path};
+
+    #[test]
+    fn home_is_shortened_by_whole_components() {
+        let home = Path::new("/home/a");
+        assert_eq!(tilde_with(Path::new("/home/a"), Some(home)), "~");
+        assert_eq!(
+            tilde_with(&home.join("x").join("y"), Some(home)),
+            format!("~{S}x{S}y")
+        );
+        assert_eq!(tilde_with(Path::new("/home/ab"), Some(home)), "/home/ab");
+        assert_eq!(tilde_with(Path::new("/srv"), None), "/srv");
     }
 }

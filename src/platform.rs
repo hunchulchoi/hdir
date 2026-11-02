@@ -1148,3 +1148,41 @@ mod src_at_tests {
         assert!(open_src_dir(None, &d).unwrap().is_none(), "a link: refused");
     }
 }
+
+/// Roots of the drives set in a `GetLogicalDrives` bit mask (bit 0 = `A:`).
+pub fn drive_roots_from_mask(mask: u32) -> Vec<std::path::PathBuf> {
+    (0..26u8)
+        .filter(|i| mask & (1 << i) != 0)
+        .map(|i| std::path::PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
+        .collect()
+}
+
+/// The drives present on this machine (`C:\\`, `D:\\`, ...); none off Windows.
+pub fn drive_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        // SAFETY: no arguments, no preconditions.
+        let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        drive_roots_from_mask(mask)
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::drive_roots_from_mask;
+    use std::path::PathBuf;
+
+    #[test]
+    fn mask_bits_are_drive_letters() {
+        assert_eq!(
+            drive_roots_from_mask(0b1100),
+            vec![PathBuf::from("C:\\"), PathBuf::from("D:\\")]
+        );
+        assert!(drive_roots_from_mask(0).is_empty());
+        assert_eq!(drive_roots_from_mask(1 << 25), vec![PathBuf::from("Z:\\")]);
+    }
+}

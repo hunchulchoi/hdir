@@ -212,6 +212,7 @@ pub fn resolve_cd(
             .map(Path::to_path_buf)
             .ok_or_else(|| "이전 디렉터리 없음".to_string()),
         CdTarget::Path(p) => {
+            let p = &drive_root(p, cfg!(windows));
             let full = join_raw(cwd, p);
             canonical_dir(&full).map_err(|e| format!("{}: {e}", p.display()))
         }
@@ -669,5 +670,30 @@ mod shell_tests {
         );
         std::fs::write(d.path().join("pwsh.exe"), "").unwrap();
         assert_eq!(default_shell(None, Some(d.path().into()), true), "pwsh");
+    }
+}
+
+/// `D:` alone means the drive's current folder to Windows; hdir has none,
+/// so it is that drive's root (`D:\\`). Anything else is unchanged.
+pub fn drive_root(p: &Path, windows: bool) -> PathBuf {
+    let s = p.as_os_str().to_string_lossy();
+    let b = s.as_bytes();
+    if windows && b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return PathBuf::from(format!("{s}\\"));
+    }
+    p.to_path_buf()
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_drive_letter_is_its_root_on_windows_only() {
+        assert_eq!(drive_root(Path::new("d:"), true), PathBuf::from("d:\\"));
+        assert_eq!(drive_root(Path::new("D:"), false), PathBuf::from("D:"));
+        for p in ["D:\\x", "DD:", "1:", "x"] {
+            assert_eq!(drive_root(Path::new(p), true), PathBuf::from(p));
+        }
     }
 }

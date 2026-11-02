@@ -123,9 +123,11 @@ enum MenuKind {
         /// Set when `path` is on a remote host.
         session: Option<Arc<RemoteSession>>,
     },
-    /// Alt+F1/F2 location picker for `panel`: item 0 is local, then `servers`.
+    /// Alt+F1/F2 location picker for `panel`: item 0 is local, then the
+    /// drive roots (Windows), then `servers`.
     Location {
         panel: usize,
+        drives: Vec<PathBuf>,
         servers: Vec<Server>,
     },
 }
@@ -619,6 +621,8 @@ pub struct App {
     pub ssh_hosts: Vec<SshHost>,
     /// `~/.ssh/config` to read in `configure`.
     pub ssh_config_path: Option<PathBuf>,
+    /// Drive roots offered in the location menu (Windows; empty elsewhere).
+    pub drives: Vec<PathBuf>,
     /// Per panel: the local directory to return to with `:local`.
     local_cwds: [Option<PathBuf>; 2],
     /// Per panel: generation of the connect attempt in flight.
@@ -717,6 +721,7 @@ impl App {
             control_path: session::control_path(dirs::cache_dir().as_deref(), current_uid()),
             ssh_hosts: Vec::new(),
             ssh_config_path: None,
+            drives: crate::platform::drive_roots(),
             local_cwds: [None, None],
             connecting: [None, None],
             connect_gen: 0,
@@ -909,14 +914,23 @@ impl App {
         let theme_names = match &open.kind {
             MenuKind::Theme(names) => Some(names.clone()),
             MenuKind::Main => None,
-            MenuKind::Location { panel, servers } => {
-                let (panel, servers) = (*panel, servers.clone());
+            MenuKind::Location {
+                panel,
+                drives,
+                servers,
+            } => {
+                let (panel, drives, servers) = (*panel, drives.clone(), servers.clone());
                 match event {
                     MenuEvent::Chosen(i) => {
                         self.menu = None;
-                        match i.checked_sub(1).and_then(|n| servers.get(n)) {
-                            None => self.switch_local(panel),
-                            Some(sv) => self.connect_server(panel, sv.clone(), None),
+                        let n = i.checked_sub(1);
+                        if let Some(root) = n.and_then(|n| drives.get(n)) {
+                            self.go_local_dir(panel, root.clone());
+                        } else {
+                            match n.and_then(|n| servers.get(n - drives.len())) {
+                                None => self.switch_local(panel),
+                                Some(sv) => self.connect_server(panel, sv.clone(), None),
+                            }
                         }
                     }
                     MenuEvent::Cancelled => self.menu = None,
@@ -1219,7 +1233,9 @@ impl App {
     /// Alt+F1/F2: choose local or a server for panel `idx`.
     fn open_location_menu(&mut self, idx: usize) {
         let servers = self.servers();
+        let drives = self.drives.clone();
         let mut items = vec!["로컬".to_string()];
+        items.extend(drives.iter().map(|d| format!("{}  드라이브", d.display())));
         items.extend(servers.iter().map(|s| {
             // ssh aliases show where they point (user@hostname) when known.
             let detail = self
@@ -1250,6 +1266,7 @@ impl App {
             menu: Menu::new(title, items, 0),
             kind: MenuKind::Location {
                 panel: idx,
+                drives,
                 servers,
             },
         });
@@ -1454,6 +1471,24 @@ impl App {
     }
 
     /// `:local` / picking "로컬": back to the last local directory.
+    /// Show the local folder `dir` in panel `idx` (leaving a server if it
+    /// showed one): a drive picked in the location menu.
+    fn go_local_dir(&mut self, idx: usize, dir: PathBuf) {
+        self.connecting[idx] = None;
+        self.pending_master.retain(|j| j.idx != idx);
+        self.invalidate_probe();
+        self.status = None;
+        if self.panels[idx].location.is_remote() {
+            self.prev_dirs[idx] = None;
+            self.panels[idx].set_location(Location::Local, dir);
+            self.reload_panel(idx, None);
+            return;
+        }
+        let id = self.next_id();
+        let req = self.panels[idx].begin_change_dir(id, dir, None, LoadKind::Enter);
+        self.dispatch(idx, req);
+    }
+
     fn switch_local(&mut self, idx: usize) {
         self.connecting[idx] = None;
         self.pending_master.retain(|j| j.idx != idx);
@@ -4433,6 +4468,24 @@ mod tests {
         let (_t2, mut app2) = fixture();
         press(&mut app2, KeyCode::Insert);
         assert!(app2.panels[0].selected.is_empty());
+    }
+
+    #[test]
+    fn a_drive_picked_in_the_location_menu_opens_its_root() {
+        let (t, mut app) = fixture();
+        let (c, d) = (t.path().join("adir"), t.path().join("bdir"));
+        app.drives = vec![c.clone(), d.clone()];
+        press_mods(&mut app, KeyCode::F(2), KeyModifiers::ALT);
+        let items = app.menu.as_ref().expect("location menu").menu.items.clone();
+        assert_eq!(items[0], "로컬");
+        assert!(items[2].starts_with(&d.display().to_string()), "{items:?}");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert!(app.menu.is_none());
+        assert_eq!(app.panels[1].cwd, d);
+        assert_ne!(app.panels[0].cwd, d, "the other panel stays");
     }
 
     #[test]
