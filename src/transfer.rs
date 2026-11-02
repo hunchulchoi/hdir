@@ -191,7 +191,58 @@ pub fn tar_out_cmd(dir: &[u8], name: &[u8]) -> Vec<u8> {
 /// Remote side of a transfer stream: unpack stdin into `stage`, keeping
 /// modes (`-p`) but not the sender's owners (`-o`).
 pub fn tar_in_cmd(stage: &[u8]) -> Vec<u8> {
-    cat(&[b"cd -- ", &sh_quote(stage), b" || exit 1; tar -xpof -"])
+    cat(&[
+        b"cd -- ",
+        &sh_quote(stage),
+        b" || exit 1; tar -xpof - || exit 1; ",
+        STRIP_SETID,
+    ])
+}
+
+/// Clears setuid / setgid on every regular file under `.`: kept modes must
+/// not turn a received program into a privilege for whoever unpacked it.
+const STRIP_SETID: &[u8] =
+    b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +";
+
+/// [`STRIP_SETID`] for a local stage (links are never followed).
+#[cfg(unix)]
+fn strip_setid(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(q) = todo.pop() {
+        let m = std::fs::symlink_metadata(&q)?;
+        if m.is_dir() {
+            for e in std::fs::read_dir(&q)? {
+                todo.push(e?.path());
+            }
+        } else if m.is_file() && m.permissions().mode() & 0o6000 != 0 {
+            let mode = m.permissions().mode() & !0o6000;
+            std::fs::set_permissions(&q, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn strip_setid(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Exit 0 when `a` and `b` are on the same filesystem (device), else not.
+pub fn same_fs_cmd(os: &RemoteOs, a: &[u8], b: &[u8]) -> Vec<u8> {
+    let st: &[u8] = match os {
+        RemoteOs::Bsd => b"stat -f %d -- ",
+        RemoteOs::Linux | RemoteOs::Other(_) => b"stat -c %d -- ",
+    };
+    cat(&[
+        b"x=$(",
+        st,
+        &sh_quote(a),
+        b") && y=$(",
+        st,
+        &sh_quote(b),
+        b") && [ -n \"$x\" ] && [ \"$x\" = \"$y\" ]",
+    ])
 }
 
 /// Local `tar` writing `dir/name` to stdout. On macOS without AppleDouble
@@ -1017,7 +1068,12 @@ fn send(
         }
     }
     match (oa.code, ob.code) {
-        (Some(0), Some(0)) => Ok(()),
+        (Some(0), Some(0)) => match stage {
+            Stage::Local(t, _) => {
+                strip_setid(t.path()).map_err(|e| format!("받은 파일 권한 정리 실패: {e}"))
+            }
+            Stage::Remote(..) => Ok(()),
+        },
         // the side that failed first; a reader that died leaves the writer
         // with a broken pipe, and a writer that died leaves a short archive
         (Some(0), _) => Err(code_err(&ob)),
@@ -1159,7 +1215,6 @@ fn item(
         Err(e) => return fail(e),
     }
     let is_move = spec.kind == JobKind::Move;
-    let on_host_move = is_move && matches!(route, Route::SameHost(_));
     // A folder sent into itself (one machine seen through two names, ssh
     // to localhost): the copy would keep copying its own stage.
     match dir_id(&spec.src, &src) {
@@ -1167,18 +1222,30 @@ fn item(
         Ok(_) => {}
         Err(e) => return fail(e),
     }
+    let stage = match make_stage(&spec.dst, &spec.dest_dir, real) {
+        Ok(st) => st,
+        Err(e) => return fail(e),
+    };
+    // A move on one server is a rename, but only within one filesystem:
+    // across them `mv` copies and deletes, unchecked, so that case takes the
+    // copy, check and delete path of the other routes.
+    let on_host_move = is_move
+        && match (route, &stage) {
+            (Route::SameHost(s), Stage::Remote(_, _, p)) => {
+                let cmd = same_fs_cmd(&s.os, &b(&src), p);
+                matches!(s.exec(&cmd), Ok(o) if o.code == Some(0))
+            }
+            _ => false,
+        };
     // A move deletes the source only if it is still what was sent: not
     // changed meanwhile, and not replaced by the copy (the same file reached
     // through two connections, ssh to localhost).
     let before = (is_move && !on_host_move)
         .then(|| stamp(&spec.src, &spec.src_dir, name, ctl.cancel_flag()));
     if ctl.is_cancelled() {
+        r.warnings.extend(discard(stage));
         return Step::Stop(OpOutcome::Cancelled);
     }
-    let stage = match make_stage(&spec.dst, &spec.dest_dir, real) {
-        Ok(st) => st,
-        Err(e) => return fail(e),
-    };
     // On one server a move first renames the source into the stage (a copy
     // there when it crosses filesystems), then places it like any item, so
     // an existing target is never written over in place.
@@ -1589,7 +1656,9 @@ mod tests {
         );
         assert_eq!(
             tar_in_cmd(b"/d/.hdir-xfer.1"),
-            b"cd -- '/d/.hdir-xfer.1' || exit 1; tar -xpof -".to_vec()
+            b"cd -- '/d/.hdir-xfer.1' || exit 1; tar -xpof - || exit 1; \
+              find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +"
+                .to_vec()
         );
         let out = local_tar_out(Path::new("/s"), std::ffi::OsStr::new("-x"));
         let tail: Vec<&str> = out[out.len() - 5..]
@@ -3915,5 +3984,105 @@ mod tests {
                 "{cmds:?}"
             );
         }
+    }
+
+    #[test]
+    fn real_received_programs_lose_setuid_and_setgid() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        fs::create_dir(src.join("d")).unwrap();
+        fs::write(src.join("d/prog"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(src.join("d/prog"), fs::Permissions::from_mode(0o4755)).unwrap();
+        fs::write(src.join("d/plain"), "x").unwrap();
+        fs::set_permissions(src.join("d/plain"), fs::Permissions::from_mode(0o640)).unwrap();
+        if fs::metadata(src.join("d/prog"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o4000
+            == 0
+        {
+            return; // this filesystem drops setuid itself
+        }
+        let no = AtomicBool::new(false);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        // shell side (remote receiver)
+        let shell_in = private_dir(t.path(), "shell-in");
+        let to: Vec<OsString> = vec!["sh".into(), "-c".into(), {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&shell_in))).to_os_string()
+        }];
+        let (oa, ob) = crate::session::run_pipe_cancellable(
+            &local_tar_out(&src, std::ffi::OsStr::new("d")),
+            &to,
+            std::time::Duration::from_secs(30),
+            &no,
+        );
+        assert_eq!((oa.code, ob.code), (Some(0), Some(0)), "{oa:?} {ob:?}");
+        assert_eq!(mode(&shell_in.join("d/prog")), 0o755);
+        assert_eq!(mode(&shell_in.join("d/plain")), 0o640, "other modes kept");
+        // local receiver
+        let local_in = private_dir(t.path(), "local-in");
+        let (oa, ob) = crate::session::run_pipe_cancellable(
+            &local_tar_out(&src, std::ffi::OsStr::new("d")),
+            &local_tar_in(&local_in),
+            std::time::Duration::from_secs(30),
+            &no,
+        );
+        assert_eq!((oa.code, ob.code), (Some(0), Some(0)));
+        strip_setid(&local_in).unwrap();
+        assert_eq!(mode(&local_in.join("d/prog")), 0o755);
+    }
+
+    #[test]
+    fn a_same_server_move_across_filesystems_is_copied_checked_and_deleted() {
+        let placed = Arc::new(AtomicBool::new(false));
+        let p2 = Arc::clone(&placed);
+        let f = FakeCmd::new(move |a| {
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.starts_with("x=$(stat") {
+                return code(1); // different devices
+            }
+            if c.ends_with("|| exit 46") {
+                p2.store(true, Ordering::SeqCst);
+                return code(0);
+            }
+            if c.starts_with("if [ -L '/dst/b'") && p2.load(Ordering::SeqCst) {
+                return code(IS_OTHER);
+            }
+            answer(c, &[], &[], "0\x00")
+        });
+        let sess = session(Arc::clone(&f));
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(Arc::clone(&sess)),
+            &p("/srv"),
+            &["b"],
+            Side::Remote(sess),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            (r.outcome, r.copied),
+            (OpOutcome::Done, 1),
+            "{:?}",
+            r.warnings
+        );
+        let cmds = f.remote_cmds();
+        assert!(
+            !cmds.iter().any(|c| c.starts_with("mv -- '/srv/b'")),
+            "no cross-filesystem mv: {cmds:?}"
+        );
+        assert!(cmds.contains(&format!("cp -Rp -- '/srv/b' '{STAGE}/'")));
+        let q = cmds
+            .iter()
+            .position(|c| c.contains("mktemp -d .hdir-del."))
+            .expect("set aside");
+        let rm = cmds
+            .iter()
+            .position(|c| c.contains("rm -rf"))
+            .expect("deleted");
+        assert!(q < rm);
     }
 }
