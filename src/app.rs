@@ -49,9 +49,12 @@ pub type UndoRunner = Arc<dyn Fn(UndoOp) -> UndoApplied + Send + Sync>;
 /// What a currently open dialog will do once answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingAction {
-    Mkdir,
+    Mkdir {
+        at: PanelsAt,
+    },
     Rename {
         from: PathBuf,
+        at: PanelsAt,
     },
     Trash {
         paths: Vec<PathBuf>,
@@ -67,6 +70,9 @@ pub enum PendingAction {
     Transfer {
         kind: JobKind,
         sources: Vec<PathBuf>,
+        /// The panels when it opened: a connect or a load may change them
+        /// before Enter, and the names belong to what was shown then.
+        at: PanelsAt,
     },
     /// Answer to a worker's overwrite question.
     Conflict,
@@ -632,6 +638,16 @@ pub struct App {
     connect_rx: Receiver<ConnectMsg>,
     /// Connects that need the terminal for ssh's prompts, in request order.
     pending_master: VecDeque<ConnectJob>,
+}
+
+/// A prompt answered after its panels moved (a connect or a load landed).
+const PANELS_CHANGED_MSG: &str = "패널이 바뀌어 작업을 취소함";
+
+/// Which panel was active and where each one was (server and folder).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelsAt {
+    active: usize,
+    at: [(Option<usize>, PathBuf); 2],
 }
 
 impl Default for App {
@@ -2522,10 +2538,22 @@ impl App {
         };
         let initial = self.other_panel().cwd.to_string_lossy().into_owned();
         self.status = None;
+        let at = self.panels_at();
         self.dialog = Some((
             Dialog::input(title, "대상 경로:", &initial),
-            PendingAction::Transfer { kind, sources },
+            PendingAction::Transfer { kind, sources, at },
         ));
+    }
+
+    fn panels_at(&self) -> PanelsAt {
+        let one = |p: &Panel| {
+            let server = p.location.session().map(|s| Arc::as_ptr(s) as usize);
+            (server, p.cwd.clone())
+        };
+        PanelsAt {
+            active: self.active,
+            at: [one(&self.panels[0]), one(&self.panels[1])],
+        }
     }
 
     fn start_job(&mut self, kind: JobKind, sources: Vec<PathBuf>, input: &str) {
@@ -3041,9 +3069,10 @@ impl App {
 
     fn open_mkdir(&mut self) {
         self.status = None;
+        let at = self.panels_at();
         self.dialog = Some((
             Dialog::input("새 폴더", "폴더 이름:", ""),
-            PendingAction::Mkdir,
+            PendingAction::Mkdir { at },
         ));
     }
 
@@ -3055,9 +3084,10 @@ impl App {
         let from = panel.cwd.join(&e.os_name);
         let name = e.os_name.to_string_lossy().into_owned();
         self.status = None;
+        let at = self.panels_at();
         self.dialog = Some((
             Dialog::input("이름 변경", "새 이름:", &name),
-            PendingAction::Rename { from },
+            PendingAction::Rename { from, at },
         ));
     }
 
@@ -3332,7 +3362,14 @@ impl App {
             return;
         };
         match (action, result) {
-            (PendingAction::Mkdir, DialogResult::Submitted(name)) => {
+            (PendingAction::Mkdir { at }, DialogResult::Submitted(_))
+            | (PendingAction::Rename { at, .. }, DialogResult::Submitted(_))
+            | (PendingAction::Transfer { at, .. }, DialogResult::Submitted(_))
+                if at != self.panels_at() =>
+            {
+                self.status = Some(PANELS_CHANGED_MSG.into());
+            }
+            (PendingAction::Mkdir { .. }, DialogResult::Submitted(name)) => {
                 if self.busy() {
                     self.status = Some("작업 진행 중".into());
                     return;
@@ -3363,7 +3400,7 @@ impl App {
                 ));
                 self.status = Some("폴더 생성 중…".into());
             }
-            (PendingAction::Rename { from }, DialogResult::Submitted(name)) => {
+            (PendingAction::Rename { from, .. }, DialogResult::Submitted(name)) => {
                 if self.busy() {
                     self.status = Some("작업 진행 중".into());
                     return;
@@ -3440,7 +3477,7 @@ impl App {
                 }));
                 self.status = Some("영구 삭제 중…".into());
             }
-            (PendingAction::Transfer { kind, sources }, DialogResult::Submitted(input)) => {
+            (PendingAction::Transfer { kind, sources, .. }, DialogResult::Submitted(input)) => {
                 self.start_job(kind, sources, &input);
             }
             (PendingAction::Conflict, result) => {
@@ -4436,7 +4473,7 @@ mod tests {
     #[test]
     fn enter_dir_and_backspace_returns_to_it() {
         let (tmp, mut app) = fixture();
-        let root = fs::canonicalize(tmp.path()).unwrap();
+        let root = crate::platform::canonicalize(tmp.path()).unwrap();
         press(&mut app, KeyCode::Down); // adir
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
@@ -9777,6 +9814,58 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             wait_job(&mut app);
             assert_eq!(scps(&f)[0].1, "prod-web:/srv/data/sub/.hdir-xfer.ABC123");
+        }
+
+        #[test]
+        fn mkdir_and_rename_prompts_are_dropped_when_the_panel_changed() {
+            for key in [KeyCode::F(7), KeyCode::F(2)] {
+                let (_t, mut app, f) = env();
+                remote_has(&f, &[]);
+                alt(&mut app, 1);
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Enter);
+                cursor_to(&mut app, "f.txt");
+                press(&mut app, key);
+                assert!(app.dialog.is_some(), "{key:?}");
+                wait_remote(&mut app);
+                assert!(app.panels[0].location.is_remote());
+                type_str(&mut app, "x");
+                press(&mut app, KeyCode::Enter);
+                assert!(app.task.is_none(), "{key:?}: nothing runs on the server");
+                assert!(
+                    app.status.as_deref().is_some_and(|s| s.contains("바뀌어")),
+                    "{key:?}: {:?}",
+                    app.status
+                );
+            }
+        }
+
+        #[test]
+        fn a_transfer_prompt_is_dropped_when_its_panels_changed_meanwhile() {
+            let (t, mut app, f) = env();
+            remote_has(&f, &[]);
+            // the left panel starts connecting; F6 on a local file meanwhile
+            alt(&mut app, 1);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert!(!app.panels[0].location.is_remote(), "still local");
+            cursor_to(&mut app, "f.txt");
+            press(&mut app, KeyCode::F(6));
+            assert!(matches!(
+                app.dialog,
+                Some((_, PendingAction::Transfer { .. }))
+            ));
+            wait_remote(&mut app);
+            assert!(app.panels[0].location.is_remote(), "the connect landed");
+            press(&mut app, KeyCode::Enter);
+            assert!(app.job.is_none(), "nothing runs on the new server");
+            assert!(
+                app.status.as_deref().is_some_and(|s| s.contains("바뀌어")),
+                "{:?}",
+                app.status
+            );
+            assert!(t.path().join("f.txt").exists());
+            assert!(scps(&f).is_empty());
         }
 
         #[test]

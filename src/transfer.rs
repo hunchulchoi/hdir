@@ -1076,6 +1076,7 @@ fn left_behind(path: &str) -> String {
 }
 
 /// How placing went.
+#[derive(Debug)]
 enum Placed {
     /// In place; maybe with a warning (the stage stayed).
     Done(Option<String>),
@@ -1098,9 +1099,10 @@ fn place(
         Stage::Local(t, real) => {
             let (src, to) = (t.path().join(name), real.join(name));
             // rename(2) replaces a file or symlink at the target and never
-            // follows it; the no-replace form keeps anything there.
+            // follows it (on Windows also a read-only file, once approved);
+            // the no-replace form keeps anything there.
             let res = if replace {
-                std::fs::rename(&src, &to)
+                crate::platform::rename_replace(&src, &to)
             } else {
                 crate::fs_ops::rename_noreplace(&src, &to)
             };
@@ -4964,5 +4966,36 @@ mod windows_stamp_tests {
             .set_modified(mtime)
             .unwrap();
         assert_ne!(stamp(&Side::Local, t.path(), &name, &no).unwrap(), before);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_place_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn an_approved_overwrite_replaces_a_read_only_file() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = t.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let old = dest.join("a.txt");
+        fs::write(&old, "old").unwrap();
+        let mut ro = fs::metadata(&old).unwrap().permissions();
+        ro.set_readonly(true);
+        fs::set_permissions(&old, ro).unwrap();
+        let stage = tempfile::Builder::new()
+            .prefix(STAGE_PREFIX)
+            .tempdir_in(&dest)
+            .unwrap();
+        fs::write(stage.path().join("a.txt"), "new").unwrap();
+        let r = place(
+            Stage::Local(stage, dest.clone()),
+            &"a.txt".into(),
+            true,
+            None,
+        );
+        assert!(matches!(r, Ok(Placed::Done(None))), "{r:?}");
+        assert_eq!(fs::read(&old).unwrap(), b"new");
     }
 }
