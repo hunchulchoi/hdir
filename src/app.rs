@@ -9883,6 +9883,7 @@ mod tests {
     #[test]
     fn ssh_connect_on_windows_is_a_stub() {
         let (_t, mut app) = fixture();
+        app.drives.clear(); // the server is then item 1
         app.settings.config.servers = vec![crate::servers::ServerConfig {
             name: Some("prod".into()),
             host: Some("prod-web".into()),
