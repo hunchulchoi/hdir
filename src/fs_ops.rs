@@ -987,7 +987,7 @@ impl std::fmt::Display for CleanupFailed {
 impl std::error::Error for CleanupFailed {}
 
 /// Rename that never replaces an existing `to` (atomic where the OS supports it).
-fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     rename_noreplace_with(from, to, &rename_noreplace_os, &|a, b| fs::hard_link(a, b))
 }
 

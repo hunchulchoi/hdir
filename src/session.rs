@@ -51,7 +51,15 @@ pub trait Cmd: Send + Sync {
     fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
         self.run(argv)
     }
+    /// Like [`run_transfer`](Self::run_transfer), but stopped (with
+    /// [`CANCELLED_MSG`]) as soon as `cancel` is set.
+    fn run_cancellable(&self, argv: &[OsString], _cancel: &AtomicBool) -> CmdOutput {
+        self.run_transfer(argv)
+    }
 }
+
+/// Stderr text of a command stopped through its cancel flag.
+pub const CANCELLED_MSG: &str = "취소됨";
 
 /// Stderr text of a command that was killed for running too long.
 pub const TIMEOUT_MSG: &str = "시간 초과";
@@ -68,16 +76,33 @@ pub struct SystemCmd;
 /// Run `argv` to completion with captured output, killing it after `limit`
 /// (then `code` is `None` and stderr is [`TIMEOUT_MSG`]).
 pub fn run_limited(argv: &[OsString], limit: Duration) -> CmdOutput {
+    run_with(argv, limit, None)
+}
+
+/// Like [`run_limited`], also stopped once `cancel` is set (then `code` is
+/// `None` and stderr is [`CANCELLED_MSG`]). On unix the command gets its own
+/// process group and the whole group is killed, so helpers it spawned (scp's
+/// ssh) cannot keep the output pipes open.
+pub fn run_cancellable(argv: &[OsString], limit: Duration, cancel: &AtomicBool) -> CmdOutput {
+    run_with(argv, limit, Some(cancel))
+}
+
+fn run_with(argv: &[OsString], limit: Duration, cancel: Option<&AtomicBool>) -> CmdOutput {
     let Some((prog, args)) = argv.split_first() else {
         return spawn_failed("empty command");
     };
-    let mut child = match Command::new(prog)
+    let mut command = Command::new(prog);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if cancel.is_some() {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return spawn_failed(&format!("{}: {e}", prog.to_string_lossy())),
     };
@@ -93,11 +118,13 @@ pub fn run_limited(argv: &[OsString], limit: Duration) -> CmdOutput {
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
     let deadline = Instant::now() + limit;
+    let mut cancelled = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+            Ok(None) if Instant::now() >= deadline || cancel.is_some_and(is_set) => {
+                cancelled = Instant::now() < deadline;
+                kill_tree(&mut child, cancel.is_some());
                 let _ = child.wait();
                 break None;
             }
@@ -113,8 +140,27 @@ pub fn run_limited(argv: &[OsString], limit: Duration) -> CmdOutput {
             stdout,
             stderr,
         },
+        None if cancelled => spawn_failed(CANCELLED_MSG),
         None => spawn_failed(TIMEOUT_MSG),
     }
+}
+
+fn is_set(flag: &AtomicBool) -> bool {
+    flag.load(Ordering::SeqCst)
+}
+
+/// Kill `child`, and its whole process group when it leads one.
+fn kill_tree(child: &mut std::process::Child, group: bool) {
+    #[cfg(unix)]
+    if group && let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: plain syscall; the group id is our own child's pid.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = group;
+    let _ = child.kill();
 }
 
 impl Cmd for SystemCmd {
@@ -123,6 +169,9 @@ impl Cmd for SystemCmd {
     }
     fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
         run_limited(argv, TRANSFER_TIMEOUT)
+    }
+    fn run_cancellable(&self, argv: &[OsString], cancel: &AtomicBool) -> CmdOutput {
+        run_cancellable(argv, TRANSFER_TIMEOUT, cancel)
     }
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
         let Some((prog, args)) = argv.split_first() else {
@@ -268,6 +317,44 @@ impl RemoteSession {
             return Err(SessionError::Disconnected);
         }
         let out = self.cmd.run_transfer(argv);
+        match out.code {
+            Some(255) => {
+                self.set_alive(false);
+                Err(SessionError::Disconnected)
+            }
+            None => Err(SessionError::Spawn(first_line(
+                &out.stderr,
+                "scp 실행 실패",
+            ))),
+            Some(_) => Ok(out),
+        }
+    }
+
+    /// Like [`exec_long`](Self::exec_long), stopped when `cancel` is set.
+    pub fn exec_cancellable(
+        &self,
+        remote_cmd: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<CmdOutput, SessionError> {
+        if !self.is_alive() {
+            return Err(SessionError::Disconnected);
+        }
+        let out = self
+            .cmd
+            .run_cancellable(&exec_argv(&self.target, remote_cmd), cancel);
+        self.exec_result(out)
+    }
+
+    /// Like [`scp`](Self::scp), stopped when `cancel` is set.
+    pub fn scp_cancellable(
+        &self,
+        argv: &[OsString],
+        cancel: &AtomicBool,
+    ) -> Result<CmdOutput, SessionError> {
+        if !self.is_alive() {
+            return Err(SessionError::Disconnected);
+        }
+        let out = self.cmd.run_cancellable(argv, cancel);
         match out.code {
             Some(255) => {
                 self.set_alive(false);
@@ -515,6 +602,7 @@ mod tests {
     struct Fake {
         log: Mutex<Vec<Vec<String>>>,
         interactive: Mutex<Vec<Vec<String>>>,
+        cancellable: Mutex<usize>,
         respond: Responder,
     }
 
@@ -523,6 +611,7 @@ mod tests {
             Arc::new(Self {
                 log: Mutex::new(Vec::new()),
                 interactive: Mutex::new(Vec::new()),
+                cancellable: Mutex::new(0),
                 respond: Box::new(respond),
             })
         }
@@ -547,6 +636,10 @@ mod tests {
             let a = strs(argv);
             self.interactive.lock().unwrap().push(a.clone());
             (self.respond)(&a)
+        }
+        fn run_cancellable(&self, argv: &[OsString], _cancel: &AtomicBool) -> CmdOutput {
+            *self.cancellable.lock().unwrap() += 1;
+            self.run(argv)
         }
     }
 
@@ -657,6 +750,68 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(o.code, None);
         assert_eq!(first_line(&o.stderr, ""), TIMEOUT_MSG);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cancellable_stops_the_child_and_its_children_when_cancelled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            c2.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        // The grandchild keeps stderr open; it must die with the group.
+        let argv: Vec<OsString> = vec!["sh".into(), "-c".into(), "sleep 30 & sleep 30".into()];
+        let o = run_cancellable(&argv, Duration::from_secs(60), &cancel);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(o.code, None);
+        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cancellable_returns_normally_when_not_cancelled() {
+        let cancel = AtomicBool::new(false);
+        let argv: Vec<OsString> = vec!["sh".into(), "-c".into(), "printf hi; exit 4".into()];
+        let o = run_cancellable(&argv, Duration::from_secs(5), &cancel);
+        assert_eq!((o.code, o.stdout.as_slice()), (Some(4), &b"hi"[..]));
+    }
+
+    #[test]
+    fn cancellable_session_calls_use_the_cancellable_runner() {
+        let f = Fake::new(|_| CmdOutput {
+            code: Some(0),
+            ..CmdOutput::default()
+        });
+        let s = session_with(Arc::clone(&f), RemoteOs::Linux);
+        let cancel = AtomicBool::new(false);
+        s.exec_cancellable(b"cp a b", &cancel).unwrap();
+        s.scp_cancellable(&["scp".into(), "x".into()], &cancel)
+            .unwrap();
+        assert_eq!(*f.cancellable.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn a_cancellable_call_exiting_255_marks_the_session_dead() {
+        let f = Fake::new(|_| CmdOutput {
+            code: Some(255),
+            ..CmdOutput::default()
+        });
+        let s = session_with(f, RemoteOs::Linux);
+        let cancel = AtomicBool::new(false);
+        let e = s.scp_cancellable(&["scp".into()], &cancel).unwrap_err();
+        assert_eq!(e, SessionError::Disconnected);
+        assert!(!s.is_alive());
+        assert_eq!(
+            s.exec_cancellable(b"x", &cancel).unwrap_err(),
+            SessionError::Disconnected
+        );
     }
 
     #[cfg(unix)]

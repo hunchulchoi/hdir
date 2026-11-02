@@ -480,6 +480,20 @@ pub fn mktemp_cmd(os: &RemoteOs, dir: &[u8]) -> Vec<u8> {
         template.push(b'/');
     }
     template.extend_from_slice(b".hdir-edit.XXXXXX");
+    cat(&[
+        &safe_dirs_check(os, &sh_quote(&d)),
+        b"t=$(mktemp ",
+        &sh_quote(&template),
+        b") || exit 1; printf '%s\\0' \"$t\"",
+    ])
+}
+
+/// Shell that exits [`UNSAFE_DIR`] unless every directory from `start` (a
+/// shell word naming an absolute, physical path) up to `/` is safe to
+/// create a private temp entry in (see [`mktemp_cmd`] for the rules). Uses
+/// the variables `me c o a l m k w g u e p` and the function `chk`. Exits 1
+/// when a check itself fails.
+pub fn safe_dirs_check(os: &RemoteOs, start: &[u8]) -> Vec<u8> {
     let gid = stat_gid_args(os);
     // An ACL that may grant writes: Linux shows any ACL as a trailing '+'
     // (the group bits are then only the mask); macOS lists the entries with
@@ -522,13 +536,7 @@ pub fn mktemp_cmd(os: &RemoteOs, dir: &[u8]) -> Vec<u8> {
          c={{q}}; while :; do chk \"$c\"; [ \"$c\" = / ] && break; c=${{c%/*}}; \
          [ -n \"$c\" ] || c=/; done; "
     );
-    let check = fill_slot(&check, "{q}", &sh_quote(&d));
-    cat(&[
-        &check,
-        b"t=$(mktemp ",
-        &sh_quote(&template),
-        b") || exit 1; printf '%s\\0' \"$t\"",
-    ])
+    fill_slot(&check, "{q}", start)
 }
 
 /// `text` with every `slot` replaced by `bytes`.

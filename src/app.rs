@@ -32,6 +32,7 @@ use crate::screen::{self, TextScreen};
 use crate::servers::{self, Server, SshHost};
 use crate::session::{self, Cmd, DISCONNECTED_MSG, Established, RemoteSession, SystemCmd};
 use crate::theme::{self, Theme};
+use crate::transfer;
 use crate::trash::{
     self, PurgeReport, RestoreResult, TrackedDelete, TrashBackend, TrashEntry, TrashView,
 };
@@ -74,9 +75,6 @@ pub enum PendingAction {
         entries: Vec<TrashEntry>,
     },
 }
-
-/// Shown for every file operation a remote panel does not support yet.
-const REMOTE_UNSUPPORTED: &str = "원격: 다음 단계에서 지원";
 
 /// What a connect worker should establish.
 #[derive(Clone)]
@@ -1553,17 +1551,8 @@ impl App {
     fn panel_action(&mut self, action: Action) {
         let page = self.page_height.max(1);
         let remote_here = self.active_panel().location.is_remote();
-        let remote_any = remote_here || self.other_panel().location.is_remote();
         if action == Action::TrashView && remote_here {
             self.status = Some("원격: 휴지통 없음".into());
-            return;
-        }
-        let blocked = match action {
-            Action::Copy | Action::Move => remote_any,
-            _ => false,
-        };
-        if blocked {
-            self.status = Some(REMOTE_UNSUPPORTED.into());
             return;
         }
         match action {
@@ -2476,6 +2465,13 @@ impl App {
         if names.is_empty() {
             return;
         }
+        let dead = [self.active_panel(), self.other_panel()]
+            .iter()
+            .any(|p| p.location.session().is_some_and(|s| !s.is_alive()));
+        if dead {
+            self.status = Some(DISCONNECTED_MSG.into());
+            return;
+        }
         let cwd = self.active_panel().cwd.clone();
         let sources: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
         let title = match kind {
@@ -2501,12 +2497,42 @@ impl App {
             self.status = Some("오류: 대상 폴더 없음".into());
             return;
         }
-        let dest_dir = resolve_dest(input, &self.active_panel().cwd);
-        let handle = JobHandle::spawn(JobSpec {
-            kind,
-            sources: sources.clone(),
-            dest_dir: dest_dir.clone(),
-        });
+        let src_loc = self.active_panel().location.clone();
+        let dst_loc = self.other_panel().location.clone();
+        let (handle, dest_dir) = if src_loc.is_remote() || dst_loc.is_remote() {
+            // With a remote side the destination is on the other panel's
+            // host, so a relative path starts from the other panel.
+            let other = &self.other_panel().cwd;
+            let dest_dir = match dst_loc {
+                Location::Local => resolve_dest(input, other),
+                Location::Remote(_) => other.join(input),
+            };
+            let side = |l: Location| match l {
+                Location::Local => transfer::Side::Local,
+                Location::Remote(s) => transfer::Side::Remote(s),
+            };
+            let handle = JobHandle::spawn_transfer(transfer::TransferSpec {
+                kind,
+                src: side(src_loc),
+                src_dir: self.active_panel().cwd.clone(),
+                names: sources
+                    .iter()
+                    .filter_map(|p| p.file_name().map(OsString::from))
+                    .collect(),
+                dst: side(dst_loc),
+                dest_dir: dest_dir.clone(),
+                trash: Arc::clone(&self.trash),
+            });
+            (handle, dest_dir)
+        } else {
+            let dest_dir = resolve_dest(input, &self.active_panel().cwd);
+            let handle = JobHandle::spawn(JobSpec {
+                kind,
+                sources: sources.clone(),
+                dest_dir: dest_dir.clone(),
+            });
+            (handle, dest_dir)
+        };
         self.job = Some(RunningJob {
             handle,
             view: ProgressView::new(kind),
@@ -7859,8 +7885,6 @@ mod tests {
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        const UNSUPPORTED: &str = "원격: 다음 단계에서 지원";
-
         struct FakeSsh {
             master_up: AtomicBool,
             auth_ok: AtomicBool,
@@ -9520,28 +9544,217 @@ mod tests {
             assert!(!got[0].starts_with("shell ssh"), "{got:?}");
         }
 
-        #[test]
-        fn remote_transfers_stay_unsupported_until_m8() {
-            let (_t, mut app, _f) = env();
-            connect_prod(&mut app);
-            for f in [5u8, 6] {
-                app.status = None;
-                press(&mut app, KeyCode::F(f));
-                assert_eq!(app.status.as_deref(), Some(UNSUPPORTED), "F{f}");
-                assert!(app.dialog.is_none() && app.viewer.is_none(), "F{f}");
+        /// Answers for transfers: remote kind checks say "missing" unless
+        /// the path is in `there` (then a file), staging dirs are made, the
+        /// scan reports one small item without links, and a download writes
+        /// `new` into the local target dir.
+        fn remote_has(f: &FakeSsh, there: &'static [&'static str]) {
+            script(f, move |a| {
+                if a[0] == "scp" {
+                    let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
+                    if !dst.starts_with("prod-web:") {
+                        let name = Path::new(src).file_name().unwrap().to_owned();
+                        fs::write(Path::new(dst).join(name), "new").unwrap();
+                    }
+                    return Some(out(0, ""));
+                }
+                let c = crate::testutil::remote_cmd(a)?;
+                if c.ends_with("|| exit 46") {
+                    return Some(out(0, "")); // rename into place
+                }
+                if c.contains("| cksum") {
+                    return Some(out(0, "1:2\n"));
+                }
+                if let Some(rest) = c.strip_prefix("if [ -L '") {
+                    let path = rest.split_once('\'').unwrap().0;
+                    let hit = there.contains(&path);
+                    return Some(out(
+                        if hit {
+                            transfer::IS_OTHER
+                        } else {
+                            transfer::NOT_THERE
+                        },
+                        "",
+                    ));
+                }
+                if let Some(o) = crate::testutil::fake_mktemp(c) {
+                    return Some(o);
+                }
+                if c.contains(" || exit 1; c=$(pwd -P && echo x)") {
+                    return Some(out(0, "9:9\n9:1\n")); // destination parents
+                }
+                if c.contains(" || exit 1; f='") {
+                    return Some(out(0, "0")); // link re-check: none
+                }
+                if c.contains("; do k=$(du -sk") {
+                    return Some(out(0, "0\x000\x00"));
+                }
+                None
+            });
+        }
+
+        fn scps(f: &FakeSsh) -> Vec<(String, String)> {
+            f.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| a[0] == "scp")
+                .map(|a| (a[a.len() - 2].clone(), a[a.len() - 1].clone()))
+                .collect()
+        }
+
+        /// Cursor on `name` in the active panel.
+        fn cursor_to(app: &mut App, name: &str) {
+            for _ in 0..20 {
+                if name_at(app, app.active) == name {
+                    return;
+                }
+                press(app, KeyCode::Down);
             }
+            panic!("{name} not found");
         }
 
         #[test]
-        fn copy_from_a_local_panel_to_a_remote_one_is_blocked_too() {
+        fn f5_on_a_remote_panel_downloads_into_the_local_panel() {
+            let (_t, mut app, f) = env();
+            remote_has(&f, &[]);
+            connect_prod(&mut app);
+            cursor_to(&mut app, "a.txt");
+            press(&mut app, KeyCode::F(5));
+            match app.dialog.as_ref().expect("target dialog") {
+                (Dialog::Input { value, .. }, _) => {
+                    assert_eq!(*value, app.panels[0].cwd.to_string_lossy())
+                }
+                _ => panic!("not an input dialog"),
+            }
+            press(&mut app, KeyCode::Enter);
+            wait_job(&mut app);
+            assert_eq!(app.status.as_deref(), Some("복사 완료: 1개"));
+            let sent = scps(&f);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].0, "prod-web:/srv/data/a.txt");
+            let stage = Path::new(&sent[0].1);
+            assert_eq!(stage.parent(), Some(app.panels[0].cwd.as_path()));
+            assert!(
+                stage
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".hdir-xfer.")
+            );
+            assert_eq!(fs::read(app.panels[0].cwd.join("a.txt")).unwrap(), b"new");
+            assert!(!stage.exists(), "the stage is gone");
+        }
+
+        #[test]
+        fn f5_on_the_local_panel_uploads_into_the_remote_cwd() {
+            let (_t, mut app, f) = env();
+            remote_has(&f, &[]);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Tab);
+            cursor_to(&mut app, "f.txt");
+            press(&mut app, KeyCode::F(5));
+            press(&mut app, KeyCode::Enter);
+            wait_job(&mut app);
+            assert_eq!(app.status.as_deref(), Some("복사 완료: 1개"));
+            assert_eq!(
+                scps(&f),
+                vec![(
+                    app.panels[0]
+                        .cwd
+                        .join("f.txt")
+                        .to_string_lossy()
+                        .into_owned(),
+                    "prod-web:/srv/data/.hdir-xfer.ABC123".to_string()
+                )]
+            );
+        }
+
+        #[test]
+        fn a_relative_target_starts_from_the_other_panel() {
+            let (_t, mut app, f) = env();
+            remote_has(&f, &[]);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Tab);
+            cursor_to(&mut app, "f.txt");
+            press(&mut app, KeyCode::F(5));
+            if let Some((Dialog::Input { value, cursor, .. }, _)) = app.dialog.as_mut() {
+                *value = "sub".into();
+                *cursor = 3;
+            }
+            press(&mut app, KeyCode::Enter);
+            wait_job(&mut app);
+            assert_eq!(scps(&f)[0].1, "prod-web:/srv/data/sub/.hdir-xfer.ABC123");
+        }
+
+        #[test]
+        fn f6_from_remote_deletes_the_source_after_the_download() {
+            let (t, mut app, f) = env();
+            remote_has(&f, &[]);
+            connect_prod(&mut app);
+            // An older local copy: the conflict is answered Overwrite.
+            fs::write(t.path().join("a.txt"), "old").unwrap();
+            cursor_to(&mut app, "a.txt");
+            press(&mut app, KeyCode::F(6));
+            press(&mut app, KeyCode::Enter);
+            // the local copy already exists: conflict → overwrite
+            assert!(matches!(
+                app.dialog,
+                None | Some((_, PendingAction::Conflict))
+            ));
+            let start = Instant::now();
+            while app.job.is_some() {
+                if matches!(app.dialog, Some((_, PendingAction::Conflict))) {
+                    press(&mut app, KeyCode::Left); // default is Skip; pick Overwrite
+                    press(&mut app, KeyCode::Enter);
+                }
+                app.tick();
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(
+                app.status.as_deref(),
+                Some("이동 완료: 1개 · 덮어쓴 파일 1개는 되돌릴 수 없음")
+            );
+            assert_eq!(fs::read(t.path().join("a.txt")).unwrap(), b"new");
+            let rm: Vec<String> = cmds(&f)
+                .into_iter()
+                .filter(|c| c.contains("rm -rf"))
+                .collect();
+            assert_eq!(rm.len(), 1, "{rm:?}");
+        }
+
+        #[test]
+        fn an_existing_remote_name_opens_the_conflict_dialog() {
+            let (_t, mut app, f) = env();
+            remote_has(&f, &["/srv/data/f.txt"]);
+            connect_prod(&mut app);
+            press(&mut app, KeyCode::Tab);
+            cursor_to(&mut app, "f.txt");
+            press(&mut app, KeyCode::F(5));
+            press(&mut app, KeyCode::Enter);
+            let start = Instant::now();
+            while !matches!(app.dialog, Some((_, PendingAction::Conflict))) {
+                app.tick();
+                assert!(start.elapsed() < Duration::from_secs(5), "no conflict");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            press(&mut app, KeyCode::Enter); // default: Skip
+            wait_job(&mut app);
+            assert!(scps(&f).is_empty());
+            assert_eq!(app.status.as_deref(), Some("복사 완료: 0개, 건너뜀 1개"));
+        }
+
+        #[test]
+        fn a_transfer_on_a_dead_connection_is_refused_up_front() {
             let (_t, mut app, _f) = env();
             connect_prod(&mut app);
-            press(&mut app, KeyCode::Tab); // back to the local left panel
-            assert_eq!(app.active, 0);
-            press(&mut app, KeyCode::Down);
+            app.panels[1].location.session().unwrap().set_alive(false);
+            press(&mut app, KeyCode::Tab);
+            cursor_to(&mut app, "f.txt");
             press(&mut app, KeyCode::F(5));
-            assert_eq!(app.status.as_deref(), Some(UNSUPPORTED));
-            assert!(app.dialog.is_none());
+            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert!(app.dialog.is_none() && app.job.is_none());
         }
 
         #[test]

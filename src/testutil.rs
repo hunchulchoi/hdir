@@ -15,6 +15,8 @@ pub struct FakeCmd {
     pub log: Mutex<Vec<Vec<String>>>,
     /// The argvs that came through `run_transfer` (also in `log`).
     pub transfers: Mutex<Vec<Vec<String>>>,
+    /// The argvs that came through `run_cancellable` (also in the others).
+    pub cancellable: Mutex<Vec<Vec<String>>>,
     respond: Responder,
 }
 
@@ -23,6 +25,7 @@ impl FakeCmd {
         Arc::new(Self {
             log: Mutex::new(Vec::new()),
             transfers: Mutex::new(Vec::new()),
+            cancellable: Mutex::new(Vec::new()),
             respond: Box::new(respond),
         })
     }
@@ -86,6 +89,14 @@ impl Cmd for FakeCmd {
     fn run_transfer(&self, argv: &[OsString]) -> CmdOutput {
         self.transfers.lock().unwrap().push(strs(argv));
         self.run(argv)
+    }
+    fn run_cancellable(
+        &self,
+        argv: &[OsString],
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> CmdOutput {
+        self.cancellable.lock().unwrap().push(strs(argv));
+        self.run_transfer(argv)
     }
 }
 
@@ -205,4 +216,15 @@ pub fn local_session(home: &std::path::Path) -> Arc<RemoteSession> {
             home: home.to_path_buf(),
         }),
     ))
+}
+
+/// Answer a `transfer::stage_cmd` (`cd -- '<dir>' ... mktemp -d "$t"`)
+/// with `<dir>` as the physical dir and `<dir>/.hdir-xfer.ABC123`.
+pub fn fake_mktemp(cmd: &str) -> Option<CmdOutput> {
+    if !cmd.contains("mktemp -d \"$t\"") {
+        return None;
+    }
+    let dir = cmd.strip_prefix("cd -- '")?.split_once('\'')?.0;
+    let sep = if dir == "/" { "" } else { "/" };
+    Some(ok(&format!("{dir}\0{dir}{sep}.hdir-xfer.ABC123\0")))
 }
