@@ -318,7 +318,9 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
               if ln -T -- $F $T 2>/dev/null; then rm -f -- $F; else ",
             there,
             b"exit 49; fi; \
-              elif [ -d $F ]; then mv -nT -- $F $T || exit 1; \
+              elif [ -d $F ]; then mv -nT -- $F $T 2>/dev/null || { ",
+            there,
+            b"exit 1; }; \
               if [ -e $F ] || [ -L $F ]; then exit 48; fi; \
               else exit 49; fi; ",
         ]),
@@ -1211,7 +1213,8 @@ mod tests {
         for part in [
             "if ln -sT -- \"$l\" '/d/x' 2>/dev/null; then rm -f -- '/d/S/x';",
             "if ln -T -- '/d/S/x' '/d/x' 2>/dev/null; then rm -f -- '/d/S/x';",
-            "elif [ -d '/d/S/x' ]; then mv -nT -- '/d/S/x' '/d/x' || exit 1; \
+            "elif [ -d '/d/S/x' ]; then mv -nT -- '/d/S/x' '/d/x' 2>/dev/null || { \
+             if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; exit 1; }; \
              if [ -e '/d/S/x' ] || [ -L '/d/S/x' ]; then exit 48; fi; else exit 49; fi; \
              rmdir -- '/d/S' || exit 46",
         ] {
