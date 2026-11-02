@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::platform::{
-    create_private_dir, create_private_file, create_symlink, is_cross_device, is_link_refused,
-    is_symlink_privilege_error, is_unsupported, open_source, remove_link, rename_noreplace_os,
-    rename_replace, same_file, set_dir_modified, truncated_name,
+    DirFd, SrcKind, create_private_dir, create_private_file, create_symlink, is_cross_device,
+    is_link_refused, is_symlink_privilege_error, is_unsupported, open_src_dir, open_src_file,
+    read_src_link, remove_link, rename_noreplace_os, rename_replace, same_file, set_dir_modified,
+    src_kind, truncated_name,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +310,20 @@ fn sibling_named(dest: &Path, kind: &str) -> PathBuf {
 ///
 /// Unless the caller already `approved` replacing `dest`, the final rename never
 /// clobbers: a file that appeared meanwhile goes through `on_conflict` again.
+#[cfg(test)]
 fn copy_file(
+    src: &Path,
+    dest: &Path,
+    ctl: &mut dyn OpControl,
+    acc: &mut Acc,
+    approved: bool,
+) -> io::Result<Step> {
+    copy_file_in(None, src, dest, ctl, acc, approved)
+}
+
+/// [`copy_file`] with the source reached through its open folder `parent`.
+fn copy_file_in(
+    parent: Option<&DirFd>,
     src: &Path,
     dest: &Path,
     ctl: &mut dyn OpControl,
@@ -318,7 +332,7 @@ fn copy_file(
 ) -> io::Result<Step> {
     // The entry may have been swapped since the lstat: never follow a link and
     // never block on a FIFO (see `open_source`), then trust the handle's metadata only.
-    let Some(mut input) = open_source(src)? else {
+    let Some(mut input) = open_src_file(parent, src)? else {
         return skip_changed(src, acc);
     };
     let meta = &input.metadata()?;
@@ -429,6 +443,7 @@ fn place(
 
 /// Create a symlink at `dest` atomically (temp link + rename), see [`place`].
 fn copy_symlink(
+    parent: Option<&DirFd>,
     src: &Path,
     dest: &Path,
     ctl: &mut dyn OpControl,
@@ -441,7 +456,7 @@ fn copy_symlink(
         ctl,
         acc,
         approved,
-        &|p| fs::read_link(p),
+        &|p| read_src_link(parent, p),
         &create_symlink,
     )
 }
@@ -498,8 +513,12 @@ fn restore_backup(backup: &Path, dest: &Path, acc: &mut Acc) -> io::Result<()> {
     })
 }
 
+/// `dir`: the source folder, opened without following links (unix); its
+/// entries are reached through it, so swapping `src` (or a folder above it)
+/// for a link mid-copy cannot redirect the copy. `None`: path based.
 fn copy_dir(
     src: &Path,
+    dir: Option<&DirFd>,
     dest: &Path,
     meta: &fs::Metadata,
     ctl: &mut dyn OpControl,
@@ -549,11 +568,17 @@ fn copy_dir(
     let skipped_before = acc.skipped;
     let mut xattr_err = None;
     let mut run = || -> io::Result<Step> {
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            if copy_entry(
-                &entry.path(),
-                &dest.join(entry.file_name()),
+        let names: Vec<OsString> = match dir {
+            Some(d) => d.entries()?,
+            None => fs::read_dir(src)?
+                .map(|e| e.map(|e| e.file_name()))
+                .collect::<io::Result<_>>()?,
+        };
+        for name in names {
+            if copy_entry_in(
+                dir,
+                &src.join(&name),
+                &dest.join(&name),
                 ctl,
                 true,
                 false,
@@ -564,7 +589,11 @@ fn copy_dir(
             }
         }
         if created {
-            if let Err(e) = crate::platform::copy_xattrs_path(src, dest) {
+            let copied = match dir {
+                Some(d) => d.copy_xattrs_to(dest),
+                None => crate::platform::copy_xattrs_path(src, dest),
+            };
+            if let Err(e) = copied {
                 xattr_err = Some(e);
             }
             set_dir_modified(dest, meta.modified()?)?;
@@ -609,12 +638,25 @@ fn copy_entry(
     replace_ok: bool,
     acc: &mut Acc,
 ) -> io::Result<Step> {
+    copy_entry_in(None, src, dest, ctl, prompt, replace_ok, acc)
+}
+
+/// [`copy_entry`] with `src` reached through its open folder `parent` (only
+/// its last component is used then).
+fn copy_entry_in(
+    parent: Option<&DirFd>,
+    src: &Path,
+    dest: &Path,
+    ctl: &mut dyn OpControl,
+    prompt: bool,
+    replace_ok: bool,
+    acc: &mut Acc,
+) -> io::Result<Step> {
     if ctl.is_cancelled() {
         return Ok(Step::Cancelled);
     }
-    let meta = fs::symlink_metadata(src)?;
-    let ft = meta.file_type();
-    if !(ft.is_dir() || ft.is_file() || ft.is_symlink()) {
+    let (kind, dev, ino) = src_kind(parent, src)?;
+    if kind == SrcKind::Other {
         acc.skipped += 1;
         return Ok(Step::Skipped);
     }
@@ -629,8 +671,26 @@ fn copy_entry(
             ConflictAction::Overwrite => approved = true,
         }
     }
-    if ft.is_dir() {
-        return copy_dir(src, dest, &meta, ctl, acc, approved);
+    if kind == SrcKind::Dir {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let Some(dir) = open_src_dir(parent, src)? else {
+                return skip_changed(src, acc);
+            };
+            let meta = dir.metadata()?;
+            // the folder opened must be the one classified a moment ago
+            if (meta.dev(), meta.ino()) != (dev, ino) {
+                return skip_changed(src, acc);
+            }
+            return copy_dir(src, Some(&dir), dest, &meta, ctl, acc, approved);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (dev, ino);
+            let meta = fs::symlink_metadata(src)?;
+            return copy_dir(src, None, dest, &meta, ctl, acc, approved);
+        }
     }
     if is_real_dir(dest) {
         return Err(io::Error::new(
@@ -638,10 +698,10 @@ fn copy_entry(
             "destination is a directory",
         ));
     }
-    if ft.is_symlink() {
-        copy_symlink(src, dest, ctl, acc, approved)
+    if kind == SrcKind::Symlink {
+        copy_symlink(parent, src, dest, ctl, acc, approved)
     } else {
-        copy_file(src, dest, ctl, acc, approved)
+        copy_file_in(parent, src, dest, ctl, acc, approved)
     }
 }
 
@@ -2457,6 +2517,54 @@ mod tests {
             self.conflicts.push(d.to_path_buf());
             self.action
         }
+    }
+
+    /// HDIR-63: once a source folder is being copied, swapping it (or a
+    /// folder inside it) for a symlink must not pull files from elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_folder_swapped_for_a_link_mid_copy_copies_nothing_from_outside() {
+        let (t, s, d) = two_dirs();
+        let outside = t.path().join("outside");
+        for dir in [
+            s.join("tree"),
+            s.join("tree/sub"),
+            outside.clone(),
+            outside.join("sub"),
+        ] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        for i in 0..6 {
+            fs::write(s.join(format!("tree/f{i}")), "orig").unwrap();
+            fs::write(s.join(format!("tree/sub/g{i}")), "orig").unwrap();
+            fs::write(outside.join(format!("f{i}")), "SECRET").unwrap();
+            fs::write(outside.join(format!("sub/g{i}")), "SECRET").unwrap();
+        }
+        let (tree, moved) = (s.join("tree"), s.join("tree.old"));
+        let mut c = Hook::new(ConflictAction::Cancel, move || {
+            // after the first chunk: the folder being copied becomes a link
+            fs::rename(&tree, &moved).unwrap();
+            std::os::unix::fs::symlink(&outside, &tree).unwrap();
+        });
+        let r = copy_items(&[s.join("tree")], &d, &mut c);
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        let mut leaked = vec![];
+        let mut todo = vec![d.join("tree")];
+        while let Some(p) = todo.pop() {
+            for e in fs::read_dir(&p).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    todo.push(e.path());
+                } else if fs::read(e.path()).unwrap() == b"SECRET" {
+                    leaked.push(e.path());
+                }
+            }
+        }
+        assert!(
+            leaked.is_empty(),
+            "copied from outside the source: {leaked:?}"
+        );
+        assert_eq!(fs::read(d.join("tree/sub/g0")).unwrap(), b"orig");
     }
 
     #[test]
