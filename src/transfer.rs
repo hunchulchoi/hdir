@@ -345,6 +345,60 @@ pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str) -> Vec<OsStri
     v
 }
 
+/// Unpack the package `pkg` (a tar uploaded into `stage`) there, then drop
+/// it and strip setuid / setgid like [`tar_in_cmd`].
+pub fn unpack_cmd(stage: &[u8], pkg: &[u8]) -> Vec<u8> {
+    let p = sh_quote(pkg);
+    cat(&[
+        b"cd -- ",
+        &sh_quote(stage),
+        b" || exit 1; tar -xpof ",
+        &p,
+        b" || exit 1; rm -f -- ",
+        &p,
+        b" || exit 1; ",
+        STRIP_SETID,
+    ])
+}
+
+/// Name of the package uploaded next to the item: never the item's own.
+fn pkg_name(item: &[u8]) -> &'static [u8] {
+    if item == b"o.tar" { b"p.tar" } else { b"o.tar" }
+}
+
+/// Windows upload (its ssh.exe hangs when fed data on stdin): tar the item
+/// into a local package, scp the package into the stage, unpack it there.
+fn send_up_packaged(
+    d: &RemoteSession,
+    src_dir: &Path,
+    name: &OsString,
+    stage: &[u8],
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let pkg = tempfile::Builder::new()
+        .prefix("hdir-pkg-")
+        .suffix(".tar")
+        .tempfile()
+        .map_err(|e| format!("임시 파일을 만들 수 없음: {e}"))?;
+    let mut item = OsString::from("./");
+    item.push(name);
+    let mut tar: Vec<OsString> = ["tar", "-cf"].map(OsString::from).to_vec();
+    tar.push(pkg.path().as_os_str().to_os_string());
+    tar.push("-C".into());
+    tar.push(src_dir.as_os_str().to_os_string());
+    tar.push(item);
+    ran(d.run_local(&tar, cancel))?;
+    let remote_pkg = cat(&[&into_dir(stage), pkg_name(&os_bytes(name))]);
+    let argv = crate::remote::scp_argv(
+        &crate::remote::Endpoint::Local(pkg.path()),
+        &crate::remote::Endpoint::Remote(&d.target, &remote_pkg),
+        d.scp_mode,
+    )?;
+    ran(d.scp_cancellable(&argv, cancel).map_err(|e| e.message())?)?;
+    let cmd = unpack_cmd(stage, pkg_name(&os_bytes(name)));
+    ran(d.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?).map(drop)
+}
+
 /// Local `tar` unpacking stdin into `stage`.
 pub fn local_tar_in(stage: &Path) -> Vec<OsString> {
     let mut v: Vec<OsString> = ["tar", "-xpof", "-", "-C"].map(OsString::from).to_vec();
@@ -1157,6 +1211,20 @@ fn send(
     };
     let remote_out =
         |s: &RemoteSession| exec_argv(&s.target, &tar_out_cmd(&s.os, &sd, &n, src_id.as_bytes()));
+    if cfg!(windows) {
+        match (route, stage) {
+            (Route::Up(d), Stage::Remote(_, _, p)) => {
+                return send_up_packaged(d, src_dir, name, p, cancel);
+            }
+            (Route::Between(..), _) => {
+                return Err(
+                    "Windows에서는 서버 간 직접 전송을 지원하지 않음: 로컬을 거쳐 복사하세요"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+    }
     // (runner, from argv, the ssh session behind `from`, to argv, ... `to`)
     let (runner, from, from_s, to, to_s) = match route {
         Route::Up(d) => (
@@ -4516,5 +4584,71 @@ mod tests {
         assert_eq!(out.status.code(), Some(SRC_MOVED));
         assert_eq!(fs::read_dir(&st).unwrap().count(), 0);
         assert_eq!(fs::read(secret.join("f")).unwrap(), b"SECRET");
+    }
+
+    #[test]
+    fn a_packaged_upload_tars_locally_then_scps_then_unpacks() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "x").unwrap();
+        let f = FakeCmd::new(|a| {
+            if a[0] == "tar" {
+                return ok("");
+            }
+            answer(remote_cmd(a).unwrap_or_default(), &[], &[], "")
+        });
+        let s = session(Arc::clone(&f));
+        let no = AtomicBool::new(false);
+        send_up_packaged(&s, t.path(), &OsString::from("a"), STAGE.as_bytes(), &no).unwrap();
+        let log = f.log.lock().unwrap().clone();
+        assert_eq!(log[0][..2], ["tar", "-cf"]);
+        assert_eq!(
+            log[0][3..],
+            [
+                "-C".to_string(),
+                t.path().to_string_lossy().into(),
+                "./a".into()
+            ]
+        );
+        assert_eq!(log[1][0], "scp");
+        assert_eq!(log[1].last().unwrap(), &format!("prod-web:{STAGE}/o.tar"));
+        let unpack = String::from_utf8(unpack_cmd(STAGE.as_bytes(), b"o.tar")).unwrap();
+        assert_eq!(remote_cmd(&log[2]), Some(unpack.as_str()));
+        assert_eq!(pkg_name(b"o.tar"), b"p.tar", "never the item's own name");
+    }
+
+    #[test]
+    fn real_unpacking_a_package_keeps_links_drops_the_package_and_setuid() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        let stage = private_dir(t.path(), "stage");
+        fs::create_dir(src.join("d")).unwrap();
+        fs::write(src.join("d/prog"), "x").unwrap();
+        fs::set_permissions(src.join("d/prog"), fs::Permissions::from_mode(0o4755)).unwrap();
+        std::os::unix::fs::symlink("/etc", src.join("d/ln")).unwrap();
+        let pkg = stage.join("o.tar");
+        let out = std::process::Command::new("tar")
+            .arg("-cf")
+            .arg(&pkg)
+            .arg("-C")
+            .arg(&src)
+            .arg("./d")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(sh(&unpack_cmd(&b(&stage), b"o.tar")).status.success());
+        assert!(!pkg.exists());
+        assert!(
+            fs::symlink_metadata(stage.join("d/ln"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let mode = fs::metadata(stage.join("d/prog"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode & 0o6000, 0, "{mode:o}");
     }
 }
