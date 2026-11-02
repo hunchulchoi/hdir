@@ -233,10 +233,18 @@ fn into_dir(dir: &[u8]) -> Vec<u8> {
 /// ([`safe_dirs_check`], exit [`UNSAFE_DIR`]). Prints the physical
 /// directory and the staging path, each NUL-terminated.
 pub fn stage_cmd(os: &RemoteOs, dest_dir: &[u8]) -> Vec<u8> {
+    // Without GNU -T, placing cannot be made race-free against names other
+    // users create, so a sticky (shared) destination is refused there.
+    let sticky: &[u8] = if matches!(os, RemoteOs::Linux) {
+        b""
+    } else {
+        b"k=$(find \"$d0\" -prune -perm -1000) || exit 1; [ -z \"$k\" ] || exit 37; "
+    };
     cat(&[
         b"cd -- ",
         &sh_quote(dest_dir),
         b" || exit 1; d0=$(pwd -P && echo x) || exit 1; d0=${d0%?x}; ",
+        sticky,
         &safe_dirs_check(os, b"\"$d0\""),
         b"case $d0 in /) t=/",
         STAGE_PREFIX.as_bytes(),
@@ -309,7 +317,10 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
               elif [ -f $F ]; then \
               if ln -T -- $F $T 2>/dev/null; then rm -f -- $F; else ",
             there,
-            b"exit 49; fi; else mv -T -- $F $T || exit 1; fi; ",
+            b"exit 49; fi; \
+              elif [ -d $F ]; then mv -nT -- $F $T || exit 1; \
+              if [ -e $F ] || [ -L $F ]; then exit 48; fi; \
+              else exit 49; fi; ",
         ]),
         // Without -T, `ln` and `mv` go into a directory that appeared
         // meanwhile: that is detected afterwards (`-ef`, `-L`, the inode),
@@ -318,7 +329,7 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
             there,
             b"if [ -L $F ]; then l=$(readlink -- $F && echo x) || exit 1; l=${l%?x}; \
               if ln -s -- \"$l\" $T 2>/dev/null; then \
-              if [ -L $T ]; then rm -f -- $F; else rm -f -- $I; exit 48; fi; else ",
+              if [ -L $T ]; then rm -f -- $F; else exit 48; fi; else ",
             there,
             b"exit 1; fi; \
               elif [ -f $F ]; then \
@@ -326,9 +337,10 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
               if [ $T -ef $F ]; then rm -f -- $F; else rm -f -- $I; exit 48; fi; else ",
             there,
             b"exit 49; fi; \
-              else set -- $(ls -di -- $F) || exit 1; i=$1; mv -- $F $T || exit 1; \
-              set -- $(ls -di -- $T) || exit 1; \
-              if [ \"$1\" != \"$i\" ]; then mv -- $I $F; exit 48; fi; fi; ",
+              elif [ -d $F ]; then set -- $(ls -di -- $F) || exit 1; i=$1; \
+              mv -- $F $T || exit 1; set -- $(ls -di -- $T) || exit 1; \
+              if [ \"$1\" != \"$i\" ]; then mv -- $I $F; exit 48; fi; \
+              else exit 49; fi; ",
         ]),
     };
     let body = fill(
@@ -1164,10 +1176,12 @@ mod tests {
         for part in [
             "if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; ",
             "if ln -s -- \"$l\" '/d/x' 2>/dev/null; then if [ -L '/d/x' ]; then rm -f -- '/d/S/x'; \
-             else rm -f -- '/d/x/x'; exit 48; fi;",
+             else exit 48; fi;",
             "if ln -- '/d/S/x' '/d/x' 2>/dev/null; then \
              if [ '/d/x' -ef '/d/S/x' ]; then rm -f -- '/d/S/x'; else rm -f -- '/d/x/x'; exit 48; fi;",
-            "set -- $(ls -di -- '/d/S/x') || exit 1; i=$1; mv -- '/d/S/x' '/d/x' || exit 1;",
+            "elif [ -d '/d/S/x' ]; then set -- $(ls -di -- '/d/S/x') || exit 1; i=$1; \
+             mv -- '/d/S/x' '/d/x' || exit 1;",
+            "else exit 49; fi; rmdir",
             "if [ \"$1\" != \"$i\" ]; then mv -- '/d/x/x' '/d/S/x'; exit 48; fi;",
         ] {
             assert!(pl.contains(part), "missing {part}\nin {pl}");
@@ -1197,7 +1211,9 @@ mod tests {
         for part in [
             "if ln -sT -- \"$l\" '/d/x' 2>/dev/null; then rm -f -- '/d/S/x';",
             "if ln -T -- '/d/S/x' '/d/x' 2>/dev/null; then rm -f -- '/d/S/x';",
-            "else mv -T -- '/d/S/x' '/d/x' || exit 1; fi; rmdir -- '/d/S' || exit 46",
+            "elif [ -d '/d/S/x' ]; then mv -nT -- '/d/S/x' '/d/x' || exit 1; \
+             if [ -e '/d/S/x' ] || [ -L '/d/S/x' ]; then exit 48; fi; else exit 49; fi; \
+             rmdir -- '/d/S' || exit 46",
         ] {
             assert!(pl.contains(part), "missing {part}\nin {pl}");
         }
@@ -3131,5 +3147,65 @@ mod tests {
         let (_, stage, sp) = stage_in(&dest);
         assert!(sh(&unmove_cmd(&os, &stage, b"b", &src)).status.success());
         assert!(!sp.exists());
+    }
+
+    #[test]
+    fn real_a_folder_on_this_os_is_never_placed_over_one_that_appeared() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let (dir, stage, sp) = stage_in(&dest);
+        fs::create_dir(sp.join("d")).unwrap();
+        fs::write(sp.join("d/x"), "mine").unwrap();
+        let to = cat(&[&dir, b"/d"]);
+        let from = cat(&[&stage, b"/d"]);
+        let script = cat(&[
+            b"m=0; mv() { if [ $m = 0 ]; then m=1; mkdir -- ",
+            &sh_quote(&to),
+            b"; fi; command mv \"$@\"; }; ",
+            &place_cmd(&crate::testutil::local_os(), &from, &to, &stage, false),
+        ]);
+        assert_eq!(sh(&script).status.code(), Some(APPEARED));
+        assert_eq!(
+            fs::read_dir(dest.join("d")).unwrap().count(),
+            0,
+            "theirs, empty"
+        );
+        assert_eq!(fs::read(sp.join("d/x")).unwrap(), b"mine");
+    }
+
+    #[test]
+    fn real_special_files_are_not_placed_without_a_safe_rename() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let (dir, stage, sp) = stage_in(&dest);
+        let fifo = sp.join("p");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let to = cat(&[&dir, b"/p"]);
+        let from = cat(&[&stage, b"/p"]);
+        for os in [RemoteOs::Bsd, RemoteOs::Linux] {
+            assert_eq!(
+                sh(&place_cmd(&os, &from, &to, &stage, false)).status.code(),
+                Some(NO_SAFE_RENAME),
+                "{os:?}"
+            );
+        }
+        assert!(!dest.join("p").exists());
+    }
+
+    #[test]
+    fn real_a_shared_sticky_destination_is_refused_without_gnu_tools() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let shared = private_dir(t.path(), "shared");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1700)).unwrap();
+        let out = sh(&stage_cmd(&RemoteOs::Bsd, &b(&shared)));
+        assert_eq!(out.status.code(), Some(UNSAFE_DIR));
+        assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
+        if cfg!(target_os = "linux") {
+            let out = sh(&stage_cmd(&RemoteOs::Linux, &b(&shared)));
+            assert!(out.status.success(), "-T makes sticky dirs fine: {out:?}");
+        }
     }
 }
