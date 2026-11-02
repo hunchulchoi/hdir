@@ -166,8 +166,8 @@ pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
     preview::classify_with(&out.stdout[nl + 1..], size, limits)
 }
 
-/// The preview script counts a directory's entries on the server (`ls -Aq`,
-/// one line per entry even for names with newlines), capped one past
+/// The preview script counts a directory's entries on the server (unsorted
+/// `find -print0`, one NUL per entry whatever the name), capped one past
 /// [`REMOTE_DIR_CAP`], so a huge directory never crosses the wire.
 fn remote_dir_info(stdout: &[u8]) -> Preview {
     let n = std::str::from_utf8(stdout)
@@ -1178,7 +1178,7 @@ mod tests {
         std::fs::write(&local, "x").unwrap();
         for (starts, err) in [
             ("p=", "not a regular file"),
-            ("[ -z \"$(find ", "Permission denied"),
+            ("u=$(find ", "Permission denied"),
         ] {
             let f = FakeCmd::new(move |a| {
                 if crate::testutil::remote_cmd(a).is_some_and(|c| c.starts_with(starts)) {
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn real_upload_refuses_a_directory_others_can_write_without_sticky() {
+    fn real_upload_refuses_a_directory_others_or_the_group_can_write_without_sticky() {
         let t = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(t.path()).unwrap();
         let open = root.join("open");
@@ -1273,21 +1273,24 @@ mod tests {
         std::fs::write(&target, "old").unwrap();
         // the link lives in a safe dir; the real file's dir decides
         symlink(&target, root.join("link")).unwrap();
-        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
         let local = edited(&root, "secret edit");
         let s = local_session(&root);
-        for remote in [target.clone(), root.join("link")] {
-            let e = upload_fresh(&s, &local, &remote).unwrap_err();
-            assert!(e.contains("다른 사용자가 쓸 수 있는"), "{e}");
-            assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
-            no_temp_left(&open);
+        // others or group members could swap the temp: both refused
+        for mode in [0o777, 0o773, 0o775, 0o770, 0o2770] {
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(mode)).unwrap();
+            for remote in [target.clone(), root.join("link")] {
+                let e = upload_fresh(&s, &local, &remote).unwrap_err();
+                assert!(e.contains("다른 사용자가 쓸 수 있는"), "{mode:o}: {e}");
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+                no_temp_left(&open);
+            }
         }
         assert!(local.exists(), "the edited copy stays local");
     }
 
     #[test]
-    fn real_upload_works_in_sticky_and_group_writable_directories() {
-        for mode in [0o1777, 0o1733, 0o775, 0o2770] {
+    fn real_upload_works_in_private_and_sticky_directories() {
+        for mode in [0o700, 0o755, 0o1777, 0o1733, 0o1770] {
             let t = tempfile::tempdir().unwrap();
             let root = std::fs::canonicalize(t.path()).unwrap();
             let d = root.join("d");
@@ -1301,6 +1304,49 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&target).unwrap(), "new", "{mode:o}");
             no_temp_left(&d);
         }
+    }
+
+    #[test]
+    fn a_failing_permission_check_stops_before_mktemp() {
+        let t = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(t.path()).unwrap();
+        let bin = root.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("find"), "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(bin.join("find"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = root.join("d");
+        std::fs::create_dir(&d).unwrap();
+        let mut script = format!("PATH='{}':\"$PATH\"\n", bin.display()).into_bytes();
+        script.extend(crate::remote::mktemp_cmd(d.as_os_str().as_encoded_bytes()));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&script))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "an unknown mode is not safe");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 0, "no temp made");
+    }
+
+    #[test]
+    fn real_dir_preview_cap_boundary() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("big");
+        std::fs::create_dir(&d).unwrap();
+        let cap = crate::remote::REMOTE_DIR_CAP;
+        for i in 0..cap {
+            std::fs::File::create(d.join(format!("f{i}"))).unwrap();
+        }
+        let s = local_session(t.path());
+        assert_eq!(
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개"))
+        );
+        std::fs::File::create(d.join("one more")).unwrap();
+        std::fs::File::create(d.join("and\nanother")).unwrap();
+        assert_eq!(
+            preview(&s, &d, Limits::PREVIEW),
+            Preview::Info(format!("원격 디렉터리 · 항목 {cap}개 이상"))
+        );
     }
 
     #[test]

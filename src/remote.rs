@@ -328,7 +328,8 @@ pub fn preview_cmd(os: &RemoteOs, path: &[u8], max: usize) -> Vec<u8> {
         &q,
         b" || exit 1; [ -r . ] || { echo 'permission denied' >&2; exit 1; }; ",
         format!(
-            "ls -Aq | head -n {} | wc -l; exit {PREVIEW_DIR}; elif [ -f ",
+            "find . ! -name . -prune -print0 | tr -dc '\\000' | head -c {} | wc -c; \
+             exit {PREVIEW_DIR}; elif [ -f ",
             REMOTE_DIR_CAP + 1
         )
         .as_bytes(),
@@ -448,15 +449,16 @@ pub fn resolve_cmd(path: &[u8]) -> Vec<u8> {
     ])
 }
 
-/// [`mktemp_cmd`] exit code: the directory is writable by other users and
+/// [`mktemp_cmd`] exit code: the directory is writable by other users (group
+/// or others) and
 /// not sticky, so they could swap the temp file for a symlink before scp
 /// writes through it. Nothing is created.
 pub const UNSAFE_DIR: i32 = 37;
 
 /// Creates an exclusive (mode 600) temp file `<dir>/.hdir-edit.XXXXXX` with
 /// `mktemp` and prints its path, NUL-terminated. Refuses ([`UNSAFE_DIR`]) a
-/// directory others can write without the sticky bit; group-writable shared
-/// directories are allowed (group members can already replace the file).
+/// directory the group or others can write without the sticky bit, and stops
+/// when the check itself fails.
 pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
     let mut d = dir.to_vec();
     while d.len() > 1 && d.ends_with(b"/") {
@@ -468,9 +470,13 @@ pub fn mktemp_cmd(dir: &[u8]) -> Vec<u8> {
     }
     template.extend_from_slice(b".hdir-edit.XXXXXX");
     cat(&[
-        b"[ -z \"$(find ",
+        b"u=$(find ",
         &sh_quote(&d),
-        format!(" -prune -perm -0002 ! -perm -1000)\" ] || exit {UNSAFE_DIR}; ").as_bytes(),
+        format!(
+            " -prune \\( -perm -0020 -o -perm -0002 \\) ! -perm -1000) || exit 1; \
+             [ -z \"$u\" ] || exit {UNSAFE_DIR}; "
+        )
+        .as_bytes(),
         b"t=$(mktemp ",
         &sh_quote(&template),
         b") || exit 1; printf '%s\\0' \"$t\"",
@@ -1208,7 +1214,7 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             s(preview_cmd(&RemoteOs::Linux, b"/d/it's -x", 65539)),
             "if [ -d '/d/it'\\''s -x' ]; then cd -- '/d/it'\\''s -x' || exit 1; \
              [ -r . ] || { echo 'permission denied' >&2; exit 1; }; \
-             ls -Aq | head -n 10001 | wc -l; exit 20; \
+             find . ! -name . -prune -print0 | tr -dc '\\000' | head -c 10001 | wc -c; exit 20; \
              elif [ -f '/d/it'\\''s -x' ]; then n=$(stat -L -c %s -- '/d/it'\\''s -x') || exit 1; \
              printf '%s\\n' $n; head -c 65539 -- '/d/it'\\''s -x'; \
              elif [ -e '/d/it'\\''s -x' ]; then exit 21; \
@@ -1233,7 +1239,9 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         let b = s(preview_cmd(&RemoteOs::Bsd, b"/a", 10));
         assert!(l.contains("n=$(stat -L -c %s -- '/a')"), "{l}");
         assert!(b.contains("n=$(stat -L -f %z -- '/a')"), "{b}");
-        assert!(!l.contains("wc -c") && !b.contains("wc -c"));
+        // (the directory branch counts entries with `wc -c`; the file one never)
+        let file_part = |c: &str| c[c.find("elif [ -f").unwrap()..].to_string();
+        assert!(!file_part(&l).contains("wc -c") && !file_part(&b).contains("wc -c"));
     }
 
     #[test]
@@ -1289,12 +1297,14 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
         assert!(c.ends_with("printf '%s\\0' \"$p\""), "{c}");
         assert_eq!(
             s(mktemp_cmd(b"/srv/it's")),
-            "[ -z \"$(find '/srv/it'\\''s' -prune -perm -0002 ! -perm -1000)\" ] || exit 37; \
+            "u=$(find '/srv/it'\\''s' -prune \\( -perm -0020 -o -perm -0002 \\) ! -perm -1000) || exit 1; \
+             [ -z \"$u\" ] || exit 37; \
              t=$(mktemp '/srv/it'\\''s/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
         );
         assert_eq!(
             s(mktemp_cmd(b"/")),
-            "[ -z \"$(find '/' -prune -perm -0002 ! -perm -1000)\" ] || exit 37; \
+            "u=$(find '/' -prune \\( -perm -0020 -o -perm -0002 \\) ! -perm -1000) || exit 1; \
+             [ -z \"$u\" ] || exit 37; \
              t=$(mktemp '/.hdir-edit.XXXXXX') || exit 1; printf '%s\\0' \"$t\""
         );
         assert_eq!(UNSAFE_DIR, 37);
