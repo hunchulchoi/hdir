@@ -9563,7 +9563,7 @@ mod tests {
                     return Some(out(0, "")); // rename into place
                 }
                 if c.contains("| cksum") {
-                    return Some(out(0, "1:2\n"));
+                    return Some(out(0, "1 2\n"));
                 }
                 if let Some(rest) = c.strip_prefix("if [ -L '") {
                     let path = rest.split_once('\'').unwrap().0;
@@ -9578,6 +9578,9 @@ mod tests {
                     ));
                 }
                 if let Some(o) = crate::testutil::fake_mktemp(c) {
+                    return Some(o);
+                }
+                if let Some(o) = crate::testutil::fake_quarantine(c) {
                     return Some(o);
                 }
                 if c.contains(" || exit 1; c=$(pwd -P && echo x)") {
