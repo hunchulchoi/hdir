@@ -9580,6 +9580,9 @@ mod tests {
                 if let Some(o) = crate::testutil::fake_mktemp(c) {
                     return Some(o);
                 }
+                if let Some(o) = crate::testutil::fake_quarantine(c) {
+                    return Some(o);
+                }
                 if c.contains(" || exit 1; c=$(pwd -P && echo x)") {
                     return Some(out(0, "9:9\n9:1\n")); // destination parents
                 }

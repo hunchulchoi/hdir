@@ -228,3 +228,9 @@ pub fn fake_mktemp(cmd: &str) -> Option<CmdOutput> {
     let sep = if dir == "/" { "" } else { "/" };
     Some(ok(&format!("{dir}\0{dir}{sep}.hdir-xfer.ABC123\0")))
 }
+
+/// Answer a `transfer::quarantine_cmd` with a fixed `.hdir-del.Q1`.
+pub fn fake_quarantine(cmd: &str) -> Option<CmdOutput> {
+    cmd.contains("mktemp -d .hdir-del.")
+        .then(|| ok(".hdir-del.Q1\0"))
+}

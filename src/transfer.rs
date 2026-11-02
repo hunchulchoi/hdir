@@ -141,9 +141,13 @@ fn word_list(names: &[&[u8]]) -> Vec<u8> {
         .join(&b' ')
 }
 
-/// Shell fragment setting `l=1` when `./$f` is or contains a symlink.
-const LINK_TEST: &[u8] =
-    b"l=0; [ -z \"$(find \"./$f\" -type l 2>/dev/null | head -c 1)\" ] || l=1; ";
+/// Shell fragment setting `l=1` when `./$f` is or contains a symlink, `0`
+/// when not (or when it does not exist: sending it fails anyway), and `e`
+/// when `find` failed (a part could not be read), which the parsers refuse
+/// instead of taking it for "no links".
+const LINK_TEST: &[u8] = b"l=0; if [ -e \"./$f\" ] || [ -L \"./$f\" ]; then \
+    l=$(find \"./$f\" -type l -exec echo 1 \\; -quit 2>/dev/null) || l=e; \
+    [ -n \"$l\" ] || l=0; fi; ";
 
 /// For each of `names` in `dir`: its size in KiB and whether it is or
 /// contains a symlink (`1`/`0`), each NUL-terminated. Only the number before
@@ -375,19 +379,58 @@ fn fill(text: &[u8], slots: &[(&[u8], &[u8])]) -> Vec<u8> {
 /// `dir/name` and everything under it, links not followed: any change to
 /// the tree (content, a rename, a new file) changes it.
 pub fn stamp_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
-    let fmt: &[u8] = match os {
-        RemoteOs::Bsd => b"stat -f '%d:%i:%z:%Fm:%Fc:%N'",
-        RemoteOs::Linux | RemoteOs::Other(_) => b"stat -c '%d:%i:%s:%.9Y:%.9Z:%n'",
+    // The top entry leaves out its ctime: setting it aside before deletion
+    // (a rename) changes that, and nothing else.
+    let (top, fmt): (&[u8], &[u8]) = match os {
+        RemoteOs::Bsd => (
+            b"stat -f '%d:%i:%z:%Fm:%N'",
+            b"stat -f '%d:%i:%z:%Fm:%Fc:%N'",
+        ),
+        RemoteOs::Linux | RemoteOs::Other(_) => (
+            b"stat -c '%d:%i:%s:%.9Y:%n'",
+            b"stat -c '%d:%i:%s:%.9Y:%.9Z:%n'",
+        ),
     };
+    let n = cat(&[b"./", &sh_quote(name)]);
     cat(&[
         b"cd -- ",
         &sh_quote(dir),
-        b" || exit 1; s=$(find ./",
-        &sh_quote(name),
-        b" -exec ",
+        b" || exit 1; t=$(",
+        top,
+        b" -- ",
+        &n,
+        b") || exit 1; s=$(find ",
+        &n,
+        b" -mindepth 1 -exec ",
         fmt,
-        b" {} +) || exit 1; printf '%s\\n' \"$s\" | LC_ALL=C sort | cksum",
+        b" {} +) || exit 1; printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum",
     ])
+}
+
+/// Prefix of the dir a remote source is set aside in before deletion.
+pub const QUARANTINE_PREFIX: &str = ".hdir-del.";
+
+/// Move `dir/name` into a fresh private `dir/.hdir-del.XXXXXX` (printed,
+/// NUL-terminated, relative to `dir`). The name inside stays `name`.
+pub fn quarantine_cmd(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"cd -- ",
+        &sh_quote(dir),
+        b" || exit 1; q=$(mktemp -d ",
+        QUARANTINE_PREFIX.as_bytes(),
+        b"XXXXXX) || exit 1; mv -- ./",
+        &sh_quote(name),
+        b" \"$q/\" || { rmdir -- \"$q\"; exit 1; }; printf '%s\\0' \"$q\"",
+    ])
+}
+
+/// The dir name printed by [`quarantine_cmd`]: the prefix plus something,
+/// no `/` (never anything else, so it cannot point elsewhere).
+pub fn parse_quarantine(stdout: &[u8]) -> Option<Vec<u8>> {
+    let end = stdout.iter().position(|&b| b == 0)?;
+    let q = &stdout[..end];
+    let rest = q.strip_prefix(QUARANTINE_PREFIX.as_bytes())?;
+    (!rest.is_empty() && !rest.contains(&b'/') && stdout.len() == end + 1).then(|| q.to_vec())
 }
 
 /// After a failed same-server move into `stage`: put `stage/name` back to
@@ -962,10 +1005,19 @@ fn local_stamp(path: &Path, cancel: &AtomicBool) -> Option<String> {
                 todo.push(e.ok()?.path());
             }
         }
+        // like the remote stamp, the top entry leaves out its ctime
+        let top = q == path;
         all.push((
-            b(&q),
+            q.strip_prefix(path.parent().unwrap_or(path))
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
             [m.dev(), m.ino(), m.len()],
-            [m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()],
+            [
+                m.mtime(),
+                m.mtime_nsec(),
+                if top { 0 } else { m.ctime() },
+                if top { 0 } else { m.ctime_nsec() },
+            ],
         ));
     }
     all.sort();
@@ -1144,20 +1196,102 @@ fn item(
         Err(e) => return fail(format!("전송 확인 실패, 원본을 지우지 않음 ({e})")),
         Ok(_) => {}
     }
+    // A remote source is deleted for good, so it is first set aside in a
+    // private dir next to it: whatever is checked below is exactly what
+    // gets deleted, even if someone recreates the name meanwhile.
+    if let Side::Remote(s) = &spec.src {
+        return delete_remote_source(s, spec, name, before, ctl);
+    }
     let after = stamp(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
     if ctl.is_cancelled() {
         return Step::Partial(format!("취소되어 원본을 지우지 않음: {}", lossy(name)));
     }
     if before.is_none() || after != before {
-        return Step::Partial(format!(
-            "원본이 전송 중 바뀌었거나 대상과 같은 파일이라 원본을 지우지 않음: {}",
-            lossy(name)
-        ));
+        return Step::Partial(changed_msg(name));
     }
     match delete_source(spec, name) {
         Ok(()) => Step::Done,
         Err(e) => Step::Partial(format!("원본을 지우지 못함: {} ({e})", lossy(name))),
     }
+}
+
+fn changed_msg(name: &OsString) -> String {
+    format!(
+        "원본이 전송 중 바뀌었거나 대상과 같은 파일이라 원본을 지우지 않음: {}",
+        lossy(name)
+    )
+}
+
+/// Move `src_dir/name` into a fresh `.hdir-del.*` dir, re-check its
+/// fingerprint there and delete it only if it still matches `before`;
+/// otherwise put it back without replacing anything.
+fn delete_remote_source(
+    s: &RemoteSession,
+    spec: &TransferSpec,
+    name: &OsString,
+    before: Option<String>,
+    ctl: &mut dyn TransferCtl,
+) -> Step {
+    let keep = Step::Partial;
+    let Some(before) = before else {
+        return keep(changed_msg(name));
+    };
+    let out = match s.exec(&quarantine_cmd(&b(&spec.src_dir), &os_bytes(name))) {
+        Ok(o) if o.code == Some(0) => o,
+        Ok(o) => {
+            return keep(format!(
+                "원본을 지우지 못함: {} ({})",
+                lossy(name),
+                code_err(&o)
+            ));
+        }
+        Err(e) => {
+            return keep(format!(
+                "원본을 지우지 못함: {} ({})",
+                lossy(name),
+                e.message()
+            ));
+        }
+    };
+    let Some(q) = parse_quarantine(&out.stdout) else {
+        return keep(format!(
+            "원본을 지우지 못함: {} (격리 폴더를 알 수 없음)",
+            lossy(name)
+        ));
+    };
+    let qdir = spec.src_dir.join(crate::platform::os_from_bytes(q));
+    let after = stamp(&spec.src, &qdir, name, ctl.cancel_flag());
+    if ctl.is_cancelled() || after.as_ref() != Some(&before) {
+        let why = if ctl.is_cancelled() {
+            format!("취소되어 원본을 지우지 않음: {}", lossy(name))
+        } else {
+            changed_msg(name)
+        };
+        let back = place_cmd(
+            &s.os,
+            &b(&qdir.join(name)),
+            &b(&spec.src_dir.join(name)),
+            &b(&qdir),
+            false,
+        );
+        return match s.exec(&back) {
+            Ok(o) if o.code == Some(0) => keep(why),
+            _ => keep(format!(
+                "{why} · 원본이 격리 폴더에 남음: {}",
+                qdir.join(name).to_string_lossy()
+            )),
+        };
+    }
+    if let Err(e) = remote_ops::delete(s, &qdir, std::slice::from_ref(name)) {
+        return keep(format!(
+            "원본을 지우지 못함: {} ({e}) · 격리 폴더: {}",
+            lossy(name),
+            qdir.to_string_lossy()
+        ));
+    }
+    // The item is gone; an empty dir left behind is only cosmetic.
+    let _ = remote_ops::rmdir(s, &qdir);
+    Step::Done
 }
 
 /// Run the whole job (blocking; called on the job worker thread).
@@ -1367,8 +1501,9 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(stamp_cmd(&RemoteOs::Linux, b"/s", b"a b")).unwrap(),
-            "cd -- '/s' || exit 1; s=$(find ./'a b' -exec stat -c '%d:%i:%s:%.9Y:%.9Z:%n' {} +) \
-             || exit 1; printf '%s\\n' \"$s\" | LC_ALL=C sort | cksum"
+            "cd -- '/s' || exit 1; t=$(stat -c '%d:%i:%s:%.9Y:%n' -- ./'a b') || exit 1; \
+             s=$(find ./'a b' -mindepth 1 -exec stat -c '%d:%i:%s:%.9Y:%.9Z:%n' {} +) || exit 1; \
+             printf '%s\\n%s\\n' \"$t\" \"$s\" | LC_ALL=C sort | cksum"
         );
         let bsd = String::from_utf8(stamp_cmd(&RemoteOs::Bsd, b"/s", b"a")).unwrap();
         assert!(
@@ -1379,10 +1514,13 @@ mod tests {
         let o = String::from_utf8(place_cmd(&RemoteOs::Bsd, b"/d/S/o", b"/d/o", b"/d/S", true))
             .unwrap();
         assert!(o.contains("'/d/S/p'") && !o.contains("'/d/S/o' ||"), "{o}");
-        assert_eq!(
-            links_cmd(b"/s", b"-x"),
-            b"cd -- '/s' || exit 1; f='-x'; l=0; [ -z \"$(find \"./$f\" -type l 2>/dev/null | head -c 1)\" ] || l=1; printf '%s' \"$l\"".to_vec()
+        let lk = String::from_utf8(links_cmd(b"/s", b"-x")).unwrap();
+        assert!(lk.starts_with("cd -- '/s' || exit 1; f='-x'; "), "{lk}");
+        assert!(
+            lk.contains("l=$(find \"./$f\" -type l -exec echo 1 \\; -quit 2>/dev/null) || l=e;"),
+            "{lk}"
         );
+        assert!(lk.ends_with("printf '%s' \"$l\""), "{lk}");
     }
 
     #[test]
@@ -1882,6 +2020,9 @@ mod tests {
             });
         }
         if let Some(o) = fake_mktemp(c) {
+            return o;
+        }
+        if let Some(o) = crate::testutil::fake_quarantine(c) {
             return o;
         }
         if c.contains("| cksum") {
@@ -3395,5 +3536,160 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(dir_id(&Side::Local, &t.path().join("f")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_quarantine_reply_must_be_a_plain_prefixed_name() {
+        assert_eq!(
+            parse_quarantine(b".hdir-del.Ab12\0"),
+            Some(b".hdir-del.Ab12".to_vec())
+        );
+        for bad in [
+            &b".hdir-del.\0"[..],
+            b"../x\0",
+            b".hdir-del.a/b\0",
+            b"/tmp/.hdir-del.a\0",
+            b".hdir-del.a",
+            b".hdir-del.a\0junk",
+            b"",
+        ] {
+            assert_eq!(parse_quarantine(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn real_a_set_aside_source_keeps_its_fingerprint_until_it_changes() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        fs::create_dir_all(src.join("d it's/sub")).unwrap();
+        fs::write(src.join("d it's/sub/f"), "abc").unwrap();
+        let os = crate::testutil::local_os();
+        let name = OsString::from("d it's");
+        let remote = |dir: &Path| {
+            let out = sh(&stamp_cmd(&os, &b(dir), b"d it's"));
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let no = AtomicBool::new(false);
+        let (r0, l0) = (remote(&src), stamp(&Side::Local, &src, &name, &no).unwrap());
+        let out = sh(&quarantine_cmd(&b(&src), b"d it's"));
+        assert!(out.status.success(), "{out:?}");
+        let q = parse_quarantine(&out.stdout).expect("quarantine dir");
+        let qdir = src.join(String::from_utf8(q).unwrap());
+        assert!(!src.join("d it's").exists() && qdir.join("d it's/sub/f").exists());
+        assert_eq!(remote(&qdir), r0, "a rename keeps the remote fingerprint");
+        assert_eq!(
+            stamp(&Side::Local, &qdir, &name, &no).unwrap(),
+            l0,
+            "and the local one"
+        );
+        fs::write(qdir.join("d it's/sub/f"), "xyz").unwrap();
+        assert_ne!(remote(&qdir), r0, "a change still shows");
+        // a missing source: nothing is created, the command fails
+        let out = sh(&quarantine_cmd(&b(&src), b"gone"));
+        assert!(!out.status.success());
+        assert_eq!(
+            fs::read_dir(&src).unwrap().count(),
+            1,
+            "only the first quarantine dir"
+        );
+    }
+
+    #[test]
+    fn a_remote_source_is_deleted_from_its_quarantine_only() {
+        let t = tempfile::tempdir().unwrap();
+        let f = host(&[], &[], "0\x000\x00");
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            (r.outcome, r.copied),
+            (OpOutcome::Done, 1),
+            "{:?}",
+            r.warnings
+        );
+        let cmds = f.remote_cmds();
+        let qi = cmds
+            .iter()
+            .position(|c| *c == String::from_utf8(quarantine_cmd(b"/srv", b"a")).unwrap())
+            .expect("set aside first");
+        let stamps: Vec<usize> = (0..cmds.len())
+            .filter(|&i| cmds[i].contains("| cksum"))
+            .collect();
+        assert_eq!(stamps.len(), 2);
+        assert!(stamps[1] > qi && cmds[stamps[1]].starts_with("cd -- '/srv/.hdir-del.Q1'"));
+        let rm = cmds
+            .iter()
+            .position(|c| c.contains("rm -rf"))
+            .expect("deleted");
+        assert!(rm > stamps[1]);
+        assert!(cmds[rm].contains("/srv/.hdir-del.Q1"), "{}", cmds[rm]);
+        assert!(cmds.iter().any(|c| c == "rmdir -- '/srv/.hdir-del.Q1'"));
+    }
+
+    #[test]
+    fn a_remote_source_changed_by_the_time_it_is_set_aside_goes_back() {
+        let t = tempfile::tempdir().unwrap();
+        let stamps = Arc::new(Mutex::new(vec!["1 2\n", "9 9\n"]));
+        let s2 = Arc::clone(&stamps);
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "scp" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("| cksum") {
+                return ok(s2.lock().unwrap().remove(0));
+            }
+            answer(c, &[], &[], "0\x000\x00")
+        });
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!((r.outcome, r.partial), (OpOutcome::Done, 1));
+        let back = String::from_utf8(place_cmd(
+            &RemoteOs::Linux,
+            b"/srv/.hdir-del.Q1/a",
+            b"/srv/a",
+            b"/srv/.hdir-del.Q1",
+            false,
+        ))
+        .unwrap();
+        let cmds = f.remote_cmds();
+        assert!(cmds.contains(&back), "put back without replacing: {cmds:?}");
+        assert!(
+            !cmds.iter().any(|c| c.contains("rm -rf")),
+            "nothing deleted"
+        );
+    }
+
+    #[test]
+    fn real_a_tree_that_cannot_be_read_is_not_taken_for_link_free() {
+        // SAFETY: plain getter.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads everything
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("d/locked")).unwrap();
+        std::os::unix::fs::symlink("/etc", t.path().join("d/locked/ln")).unwrap();
+        fs::set_permissions(t.path().join("d/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let out = sh(&links_cmd(&b(t.path()), b"d"));
+        let scan = sh(&scan_cmd(&b(t.path()), &[b"d"]));
+        fs::set_permissions(t.path().join("d/locked"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(out.stdout, b"e");
+        assert_eq!(flag(&out.stdout), None, "refused, not 'no links'");
+        assert_eq!(parse_scan(&scan.stdout, 1), None);
     }
 }
