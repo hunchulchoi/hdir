@@ -667,6 +667,57 @@ mod xattr_sys {
     pub fn is_unsupported(e: &io::Error) -> bool {
         matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP)
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A reader answering size queries and reads from a script of
+        /// (size, value) steps, like a value that changes between calls.
+        fn scripted(
+            steps: Vec<io::Result<Vec<u8>>>,
+        ) -> impl FnMut(*mut u8, usize) -> io::Result<usize> {
+            let mut steps = steps.into_iter();
+            move |buf, len| {
+                let v = steps.next().expect("no more calls")?;
+                if len > 0 && v.len() <= len {
+                    // SAFETY: the caller's buffer holds `len` bytes.
+                    unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), buf, v.len()) };
+                }
+                Ok(v.len())
+            }
+        }
+
+        #[test]
+        fn a_value_that_grows_from_zero_is_read_again() {
+            // size 0, then (buffer of 0) it is now 3 long, size 3, read 3
+            let r = read_sized(scripted(vec![
+                Ok(vec![]),
+                Ok(b"abc".to_vec()),
+                Ok(b"abc".to_vec()),
+                Ok(b"abc".to_vec()),
+            ]));
+            assert_eq!(r.unwrap(), b"abc");
+        }
+
+        #[test]
+        fn erange_retries_and_then_gives_up() {
+            let erange = || Err(io::Error::from_raw_os_error(libc::ERANGE));
+            let r = read_sized(scripted(vec![
+                Ok(b"ab".to_vec()),
+                erange(),
+                Ok(b"abcd".to_vec()),
+                Ok(b"abcd".to_vec()),
+            ]));
+            assert_eq!(r.unwrap(), b"abcd");
+            let mut steps = Vec::new();
+            for _ in 0..4 {
+                steps.push(Ok(b"ab".to_vec()));
+                steps.push(erange());
+            }
+            let e = read_sized(scripted(steps)).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ERANGE));
+        }
+    }
 }
 
 /// Copy every extended attribute from `from` to `to`. Attributes the target
@@ -742,5 +793,358 @@ pub fn xattr_get_path(path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
         Ok(v) => Ok(Some(v)),
         Err(e) if xattr_sys::is_missing(&e) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+// ---- copy sources opened relative to their folder (HDIR-63) ----
+//
+// A folder being copied is opened once, without following links, and every
+// entry inside it is reached through that handle (`*at` calls). Swapping the
+// folder, or any folder above it, for a symlink while the copy runs can then
+// never redirect the copy elsewhere. On Windows the copy stays path based.
+
+/// What a copy source entry is, as seen without following it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrcKind {
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+/// An open source folder (unix).
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct DirFd(std::os::fd::OwnedFd);
+
+/// Never constructed off unix (it has no values): copies there are path
+/// based.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub enum DirFd {}
+
+#[cfg(not(unix))]
+impl DirFd {
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        match *self {}
+    }
+    pub fn entries(&self) -> io::Result<Vec<OsString>> {
+        match *self {}
+    }
+    pub fn copy_xattrs_to(&self, _to: &Path) -> io::Result<()> {
+        match *self {}
+    }
+}
+
+#[cfg(unix)]
+fn name_cstr(name: &OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in name"))
+}
+
+/// The entry `name` of `path` (its last component) as seen from `parent`,
+/// or `path` itself without a parent.
+#[cfg(unix)]
+fn last_name(path: &Path) -> io::Result<&OsStr> {
+    path.file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))
+}
+
+#[cfg(unix)]
+impl DirFd {
+    fn open_raw(dirfd: Option<&DirFd>, path: &std::ffi::CStr) -> io::Result<Option<DirFd>> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let at = dirfd.map_or(libc::AT_FDCWD, |d| d.0.as_raw_fd());
+        // SAFETY: valid C string; the fd is owned on success.
+        let fd = unsafe { libc::openat(at, path.as_ptr(), flags) };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        // SAFETY: a fresh descriptor we own.
+        Ok(Some(DirFd(unsafe { OwnedFd::from_raw_fd(fd) })))
+    }
+
+    /// Metadata of the opened folder itself.
+    pub fn metadata(&self) -> io::Result<fs::Metadata> {
+        let f = fs::File::from(self.0.try_clone()?);
+        f.metadata()
+    }
+
+    /// Names in the folder, without `.` and `..`.
+    pub fn entries(&self) -> io::Result<Vec<OsString>> {
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let dup = self.0.try_clone()?.into_raw_fd();
+        // SAFETY: `dup` is ours; fdopendir takes it over (closedir closes it).
+        let dir = unsafe { libc::fdopendir(dup) };
+        if dir.is_null() {
+            let e = io::Error::last_os_error();
+            // SAFETY: still ours when fdopendir failed.
+            unsafe { libc::close(dup) };
+            return Err(e);
+        }
+        // SAFETY: rewind so a reused description starts at the beginning.
+        unsafe { libc::rewinddir(dir) };
+        let mut out = Vec::new();
+        let res = loop {
+            // SAFETY: errno is reset to tell the end from an error.
+            unsafe { *errno_ptr() = 0 };
+            let ent = unsafe { libc::readdir(dir) };
+            if ent.is_null() {
+                let err = unsafe { *errno_ptr() };
+                break if err == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(err))
+                };
+            }
+            // SAFETY: d_name is NUL-terminated inside the entry.
+            let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+            let b = name.to_bytes();
+            if b != b"." && b != b".." {
+                out.push(OsStr::from_bytes(b).to_os_string());
+            }
+        };
+        // SAFETY: opened above.
+        unsafe { libc::closedir(dir) };
+        res.map(|()| out)
+    }
+
+    /// Copy this folder's extended attributes onto `to` (not followed).
+    pub fn copy_xattrs_to(&self, to: &Path) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            use std::os::fd::AsRawFd;
+            use xattr_sys::{On, cpath};
+            let t = cpath(to)?;
+            copy_xattrs_on(On::Fd(self.0.as_raw_fd()), On::Path(&t))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = to;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn errno_ptr() -> *mut i32 {
+    // SAFETY: always valid for the calling thread.
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+unsafe fn errno_ptr() -> *mut i32 {
+    // SAFETY: always valid for the calling thread.
+    unsafe { libc::__error() }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    ))
+))]
+unsafe fn errno_ptr() -> *mut i32 {
+    // SAFETY: always valid for the calling thread.
+    unsafe { libc::__errno() }
+}
+
+/// Kind, device and inode of `path`, reached through `parent` when given
+/// (then only the last component of `path` is used). Never follows a link.
+pub fn src_kind(parent: Option<&DirFd>, path: &Path) -> io::Result<(SrcKind, u64, u64)> {
+    #[cfg(unix)]
+    {
+        let st = match parent {
+            Some(dir) => {
+                use std::os::fd::AsRawFd;
+                let name = name_cstr(last_name(path)?)?;
+                let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: valid fd and name; `st` is written on success.
+                let r = unsafe {
+                    libc::fstatat(
+                        dir.0.as_raw_fd(),
+                        name.as_ptr(),
+                        st.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if r != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: initialised by the successful call.
+                let st = unsafe { st.assume_init() };
+                let kind = match st.st_mode & libc::S_IFMT {
+                    libc::S_IFDIR => SrcKind::Dir,
+                    libc::S_IFREG => SrcKind::File,
+                    libc::S_IFLNK => SrcKind::Symlink,
+                    _ => SrcKind::Other,
+                };
+                #[allow(clippy::unnecessary_cast)]
+                return Ok((kind, st.st_dev as u64, st.st_ino as u64));
+            }
+            None => fs::symlink_metadata(path)?,
+        };
+        use std::os::unix::fs::MetadataExt;
+        Ok((kind_of(&st.file_type()), st.dev(), st.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        let m = fs::symlink_metadata(path)?;
+        Ok((kind_of(&m.file_type()), 0, 0))
+    }
+}
+
+fn kind_of(ft: &fs::FileType) -> SrcKind {
+    if ft.is_symlink() {
+        SrcKind::Symlink
+    } else if ft.is_dir() {
+        SrcKind::Dir
+    } else if ft.is_file() {
+        SrcKind::File
+    } else {
+        SrcKind::Other
+    }
+}
+
+/// Open a source folder without following links (`None`: no longer a real
+/// folder). Off unix there is nothing to open: `None` always.
+pub fn open_src_dir(parent: Option<&DirFd>, path: &Path) -> io::Result<Option<DirFd>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c = match parent {
+            Some(_) => name_cstr(last_name(path)?)?,
+            None => std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?,
+        };
+        DirFd::open_raw(parent, &c)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, path);
+        Ok(None)
+    }
+}
+
+/// [`open_source`] reached through `parent` when given.
+pub fn open_src_file(parent: Option<&DirFd>, path: &Path) -> io::Result<Option<fs::File>> {
+    #[cfg(unix)]
+    if let Some(dir) = parent {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let name = name_cstr(last_name(path)?)?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: valid fd and name; the result is owned on success.
+        let fd = unsafe { libc::openat(dir.0.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return if e.raw_os_error() == Some(libc::ELOOP) {
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+        // SAFETY: a fresh descriptor we own.
+        return Ok(Some(fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) })));
+    }
+    let _ = parent;
+    open_source(path)
+}
+
+/// The target of the symlink `path`, reached through `parent` when given.
+pub fn read_src_link(parent: Option<&DirFd>, path: &Path) -> io::Result<std::path::PathBuf> {
+    #[cfg(unix)]
+    if let Some(dir) = parent {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let name = name_cstr(last_name(path)?)?;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            // SAFETY: the buffer is valid for its length.
+            let n = unsafe {
+                libc::readlinkat(
+                    dir.0.as_raw_fd(),
+                    name.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let n = n as usize;
+            if n < buf.len() {
+                buf.truncate(n);
+                return Ok(OsStr::from_bytes(&buf).into());
+            }
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+    let _ = parent;
+    fs::read_link(path)
+}
+
+#[cfg(all(test, unix))]
+mod src_at_tests {
+    use super::*;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn a_source_folder_is_read_through_its_handle() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        fs::create_dir(&d).unwrap();
+        // APFS refuses names that are not UTF-8; Linux takes any bytes
+        let odd = OsStr::from_bytes(if cfg!(target_os = "linux") {
+            b"x\n\xff y"
+        } else {
+            "x\n 한 y".as_bytes()
+        });
+        fs::write(d.join(odd), "data").unwrap();
+        fs::create_dir(d.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", d.join("ln")).unwrap();
+        let dir = open_src_dir(None, &d).unwrap().expect("a real folder");
+        let mut names = dir.entries().unwrap();
+        names.sort();
+        let mut want = vec![
+            OsString::from("ln"),
+            OsString::from("sub"),
+            odd.to_os_string(),
+        ];
+        want.sort();
+        assert_eq!(names, want);
+        assert_eq!(dir.entries().unwrap().len(), 3, "readable again");
+        let kind = |n: &OsStr| src_kind(Some(&dir), &d.join(n)).unwrap().0;
+        assert_eq!(kind(odd), SrcKind::File);
+        assert_eq!(kind(OsStr::new("sub")), SrcKind::Dir);
+        assert_eq!(kind(OsStr::new("ln")), SrcKind::Symlink);
+        assert_eq!(
+            read_src_link(Some(&dir), &d.join("ln")).unwrap(),
+            std::path::PathBuf::from("../elsewhere")
+        );
+        let mut f = open_src_file(Some(&dir), &d.join(odd)).unwrap().unwrap();
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+        assert_eq!(s, "data");
+        // links are never opened as files or folders
+        assert!(open_src_file(Some(&dir), &d.join("ln")).unwrap().is_none());
+        assert!(open_src_dir(Some(&dir), &d.join("ln")).unwrap().is_none());
+        assert!(open_src_dir(Some(&dir), &d.join("sub")).unwrap().is_some());
+        // the handle keeps pointing at the folder after it was renamed away
+        fs::rename(&d, t.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(t.path(), &d).unwrap();
+        assert_eq!(dir.entries().unwrap().len(), 3);
+        assert_eq!(kind(odd), SrcKind::File);
+        assert!(open_src_dir(None, &d).unwrap().is_none(), "a link: refused");
     }
 }

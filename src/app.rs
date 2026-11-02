@@ -9597,6 +9597,9 @@ mod tests {
                 if let Some(o) = crate::testutil::fake_quarantine(c) {
                     return Some(o);
                 }
+                if c.ends_with("&& stat -c %d:%i -- .") {
+                    return Some(out(0, "5:6\n"));
+                }
                 if c.contains(" || exit 1; c=$(pwd -P && echo x)") {
                     return Some(out(0, "9:9\n9:1\n")); // destination parents
                 }

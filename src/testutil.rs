@@ -171,6 +171,9 @@ pub fn pipe_ends(a: &[String]) -> (String, String) {
             } else {
                 format!("{host}:{dir}")
             }
+        } else if part.first().is_some_and(|p| p == "sh") && reading {
+            // local_tar_out: sh -c SCRIPT sh DIR ID NAME
+            format!("{}/{}", part[4], part[6])
         } else {
             let c = part.iter().position(|x| x == "-C").unwrap();
             if reading {
