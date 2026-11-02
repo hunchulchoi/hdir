@@ -7976,7 +7976,7 @@ mod tests {
                 {
                     return o;
                 }
-                if a[0] == "scp" {
+                if a[0] == "scp" || a[0] == "pipe" {
                     return out(0, "");
                 }
                 if cmd == "uname -s" {
@@ -8015,6 +8015,20 @@ mod tests {
                         stderr: b"cd: no such directory\n".to_vec(),
                     },
                 }
+            }
+            /// Answered as one `["pipe", from.., "|", to..]` argv (see
+            /// `testutil::FakeCmd::run_pipe`).
+            fn run_pipe(
+                &self,
+                from: &[OsString],
+                to: &[OsString],
+                _cancel: &AtomicBool,
+            ) -> (CmdOutput, CmdOutput) {
+                let mut all = vec![OsString::from("pipe")];
+                all.extend(from.iter().cloned());
+                all.push(OsString::from("|"));
+                all.extend(to.iter().cloned());
+                (out(0, ""), self.run(&all))
             }
             fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
                 self.interactive.lock().unwrap().push(strs(argv));
@@ -9550,11 +9564,11 @@ mod tests {
         /// `new` into the local target dir.
         fn remote_has(f: &FakeSsh, there: &'static [&'static str]) {
             script(f, move |a| {
-                if a[0] == "scp" {
-                    let (src, dst) = (&a[a.len() - 2], &a[a.len() - 1]);
+                if a[0] == "pipe" {
+                    let (src, dst) = crate::testutil::pipe_ends(a);
                     if !dst.starts_with("prod-web:") {
-                        let name = Path::new(src).file_name().unwrap().to_owned();
-                        fs::write(Path::new(dst).join(name), "new").unwrap();
+                        let name = Path::new(&src).file_name().unwrap().to_owned();
+                        fs::write(Path::new(&dst).join(name), "new").unwrap();
                     }
                     return Some(out(0, ""));
                 }
@@ -9590,7 +9604,7 @@ mod tests {
                     return Some(out(0, "0")); // link re-check: none
                 }
                 if c.contains("; do k=$(du -sk") {
-                    return Some(out(0, "0\x000\x00"));
+                    return Some(out(0, "0\x00"));
                 }
                 None
             });
@@ -9601,8 +9615,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|a| a[0] == "scp")
-                .map(|a| (a[a.len() - 2].clone(), a[a.len() - 1].clone()))
+                .filter(|a| a[0] == "pipe")
+                .map(|a| crate::testutil::pipe_ends(a))
                 .collect()
         }
 

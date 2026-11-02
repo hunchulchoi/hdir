@@ -56,6 +56,16 @@ pub trait Cmd: Send + Sync {
     fn run_cancellable(&self, argv: &[OsString], _cancel: &AtomicBool) -> CmdOutput {
         self.run_transfer(argv)
     }
+    /// `from | to`, stopped when `cancel` is set (see [`run_pipe_cancellable`]).
+    fn run_pipe(
+        &self,
+        _from: &[OsString],
+        _to: &[OsString],
+        _cancel: &AtomicBool,
+    ) -> (CmdOutput, CmdOutput) {
+        let no = spawn_failed("pipe not supported");
+        (no.clone(), no)
+    }
 }
 
 /// Stderr text of a command stopped through its cancel flag.
@@ -145,6 +155,121 @@ fn run_with(argv: &[OsString], limit: Duration, cancel: Option<&AtomicBool>) -> 
     }
 }
 
+/// Run `from | to` (from's stdout into to's stdin), both killed together
+/// after `limit` or once `cancel` is set (each output then has `code: None`
+/// and [`TIMEOUT_MSG`] / [`CANCELLED_MSG`]). On unix both share one new
+/// process group, so helpers they spawned (ssh) die with them.
+pub fn run_pipe_cancellable(
+    from: &[OsString],
+    to: &[OsString],
+    limit: Duration,
+    cancel: &AtomicBool,
+) -> (CmdOutput, CmdOutput) {
+    let (Some((pa, aa)), Some((pb, ab))) = (from.split_first(), to.split_first()) else {
+        return (spawn_failed("empty command"), spawn_failed("empty command"));
+    };
+    let mut ca = Command::new(pa);
+    ca.args(aa)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        ca.process_group(0);
+    }
+    let mut a = match ca.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let f = spawn_failed(&format!("{}: {e}", pa.to_string_lossy()));
+            return (f, CmdOutput::default());
+        }
+    };
+    let mut cb = Command::new(pb);
+    cb.args(ab).stdout(Stdio::piped()).stderr(Stdio::piped());
+    match a.stdout.take() {
+        Some(o) => cb.stdin(Stdio::from(o)),
+        None => cb.stdin(Stdio::null()),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        if let Ok(pg) = i32::try_from(a.id()) {
+            cb.process_group(pg);
+        }
+    }
+    let mut b = match cb.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            kill_tree(&mut a, true);
+            let _ = a.wait();
+            let f = spawn_failed(&format!("{}: {e}", pb.to_string_lossy()));
+            return (CmdOutput::default(), f);
+        }
+    };
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let (ea, ob, eb) = (
+        drain(a.stderr.take()),
+        drain(b.stdout.take()),
+        drain(b.stderr.take()),
+    );
+    let deadline = Instant::now() + limit;
+    let (mut sa, mut sb) = (None, None);
+    let stopped = loop {
+        if sa.is_none() {
+            sa = a.try_wait().ok().flatten();
+        }
+        if sb.is_none() {
+            sb = b.try_wait().ok().flatten();
+        }
+        if sa.is_some() && sb.is_some() {
+            break None;
+        }
+        if Instant::now() >= deadline || is_set(cancel) {
+            // `a` leads the group `b` joined: one kill stops both.
+            kill_tree(&mut a, true);
+            let _ = b.kill();
+            let _ = a.wait();
+            let _ = b.wait();
+            break Some(if is_set(cancel) {
+                CANCELLED_MSG
+            } else {
+                TIMEOUT_MSG
+            });
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let (err_a, out_b, err_b) = (
+        ea.join().unwrap_or_default(),
+        ob.join().unwrap_or_default(),
+        eb.join().unwrap_or_default(),
+    );
+    if let Some(msg) = stopped {
+        return (spawn_failed(msg), spawn_failed(msg));
+    }
+    let code = |s: Option<std::process::ExitStatus>| s.and_then(|s| s.code());
+    (
+        CmdOutput {
+            code: code(sa),
+            stdout: Vec::new(),
+            stderr: err_a,
+        },
+        CmdOutput {
+            code: code(sb),
+            stdout: out_b,
+            stderr: err_b,
+        },
+    )
+}
+
 fn is_set(flag: &AtomicBool) -> bool {
     flag.load(Ordering::SeqCst)
 }
@@ -172,6 +297,14 @@ impl Cmd for SystemCmd {
     }
     fn run_cancellable(&self, argv: &[OsString], cancel: &AtomicBool) -> CmdOutput {
         run_cancellable(argv, TRANSFER_TIMEOUT, cancel)
+    }
+    fn run_pipe(
+        &self,
+        from: &[OsString],
+        to: &[OsString],
+        cancel: &AtomicBool,
+    ) -> (CmdOutput, CmdOutput) {
+        run_pipe_cancellable(from, to, TRANSFER_TIMEOUT, cancel)
     }
     fn run_interactive(&self, argv: &[OsString]) -> CmdOutput {
         let Some((prog, args)) = argv.split_first() else {
@@ -366,6 +499,21 @@ impl RemoteSession {
             ))),
             Some(_) => Ok(out),
         }
+    }
+
+    /// Run `from | to` through this session's runner (one side is usually an
+    /// ssh to this host). Liveness is the caller's to judge: it knows which
+    /// side was an ssh to which host.
+    pub fn pipe(
+        &self,
+        from: &[OsString],
+        to: &[OsString],
+        cancel: &AtomicBool,
+    ) -> Result<(CmdOutput, CmdOutput), SessionError> {
+        if !self.is_alive() {
+            return Err(SessionError::Disconnected);
+        }
+        Ok(self.cmd.run_pipe(from, to, cancel))
     }
 
     /// Reconnect check: is the master alive again? Flips `alive` accordingly.
@@ -772,6 +920,51 @@ mod tests {
         );
         assert_eq!(o.code, None);
         assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_feeds_one_into_the_other_and_reports_both() {
+        let no = AtomicBool::new(false);
+        let a: Vec<OsString> = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf 'a b'; echo oops >&2; exit 3".into(),
+        ];
+        let b: Vec<OsString> = vec!["sh".into(), "-c".into(), "tr a-z A-Z; exit 4".into()];
+        let (oa, ob) = run_pipe_cancellable(&a, &b, Duration::from_secs(5), &no);
+        assert_eq!((oa.code, ob.code), (Some(3), Some(4)));
+        assert_eq!(ob.stdout, b"A B");
+        assert_eq!(first_line(&oa.stderr, ""), "oops");
+        let bad: Vec<OsString> = vec!["/nonexistent/x".into()];
+        let (oa, ob) = run_pipe_cancellable(&a, &bad, Duration::from_secs(5), &no);
+        assert_eq!((oa.code, ob.code), (None, None), "{oa:?} {ob:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_pipe_stops_both_sides_quickly() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            c2.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let a: Vec<OsString> = vec![
+            "sh".into(),
+            "-c".into(),
+            "sleep 30 & while :; do echo x; sleep 1; done".into(),
+        ];
+        let b: Vec<OsString> = vec!["sh".into(), "-c".into(), "cat >/dev/null; sleep 30".into()];
+        let (oa, ob) = run_pipe_cancellable(&a, &b, Duration::from_secs(60), &cancel);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(first_line(&oa.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&ob.stderr, ""), CANCELLED_MSG);
     }
 
     #[cfg(unix)]

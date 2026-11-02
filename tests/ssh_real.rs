@@ -663,27 +663,38 @@ fn transfers_round_trip() {
     );
 
     // a link at the target is replaced, not written through; a link in the
-    // source is never followed by scp
+    // source travels as a link (the tar stream never follows it)
     let link = format!(
         "cd -- {} && printf keep > big && ln -s ../big in/lnk",
         q(&dir)
     );
     assert_eq!(remote(&cmd, &target, link.as_bytes()).code, Some(0));
     std::fs::write(local.path().join("lnk"), "mine").unwrap();
-    std::os::unix::fs::symlink("/etc", local.path().join("updir/etc-link")).unwrap();
+    std::fs::create_dir(local.path().join("linkdir")).unwrap();
+    std::os::unix::fs::symlink("/etc", local.path().join("linkdir/etc-link")).unwrap();
     let r = run(
         &spec(
             JobKind::Copy,
             Side::Local,
             local.path(),
-            &["lnk", "updir"],
+            &["lnk", "linkdir"],
             remote_s(),
             &rdir.join("in"),
         ),
         &mut ctl(),
     );
-    assert_eq!((r.outcome, r.copied, r.skipped), (OpOutcome::Done, 1, 1));
-    assert!(r.warnings[0].contains("심볼릭 링크"), "{:?}", r.warnings);
+    assert_eq!(
+        (r.outcome, r.copied, r.skipped),
+        (OpOutcome::Done, 2, 0),
+        "{:?}",
+        r.warnings
+    );
+    let link = remote(
+        &cmd,
+        &target,
+        format!("readlink -- {}", q(&format!("{dir}/in/linkdir/etc-link"))).as_bytes(),
+    );
+    assert_eq!(link.stdout, b"/etc\n", "the link itself, not /etc's files");
     assert_eq!(
         cat(&format!("{dir}/big")).stdout,
         b"keep",
@@ -696,7 +707,7 @@ fn transfers_round_trip() {
         format!("[ -L {} ]", q(&format!("{dir}/in/lnk"))).as_bytes(),
     );
     assert_ne!(still_link.code, Some(0), "the link itself was replaced");
-    std::fs::remove_file(local.path().join("updir/etc-link")).unwrap();
+    std::fs::remove_file(local.path().join("linkdir/etc-link")).unwrap();
     assert_eq!(
         remote(
             &cmd,
