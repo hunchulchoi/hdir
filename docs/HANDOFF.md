@@ -1,14 +1,14 @@
 # hdir 핸드오프
 
-작성: 2026-11-02 · 기준 커밋: `main` (PR #16 merge 직후, M9 PR 진행 중)
+작성: 2026-11-02 · 기준 커밋: `main` (PR #18 merge 이후, HDIR-81 브랜치 `m8-tar`)
 
 Mdir 스타일 듀얼 패널 TUI 파일 관리자 (Rust + Ratatui). 원 구상 `docs/mvp계획.md`, 전체 설계 `docs/plan.md`, 개발 룰 `CLAUDE.md`.
 
 ## 1. 한눈에 보는 상태
 
-- 끝난 모듈: M1 코어 TUI, M2 파일 작업 + 휴지통, M3 뷰어·미리보기·모드, M4 설정·테마·키, M5 확장자 연결, M6 셸 통합, M7 SSH 원격 패널, M8 scp 전송.
-- M9 문서·릴리스(HDIR-52 README, HDIR-53 release 빌드)는 브랜치 `m9-docs`.
-- 남은 일: 낮은 우선순위 Todo(HDIR-56, 59, 63), 후속 HDIR-81(tar 스트림 전송), Windows Backlog(HDIR-66~72, 요청 시에만).
+- 끝난 모듈: M1 코어 TUI, M2 파일 작업 + 휴지통, M3 뷰어·미리보기·모드, M4 설정·테마·키, M5 확장자 연결, M6 셸 통합, M7 SSH 원격 패널, M8 원격 전송, M9 문서·릴리스.
+- 원격 전송은 tar 스트림(HDIR-81)으로 바꾸는 중(브랜치 `m8-tar`).
+- 남은 일: 낮은 우선순위 Todo(HDIR-56, 59, 63), Windows Backlog(HDIR-66~72, 요청 시에만). 라이선스 미정(LICENSE 없음).
 - 테스트 (PR #16 기준): macOS 991, Linux 991, Windows 712 통과. 셸 통합 6, 실제 ssh 4(`#[ignore]`, stage 서버와 `scripts/ssh-docker-test.sh`), README 예시 검사 1.
 - 최소 Rust 1.88 (`rust-version`, 1.87은 의존성이 거부함을 Docker로 확인).
 
@@ -50,12 +50,8 @@ ssh -o BatchMode=yes choi@stage.devfor.link true && ssh -o BatchMode=yes win11.d
 
 ## 4. 남은 작업 (우선순위 순)
 
-### M8 후속
-| 이슈 | 내용 |
-|---|---|
-| HDIR-81 | 원격 전송을 링크를 보존하는 tar 스트림으로 교체 (지금은 scp가 링크를 따라가서 링크가 든 항목은 건너뜀, 마지막 검사와 scp 사이 짧은 경쟁 남음). 폴더 이동 중 깊은 변경은 이제 트리 지문으로 잡음 |
-
-M8 설계 요지(`src/transfer.rs` 모듈 문서): 대상 안 비공개 임시 폴더(`.hdir-xfer.*`)로 받고 no-replace로 배치, 링크 따라가지 않음, 대상 폴더 안전 검사(`remote::safe_dirs_check` 공용), 이동은 트리 지문이 같을 때만 원본 삭제, 자기 안으로 보내기는 dev:inode 체인으로 차단, BSD 원격은 sticky 대상 거부. Codex 리뷰 9회 이력은 PR #16 본문.
+### M8 설계 요지
+`src/transfer.rs` 모듈 문서 참고. 로컬↔서버·서버↔서버는 tar 스트림(링크는 링크로, 각 서버 자기 ControlMaster), 같은 서버는 `cp -Rp`/rename. 대상 안 비공개 임시 폴더(`.hdir-xfer.*`)로 받고 no-replace 배치, 대상 폴더 안전 검사(`remote::safe_dirs_check` 공용), 자기 안으로 보내기는 dev:inode 체인으로 차단, BSD 원격은 sticky 대상 거부. 이동은 트리 지문이 같을 때만 원본 삭제(원격 원본은 `.hdir-del.*`로 격리 후 재확인). Codex 리뷰 이력은 PR #16, #18 본문.
 
 ### 낮은 우선순위
 HDIR-56 term 테스트 구조, HDIR-59 xattr 보존, HDIR-63 fd 기반 순회 TOCTOU.

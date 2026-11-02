@@ -98,6 +98,90 @@ impl Cmd for FakeCmd {
         self.cancellable.lock().unwrap().push(strs(argv));
         self.run_transfer(argv)
     }
+    /// A pipe is answered as one argv: `["pipe", <from...>, "|", <to...>]`;
+    /// the reply is the `to` side's (the `from` side succeeds), unless its
+    /// stderr starts with `from:`: then it is the sending side's.
+    fn run_pipe(
+        &self,
+        from: &[OsString],
+        to: &[OsString],
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> (CmdOutput, CmdOutput) {
+        let mut all = vec![OsString::from("pipe")];
+        all.extend(from.iter().cloned());
+        all.push(OsString::from("|"));
+        all.extend(to.iter().cloned());
+        let out = self.run_transfer(&all);
+        // a reply whose stderr starts with "from:" is the sending side's
+        if out.stderr.starts_with(b"from:") {
+            return (out, fail(141, "broken pipe\n"));
+        }
+        (ok(""), out)
+    }
+}
+
+impl FakeCmd {
+    /// Every pipe run, as the combined argv `run_pipe` answers.
+    pub fn pipe_calls(&self) -> Vec<Vec<String>> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.first().is_some_and(|p| p == "pipe"))
+            .cloned()
+            .collect()
+    }
+}
+
+/// The two halves of a `pipe` argv from [`FakeCmd`]: what was read and
+/// where it was unpacked, as `host:dir/name` / `host:stage` or local paths.
+pub fn pipe_ends(a: &[String]) -> (String, String) {
+    let bar = a.iter().position(|x| x == "|").expect("a pipe argv");
+    let (from, to) = (&a[1..bar], &a[bar + 1..]);
+    let quoted = |s: &str, after: &str| -> String {
+        s.split_once(after)
+            .map(|(_, r)| {
+                // shell quoting as built by sh_quote: '...' with '\'' inside
+                let mut out = String::new();
+                let mut rest = r;
+                while let Some(body) = rest.strip_prefix('\'') {
+                    let end = body.find('\'').unwrap();
+                    out.push_str(&body[..end]);
+                    rest = &body[end + 1..];
+                    match rest.strip_prefix("\\'") {
+                        Some(r2) => {
+                            out.push('\'');
+                            rest = r2;
+                        }
+                        None => break,
+                    }
+                }
+                out
+            })
+            .unwrap_or_default()
+    };
+    let side = |part: &[String], reading: bool| -> String {
+        if part.first().is_some_and(|p| p == "ssh") {
+            let host = &part[part.iter().position(|x| x == "--").unwrap() + 1];
+            let cmd = remote_cmd(part).unwrap_or_default();
+            let dir = quoted(cmd, "cd -- ");
+            if reading {
+                let name = quoted(cmd, "tar -cf - ./");
+                format!("{host}:{dir}/{name}")
+            } else {
+                format!("{host}:{dir}")
+            }
+        } else {
+            let c = part.iter().position(|x| x == "-C").unwrap();
+            if reading {
+                let name = part[c + 2].strip_prefix("./").unwrap_or(&part[c + 2]);
+                format!("{}/{name}", part[c + 1])
+            } else {
+                part[c + 1].clone()
+            }
+        }
+    };
+    (side(from, true), side(to, false))
 }
 
 pub fn ok(stdout: &str) -> CmdOutput {

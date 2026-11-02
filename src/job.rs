@@ -859,6 +859,6 @@ mod transfer_tests {
         assert!(
             matches!(ev.last(), Some(JobEvent::Finished { report }) if report.outcome == OpOutcome::Cancelled)
         );
-        assert!(f.scp_calls().is_empty());
+        assert!(f.pipe_calls().is_empty());
     }
 }
