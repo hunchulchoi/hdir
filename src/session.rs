@@ -233,6 +233,21 @@ impl RemoteSession {
             return Err(SessionError::Disconnected);
         }
         let out = self.cmd.run(&exec_argv(&self.target, remote_cmd));
+        self.exec_result(out)
+    }
+
+    /// Like [`exec`](Self::exec) for a command that reads or writes a whole
+    /// file (checksum, in-place copy): limited like a transfer, not by
+    /// [`CMD_TIMEOUT`].
+    pub fn exec_long(&self, remote_cmd: &[u8]) -> Result<CmdOutput, SessionError> {
+        if !self.is_alive() {
+            return Err(SessionError::Disconnected);
+        }
+        let out = self.cmd.run_transfer(&exec_argv(&self.target, remote_cmd));
+        self.exec_result(out)
+    }
+
+    fn exec_result(&self, out: CmdOutput) -> Result<CmdOutput, SessionError> {
         match out.code {
             Some(255) => {
                 self.set_alive(false);
