@@ -1379,6 +1379,64 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_account_list_refuses_group_writable_dirs() {
+        let own = fake_id("UID", "GID", "me");
+        let get = "case \"$1\" in group) echo 'me:x:GID:';; *) exit 2;; esac";
+        assert_eq!(
+            mktemp_with(0o775, &[("id", &own), ("getent", get)]),
+            (Some(UNSAFE_DIR), false)
+        );
+    }
+
+    #[test]
+    fn the_permission_check_names_the_raw_directory_bytes() {
+        let c = crate::remote::mktemp_cmd(&crate::remote::RemoteOs::Linux, b"/srv/bad\xff");
+        let raw = b"find '/srv/bad\xff' -prune";
+        assert!(
+            c.windows(raw.len()).any(|w| w == raw),
+            "raw bytes in every check"
+        );
+        let replacement = "\u{FFFD}".as_bytes();
+        assert!(
+            !c.windows(3).any(|w| w == replacement),
+            "nothing decoded lossily"
+        );
+    }
+
+    #[test]
+    fn real_dir_count_stops_at_the_cap_even_when_find_is_cut_off() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("big");
+        std::fs::create_dir(&d).unwrap();
+        let cap = crate::remote::REMOTE_DIR_CAP;
+        // long names: far more than a pipe buffer, so find meets SIGPIPE
+        let pad = "x".repeat(120);
+        for i in 0..cap + 50 {
+            std::fs::File::create(d.join(format!("{pad}{i}"))).unwrap();
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(
+                <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
+                    &crate::remote::preview_cmd(
+                        &crate::testutil::local_os(),
+                        d.as_os_str().as_encoded_bytes(),
+                        10,
+                    ),
+                ),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(crate::remote::PREVIEW_DIR),
+            "{out:?}"
+        );
+        let n: usize = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert_eq!(n, cap + 1);
+    }
+
+    #[test]
     fn group_writable_dirs_are_fine_only_for_an_exclusive_private_group() {
         let own = fake_id("UID", "GID", "me");
         let alone = fake_getent("", "");
@@ -1416,6 +1474,10 @@ mod tests {
         assert_eq!(mktemp_with(0o1777, &[("id", &me)]), (Some(0), true));
         assert_eq!(mktemp_with(0o1770, &[("id", &me)]), (Some(0), true));
         // owned by someone else (as far as `id -u` says): they could swap it
+        // (root owns the test dir when run as root, and root is trusted)
+        if unsafe { libc::getuid() } == 0 {
+            return;
+        }
         let stranger = fake_id("999999", "GID", "staff");
         assert_eq!(
             mktemp_with(0o1777, &[("id", &stranger)]),

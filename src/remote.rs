@@ -474,28 +474,44 @@ pub fn mktemp_cmd(os: &RemoteOs, dir: &[u8]) -> Vec<u8> {
         template.push(b'/');
     }
     template.extend_from_slice(b".hdir-edit.XXXXXX");
-    let q = sh_quote(&d);
-    let q = String::from_utf8_lossy(&q);
     let gid = stat_gid_args(os);
+    // Built as text with a `{q}` slot, then filled with the raw quoted bytes:
+    // a non-UTF-8 path must reach the remote unchanged.
     let check = format!(
         "me=$(id -u) && [ -n \"$me\" ] || exit 1; \
-         k=$(find {q} -prune -perm -1000 \\( -user 0 -o -user \"$me\" \\)) || exit 1; \
+         k=$(find {{q}} -prune -perm -1000 \\( -user 0 -o -user \"$me\" \\)) || exit 1; \
          if [ -z \"$k\" ]; then \
-         w=$(find {q} -prune -perm -0002) || exit 1; [ -z \"$w\" ] || exit {UNSAFE_DIR}; \
-         w=$(find {q} -prune -perm -0020) || exit 1; \
-         if [ -n \"$w\" ]; then g=$({gid} {q}) || exit {UNSAFE_DIR}; \
+         w=$(find {{q}} -prune -perm -0002) || exit 1; [ -z \"$w\" ] || exit {UNSAFE_DIR}; \
+         w=$(find {{q}} -prune -perm -0020) || exit 1; \
+         if [ -n \"$w\" ]; then g=$({gid} {{q}}) || exit {UNSAFE_DIR}; \
          u=$(id -un) && [ -n \"$u\" ] && [ \"$g\" = \"$(id -g)\" ] && [ \"$(id -gn)\" = \"$u\" ] \
          || exit {UNSAFE_DIR}; \
          e=$(getent group \"$g\") || exit {UNSAFE_DIR}; case $e in *:) ;; *) exit {UNSAFE_DIR};; esac; \
-         o=$(getent passwd | awk -F: -v g=\"$g\" -v u=\"$u\" '$4 == g && $1 != u') || exit {UNSAFE_DIR}; \
-         [ -z \"$o\" ] || exit {UNSAFE_DIR}; fi; fi; "
+         p=$(getent passwd) && [ -n \"$p\" ] || exit {UNSAFE_DIR}; \
+         o=$(printf '%s\\n' \"$p\" | awk -F: -v g=\"$g\" -v u=\"$u\" '$4 == g && $1 != u') \
+         || exit {UNSAFE_DIR}; [ -z \"$o\" ] || exit {UNSAFE_DIR}; fi; fi; "
     );
+    let check = fill_slot(&check, "{q}", &sh_quote(&d));
     cat(&[
-        check.as_bytes(),
+        &check,
         b"t=$(mktemp ",
         &sh_quote(&template),
         b") || exit 1; printf '%s\\0' \"$t\"",
     ])
+}
+
+/// `text` with every `slot` replaced by `bytes`.
+fn fill_slot(text: &str, slot: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(text.len());
+    let mut parts = text.split(slot);
+    if let Some(first) = parts.next() {
+        o.extend_from_slice(first.as_bytes());
+    }
+    for p in parts {
+        o.extend_from_slice(bytes);
+        o.extend_from_slice(p.as_bytes());
+    }
+    o
 }
 
 /// Exit codes of [`replace_cmd`]. On [`REPLACE_NOT_OWNER`] the temp file is
@@ -1323,8 +1339,9 @@ f\t1\t1.0\t644\tf\t\0zz\t1\t1.0\t644\tf\tn\0\0f\t2\t2.0\t600\tf\tok2\0f\t1\t1.0\
             "u=$(id -un) && [ -n \"$u\" ] && [ \"$g\" = \"$(id -g)\" ] && [ \"$(id -gn)\" = \"$u\" ]"
                 .to_string(),
             "e=$(getent group \"$g\") || exit 37; case $e in *:) ;; *) exit 37;; esac; ".to_string(),
-            "o=$(getent passwd | awk -F: -v g=\"$g\" -v u=\"$u\" '$4 == g && $1 != u') || exit 37; \
-             [ -z \"$o\" ] || exit 37; "
+            "p=$(getent passwd) && [ -n \"$p\" ] || exit 37; ".to_string(),
+            "o=$(printf '%s\\n' \"$p\" | awk -F: -v g=\"$g\" -v u=\"$u\" '$4 == g && $1 != u') \
+             || exit 37; [ -z \"$o\" ] || exit 37; "
                 .to_string(),
         ] {
             assert!(l.contains(&part), "missing {part}\nin {l}");
