@@ -940,9 +940,9 @@ mod md_tests {
     #[test]
     fn a_resize_rewraps_and_long_lines_scroll_sideways() {
         let src = format!(
-            "{}\n\n```\n{}\n```\n\n| a | b |\n|---|---|\n| {} | x |",
+            "{}\n\n```\n{}ZZEND\n```\n\n| a | b |\n|---|---|\n| {} | x |",
             "단어 ".repeat(30),
-            format!("{}ZZEND", "c".repeat(100)),
+            "c".repeat(100),
             "긴셀".repeat(20)
         );
         let mut v = md(&src);
