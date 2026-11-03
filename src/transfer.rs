@@ -172,6 +172,57 @@ pub fn scan_cmd(dir: &[u8], names: &[&[u8]]) -> Vec<u8> {
     ])
 }
 
+/// For each of `names` in `dir`: `1` when it is a real folder (not a
+/// link), else `0`, one character per name.
+pub fn dirs_cmd(dir: &[u8], names: &[&[u8]]) -> Vec<u8> {
+    cat(&[
+        b"cd -- ",
+        &sh_quote(dir),
+        b" || exit 1; for f in ",
+        &word_list(names),
+        b"; do if [ -d \"./$f\" ] && [ ! -L \"./$f\" ]; then printf 1; else printf 0; fi; done",
+    ])
+}
+
+/// [`dirs_cmd`] output as flags; `None` unless it has exactly `n`.
+pub fn parse_dirs(stdout: &[u8], n: usize) -> Option<Vec<bool>> {
+    let flags: Vec<bool> = stdout
+        .iter()
+        .take_while(|c| **c == b'0' || **c == b'1')
+        .map(|c| *c == b'1')
+        .collect();
+    (flags.len() == n).then_some(flags)
+}
+
+/// Which names the destination already has as real folders: they are
+/// always skipped (a folder is never overwritten or merged), so their
+/// trees need no sizing. Unknown (the check failed): none.
+fn dest_dirs(spec: &TransferSpec) -> Vec<bool> {
+    let n = spec.names.len();
+    match &spec.dst {
+        Side::Local => spec
+            .names
+            .iter()
+            .map(|name| {
+                std::fs::symlink_metadata(spec.dest_dir.join(name)).is_ok_and(|m| m.is_dir())
+            })
+            .collect(),
+        Side::Remote(s) => {
+            let names: Vec<Vec<u8>> = spec
+                .names
+                .iter()
+                .map(|n| os_bytes(n).into_owned())
+                .collect();
+            let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+            s.exec(&dirs_cmd(&b(&spec.dest_dir), &refs))
+                .ok()
+                .filter(|o| o.code == Some(0))
+                .and_then(|o| parse_dirs(&o.stdout, n))
+                .unwrap_or_else(|| vec![false; n])
+        }
+    }
+}
+
 /// Bytes per name from [`scan_cmd`] output; `None` unless it holds exactly
 /// `n` records (unknown sizes count as 0).
 pub fn parse_scan(stdout: &[u8], n: usize) -> Option<Vec<u64>> {
@@ -1151,17 +1202,23 @@ fn scan(
     if spec.kind == JobKind::Move && matches!(route, Route::SameHost(_)) {
         return Ok(Some(vec![0; n]));
     }
+    // names that will be skipped anyway are not sized (0 bytes)
+    let skip = dest_dirs(spec);
+    let wanted: Vec<usize> = (0..n).filter(|&i| !skip[i]).collect();
+    let mut sizes = vec![0; n];
     match &spec.src {
-        Side::Local => Ok(spec
-            .names
-            .iter()
-            .map(|name| scan_local(&spec.src_dir.join(name), cancel))
-            .collect()),
-        Side::Remote(s) => {
-            let names: Vec<Vec<u8>> = spec
-                .names
+        Side::Local => {
+            for &i in &wanted {
+                match scan_local(&spec.src_dir.join(&spec.names[i]), cancel) {
+                    Some(b) => sizes[i] = b,
+                    None => return Ok(None),
+                }
+            }
+        }
+        Side::Remote(s) if !wanted.is_empty() => {
+            let names: Vec<Vec<u8>> = wanted
                 .iter()
-                .map(|n| os_bytes(n).into_owned())
+                .map(|&i| os_bytes(&spec.names[i]).into_owned())
                 .collect();
             let refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
             let res = s.exec_cancellable(&scan_cmd(&b(&spec.src_dir), &refs), cancel);
@@ -1169,15 +1226,19 @@ fn scan(
                 return Ok(None);
             }
             let out = ran(res.map_err(|e| e.message())?)?;
-            match parse_scan(&out.stdout, n) {
-                Some(v) => Ok(Some(v)),
-                None => Err(crate::tr!(
+            let Some(v) = parse_scan(&out.stdout, wanted.len()) else {
+                return Err(crate::tr!(
                     "원격 항목을 확인할 수 없음",
                     "Cannot check the remote items"
-                )),
+                ));
+            };
+            for (&i, b) in wanted.iter().zip(v) {
+                sizes[i] = b;
             }
         }
+        Side::Remote(_) => {}
     }
+    Ok(Some(sizes))
 }
 
 /// A staging directory inside the destination.
@@ -3380,6 +3441,24 @@ mod tests {
         if c.contains("for f do printf .") {
             return ok("1\n"); // the entry count
         }
+        if c.contains("then printf 1; else printf 0; fi") {
+            // which names are real folders in the destination
+            let base = quoted_after(c, "cd -- '").unwrap_or("");
+            let list = c.split_once("for f in ").unwrap().1;
+            let list = list.split_once("; do").unwrap().0;
+            let out: String = list
+                .split("' '")
+                .map(|n| n.trim_matches('\''))
+                .map(|n| {
+                    if dirs.contains(&format!("{base}/{n}").as_str()) {
+                        '1'
+                    } else {
+                        '0'
+                    }
+                })
+                .collect();
+            return ok(&out);
+        }
         if c.starts_with("cd -- ") && c.contains("du -sk") {
             // the up-front scan has every name, the re-check before sending one
             let list = c.split_once("for f in ").unwrap().1;
@@ -3421,6 +3500,74 @@ mod tests {
     }
 
     const STAGE: &str = "/dst/.hdir-xfer.ABC123";
+
+    #[test]
+    fn folders_already_in_the_destination_are_not_sized_first() {
+        // remote source: the scan leaves out names the destination has as folders
+        let f = host(&["/dst/big"], &[], "7\x00");
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["big", "small"],
+            Side::Remote(Arc::clone(&session(Arc::clone(&f)))),
+            &p("/dst"),
+        );
+        let mut c = Ctl::new();
+        let r = run(&s, &mut c);
+        assert_eq!(
+            r.skipped,
+            1,
+            "{:?} {:?} {:?}",
+            r.outcome,
+            r.warnings,
+            f.remote_cmds()
+        );
+        let scans: Vec<String> = f
+            .remote_cmds()
+            .into_iter()
+            .filter(|c| c.contains("du -sk"))
+            .collect();
+        assert!(scans.iter().all(|c| !c.contains("'big'")), "{scans:?}");
+        assert!(scans.iter().any(|c| c.contains("'small'")), "{scans:?}");
+        // local source: its tree is never walked, so it adds no bytes
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("big")).unwrap();
+        fs::write(t.path().join("big/data"), vec![0u8; 50_000]).unwrap();
+        fs::write(t.path().join("small"), "12345").unwrap();
+        let f = host(&["/dst/big"], &[], "");
+        let s = spec(
+            JobKind::Copy,
+            Side::Local,
+            t.path(),
+            &["big", "small"],
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/dst"),
+        );
+        let mut c = Ctl::new();
+        let r = run(&s, &mut c);
+        assert_eq!(r.skipped, 1);
+        assert_eq!(c.totals.map(|t| t.bytes), Some(5), "big is not counted");
+    }
+
+    #[test]
+    fn dirs_cmd_quotes_names_and_tells_folders() {
+        assert_eq!(
+            dirs_cmd(b"/d it's", &[b"a b", b"-x"]),
+            b"cd -- '/d it'\\''s' || exit 1; for f in 'a b' '-x'; do \
+              if [ -d \"./$f\" ] && [ ! -L \"./$f\" ]; then printf 1; else printf 0; fi; done"
+                .to_vec()
+        );
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("dir x")).unwrap();
+        fs::write(t.path().join("-f"), "").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(t.path().join("dir x"), t.path().join("ln")).unwrap();
+        let out = sh(&dirs_cmd(&b(t.path()), &[b"dir x", b"-f", b"ln", b"none"]));
+        assert_eq!(out.stdout, b"1000", "{out:?}");
+        assert_eq!(parse_dirs(b"1001", 4), Some(vec![true, false, false, true]));
+        assert_eq!(parse_dirs(b"10", 3), None);
+    }
 
     #[test]
     fn upload_goes_through_a_stage_and_is_renamed_into_place() {
