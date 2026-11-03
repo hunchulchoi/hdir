@@ -413,7 +413,7 @@ fn mode_of(_meta: &fs::Metadata) -> u32 {
 }
 
 /// Hidden by the platform: a leading dot everywhere, plus the hidden attribute on Windows.
-fn is_hidden(name: &str, meta: &fs::Metadata) -> bool {
+pub(crate) fn is_hidden(name: &str, meta: &fs::Metadata) -> bool {
     name.starts_with('.') || hidden_attr(meta)
 }
 

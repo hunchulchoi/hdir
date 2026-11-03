@@ -48,6 +48,15 @@ fn main() -> ExitCode {
     app.base_lang = lang;
     app.ssh_config_path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));
     let result = run_app(&mut app);
+    if !app.flush_favorites(Duration::from_secs(2)) {
+        eprintln!(
+            "hdir: {}",
+            hdir::tr!(
+                "즐겨찾기가 저장되지 않았을 수 있음",
+                "favorites may not have been saved"
+            )
+        );
+    }
     // An edited remote file may still be uploading.
     // The terminal is back to normal here, so the report is visible.
     let uploaded = app.quit_uploads(Duration::from_secs(120), &mut std::io::stderr());
