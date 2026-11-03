@@ -1538,6 +1538,13 @@ pub fn set_test_acl(path: &Path) -> io::Result<()> {
     )
 }
 
+/// The access ACL stored on `path`, if any.
+#[cfg(all(test, target_os = "linux"))]
+pub fn test_acl_of(path: &Path) -> Option<Vec<u8>> {
+    let c = xattr_sys::cpath(path).ok()?;
+    xattr_sys::get(xattr_sys::On::Path(&c), c"system.posix_acl_access").ok()
+}
+
 #[cfg(test)]
 mod acl_tests {
     use super::*;

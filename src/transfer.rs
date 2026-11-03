@@ -1372,10 +1372,12 @@ fn has_acls(
     }
 }
 
-/// Whether this side's tar can carry POSIX ACLs (`None`: local).
+/// Whether this side's tar can carry POSIX ACLs (`None`: local). Asked
+/// once per connection, and once per run for the local tar.
 fn tar_acls_ok(side: Option<&RemoteSession>) -> bool {
+    static LOCAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     match side {
-        None => {
+        None => *LOCAL.get_or_init(|| {
             cfg!(target_os = "linux")
                 && std::process::Command::new("sh")
                     .arg("-c")
@@ -1385,11 +1387,11 @@ fn tar_acls_ok(side: Option<&RemoteSession>) -> bool {
                     .stdin(std::process::Stdio::null())
                     .status()
                     .is_ok_and(|st| st.success())
-        }
-        Some(s) => {
+        }),
+        Some(s) => s.tar_acls(|| {
             matches!(s.os, RemoteOs::Linux)
                 && matches!(s.exec(TAR_ACLS_PROBE), Ok(o) if o.code == Some(0))
-        }
+        }),
     }
 }
 
@@ -2543,6 +2545,13 @@ mod tests {
                 acls,
                 "acls={acls}"
             );
+            if acls {
+                // the same entries: the group stays shut out
+                assert_eq!(
+                    crate::platform::test_acl_of(&stage.join("d/e/f")),
+                    Some(crate::platform::test_acl_value(65534))
+                );
+            }
         }
     }
 
@@ -3539,6 +3548,25 @@ mod tests {
         assert!(joined.contains("tar --acls -cf -"), "{joined}");
         assert!(joined.contains("tar --acls -xpof -"), "{joined}");
         assert!(!to.remote_cmds().iter().any(|c| c.contains("go-rwx")));
+    }
+
+    #[test]
+    fn each_server_is_asked_about_tar_acls_once_per_connection() {
+        let (from, to) = (acl_host("1\n", 0), acl_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a", "b"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        assert_eq!(run(&s, &mut Ctl::new()).outcome, OpOutcome::Done);
+        let probe = String::from_utf8(TAR_ACLS_PROBE.to_vec()).unwrap();
+        for f in [&from, &to] {
+            let n = f.remote_cmds().iter().filter(|c| **c == probe).count();
+            assert_eq!(n, 1, "{:?}", f.remote_cmds());
+        }
     }
 
     #[test]

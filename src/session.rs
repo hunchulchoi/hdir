@@ -508,6 +508,8 @@ pub struct RemoteSession {
     pub scp_mode: ScpMode,
     cmd: Arc<dyn Cmd>,
     alive: AtomicBool,
+    /// Whether the server's tar carries POSIX ACLs, once asked.
+    tar_acls: std::sync::OnceLock<bool>,
 }
 
 impl std::fmt::Debug for RemoteSession {
@@ -545,7 +547,14 @@ impl RemoteSession {
             scp_mode,
             cmd,
             alive: AtomicBool::new(true),
+            tar_acls: std::sync::OnceLock::new(),
         }
+    }
+
+    /// `ask()` the first time; the same answer for the rest of this
+    /// connection.
+    pub fn tar_acls(&self, ask: impl FnOnce() -> bool) -> bool {
+        *self.tar_acls.get_or_init(ask)
     }
 
     pub fn is_alive(&self) -> bool {
