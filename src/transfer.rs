@@ -5646,6 +5646,16 @@ mod tests {
             Side::Local,
             t.path(),
         );
+        // a filesystem that cannot keep setuid / setgid bits: nothing to test
+        let probe = t.path().join("probe");
+        fs::write(&probe, "x").unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o6750)).unwrap();
+        let kept = fs::metadata(&probe).unwrap().permissions().mode() & 0o7777;
+        fs::remove_file(&probe).unwrap();
+        if kept != 0o6750 {
+            eprintln!("setuid / setgid not kept here ({kept:o}), skipped");
+            return;
+        }
         assert_eq!(run(&s, &mut Ctl::new()).outcome, OpOutcome::Done);
         let mode = |n: &str| {
             fs::metadata(t.path().join("d").join(n))
@@ -5654,9 +5664,6 @@ mod tests {
                 .mode()
                 & 0o7777
         };
-        if mode("plain") != 0o640 {
-            return;
-        }
         assert_eq!(
             [mode("u"), mode("g"), mode("ug"), mode("plain")],
             [0o755, 0o755, 0o750, 0o640]
