@@ -150,6 +150,9 @@ enum OpenChoice {
     Viewer,
 }
 
+/// A tree listing from a worker: (tree generation, folder, its subfolders).
+type TreeListing = (u64, PathBuf, Result<Vec<crate::tree::Sub>, String>);
+
 /// The open popup menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenMenu {
@@ -166,6 +169,7 @@ const MENU_WARNINGS: usize = 4;
 const MENU_OPEN_WITH: usize = 5;
 const MENU_FAVORITES: usize = 6;
 const MENU_HISTORY: usize = 7;
+const MENU_TREE: usize = 8;
 
 /// Decides off the UI thread whether a file is text (first chunk only).
 pub type TextProbe = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
@@ -647,6 +651,12 @@ pub struct App {
     pub favorites: Vec<PathBuf>,
     /// Local folders visited in this run.
     history: crate::places::History,
+    /// The open directory tree (Alt+F10).
+    pub tree: Option<crate::tree::TreeView>,
+    /// Generation of `tree`: listings for an older tree are dropped.
+    tree_gen: u64,
+    tree_tx: Sender<TreeListing>,
+    tree_rx: Receiver<TreeListing>,
     /// Each panel's folder as last recorded in `history`.
     seen: [Option<PathBuf>; 2],
     /// The one worker that writes favorites, in order (started on first use).
@@ -688,6 +698,7 @@ impl App {
     pub fn with_trash(left: PathBuf, right: PathBuf, trash: Arc<dyn TrashBackend>) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel();
         let (place_tx, place_rx) = mpsc::channel();
+        let (tree_tx, tree_rx) = mpsc::channel();
         let (connect_tx, connect_rx) = mpsc::channel();
         let shell = std::env::var("SHELL")
             .ok()
@@ -778,6 +789,10 @@ impl App {
             favorites: Vec::new(),
             history: crate::places::History::default(),
             seen: [None, None],
+            tree: None,
+            tree_gen: 0,
+            tree_tx,
+            tree_rx,
             fav_saver: None,
             place_tx,
             place_rx,
@@ -895,6 +910,9 @@ impl App {
         items.push(crate::i18n::t("연결 프로그램 선택", "Choose program").to_string());
         items.push(crate::i18n::t("즐겨찾기 (F11)", "Favorites (F11)").to_string());
         items.push(crate::i18n::t("최근 경로 (F12)", "History (F12)").to_string());
+        items.push(
+            crate::i18n::t("디렉터리 트리 (Alt+F10)", "Directory tree (Alt+F10)").to_string(),
+        );
         self.status = None;
         self.menu = Some(OpenMenu {
             menu: Menu::new(crate::i18n::t("메뉴", "Menu"), items, 0),
@@ -1050,6 +1068,92 @@ impl App {
             });
         if let Err(e) = started {
             self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
+        }
+    }
+
+    /// Alt+F10: the folders around the active panel's folder.
+    fn open_tree(&mut self) {
+        if self.active_panel().location.is_remote() {
+            self.status = Some(
+                crate::i18n::t(
+                    "원격 패널의 디렉터리 트리는 아직 지원하지 않음",
+                    "The directory tree is not available on remote panels yet",
+                )
+                .into(),
+            );
+            return;
+        }
+        self.status = None;
+        self.invalidate_probe();
+        self.tree_gen += 1;
+        let mut tree = crate::tree::TreeView::new(&self.active_panel().cwd);
+        let wanted = tree.wanted();
+        self.tree = Some(tree);
+        self.read_tree(wanted);
+    }
+
+    /// Read these tree folders on workers; results arrive in `tick_tree`.
+    fn read_tree(&mut self, dirs: Vec<PathBuf>) {
+        let hidden = self.active_panel().show_hidden;
+        for dir in dirs {
+            let (tx, generation) = (self.tree_tx.clone(), self.tree_gen);
+            let started = std::thread::Builder::new()
+                .name("hdir-tree".into())
+                .spawn(move || {
+                    let r = crate::tree::read_subdirs(&dir, hidden);
+                    let _ = tx.send((generation, dir, r));
+                });
+            if let Err(e) = started
+                && let Some(t) = self.tree.as_mut()
+            {
+                t.loaded(Path::new(""), Err(e.to_string()));
+            }
+        }
+    }
+
+    fn tick_tree(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((generation, dir, result)) = self.tree_rx.try_recv() {
+            if generation != self.tree_gen {
+                continue;
+            }
+            if let Some(t) = self.tree.as_mut() {
+                t.loaded(&dir, result);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn handle_tree_key(&mut self, key: KeyEvent) {
+        let Some(action) = self.settings.keymap.lookup(Context::Tree, &key) else {
+            return;
+        };
+        let page = self.page_height.max(1) as isize;
+        let Some(tree) = self.tree.as_mut() else {
+            return;
+        };
+        match action {
+            Action::CursorUp => tree.move_by(-1),
+            Action::CursorDown => tree.move_by(1),
+            Action::PageUp => tree.move_by(-page),
+            Action::PageDown => tree.move_by(page),
+            Action::Home => tree.home(),
+            Action::End => tree.end(),
+            Action::Expand => {
+                let wanted = tree.expand();
+                self.read_tree(wanted);
+            }
+            Action::Collapse => tree.collapse(),
+            Action::Enter => {
+                let dir = tree.cursor().to_path_buf();
+                self.tree = None;
+                // the loader reads it; a folder that is gone or locked
+                // leaves the panel where it was, with the reason
+                self.go_local_dir(self.active, dir);
+            }
+            Action::Cancel => self.tree = None,
+            _ => {}
         }
     }
 
@@ -1260,6 +1364,7 @@ impl App {
                     MENU_OPEN_WITH => self.open_with_menu(),
                     MENU_FAVORITES => self.open_favorites(0),
                     MENU_HISTORY => self.open_history(),
+                    MENU_TREE => self.open_tree(),
                     _ => {}
                 }
             }
@@ -1358,6 +1463,10 @@ impl App {
         }
         if self.dialog.is_some() {
             self.handle_dialog_key(key);
+            return;
+        }
+        if self.tree.is_some() {
+            self.handle_tree_key(key);
             return;
         }
         if self.screen.is_some() {
@@ -1992,10 +2101,13 @@ impl App {
             Action::Help => self.open_help(),
             Action::Favorites => self.open_favorites(0),
             Action::History => self.open_history(),
+            Action::Tree => self.open_tree(),
             Action::Confirm
             | Action::Cancel
             | Action::ScrollLeft
             | Action::ScrollRight
+            | Action::Expand
+            | Action::Collapse
             | Action::Search
             | Action::SearchNext => {}
         }
@@ -3009,7 +3121,7 @@ impl App {
         let loaded = self.drain_loads() | self.tick_connect();
         let task =
             self.tick_task() | self.tick_viewer_load() | self.tick_probe() | self.tick_uploads();
-        let spawned = self.tick_spawn() | self.tick_place();
+        let spawned = self.tick_spawn() | self.tick_place() | self.tick_tree();
         let preview = self.tick_preview();
         self.track_history();
         // the Classic clock: redraw once the minute it shows has passed
@@ -4002,7 +4114,13 @@ impl App {
             "{} · /: search · n: next",
             self.close_hint()
         );
-        if let Some(scr) = self.screen.as_mut() {
+        if let Some(tree) = self.tree.as_mut() {
+            let hint = crate::i18n::t(
+                "←→ 접기·펼치기 · Enter 이동 · Esc 취소",
+                "←→ collapse·expand · Enter go · Esc cancel",
+            );
+            crate::tree::render(frame, tree, &self.theme, hint);
+        } else if let Some(scr) = self.screen.as_mut() {
             screen::render(frame, scr, &self.theme);
         } else if let Some(v) = self.viewer.as_mut() {
             let hint = &viewer_hint;
@@ -4542,7 +4660,8 @@ mod tests {
                 "설정 경고 보기",
                 "연결 프로그램 선택",
                 "즐겨찾기 (F11)",
-                "최근 경로 (F12)"
+                "최근 경로 (F12)",
+                "디렉터리 트리 (Alt+F10)"
             ]
         );
         let text = draw_text(&mut app, 80, 24);
@@ -5850,6 +5969,118 @@ mod tests {
         let help = page_text(&app);
         assert!(help.contains("F11") && help.contains("즐겨찾기"), "{help}");
         assert!(help.contains("F12") && help.contains("최근 경로"), "{help}");
+    }
+
+    // ---- HDIR-97: directory tree ----
+
+    fn settle_tree(app: &mut App) {
+        let start = Instant::now();
+        loop {
+            app.tick();
+            let busy = app.tree.as_ref().is_some_and(|t| {
+                t.rows()
+                    .iter()
+                    .any(|r| r.kind == crate::tree::RowKind::Loading)
+            });
+            if !busy {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "tree load timed out"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn alt_f10(app: &mut App) {
+        press_mods(app, KeyCode::F(10), KeyModifiers::ALT);
+    }
+
+    #[test]
+    fn alt_f10_opens_the_tree_on_the_current_folder_and_enter_goes_there() {
+        let (t, mut app) = fixture();
+        let root = app.panels[0].cwd.clone();
+        cursor_to(&mut app, "adir");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        let adir = root.join("adir");
+        assert_eq!(app.panels[0].cwd, adir);
+        alt_f10(&mut app);
+        settle_tree(&mut app);
+        let tree = app.tree.as_ref().expect("tree open");
+        assert_eq!(tree.cursor(), adir.as_path());
+        // the siblings of adir are listed, files are not
+        let names: Vec<String> = tree.rows().iter().map(|r| r.name.clone()).collect();
+        assert!(names.contains(&"bdir".to_string()) && !names.contains(&"f.txt".to_string()));
+        let text = draw_text(&mut app, 80, 24);
+        assert!(
+            text.contains("디렉터리 트리") || text.contains("디 렉 터 리"),
+            "{text}"
+        );
+        // Left closes adir, Left again goes up to root; Down to bdir; Enter
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.tree.as_ref().unwrap().cursor(), root.as_path());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.tree.as_ref().unwrap().cursor(),
+            root.join("bdir").as_path()
+        );
+        press(&mut app, KeyCode::Enter);
+        assert!(app.tree.is_none());
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root.join("bdir"));
+        drop(t);
+    }
+
+    #[test]
+    fn esc_closes_the_tree_and_the_panel_stays() {
+        let (_t, mut app) = fixture();
+        let root = app.panels[0].cwd.clone();
+        alt_f10(&mut app);
+        settle_tree(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.tree.is_none());
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root);
+    }
+
+    #[test]
+    fn a_folder_gone_since_it_was_listed_keeps_the_panel_and_says_so() {
+        let (t, mut app) = fixture();
+        let root = app.panels[0].cwd.clone();
+        alt_f10(&mut app);
+        settle_tree(&mut app);
+        press(&mut app, KeyCode::Right); // root is open; open it again is a no-op
+        press(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.tree.as_ref().unwrap().cursor(),
+            root.join("adir").as_path()
+        );
+        fs::remove_file(t.path().join("adir/inner.txt")).unwrap();
+        fs::remove_dir(t.path().join("adir")).unwrap();
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root);
+        assert!(app.panels[0].error.is_some(), "the panel says why");
+    }
+
+    #[test]
+    fn the_tree_is_in_the_menu_and_help() {
+        let (_t, mut app) = fixture();
+        app.open_main_menu();
+        assert!(menu_items(&app).iter().any(|i| i.contains("디렉터리 트리")));
+        app.menu = None;
+        app.open_help();
+        let help = page_text(&app);
+        assert!(
+            help.contains("Alt+F10") && help.contains("디렉터리 트리"),
+            "{help}"
+        );
+        assert!(help.contains("펼치기"), "{help}");
     }
 
     #[test]
@@ -10594,6 +10825,19 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
             assert_eq!(app.panels[1].cwd, there);
+        }
+
+        #[test]
+        fn the_tree_is_for_local_panels_for_now() {
+            let (_t, mut app, _f) = env();
+            connect_prod(&mut app);
+            press_mods(&mut app, KeyCode::F(10), KeyModifiers::ALT);
+            assert!(app.tree.is_none());
+            assert!(
+                app.status.as_deref().unwrap().contains("원격"),
+                "{:?}",
+                app.status
+            );
         }
 
         #[test]

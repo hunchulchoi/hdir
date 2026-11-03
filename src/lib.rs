@@ -31,6 +31,7 @@ pub mod testutil;
 pub mod theme;
 pub mod transfer;
 pub mod trash;
+pub mod tree;
 pub mod ui;
 pub mod undo;
 pub mod vfs;

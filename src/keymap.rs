@@ -60,6 +60,11 @@ pub enum Action {
     Favorites,
     /// The folders visited in this run (F12).
     History,
+    /// The directory tree view (Alt+F10).
+    Tree,
+    /// Tree: open / close the folder under the cursor.
+    Expand,
+    Collapse,
     CancelJob,
     /// Viewer: horizontal scroll.
     ScrollLeft,
@@ -90,6 +95,7 @@ pub enum Context {
     Dialog,
     Menu,
     Trash,
+    Tree,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,6 +284,7 @@ const MDIR_PANEL: &[(Action, &[&str])] = &[
     (A::OpenWith, &["Shift+Enter", "Ctrl+O"]),
     (A::Favorites, &["F11", "Alt+D"]),
     (A::History, &["F12", "Alt+H"]),
+    (A::Tree, &["Alt+F10", "Alt+T"]),
     (A::CancelJob, &["Esc"]),
 ];
 
@@ -353,6 +360,21 @@ const VIM_PANEL: &[(Action, &[&str])] = &[
     (A::Quit, &["q"]),
 ];
 
+const MDIR_TREE: &[(Action, &[&str])] = &[
+    (A::CursorUp, &["Up"]),
+    (A::CursorDown, &["Down"]),
+    (A::PageUp, &["PageUp"]),
+    (A::PageDown, &["PageDown"]),
+    (A::Home, &["Home"]),
+    (A::End, &["End"]),
+    (A::Expand, &["Right", "+"]),
+    (A::Collapse, &["Left", "-", "Backspace"]),
+    (A::Enter, &["Enter"]),
+    (A::Cancel, &["Esc", "Alt+F10"]),
+];
+
+const VIM_TREE: &[(Action, &[&str])] = &[(A::Collapse, &["h"]), (A::Expand, &["l"])];
+
 const VIM_LIST: &[(Action, &[&str])] = &[
     (A::CursorDown, &["j"]),
     (A::CursorUp, &["k"]),
@@ -385,6 +407,7 @@ impl Keymap {
         km.add_table(Context::Dialog, MDIR_DIALOG);
         km.add_table(Context::Menu, MDIR_MENU);
         km.add_table(Context::Trash, MDIR_TRASH);
+        km.add_table(Context::Tree, MDIR_TREE);
         match name.to_lowercase().as_str() {
             "mdir" => Some(km),
             "vim" => {
@@ -392,6 +415,8 @@ impl Keymap {
                 km.add_table(Context::Viewer, VIM_LIST);
                 km.add_table(Context::Menu, VIM_LIST);
                 km.add_table(Context::Trash, VIM_LIST);
+                km.add_table(Context::Tree, VIM_LIST);
+                km.add_table(Context::Tree, VIM_TREE);
                 Some(km)
             }
             _ => None,
@@ -460,6 +485,7 @@ pub struct KeysConfig {
     pub dialog: HashMap<String, StringOrVec>,
     pub menu: HashMap<String, StringOrVec>,
     pub trash: HashMap<String, StringOrVec>,
+    pub tree: HashMap<String, StringOrVec>,
 }
 
 /// Dialog keys that can never be removed or rebound (prevents lock-out).
@@ -563,6 +589,7 @@ pub fn build(cfg: &KeysConfig) -> (Keymap, Vec<String>) {
         (Context::Dialog, "keys.dialog", &cfg.dialog),
         (Context::Menu, "keys.menu", &cfg.menu),
         (Context::Trash, "keys.trash", &cfg.trash),
+        (Context::Tree, "keys.tree", &cfg.tree),
     ];
     for (ctx, name, section) in sections {
         apply_section(&mut km, ctx, name, section, &mut warns);

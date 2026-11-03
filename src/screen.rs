@@ -116,6 +116,9 @@ pub fn action_label(a: Action) -> &'static str {
         Action::OpenWith => t("연결 프로그램 선택", "Choose program"),
         Action::Favorites => t("즐겨찾기", "Favorites"),
         Action::History => t("최근 경로", "History"),
+        Action::Tree => t("디렉터리 트리", "Directory tree"),
+        Action::Expand => t("펼치기", "Expand"),
+        Action::Collapse => t("접기 / 상위", "Collapse / up"),
         Action::CancelJob => t("작업 취소", "Cancel job"),
         Action::ScrollLeft => t("왼쪽으로 스크롤", "Scroll left"),
         Action::ScrollRight => t("오른쪽으로 스크롤", "Scroll right"),
@@ -133,6 +136,7 @@ fn context_label(c: Context) -> &'static str {
         Context::Viewer => t("뷰어 / 도움말", "Viewer / help"),
         Context::Dialog => t("대화상자", "Dialog"),
         Context::Menu => t("메뉴", "Menu"),
+        Context::Tree => t("디렉터리 트리", "Directory tree"),
     }
 }
 
@@ -148,6 +152,7 @@ pub fn help_lines(km: &Keymap) -> Vec<String> {
             Context::Viewer,
             Context::Dialog,
             Context::Menu,
+            Context::Tree,
         ],
     )
 }
