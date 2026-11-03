@@ -1198,9 +1198,15 @@ fn make_stage<'a>(
                     )
                 })?
                 .to_path_buf();
-            tempfile::Builder::new()
-                .prefix(STAGE_PREFIX)
-                .tempdir_in(&real)
+            let mut b = tempfile::Builder::new();
+            b.prefix(STAGE_PREFIX);
+            // private while it fills: others cannot list or open what lands
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                b.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            b.tempdir_in(&real)
                 .map(|t| Stage::Local(t, real))
                 .map_err(|e| {
                     crate::tr!(
@@ -4472,6 +4478,34 @@ mod tests {
             "checked once, up front"
         );
         assert!(f.pipe_calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_stage_is_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(None));
+        let s2 = Arc::clone(&seen);
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                let (_, dst) = pipe_ends(a);
+                let mode = fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+                *s2.lock().unwrap() = Some(mode);
+                return fake_scp(a);
+            }
+            answer(remote_cmd(a).unwrap_or_default(), &[], &[], "0\x000\x00")
+        });
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        assert_eq!(run(&s, &mut Ctl::new()).outcome, OpOutcome::Done);
+        assert_eq!(*seen.lock().unwrap(), Some(0o700), "others cannot look in");
     }
 
     #[test]

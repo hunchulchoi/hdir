@@ -942,7 +942,7 @@ mod md_tests {
         let src = format!(
             "{}\n\n```\n{}\n```\n\n| a | b |\n|---|---|\n| {} | x |",
             "단어 ".repeat(30),
-            "c".repeat(100),
+            format!("{}ZZEND", "c".repeat(100)),
             "긴셀".repeat(20)
         );
         let mut v = md(&src);
@@ -952,6 +952,18 @@ mod md_tests {
         assert!(count(&narrow) > count(&wide), "paragraphs rewrap");
         // the code line is never wrapped: the right part is reached by scrolling
         assert_eq!(narrow.iter().filter(|r| r.contains("ccc")).count(), 1);
+        assert!(
+            !narrow.iter().any(|r| r.contains("ZZEND")),
+            "not yet visible"
+        );
+        for _ in 0..10 {
+            v.apply(Action::ScrollRight);
+        }
+        let (rows, _) = draw(&mut v, 30, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("ZZEND")),
+            "the end of the code line: {rows:?}"
+        );
         for _ in 0..20 {
             v.apply(Action::ScrollRight);
         }

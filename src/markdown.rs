@@ -9,6 +9,31 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Par
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Widest a table column gets; longer cells are cut with `…`.
+pub const COL_MAX_WIDTH: usize = 80;
+/// Widest a table line gets; columns past it are left out (`…`).
+pub const TABLE_MAX_WIDTH: usize = 1000;
+
+/// `line` cut to `width` columns, ending in `…` when cut.
+fn cut_line(line: &MdLine, width: usize) -> MdLine {
+    if plain(line).width() <= width {
+        return line.clone();
+    }
+    let mut out: MdLine = Vec::new();
+    let mut used = 0;
+    'outer: for (text, st) in line {
+        for g in text.graphemes(true) {
+            if used + g.width() > width.saturating_sub(1) {
+                break 'outer;
+            }
+            used += g.width();
+            push_seg(&mut out, g, *st);
+        }
+    }
+    out.push(("…".into(), Style::of(Kind::Table)));
+    out
+}
+
 /// What a piece of text is, for its color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -221,27 +246,24 @@ impl Builder {
                             continue;
                         }
                     }
-                    // a word wider than the room is cut by cluster
-                    let mut rest = word;
-                    while rest.width() > room - used.min(room) && used == 0 && rest.width() > room {
-                        let mut take = 0;
-                        let mut cut = 0;
-                        for (b, g) in rest.grapheme_indices(true) {
-                            if take + g.width() > room {
-                                break;
-                            }
-                            take += g.width();
-                            cut = b + g.len();
-                        }
-                        if cut == 0 {
-                            break;
-                        }
-                        push_seg(lines.last_mut().unwrap(), &rest[..cut], st);
-                        lines.push(Vec::new());
-                        rest = &rest[cut..];
+                    if w <= room - used {
+                        push_seg(lines.last_mut().unwrap(), word, st);
+                        used += w;
+                        continue;
                     }
-                    push_seg(lines.last_mut().unwrap(), rest, st);
-                    used += rest.width();
+                    // a word wider than the room: cut by cluster, one pass
+                    let mut from = 0;
+                    for (b, g) in word.grapheme_indices(true) {
+                        let gw = g.width();
+                        if used + gw > room && used > 0 {
+                            push_seg(lines.last_mut().unwrap(), &word[from..b], st);
+                            lines.push(Vec::new());
+                            used = 0;
+                            from = b;
+                        }
+                        used += gw;
+                    }
+                    push_seg(lines.last_mut().unwrap(), &word[from..], st);
                 }
             }
         }
@@ -507,17 +529,31 @@ impl Builder {
 
     /// `│ a │ b │` rows with a `├─┼─┤` line under the header; no wrapping.
     fn table_lines(&mut self, t: Table) {
-        let cols = t.rows.iter().map(Vec::len).max().unwrap_or(0);
-        let mut widths = vec![0; cols];
+        let all = t.rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut widths = vec![0; all];
         for row in &t.rows {
             for (i, c) in row.iter().enumerate() {
-                widths[i] = widths[i].max(plain(c).width());
+                widths[i] = widths[i].max(plain(c).width().min(COL_MAX_WIDTH));
             }
         }
+        // only the columns that fit in TABLE_MAX_WIDTH; a `…` column after
+        let mut total = 1;
+        let cols = widths
+            .iter()
+            .take_while(|w| {
+                total += *w + 3;
+                total <= TABLE_MAX_WIDTH
+            })
+            .count()
+            .max(1)
+            .min(all);
+        let more = cols < all;
+        widths.truncate(cols);
         let bar = Style::of(Kind::Table);
         let rule = |l: &str, m: &str, r: &str| -> String {
             let mid: Vec<String> = widths.iter().map(|w| "─".repeat(w + 2)).collect();
-            format!("{l}{}{r}", mid.join(m))
+            let tail = if more { "…" } else { "" };
+            format!("{l}{}{r}{tail}", mid.join(m))
         };
         let top = rule("┌", "┬", "┐");
         let mut line = self.prefix(false);
@@ -528,7 +564,8 @@ impl Builder {
             line.push(("│".into(), bar));
             for (i, w) in widths.iter().enumerate() {
                 let empty = Vec::new();
-                let cell = row.get(i).unwrap_or(&empty);
+                let cell = cut_line(row.get(i).unwrap_or(&empty), *w);
+                let cell = &cell;
                 let pad = w - plain(cell).width();
                 let (l, r) = match t.aligns.get(i) {
                     Some(Alignment::Right) => (pad, 0),
@@ -545,6 +582,9 @@ impl Builder {
                 }
                 line.push((" ".repeat(r + 1), Style::of(Kind::Text)));
                 line.push(("│".into(), bar));
+            }
+            if more {
+                line.push(("…".into(), bar));
             }
             self.out.push(line);
             if ri + 1 == t.head_rows {
@@ -726,6 +766,41 @@ mod tests {
         let widths: Vec<usize> = t.iter().map(|l| l.width()).collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
         assert!(style_of(&render(src, 10), "이름").bold, "header bold");
+    }
+
+    #[test]
+    fn a_huge_cell_or_many_columns_never_blow_up_the_table() {
+        // one 64 KiB cell and many short rows
+        let mut src = format!("| a | b |\n|---|---|\n| {} | x |\n", "w".repeat(65_536));
+        for _ in 0..2_000 {
+            src.push_str("| s | t |\n");
+        }
+        let lines = render(&src, 80);
+        let widest = lines.iter().map(|l| plain(l).width()).max().unwrap();
+        assert!(widest <= TABLE_MAX_WIDTH + 4, "{widest}");
+        assert!(
+            lines.iter().any(|l| plain(l).contains('…')),
+            "cut cells are marked"
+        );
+        // a thousand columns
+        let head = format!("|{}\n|{}\n", " c |".repeat(1_000), "---|".repeat(1_000));
+        let lines = render(&head, 80);
+        let widest = lines.iter().map(|l| plain(l).width()).max().unwrap();
+        assert!(widest <= TABLE_MAX_WIDTH + 4, "{widest}");
+    }
+
+    #[test]
+    fn a_very_long_word_wraps_in_linear_time() {
+        let word = "가".repeat(200_000);
+        let start = std::time::Instant::now();
+        let lines = render(&word, 80);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(lines.len(), 200_000 * 2 / 80);
+        assert!(lines.iter().all(|l| plain(l).width() == 80));
     }
 
     #[test]
