@@ -1042,11 +1042,23 @@ impl App {
                     // one write at a time, always the newest list
                     while let Ok(mut job) = rx.recv() {
                         let mut taken = 1;
-                        while let Ok(newer) = rx.try_recv() {
-                            job = newer;
-                            taken += 1;
+                        // a few tries: on Windows a reader (an antivirus, a
+                        // viewer) can briefly block replacing the file
+                        let mut last = Ok(());
+                        for attempt in 0..10 {
+                            while let Ok(newer) = rx.try_recv() {
+                                job = newer;
+                                taken += 1;
+                            }
+                            last = crate::places::save_favorites(&job.0, &job.1);
+                            if last.is_ok() {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                20 << attempt.min(4),
+                            ));
                         }
-                        if let Err(e) = crate::places::save_favorites(&job.0, &job.1) {
+                        if let Err(e) = last {
                             let _ = report.send(crate::tr!(
                                 "즐겨찾기 저장 실패: {e}",
                                 "Favorites not saved: {e}"
