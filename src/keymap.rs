@@ -56,6 +56,10 @@ pub enum Action {
     ConnectLeft,
     ConnectRight,
     OpenWith,
+    /// The favorite folders list (F11).
+    Favorites,
+    /// The folders visited in this run (F12).
+    History,
     CancelJob,
     /// Viewer: horizontal scroll.
     ScrollLeft,
@@ -272,6 +276,8 @@ const MDIR_PANEL: &[(Action, &[&str])] = &[
     (A::ConnectLeft, &["Alt+F1"]),
     (A::ConnectRight, &["Alt+F2"]),
     (A::OpenWith, &["Shift+Enter", "Ctrl+O"]),
+    (A::Favorites, &["F11", "Alt+D"]),
+    (A::History, &["F12", "Alt+H"]),
     (A::CancelJob, &["Esc"]),
 ];
 
@@ -296,6 +302,9 @@ const MDIR_DIALOG: &[(Action, &[&str])] = &[(A::Confirm, &["Enter"]), (A::Cancel
 const MDIR_MENU: &[(Action, &[&str])] = &[
     (A::CursorUp, &["Up"]),
     (A::CursorDown, &["Down"]),
+    (A::Home, &["Home"]),
+    (A::End, &["End"]),
+    (A::Delete, &["Delete", "F8"]),
     (A::Enter, &["Enter"]),
     (A::Cancel, &["Esc", "F9"]),
 ];

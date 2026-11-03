@@ -120,6 +120,10 @@ enum ConnectMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MenuKind {
     Main,
+    /// Item 0 adds the current folder; then these folders.
+    Favorites(Vec<PathBuf>),
+    /// Visited folders, newest first.
+    History(Vec<PathBuf>),
     /// Theme names, parallel to the menu items.
     Theme(Vec<String>),
     /// Open-with choices for `path`, parallel to the menu items.
@@ -160,6 +164,8 @@ const MENU_KEYS: usize = 2;
 const MENU_RELOAD: usize = 3;
 const MENU_WARNINGS: usize = 4;
 const MENU_OPEN_WITH: usize = 5;
+const MENU_FAVORITES: usize = 6;
+const MENU_HISTORY: usize = 7;
 
 /// Decides off the UI thread whether a file is text (first chunk only).
 pub type TextProbe = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
@@ -637,6 +643,12 @@ pub struct App {
     pending_master: VecDeque<ConnectJob>,
     /// Language detected at startup; used when the config has no `lang`.
     pub base_lang: crate::i18n::Lang,
+    /// Favorite folders (`favorites.toml`).
+    pub favorites: Vec<PathBuf>,
+    /// Local folders visited in this run.
+    history: crate::places::History,
+    /// Each panel's folder as last recorded in `history`.
+    seen: [Option<PathBuf>; 2],
     /// The time source of the Classic clock (fixed in tests).
     pub clock: fn() -> std::time::SystemTime,
     /// Minute (since the epoch) the clock last showed.
@@ -756,6 +768,9 @@ impl App {
             connect_rx,
             pending_master: VecDeque::new(),
             base_lang: crate::i18n::Lang::default(),
+            favorites: Vec::new(),
+            history: crate::places::History::default(),
+            seen: [None, None],
             clock: std::time::SystemTime::now,
             drawn_minute: None,
         }
@@ -775,6 +790,9 @@ impl App {
             self.ssh_hosts = hosts;
             self.settings.warnings.extend(warnings);
         }
+        let (favorites, warnings) = crate::places::load_favorites(self.config_dir.as_deref());
+        self.favorites = favorites;
+        self.settings.warnings.extend(warnings);
         if let Some(s) = config::warning_summary(&self.settings.warnings) {
             self.status = Some(s);
         }
@@ -865,11 +883,139 @@ impl App {
         .to_vec();
         items.push(warnings);
         items.push(crate::i18n::t("연결 프로그램 선택", "Choose program").to_string());
+        items.push(crate::i18n::t("즐겨찾기 (F11)", "Favorites (F11)").to_string());
+        items.push(crate::i18n::t("최근 경로 (F12)", "History (F12)").to_string());
         self.status = None;
         self.menu = Some(OpenMenu {
             menu: Menu::new(crate::i18n::t("메뉴", "Menu"), items, 0),
             kind: MenuKind::Main,
         });
+    }
+
+    /// F11: "add the current folder", then the favorites; the cursor on
+    /// item `cursor`.
+    fn open_favorites(&mut self, cursor: usize) {
+        let mut items =
+            vec![crate::i18n::t("+ 현재 폴더 추가", "+ Add current folder").to_string()];
+        items.extend(self.favorites.iter().map(|p| ui::tilde_path(p)));
+        self.status = None;
+        self.menu = Some(OpenMenu {
+            menu: Menu::new(crate::i18n::t("즐겨찾기", "Favorites"), items, cursor).keeping_end(),
+            kind: MenuKind::Favorites(self.favorites.clone()),
+        });
+    }
+
+    /// F12: the local folders visited in this run, newest first.
+    fn open_history(&mut self) {
+        self.track_history();
+        let paths = self.history.paths();
+        let items = paths.iter().map(|p| ui::tilde_path(p)).collect();
+        self.status = None;
+        self.menu = Some(OpenMenu {
+            menu: Menu::new(crate::i18n::t("최근 경로", "History"), items, 0).keeping_end(),
+            kind: MenuKind::History(paths),
+        });
+    }
+
+    /// Record each local panel's folder when it changed since last time.
+    fn track_history(&mut self) {
+        for i in 0..2 {
+            let p = &self.panels[i];
+            if p.location.is_remote() || p.loading.is_some() {
+                continue;
+            }
+            if self.seen[i].as_ref() != Some(&p.cwd) {
+                self.seen[i] = Some(p.cwd.clone());
+                self.history.visit(&p.cwd);
+            }
+        }
+    }
+
+    fn add_favorite(&mut self) {
+        let panel = self.active_panel();
+        if panel.location.is_remote() {
+            self.status = Some(
+                crate::i18n::t(
+                    "원격 폴더는 즐겨찾기에 추가할 수 없음",
+                    "Remote folders cannot be added to favorites",
+                )
+                .into(),
+            );
+            return;
+        }
+        let cwd = panel.cwd.clone();
+        let shown = ui::tilde_path(&cwd);
+        if !crate::places::add_favorite(&mut self.favorites, &cwd) {
+            self.status = Some(crate::tr!(
+                "이미 즐겨찾기에 있음: {shown}",
+                "Already in favorites: {shown}"
+            ));
+            return;
+        }
+        self.status = Some(crate::tr!(
+            "즐겨찾기에 추가: {shown}",
+            "Added to favorites: {shown}"
+        ));
+        self.save_favorites();
+    }
+
+    /// Delete the favorite at menu row `row` and reopen the list there.
+    fn delete_favorite(&mut self, path: &Path, row: usize) {
+        self.favorites.retain(|p| p != path);
+        let shown = ui::tilde_path(path);
+        self.open_favorites(row.min(self.favorites.len()));
+        self.status = Some(crate::tr!(
+            "즐겨찾기에서 지움: {shown}",
+            "Removed from favorites: {shown}"
+        ));
+        self.save_favorites();
+    }
+
+    /// Write the favorites off the UI thread; only a failure is reported.
+    fn save_favorites(&mut self) {
+        let Some(dir) = self.config_dir.clone() else {
+            self.status = Some(
+                crate::i18n::t(
+                    "설정 폴더를 알 수 없어 즐겨찾기를 저장하지 못함",
+                    "Favorites not saved: config folder unknown",
+                )
+                .into(),
+            );
+            return;
+        };
+        let list = self.favorites.clone();
+        let tx = self.spawn_tx.clone();
+        let started = std::thread::Builder::new()
+            .name("hdir-favorites".into())
+            .spawn(move || {
+                if let Err(e) = crate::places::save_favorites(&dir, &list) {
+                    let _ = tx.send(crate::tr!(
+                        "즐겨찾기 저장 실패: {e}",
+                        "Favorites not saved: {e}"
+                    ));
+                }
+            });
+        if let Err(e) = started {
+            self.status = Some(crate::tr!(
+                "즐겨찾기 저장 실패: {e}",
+                "Favorites not saved: {e}"
+            ));
+        }
+    }
+
+    /// Take the active panel to the local folder `dir`. A missing folder is
+    /// reported and the panel stays where it is.
+    fn go_to_place(&mut self, dir: PathBuf) {
+        let idx = self.active;
+        if self.panels[idx].location.is_remote() && !dir.is_dir() {
+            let shown = ui::tilde_path(&dir);
+            self.status = Some(crate::tr!(
+                "폴더를 열 수 없음: {shown}",
+                "Cannot open the folder: {shown}"
+            ));
+            return;
+        }
+        self.go_local_dir(idx, dir);
     }
 
     fn open_theme_menu(&mut self) {
@@ -951,6 +1097,39 @@ impl App {
         let theme_names = match &open.kind {
             MenuKind::Theme(names) => Some(names.clone()),
             MenuKind::Main => None,
+            MenuKind::Favorites(paths) => {
+                let paths = paths.clone();
+                match event {
+                    MenuEvent::Chosen(0) => {
+                        self.menu = None;
+                        self.add_favorite();
+                    }
+                    MenuEvent::Chosen(i) => {
+                        self.menu = None;
+                        if let Some(p) = paths.get(i - 1) {
+                            self.go_to_place(p.clone());
+                        }
+                    }
+                    MenuEvent::Delete(i) if i > 0 => self.delete_favorite(&paths[i - 1], i),
+                    MenuEvent::Cancelled => self.menu = None,
+                    _ => {}
+                }
+                return;
+            }
+            MenuKind::History(paths) => {
+                let paths = paths.clone();
+                match event {
+                    MenuEvent::Chosen(i) => {
+                        self.menu = None;
+                        if let Some(p) = paths.get(i) {
+                            self.go_to_place(p.clone());
+                        }
+                    }
+                    MenuEvent::Cancelled => self.menu = None,
+                    _ => {}
+                }
+                return;
+            }
             MenuKind::Location {
                 panel,
                 drives,
@@ -1022,6 +1201,8 @@ impl App {
                     MENU_RELOAD => self.reload_config(),
                     MENU_WARNINGS => self.open_warnings(),
                     MENU_OPEN_WITH => self.open_with_menu(),
+                    MENU_FAVORITES => self.open_favorites(0),
+                    MENU_HISTORY => self.open_history(),
                     _ => {}
                 }
             }
@@ -1099,6 +1280,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         self.handle_key_inner(key);
+        self.track_history();
         // Any overlay opened by this key supersedes a pending text probe.
         if self.dialog.is_some()
             || self.screen.is_some()
@@ -1751,6 +1933,8 @@ impl App {
             Action::OpenWith => self.open_with_menu(),
             Action::Menu => self.open_main_menu(),
             Action::Help => self.open_help(),
+            Action::Favorites => self.open_favorites(0),
+            Action::History => self.open_history(),
             Action::Confirm
             | Action::Cancel
             | Action::ScrollLeft
@@ -2770,6 +2954,7 @@ impl App {
             self.tick_task() | self.tick_viewer_load() | self.tick_probe() | self.tick_uploads();
         let spawned = self.tick_spawn();
         let preview = self.tick_preview();
+        self.track_history();
         // the Classic clock: redraw once the minute it shows has passed
         let minute = self.mode == Mode::Classic
             && self
@@ -4298,7 +4483,9 @@ mod tests {
                 "키 설정 보기",
                 "설정 다시 읽기",
                 "설정 경고 보기",
-                "연결 프로그램 선택"
+                "연결 프로그램 선택",
+                "즐겨찾기 (F11)",
+                "최근 경로 (F12)"
             ]
         );
         let text = draw_text(&mut app, 80, 24);
@@ -5448,6 +5635,133 @@ mod tests {
         app.mode = crate::config::Mode::Dev;
         app.clock = at_9;
         assert!(!app.tick(), "Dev shows no clock");
+    }
+
+    // ---- HDIR-96: favorites and history ----
+
+    fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !ok() {
+            assert!(start.elapsed() < Duration::from_secs(5), "{what} timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn f11_adds_the_current_folder_and_keeps_it_for_the_next_run() {
+        let (t, mut app) = fixture();
+        let cfg = tempfile::tempdir().unwrap();
+        app.configure(Some(cfg.path().to_path_buf()), None);
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::F(11));
+        assert_eq!(menu_items(&app), ["+ 현재 폴더 추가"]);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.menu.is_none());
+        assert_eq!(app.favorites, std::slice::from_ref(&root));
+        assert!(
+            app.status.as_deref().unwrap().contains("즐겨찾기에 추가"),
+            "{:?}",
+            app.status
+        );
+        let file = crate::places::favorites_file(cfg.path());
+        wait_for("save", || {
+            fs::read_to_string(&file).is_ok_and(|t| t.contains("paths"))
+        });
+        // adding it again says so
+        press(&mut app, KeyCode::F(11));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.favorites.len(), 1);
+        assert!(
+            app.status.as_deref().unwrap().contains("이미"),
+            "{:?}",
+            app.status
+        );
+        // a new run reads them back
+        let (_t2, mut again) = fixture();
+        again.configure(Some(cfg.path().to_path_buf()), None);
+        assert_eq!(again.favorites, [root]);
+        drop(t);
+    }
+
+    #[test]
+    fn a_favorite_takes_the_active_panel_there_and_can_be_deleted() {
+        let (t, mut app) = fixture();
+        let target = t.path().join("한글 폴더 a");
+        fs::create_dir(&target).unwrap();
+        let target = crate::platform::canonicalize(&target).unwrap();
+        app.favorites = vec![target.clone(), t.path().join("gone")];
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::F(11));
+        let items = menu_items(&app);
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(items[1].contains("한글 폴더 a"), "{items:?}");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.panels[1].cwd, target, "the active (right) panel moved");
+        // a missing favorite: a message, the folder stays
+        press(&mut app, KeyCode::F(11));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.panels[1].cwd, target);
+        assert!(app.panels[1].error.is_some() || app.status.is_some());
+        // Delete removes the entry under the cursor and keeps the list open
+        press(&mut app, KeyCode::F(11));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.favorites, std::slice::from_ref(&target));
+        assert_eq!(menu_items(&app).len(), 2);
+        // the "add" row cannot be deleted
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Delete);
+        assert_eq!(app.favorites, [target]);
+    }
+
+    #[test]
+    fn f12_lists_visited_folders_newest_first_and_goes_back() {
+        let (_t, mut app) = fixture();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::F(12));
+        assert_eq!(menu_items(&app).len(), 1, "only the starting folder");
+        press(&mut app, KeyCode::Esc);
+        cursor_to(&mut app, "adir");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        press(&mut app, KeyCode::Backspace);
+        settle(&mut app);
+        cursor_to(&mut app, "bdir");
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        press(&mut app, KeyCode::F(12));
+        let items = menu_items(&app);
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(
+            items[0].ends_with("bdir") && items[2].ends_with("adir"),
+            "{items:?}"
+        );
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(app.panels[0].cwd, root);
+    }
+
+    #[test]
+    fn the_main_menu_and_help_show_the_new_lists() {
+        let (_t, mut app) = fixture();
+        app.open_main_menu();
+        let items = menu_items(&app).join("\n");
+        assert!(
+            items.contains("즐겨찾기") && items.contains("최근 경로"),
+            "{items}"
+        );
+        app.menu = None;
+        app.open_help();
+        let help = page_text(&app);
+        assert!(help.contains("F11") && help.contains("즐겨찾기"), "{help}");
+        assert!(help.contains("F12") && help.contains("최근 경로"), "{help}");
     }
 
     #[test]

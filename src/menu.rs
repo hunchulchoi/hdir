@@ -17,6 +17,8 @@ pub struct Menu {
     pub title: String,
     pub items: Vec<String>,
     pub cursor: usize,
+    /// Cut long items at the front (`…/end`), for paths.
+    pub keep_end: bool,
 }
 
 /// What a menu key did.
@@ -27,6 +29,8 @@ pub enum MenuEvent {
     Moved,
     /// Enter on the item at this index.
     Chosen(usize),
+    /// Delete on the item at this index (lists that allow removing).
+    Delete(usize),
     Cancelled,
 }
 
@@ -37,7 +41,14 @@ impl Menu {
             title: title.to_string(),
             items,
             cursor,
+            keep_end: false,
         }
+    }
+
+    /// Long items lose their start rather than their end.
+    pub fn keeping_end(mut self) -> Self {
+        self.keep_end = true;
+        self
     }
 
     /// Apply a menu-context action.
@@ -50,6 +61,7 @@ impl Menu {
             Action::Home => self.cursor = 0,
             Action::End => self.cursor = last,
             Action::Enter if !self.items.is_empty() => return MenuEvent::Chosen(self.cursor),
+            Action::Delete if !self.items.is_empty() => return MenuEvent::Delete(self.cursor),
             Action::Cancel => return MenuEvent::Cancelled,
             _ => {}
         }
@@ -96,7 +108,12 @@ pub fn render(frame: &mut Frame, area: Rect, menu: &Menu, theme: &Theme) {
         .take(rows)
         .map(|(i, item)| {
             let style = if i == menu.cursor { sel } else { base };
-            Line::styled(fit_width(&format!(" {item}"), w), style)
+            let text = if menu.keep_end {
+                crate::ui::tail_width(item, w.saturating_sub(1))
+            } else {
+                item.clone()
+            };
+            Line::styled(fit_width(&format!(" {text}"), w), style)
         })
         .collect();
     frame.render_widget(Paragraph::new(lines).style(base), inner);
@@ -114,6 +131,27 @@ mod tests {
 
     fn menu(n: usize) -> Menu {
         Menu::new("메뉴", (0..n).map(|i| format!("item{i}")).collect(), 0)
+    }
+
+    #[test]
+    fn path_lists_keep_the_end_of_long_items() {
+        let long = format!("/very/long/{}/target", "x".repeat(80));
+        let m = Menu::new("즐겨찾기", vec![long, "/short".into()], 0).keeping_end();
+        let mut t = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        t.draw(|f| render(f, f.area(), &m, &th())).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..8)
+            .map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let all = rows.join("\n");
+        assert!(all.contains("…xxx") && all.contains("x/target│"), "{all}");
+        assert!(all.contains("/short"), "{all}");
+        assert_eq!(
+            Menu::new("m", vec![], 0).apply(Action::Delete),
+            MenuEvent::None
+        );
+        let mut m = Menu::new("m", vec!["a".into(), "b".into()], 1);
+        assert_eq!(m.apply(Action::Delete), MenuEvent::Delete(1));
     }
 
     #[test]

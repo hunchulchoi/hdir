@@ -315,7 +315,7 @@ fn real_config_path(path: &Path) -> Result<PathBuf, String> {
 /// Write `text` to `real` via an exclusively created sibling temp file
 /// (0600 on unix, never a fixed name, never follows a symlink), give it the
 /// existing file's permissions, then atomically replace.
-fn write_atomic(real: &Path, text: &str) -> Result<(), String> {
+pub(crate) fn write_atomic(real: &Path, text: &str) -> Result<(), String> {
     use std::io::Write;
     let err = |e: std::io::Error| crate::tr!("저장 실패: {e}", "Save failed: {e}");
     let (tmp, mut file) = (0..16)
