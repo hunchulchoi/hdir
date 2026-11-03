@@ -594,62 +594,8 @@ pub fn fmt_datetime(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM` in local time.
-#[cfg(windows)]
 pub fn format_local(ts: i64) -> String {
-    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
-    // Unix seconds -> 100ns ticks since 1601-01-01.
-    let Some(ticks) = ts
-        .checked_add(11_644_473_600)
-        .filter(|s| *s >= 0)
-        .and_then(|s| (s as u64).checked_mul(10_000_000))
-    else {
-        return "-".to_string();
-    };
-    let utc = FILETIME {
-        dwLowDateTime: ticks as u32,
-        dwHighDateTime: (ticks >> 32) as u32,
-    };
-    // SAFETY: plain-data structs; all pointers are valid for the call.
-    let mut utc_st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    let mut st: SYSTEMTIME = unsafe { std::mem::zeroed() };
-    // The zone conversion uses the DST rules in force *at that instant*
-    // (FileTimeToLocalFileTime would apply today's offset to every date).
-    // SAFETY: as above; a null zone means the current time zone.
-    let ok = unsafe {
-        FileTimeToSystemTime(&utc, &mut utc_st) != 0
-            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut st) != 0
-    };
-    if !ok {
-        return "-".to_string();
-    }
-    fmt_datetime(
-        st.wYear as i32,
-        st.wMonth as u32,
-        st.wDay as u32,
-        st.wHour as u32,
-        st.wMinute as u32,
-    )
-}
-
-/// `YYYY-MM-DD HH:MM` in local time.
-#[cfg(unix)]
-pub fn format_local(ts: i64) -> String {
-    let t = ts as libc::time_t;
-    // SAFETY: `tm` is plain data; localtime_r only writes into it.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are valid for the duration of the call.
-    let ok = !unsafe { libc::localtime_r(&t, &mut tm) }.is_null();
-    if !ok {
-        return "-".to_string();
-    }
-    fmt_datetime(
-        tm.tm_year + 1900,
-        (tm.tm_mon + 1) as u32,
-        tm.tm_mday as u32,
-        tm.tm_hour as u32,
-        tm.tm_min as u32,
-    )
+    crate::clock::local(ts).map_or_else(|| "-".to_string(), |l| l.long())
 }
 
 // ---- view state ----
