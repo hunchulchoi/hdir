@@ -649,6 +649,12 @@ pub struct App {
     history: crate::places::History,
     /// Each panel's folder as last recorded in `history`.
     seen: [Option<PathBuf>; 2],
+    /// The one worker that writes favorites, in order (started on first use).
+    fav_saver: Option<Sender<(PathBuf, Vec<PathBuf>)>>,
+    /// Results of checking a chosen local folder for a remote panel:
+    /// (panel, its connection generation, folder, is a folder).
+    place_tx: Sender<(usize, u64, PathBuf, bool)>,
+    place_rx: Receiver<(usize, u64, PathBuf, bool)>,
     /// The time source of the Classic clock (fixed in tests).
     pub clock: fn() -> std::time::SystemTime,
     /// Minute (since the epoch) the clock last showed.
@@ -681,6 +687,7 @@ impl App {
 
     pub fn with_trash(left: PathBuf, right: PathBuf, trash: Arc<dyn TrashBackend>) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel();
+        let (place_tx, place_rx) = mpsc::channel();
         let (connect_tx, connect_rx) = mpsc::channel();
         let shell = std::env::var("SHELL")
             .ok()
@@ -771,6 +778,9 @@ impl App {
             favorites: Vec::new(),
             history: crate::places::History::default(),
             seen: [None, None],
+            fav_saver: None,
+            place_tx,
+            place_rx,
             clock: std::time::SystemTime::now,
             drawn_minute: None,
         }
@@ -983,23 +993,38 @@ impl App {
             );
             return;
         };
-        let list = self.favorites.clone();
-        let tx = self.spawn_tx.clone();
-        let started = std::thread::Builder::new()
-            .name("hdir-favorites".into())
-            .spawn(move || {
-                if let Err(e) = crate::places::save_favorites(&dir, &list) {
-                    let _ = tx.send(crate::tr!(
+        if self.fav_saver.is_none() {
+            let (tx, rx) = mpsc::channel::<(PathBuf, Vec<PathBuf>)>();
+            let report = self.spawn_tx.clone();
+            let started = std::thread::Builder::new()
+                .name("hdir-favorites".into())
+                .spawn(move || {
+                    // one write at a time, always the newest list
+                    while let Ok(mut job) = rx.recv() {
+                        while let Ok(newer) = rx.try_recv() {
+                            job = newer;
+                        }
+                        if let Err(e) = crate::places::save_favorites(&job.0, &job.1) {
+                            let _ = report.send(crate::tr!(
+                                "즐겨찾기 저장 실패: {e}",
+                                "Favorites not saved: {e}"
+                            ));
+                        }
+                    }
+                });
+            match started {
+                Ok(_) => self.fav_saver = Some(tx),
+                Err(e) => {
+                    self.status = Some(crate::tr!(
                         "즐겨찾기 저장 실패: {e}",
                         "Favorites not saved: {e}"
                     ));
+                    return;
                 }
-            });
-        if let Err(e) = started {
-            self.status = Some(crate::tr!(
-                "즐겨찾기 저장 실패: {e}",
-                "Favorites not saved: {e}"
-            ));
+            }
+        }
+        if let Some(tx) = &self.fav_saver {
+            let _ = tx.send((dir, self.favorites.clone()));
         }
     }
 
@@ -1007,15 +1032,47 @@ impl App {
     /// reported and the panel stays where it is.
     fn go_to_place(&mut self, dir: PathBuf) {
         let idx = self.active;
-        if self.panels[idx].location.is_remote() && !dir.is_dir() {
-            let shown = ui::tilde_path(&dir);
-            self.status = Some(crate::tr!(
-                "폴더를 열 수 없음: {shown}",
-                "Cannot open the folder: {shown}"
-            ));
+        if !self.panels[idx].location.is_remote() {
+            // a local panel loads it on the loader and keeps its folder on error
+            self.go_local_dir(idx, dir);
             return;
         }
-        self.go_local_dir(idx, dir);
+        // leaving a server: check the folder first (on a worker: a stat can
+        // hang on a dead mount), so a bad choice keeps the remote panel
+        self.status = None;
+        let generation = self.connect_gen;
+        let tx = self.place_tx.clone();
+        let started = std::thread::Builder::new()
+            .name("hdir-place".into())
+            .spawn(move || {
+                let ok = dir.is_dir();
+                let _ = tx.send((idx, generation, dir, ok));
+            });
+        if let Err(e) = started {
+            self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
+        }
+    }
+
+    /// Apply finished folder checks from [`App::go_to_place`].
+    fn tick_place(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((idx, generation, dir, ok)) = self.place_rx.try_recv() {
+            // the panel was reconnected or switched meanwhile: drop it
+            if generation != self.connect_gen || !self.panels[idx].location.is_remote() {
+                continue;
+            }
+            changed = true;
+            if ok {
+                self.go_local_dir(idx, dir);
+            } else {
+                let shown = ui::tilde_path(&dir);
+                self.status = Some(crate::tr!(
+                    "폴더를 열 수 없음: {shown}",
+                    "Cannot open the folder: {shown}"
+                ));
+            }
+        }
+        changed
     }
 
     fn open_theme_menu(&mut self) {
@@ -2952,7 +3009,7 @@ impl App {
         let loaded = self.drain_loads() | self.tick_connect();
         let task =
             self.tick_task() | self.tick_viewer_load() | self.tick_probe() | self.tick_uploads();
-        let spawned = self.tick_spawn();
+        let spawned = self.tick_spawn() | self.tick_place();
         let preview = self.tick_preview();
         self.track_history();
         // the Classic clock: redraw once the minute it shows has passed
@@ -5681,6 +5738,37 @@ mod tests {
         again.configure(Some(cfg.path().to_path_buf()), None);
         assert_eq!(again.favorites, [root]);
         drop(t);
+    }
+
+    #[test]
+    fn quick_favorite_changes_end_with_the_latest_list_on_disk() {
+        let (t, mut app) = fixture();
+        let cfg = tempfile::tempdir().unwrap();
+        app.configure(Some(cfg.path().to_path_buf()), None);
+        let mut dirs = Vec::new();
+        for i in 0..20 {
+            let d = t.path().join(format!("d{i:02}"));
+            fs::create_dir(&d).unwrap();
+            dirs.push(crate::platform::canonicalize(&d).unwrap());
+        }
+        for d in &dirs {
+            app.panels[0].cwd = d.clone();
+            app.add_favorite();
+        }
+        for i in (0..20).step_by(2) {
+            app.open_favorites(0);
+            let row = 1 + app.favorites.iter().position(|p| *p == dirs[i]).unwrap();
+            app.delete_favorite(&dirs[i].clone(), row);
+        }
+        app.menu = None;
+        let want = app.favorites.clone();
+        assert_eq!(want.len(), 10);
+        let file = crate::places::favorites_file(cfg.path());
+        let on_disk = || crate::places::load_favorites(Some(cfg.path())).0;
+        wait_for("latest list saved", || on_disk() == want);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(on_disk(), want, "an older save never lands last");
+        assert!(file.exists());
     }
 
     #[test]
@@ -10466,6 +10554,46 @@ mod tests {
             press(&mut app, KeyCode::F(5));
             assert_eq!(app.status.as_deref(), Some(disconnected_msg()));
             assert!(app.dialog.is_none() && app.job.is_none());
+        }
+
+        #[test]
+        fn a_favorite_chosen_on_a_remote_panel_is_checked_off_the_ui_thread() {
+            let (t, mut app, _f) = env();
+            connect_prod(&mut app);
+            assert_eq!(app.active, 1);
+            let there = crate::platform::canonicalize(&t.path().join("adir")).unwrap();
+            app.favorites = vec![t.path().join("gone"), there.clone()];
+            press(&mut app, KeyCode::F(11));
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert!(
+                app.panels[1].location.is_remote(),
+                "not decided on the UI thread"
+            );
+            assert_eq!(app.status, None, "the check runs on a worker");
+            let start = Instant::now();
+            while app.status.is_none() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                app.status.as_deref().unwrap().contains("열 수 없음"),
+                "{:?}",
+                app.status
+            );
+            assert!(app.panels[1].location.is_remote(), "the panel stays");
+            press(&mut app, KeyCode::F(11));
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let start = Instant::now();
+            while app.panels[1].location.is_remote() || app.panels[1].loading.is_some() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(app.panels[1].cwd, there);
         }
 
         #[test]
