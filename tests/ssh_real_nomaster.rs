@@ -228,6 +228,10 @@ os.setxattr(\"secret.txt\", \"system.posix_acl_access\", v)'",
     let got = back.path().join("secret.txt");
     assert_eq!(std::fs::read(&got).unwrap(), b"secret");
     let no = AtomicBool::new(false);
+    // a macOS client cannot take POSIX ACLs: it must always restrict
+    if cfg!(target_os = "macos") {
+        assert!(!hdir::platform::tree_has_posix_acl(&got, &no));
+    }
     if hdir::platform::tree_has_posix_acl(&got, &no) {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     } else {

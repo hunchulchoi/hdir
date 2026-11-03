@@ -59,6 +59,9 @@ pub const DIR_APPEARED: i32 = 47;
 pub const APPEARED: i32 = 48;
 /// [`place_cmd`]: a free target, but no hard links to place a file safely.
 pub const NO_SAFE_RENAME: i32 = 49;
+/// [`place_cmd`]: something took an approved target's place while the old
+/// item was set aside; both stay in the stage.
+pub const ASIDE_LEFT: i32 = 50;
 
 /// Name prefix of staging directories.
 pub const STAGE_PREFIX: &str = ".hdir-xfer.";
@@ -588,10 +591,26 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
         (true, true) => b"if [ -d $T ] && [ ! -L $T ]; then exit 47; fi; \
                           mv -fT -- $F $T || exit 1; "
             .to_vec(),
-        (true, false) => b"if [ -L $T ]; then if [ -d $T ]; then mv -f -- $T $A || exit 1; \
-              mv -f -- $F $T || { mv -f -- $A $T; exit 1; }; rm -f -- $A; \
-              else mv -f -- $F $T || exit 1; fi; \
-              elif [ -d $T ]; then exit 47; else mv -f -- $F $T || exit 1; fi; "
+        // No -T: whatever is at the target is first set aside in the stage
+        // (a fresh name there), then the item goes in with -n, which never
+        // writes over anything. Whether it landed on the name itself (and
+        // not in a folder or a link to one that took the name meanwhile) is
+        // checked by inode; if not, it is taken back and the set-aside item
+        // stays in the stage ([`ASIDE_LEFT`]) rather than being lost.
+        (true, false) => b"set -- $(ls -di -- $F) || exit 1; i=$1; s=; \
+              if [ -e $T ] || [ -L $T ]; then \
+              if [ -d $T ] && [ ! -L $T ]; then exit 47; fi; \
+              mv -n -- $T $A || exit 1; \
+              if [ -d $A ] && [ ! -L $A ]; then mv -n -- $A $T; exit 47; fi; \
+              if [ -e $T ] || [ -L $T ]; then mv -n -- $A $T; exit 1; fi; s=1; fi; \
+              mv -n -- $F $T || { if [ -n \"$s\" ]; then \
+              if [ -e $T ] || [ -L $T ]; then exit 50; fi; mv -n -- $A $T; \
+              if [ -e $A ] || [ -L $A ]; then exit 50; fi; fi; exit 1; }; \
+              set -- $(ls -di -- $T 2>/dev/null) x; \
+              if [ \"$1\" != \"$i\" ] || [ -e $F ] || [ -L $F ]; then \
+              if [ ! -e $F ] && [ ! -L $F ]; then mv -n -- $I $F; fi; \
+              if [ -n \"$s\" ]; then exit 50; fi; exit 48; fi; \
+              if [ -n \"$s\" ]; then rm -f -- $A; fi; "
             .to_vec(),
         // Nothing is ever renamed over a name that may have been taken: a
         // file is hard-linked, a symlink re-created (both fail when the name
@@ -621,8 +640,12 @@ pub fn place_cmd(os: &RemoteOs, from: &[u8], to: &[u8], stage: &[u8], replace: b
             there,
             b"if [ -L $F ]; then l=$(readlink -- $F && echo x) || exit 1; l=${l%?x}; \
               if ln -sn -- \"$l\" $T 2>/dev/null; then \
-              r=$(readlink -- $T && echo x) || exit 48; \
-              if [ -L $T ] && [ \"${r%?x}\" = \"$l\" ]; then rm -f -- $F; else exit 48; fi; else ",
+              r=$(readlink -- $T 2>/dev/null && echo x); \
+              if [ -L $T ] && [ \"${r%?x}\" = \"$l\" ]; then rm -f -- $F; else \
+              b=${l##*/}; if [ -n \"$b\" ]; then \
+              q=$(readlink -- $T/\"$b\" 2>/dev/null && echo x); \
+              if [ -L $T/\"$b\" ] && [ \"${q%?x}\" = \"$l\" ]; then rm -f -- $T/\"$b\"; fi; fi; \
+              exit 48; fi; else ",
             there,
             b"exit 1; fi; \
               elif [ -f $F ]; then \
@@ -1302,6 +1325,15 @@ fn place(
                     "This filesystem does not support safe renaming",
                 )
                 .to_string(),
+                // both the copy and the item it was replacing are in the
+                // stage: never discard it
+                Some(ASIDE_LEFT) => {
+                    return Err(crate::tr!(
+                        "대상에 다른 항목이 생겨 옮기지 않음 · 받은 항목과 원래 항목이 임시 폴더에 남음: {}",
+                        "Not moved: something took the destination's place · the copy and the original stayed in the temp folder: {}",
+                        String::from_utf8_lossy(&p)
+                    ));
+                }
                 _ => code_err(&out),
             };
             if restore.is_some() {
@@ -2248,14 +2280,18 @@ mod tests {
         );
         let pl = String::from_utf8(place_cmd(&RemoteOs::Bsd, b"/d/S/x", b"/d/x", b"/d/S", true))
             .unwrap();
-        assert_eq!(
-            pl,
-            "if [ -L '/d/x' ]; then if [ -d '/d/x' ]; then mv -f -- '/d/x' '/d/S/o' || exit 1; \
-             mv -f -- '/d/S/x' '/d/x' || { mv -f -- '/d/S/o' '/d/x'; exit 1; }; \
-             rm -f -- '/d/S/o'; else mv -f -- '/d/S/x' '/d/x' || exit 1; fi; \
-             elif [ -d '/d/x' ]; then exit 47; else mv -f -- '/d/S/x' '/d/x' || exit 1; fi; \
-             rmdir -- '/d/S' || exit 46"
-        );
+        for part in [
+            "set -- $(ls -di -- '/d/S/x') || exit 1; i=$1; s=; ",
+            "if [ -d '/d/x' ] && [ ! -L '/d/x' ]; then exit 47; fi; mv -n -- '/d/x' '/d/S/o' || exit 1;",
+            "mv -n -- '/d/S/x' '/d/x' || {",
+            "set -- $(ls -di -- '/d/x' 2>/dev/null) x;",
+            "mv -n -- '/d/x/x' '/d/S/x'",
+            "if [ -n \"$s\" ]; then exit 50; fi; exit 48; fi;",
+            "if [ -n \"$s\" ]; then rm -f -- '/d/S/o'; fi; rmdir -- '/d/S' || exit 46",
+        ] {
+            assert!(pl.contains(part), "missing {part}\nin {pl}");
+        }
+        assert!(!pl.contains("mv -f"), "never an overwriting mv: {pl}");
         let pl = String::from_utf8(place_cmd(
             &RemoteOs::Bsd,
             b"/d/S/x",
@@ -2267,8 +2303,11 @@ mod tests {
         for part in [
             "if [ -e '/d/x' ] || [ -L '/d/x' ]; then exit 48; fi; ",
             "if ln -sn -- \"$l\" '/d/x' 2>/dev/null; then \
-             r=$(readlink -- '/d/x' && echo x) || exit 48; \
-             if [ -L '/d/x' ] && [ \"${r%?x}\" = \"$l\" ]; then rm -f -- '/d/S/x'; else exit 48; fi;",
+             r=$(readlink -- '/d/x' 2>/dev/null && echo x); \
+             if [ -L '/d/x' ] && [ \"${r%?x}\" = \"$l\" ]; then rm -f -- '/d/S/x'; else \
+             b=${l##*/}; if [ -n \"$b\" ]; then",
+            "if [ -L '/d/x'/\"$b\" ] && [ \"${q%?x}\" = \"$l\" ]; then rm -f -- '/d/x'/\"$b\"; fi; fi; \
+             exit 48; fi;",
             "if ln -- '/d/S/x' '/d/x' 2>/dev/null; then \
              if [ '/d/x' -ef '/d/S/x' ]; then rm -f -- '/d/S/x'; else rm -f -- '/d/x/x'; exit 48; fi;",
             "elif [ -d '/d/S/x' ]; then set -- $(ls -di -- '/d/S/x') || exit 1; i=$1; \
@@ -2756,6 +2795,187 @@ mod tests {
         fs::write(sp.join("half/x"), "x").unwrap();
         assert!(sh(&unstage_cmd(&stage)).status.success());
         assert!(!sp.exists());
+    }
+
+    /// `script` run by `sh` with a `mv` shim first on PATH: just before the
+    /// `mv` whose last two arguments are `from` and `to`, it plants `plant`
+    /// (a folder holding `victim`, or a link to `outside`) at `to`, as a
+    /// racing user would.
+    fn sh_with_planting_mv(script: &[u8], t: &Path, plant: &str) -> std::process::Output {
+        sh_with_planting("mv", script, t, plant)
+    }
+
+    /// [`sh_with_planting_mv`] for any command `cmd` (`mv`, `ln`).
+    fn sh_with_planting(cmd: &str, script: &[u8], t: &Path, plant: &str) -> std::process::Output {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let bin = t.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let real = [format!("/bin/{cmd}"), format!("/usr/bin/{cmd}")]
+            .into_iter()
+            .find(|m| Path::new(m).exists())
+            .unwrap();
+        let shim = format!(
+            "#!/bin/sh\n\
+             for a do to=$a; done\n\
+             if [ \"$to\" = \"$PLANT_AT\" ] && [ ! -e \"$PLANT_AT.done\" ] && \
+             [ \"$(eval echo \\\"\\${{$(($#-1))}}\\\")\" = \"$PLANT_FROM\" ]; then\n\
+               : > \"$PLANT_AT.done\"; rm -f \"$PLANT_AT\"\n\
+               case $PLANT in\n\
+                 dir) mkdir \"$PLANT_AT\" && printf victim > \"$PLANT_AT/$PLANT_NAME\";;\n\
+                 link) ln -s \"$PLANT_OUTSIDE\" \"$PLANT_AT\";;\n\
+               esac\n\
+             fi\n\
+             exec {real} \"$@\"\n"
+        );
+        fs::write(bin.join(cmd), shim).unwrap();
+        fs::set_permissions(bin.join(cmd), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(std::ffi::OsStr::from_bytes(script))
+            .env("PATH", path)
+            .env("PLANT", plant)
+            .output()
+            .unwrap()
+    }
+
+    /// BSD `mv` has no -T: an approved overwrite must never go into a
+    /// folder (or a link to one) that took the target's place meanwhile, and
+    /// never lose the file it was replacing.
+    #[test]
+    fn real_bsd_overwrite_never_lands_in_a_folder_that_appeared() {
+        for plant in ["dir", "link"] {
+            let t = tempfile::tempdir().unwrap();
+            let dest = private_dir(t.path(), "dest");
+            let outside = private_dir(t.path(), "outside");
+            fs::write(outside.join("a.txt"), "victim").unwrap();
+            fs::write(dest.join("a.txt"), "old").unwrap();
+            let (dir, stage, sp) = stage_in(&dest);
+            fs::write(sp.join("a.txt"), "new").unwrap();
+            let to = cat(&[&dir, b"/a.txt"]);
+            let from = cat(&[&stage, b"/a.txt"]);
+            let script = place_cmd(&RemoteOs::Bsd, &from, &to, &stage, true);
+            let script = cat(&[
+                b"PLANT_AT=",
+                &sh_quote(&to),
+                b"; PLANT_FROM=",
+                &sh_quote(&from),
+                b"; PLANT_NAME=a.txt; PLANT_OUTSIDE=",
+                &sh_quote(&b(&outside)),
+                b"; export PLANT_AT PLANT_FROM PLANT_NAME PLANT_OUTSIDE; ",
+                &script,
+            ]);
+            let out = sh_with_planting_mv(&script, t.path(), plant);
+            assert_ne!(out.status.code(), Some(0), "{plant}: {out:?}");
+            assert_eq!(
+                fs::read(outside.join("a.txt")).unwrap(),
+                b"victim",
+                "{plant}"
+            );
+            if plant == "dir" {
+                assert_eq!(fs::read(dest.join("a.txt/a.txt")).unwrap(), b"victim");
+            }
+            // the new copy and the replaced file both survive in the stage
+            let kept: Vec<Vec<u8>> = fs::read_dir(&sp)
+                .unwrap()
+                .flatten()
+                .map(|e| fs::read(e.path()).unwrap_or_default())
+                .collect();
+            assert!(kept.contains(&b"new".to_vec()), "{plant}: {kept:?}");
+            assert!(kept.contains(&b"old".to_vec()), "{plant}: {kept:?}");
+            assert_eq!(out.status.code(), Some(ASIDE_LEFT), "{plant}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_stage_holding_the_replaced_item_is_never_discarded() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "new").unwrap();
+        let f = FakeCmd::new(|a| {
+            if a[0] == "pipe" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.ends_with("|| exit 46") {
+                return code(ASIDE_LEFT);
+            }
+            answer(c, &[], &["/dst/a"], "0\x000\x00")
+        });
+        let s = spec(
+            JobKind::Move,
+            Side::Local,
+            t.path(),
+            &["a"],
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::answering(&[ConflictAnswer::Overwrite]));
+        assert!(
+            matches!(&r.outcome, OpOutcome::Failed(m) if m.contains(STAGE)),
+            "{:?}",
+            r.outcome
+        );
+        let unstage = String::from_utf8(unstage_cmd(STAGE.as_bytes())).unwrap();
+        assert!(!f.remote_cmds().contains(&unstage), "{:?}", f.remote_cmds());
+        assert_eq!(
+            fs::read(t.path().join("a")).unwrap(),
+            b"new",
+            "move source kept"
+        );
+    }
+
+    /// A link placed on a free name while a folder takes that name: the
+    /// link `ln` made inside the folder is removed again.
+    #[test]
+    fn real_bsd_link_placing_leaves_nothing_in_a_folder_that_appeared() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let (dir, stage, sp) = stage_in(&dest);
+        std::os::unix::fs::symlink("target-x", sp.join("a")).unwrap();
+        let to = cat(&[&dir, b"/a"]);
+        let from = cat(&[&stage, b"/a"]);
+        let script = cat(&[
+            b"PLANT_AT=",
+            &sh_quote(&to),
+            b"; PLANT_FROM=target-x; PLANT_NAME=a; export PLANT_AT PLANT_FROM PLANT_NAME; ",
+            &place_cmd(&RemoteOs::Bsd, &from, &to, &stage, false),
+        ]);
+        let out = sh_with_planting("ln", &script, t.path(), "dir");
+        assert_eq!(out.status.code(), Some(APPEARED), "{out:?}");
+        let inside: Vec<String> = fs::read_dir(dest.join("a"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(inside, ["a"], "only the folder's own file");
+        assert_eq!(fs::read(dest.join("a/a")).unwrap(), b"victim");
+        assert_eq!(fs::read_link(sp.join("a")).unwrap(), Path::new("target-x"));
+    }
+
+    #[test]
+    fn real_bsd_overwrite_replaces_files_and_links_in_place() {
+        let t = tempfile::tempdir().unwrap();
+        let dest = private_dir(t.path(), "dest");
+        let outside = private_dir(t.path(), "outside");
+        fs::write(dest.join("f"), "old").unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("l")).unwrap();
+        for name in ["f", "l", "new-name"] {
+            let (dir, stage, sp) = stage_in(&dest);
+            fs::write(sp.join(name), "new").unwrap();
+            let to = cat(&[&dir, b"/", name.as_bytes()]);
+            let from = cat(&[&stage, b"/", name.as_bytes()]);
+            let out = sh(&place_cmd(&RemoteOs::Bsd, &from, &to, &stage, true));
+            assert!(out.status.success(), "{name}: {out:?}");
+            assert!(fs::symlink_metadata(dest.join(name)).unwrap().is_file());
+            assert_eq!(fs::read(dest.join(name)).unwrap(), b"new");
+            assert!(!sp.exists(), "{name}: stage gone");
+        }
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[test]
@@ -5426,6 +5646,16 @@ mod tests {
             Side::Local,
             t.path(),
         );
+        // a filesystem that cannot keep setuid / setgid bits: nothing to test
+        let probe = t.path().join("probe");
+        fs::write(&probe, "x").unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o6750)).unwrap();
+        let kept = fs::metadata(&probe).unwrap().permissions().mode() & 0o7777;
+        fs::remove_file(&probe).unwrap();
+        if kept != 0o6750 {
+            eprintln!("setuid / setgid not kept here ({kept:o}), skipped");
+            return;
+        }
         assert_eq!(run(&s, &mut Ctl::new()).outcome, OpOutcome::Done);
         let mode = |n: &str| {
             fs::metadata(t.path().join("d").join(n))
@@ -5434,9 +5664,6 @@ mod tests {
                 .mode()
                 & 0o7777
         };
-        if mode("plain") != 0o640 {
-            return;
-        }
         assert_eq!(
             [mode("u"), mode("g"), mode("ug"), mode("plain")],
             [0o755, 0o755, 0o750, 0o640]
