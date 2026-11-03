@@ -117,6 +117,10 @@ pub fn action_label(a: Action) -> &'static str {
         Action::Favorites => t("즐겨찾기", "Favorites"),
         Action::History => t("최근 경로", "History"),
         Action::Tree => t("디렉터리 트리", "Directory tree"),
+        Action::ToggleMarkdown => t(
+            "서식 / 원문 전환 (Markdown)",
+            "Formatted / source (Markdown)",
+        ),
         Action::Expand => t("펼치기", "Expand"),
         Action::Collapse => t("접기 / 상위", "Collapse / up"),
         Action::CancelJob => t("작업 취소", "Cancel job"),

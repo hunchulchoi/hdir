@@ -60,6 +60,19 @@ impl LineIndex {
     }
 }
 
+/// A Markdown document: its source and the formatted lines for one width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MdView {
+    source: String,
+    /// Showing the source instead of the formatted text.
+    raw: bool,
+    /// Width `lines` were laid out for (0: not yet).
+    width: usize,
+    lines: Vec<crate::markdown::MdLine>,
+    plain: Vec<String>,
+    max_width: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Viewer {
     pub path: PathBuf,
@@ -84,6 +97,7 @@ pub struct Viewer {
     rows: usize,
     cols: usize,
     max_width: usize,
+    md: Option<MdView>,
 }
 
 impl Viewer {
@@ -104,7 +118,28 @@ impl Viewer {
             rows: 10,
             cols: 80,
             max_width: 0,
+            md: None,
         }
+    }
+
+    /// Showing formatted Markdown (not the source).
+    fn formatted(&self) -> bool {
+        self.md.as_ref().is_some_and(|m| !m.raw)
+    }
+
+    /// Lay the Markdown out for `width` columns (when that changed).
+    fn layout_md(&mut self, width: usize) {
+        let Some(m) = self.md.as_mut().filter(|m| !m.raw && m.width != width) else {
+            return;
+        };
+        m.lines = crate::markdown::render(&m.source, width);
+        m.plain = m.lines.iter().map(crate::markdown::plain).collect();
+        m.max_width = m.plain.iter().map(|l| l.width()).max().unwrap_or(0);
+        m.width = width;
+        // line numbers changed: searches and indexes start over
+        self.lower = None;
+        self.line_index.clear();
+        self.match_line = None;
     }
 
     /// Adopt the loaded preview.
@@ -115,9 +150,20 @@ impl Viewer {
         self.notice = None;
         self.lower = None;
         self.line_index.clear();
+        self.md = None;
         self.content = match p {
             Preview::Text { lines, truncated } => {
                 self.max_width = lines.iter().map(|l| l.width()).max().unwrap_or(0);
+                if crate::markdown::is_markdown(&self.path) {
+                    self.md = Some(MdView {
+                        source: lines.join("\n"),
+                        raw: false,
+                        width: 0,
+                        lines: Vec::new(),
+                        plain: Vec::new(),
+                        max_width: 0,
+                    });
+                }
                 Content::Text { lines, truncated }
             }
             Preview::Binary { size, kind } => Content::Message(crate::tr!(
@@ -135,8 +181,9 @@ impl Viewer {
     }
 
     fn lines(&self) -> &[String] {
-        match &self.content {
-            Content::Text { lines, .. } => lines,
+        match (&self.content, &self.md) {
+            (Content::Text { .. }, Some(m)) if !m.raw => &m.plain,
+            (Content::Text { lines, .. }, _) => lines,
             _ => &[],
         }
     }
@@ -146,7 +193,11 @@ impl Viewer {
     }
 
     fn max_hscroll(&self) -> usize {
-        self.max_width.saturating_sub(self.cols)
+        let widest = match &self.md {
+            Some(m) if !m.raw => m.max_width,
+            _ => self.max_width,
+        };
+        widest.saturating_sub(self.cols)
     }
 
     /// Apply a viewer-context action; returns true when the viewer should close.
@@ -169,6 +220,17 @@ impl Viewer {
             }
             Action::SearchNext if self.query.is_some() => {
                 self.find(self.match_line.map_or(self.scroll, |m| m + 1));
+            }
+            Action::ToggleMarkdown => {
+                if let Some(m) = self.md.as_mut() {
+                    m.raw = !m.raw;
+                    m.width = 0;
+                    self.scroll = 0;
+                    self.hscroll = 0;
+                    self.lower = None;
+                    self.line_index.clear();
+                    self.match_line = None;
+                }
             }
             _ => {}
         }
@@ -224,11 +286,12 @@ impl Viewer {
 
     /// `N/M` plus the truncation marker; empty while loading or for messages.
     fn counter(&self) -> String {
-        let Content::Text { lines, truncated } = &self.content else {
+        let Content::Text { truncated, .. } = &self.content else {
             return String::new();
         };
-        let n = (self.scroll + 1).min(lines.len());
-        let mut s = format!("{n}/{}", lines.len());
+        let total = self.lines().len();
+        let n = (self.scroll + 1).min(total);
+        let mut s = format!("{n}/{total}");
         if *truncated {
             s.push_str(t(" · 잘림", " · truncated"));
         }
@@ -302,6 +365,64 @@ fn window_indexed(s: &str, idx: &LineIndex, start: usize, width: usize) -> Strin
     out
 }
 
+/// Terminal style of a Markdown piece.
+fn md_style(st: &crate::markdown::Style, theme: &Theme) -> Style {
+    use crate::markdown::Kind;
+    use ratatui::style::Modifier;
+    let fg = match st.kind {
+        Kind::Text => theme.fg,
+        Kind::Heading(_) => theme.title,
+        Kind::Code | Kind::CodeBlock => theme.exec,
+        Kind::Marker | Kind::Rule | Kind::Table => theme.border,
+        Kind::Link => theme.symlink,
+        Kind::Url | Kind::Html => theme.hidden,
+    };
+    let mut s = Style::default().fg(fg).bg(theme.bg);
+    if st.bold {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    if st.italic {
+        s = s.add_modifier(Modifier::ITALIC);
+    }
+    if st.strike {
+        s = s.add_modifier(Modifier::CROSSED_OUT);
+    }
+    if st.kind == Kind::Link {
+        s = s.add_modifier(Modifier::UNDERLINED);
+    }
+    s
+}
+
+/// A formatted line from column `start`, exactly `width` columns wide.
+fn md_window(
+    line: &crate::markdown::MdLine,
+    start: usize,
+    width: usize,
+    theme: &Theme,
+) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::text::Span;
+    let mut out = Vec::new();
+    let (mut col, mut used) = (0, 0);
+    for (text, st) in line {
+        let end = col + text.width();
+        if end > start && used < width {
+            let from = col.max(start);
+            let piece = (end - from).min(width - used);
+            out.push(Span::styled(
+                window(text, from - col, piece),
+                md_style(st, theme),
+            ));
+            used += piece;
+        }
+        col = end;
+    }
+    out.push(Span::styled(
+        " ".repeat(width - used),
+        Style::default().fg(theme.fg).bg(theme.bg),
+    ));
+    out
+}
+
 pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str) {
     let area = frame.area();
     let (w, h) = (area.width as usize, area.height as usize);
@@ -312,6 +433,7 @@ pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str
     let bar = Style::default().fg(theme.status_fg).bg(theme.status_bg);
     v.rows = h.saturating_sub(2);
     v.cols = w;
+    v.layout_md(w);
     v.scroll = v.scroll.min(v.max_scroll());
     v.hscroll = v.hscroll.min(v.max_hscroll());
 
@@ -328,6 +450,19 @@ pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str
     let mut lines: Vec<Line> = vec![Line::styled(fit_width(&header, w), bar)];
 
     match &v.content {
+        Content::Text { .. } if v.formatted() => {
+            let m = v.md.as_ref().expect("formatted");
+            for (i, l) in m.lines.iter().enumerate().skip(v.scroll).take(v.rows) {
+                let mut spans = md_window(l, v.hscroll, w, theme);
+                if v.match_line == Some(i) {
+                    let hl = Style::default().fg(theme.cursor_fg).bg(theme.cursor_bg);
+                    for s in &mut spans {
+                        s.style = hl;
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+        }
         Content::Text { lines: text, .. } => {
             let visible = v.scroll..(v.scroll + v.rows).min(text.len());
             v.line_index.retain(|i, _| visible.contains(i));
@@ -367,6 +502,14 @@ pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str
         let footer = match (&v.input, &v.notice) {
             (Some(q), _) => format!(" /{q}_"),
             (None, Some(n)) => format!(" {n}"),
+            (None, None) if v.md.is_some() => {
+                let to = if v.formatted() {
+                    t("원문", "source")
+                } else {
+                    t("서식", "formatted")
+                };
+                format!(" {close_hint} · m: {to}")
+            }
             (None, None) => format!(" {close_hint}"),
         };
         lines.push(Line::styled(fit_width(&footer, w), bar));
@@ -729,6 +872,141 @@ mod tests {
         draw(&mut v, 3, 2);
         draw(&mut v, 1, 1);
         draw(&mut v, 0, 0);
+    }
+}
+
+#[cfg(test)]
+mod md_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn th() -> Theme {
+        crate::theme::builtin("mdir").unwrap()
+    }
+
+    fn md(src: &str) -> Viewer {
+        let mut v = Viewer::loading(PathBuf::from("/docs/읽어 보기.md"));
+        v.set_preview(Preview::Text {
+            lines: src.lines().map(String::from).collect(),
+            truncated: false,
+        });
+        v
+    }
+
+    fn draw(v: &mut Viewer, w: u16, h: u16) -> (Vec<String>, ratatui::buffer::Buffer) {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render(f, v, &th(), "q: 닫기")).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < w {
+                    let sym = buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += sym.width().max(1) as u16;
+                }
+                row
+            })
+            .collect();
+        (rows, buf)
+    }
+
+    #[test]
+    fn a_markdown_file_opens_formatted_and_m_shows_the_source() {
+        let mut v = md("# 제목\n\n본문 **굵게**\n\n- 항목");
+        let (rows, buf) = draw(&mut v, 40, 10);
+        assert_eq!(rows[1].trim_end(), "제목");
+        assert!(rows[2].starts_with("════"), "{rows:?}");
+        assert!(rows[4].starts_with("본문 굵게"), "{rows:?}");
+        assert!(rows[6].starts_with("• 항목"), "{rows:?}");
+        assert_eq!(buf[(0, 1)].fg, th().title, "heading color");
+        assert!(
+            buf[(5, 4)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(rows[9].contains("m:"), "the toggle is shown: {}", rows[9]);
+        assert!(!v.apply(Action::ToggleMarkdown));
+        let (rows, _) = draw(&mut v, 40, 10);
+        assert_eq!(rows[1].trim_end(), "# 제목", "source view");
+        assert!(rows[0].contains("1/5"), "{}", rows[0]);
+        v.apply(Action::ToggleMarkdown);
+        let (rows, _) = draw(&mut v, 40, 10);
+        assert_eq!(rows[1].trim_end(), "제목");
+    }
+
+    #[test]
+    fn a_resize_rewraps_and_long_lines_scroll_sideways() {
+        let src = format!(
+            "{}\n\n```\n{}ZZEND\n```\n\n| a | b |\n|---|---|\n| {} | x |",
+            "단어 ".repeat(30),
+            "c".repeat(100),
+            "긴셀".repeat(20)
+        );
+        let mut v = md(&src);
+        let (wide, _) = draw(&mut v, 80, 30);
+        let (narrow, _) = draw(&mut v, 30, 30);
+        let count = |rows: &[String]| rows.iter().filter(|r| r.contains("단어")).count();
+        assert!(count(&narrow) > count(&wide), "paragraphs rewrap");
+        // the code line is never wrapped: the right part is reached by scrolling
+        assert_eq!(narrow.iter().filter(|r| r.contains("ccc")).count(), 1);
+        assert!(
+            !narrow.iter().any(|r| r.contains("ZZEND")),
+            "not yet visible"
+        );
+        for _ in 0..10 {
+            v.apply(Action::ScrollRight);
+        }
+        let (rows, _) = draw(&mut v, 30, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("ZZEND")),
+            "the end of the code line: {rows:?}"
+        );
+        for _ in 0..20 {
+            v.apply(Action::ScrollRight);
+        }
+        assert!(v.hscroll > 0);
+        let (rows, _) = draw(&mut v, 30, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("긴셀")),
+            "the wide table scrolls"
+        );
+        for r in &rows {
+            assert_eq!(r.width(), 30, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn search_finds_the_formatted_text() {
+        let mut v = md("# Title\n\nfirst\n\n**찾는 말** here");
+        draw(&mut v, 40, 10);
+        v.apply(Action::Search);
+        for c in "찾는".chars() {
+            v.input_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        v.input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(v.match_line, Some(5));
+    }
+
+    #[test]
+    fn plain_text_files_and_empty_markdown_are_unchanged() {
+        let mut t = Viewer::loading(PathBuf::from("/a.txt"));
+        t.set_preview(Preview::Text {
+            lines: vec!["# not a heading".into()],
+            truncated: false,
+        });
+        let (rows, _) = draw(&mut t, 30, 5);
+        assert_eq!(rows[1].trim_end(), "# not a heading");
+        assert!(!rows[4].contains("m:"));
+        let mut e = Viewer::loading(PathBuf::from("/e.md"));
+        e.set_preview(Preview::Empty);
+        let (rows, _) = draw(&mut e, 30, 5);
+        assert!(rows[1].contains("빈 파일"), "{rows:?}");
+        e.apply(Action::ToggleMarkdown);
+        draw(&mut e, 0, 0);
+        draw(&mut e, 3, 2);
     }
 }
 

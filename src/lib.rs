@@ -15,6 +15,7 @@ pub mod job;
 pub mod keymap;
 pub mod launcher;
 pub mod loader;
+pub mod markdown;
 pub mod menu;
 pub mod panel;
 pub mod places;
