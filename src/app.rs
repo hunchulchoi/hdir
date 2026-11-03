@@ -30,7 +30,7 @@ use crate::remote::{self, SshTarget};
 use crate::remote_ops::{self, EditCopy};
 use crate::screen::{self, TextScreen};
 use crate::servers::{self, Server, SshHost};
-use crate::session::{self, Cmd, DISCONNECTED_MSG, Established, RemoteSession, SystemCmd};
+use crate::session::{self, Cmd, Established, RemoteSession, SystemCmd, disconnected_msg};
 use crate::theme::{self, Theme};
 use crate::transfer;
 use crate::trash::{
@@ -164,9 +164,6 @@ const MENU_OPEN_WITH: usize = 5;
 /// Decides off the UI thread whether a file is text (first chunk only).
 pub type TextProbe = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
-/// Status shown when Enter lands on a FIFO, socket or device.
-const SPECIAL_FILE: &str = remote_ops::SPECIAL_FILE;
-
 /// Reads the first 8 KiB of `path` and classifies it like the preview does.
 /// Errors (vanished, unreadable, dangling symlink, special file) carry the
 /// user-facing reason; special files are refused before any blocking open.
@@ -175,7 +172,7 @@ pub fn probe_text(path: &Path) -> Result<bool, String> {
     // `metadata` follows symlinks, so a link to a FIFO is refused as well.
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.file_type().is_file() {
-        return Err(SPECIAL_FILE.into());
+        return Err(remote_ops::special_file().into());
     }
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -1198,7 +1195,7 @@ impl App {
     /// (never leaves the TUI), everything else runs on `ssh -t`.
     fn run_remote_command_line(&mut self, session: Arc<RemoteSession>, cwd: PathBuf, cmd: &str) {
         if !session.is_alive() {
-            self.status = Some(DISCONNECTED_MSG.into());
+            self.status = Some(disconnected_msg().into());
             return;
         }
         // "~" stands for the remote home; `~/x` becomes `~/x` again.
@@ -2298,7 +2295,7 @@ impl App {
                         self.start_remote_fetch(s, path, FetchPurpose::System);
                     }
                 },
-                Err(e) if e == SPECIAL_FILE => self.status = Some(e),
+                Err(e) if e == remote_ops::special_file() => self.status = Some(e),
                 Err(e) => {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     self.status = Some(format!("오류: {name}: {e}"));
@@ -2536,7 +2533,7 @@ impl App {
             .iter()
             .any(|p| p.location.session().is_some_and(|s| !s.is_alive()));
         if dead {
-            self.status = Some(DISCONNECTED_MSG.into());
+            self.status = Some(disconnected_msg().into());
             return;
         }
         let cwd = self.active_panel().cwd.clone();
@@ -2679,7 +2676,7 @@ impl App {
                         .session()
                         .is_some_and(|s| !s.is_alive())
                 {
-                    self.status = Some(DISCONNECTED_MSG.into());
+                    self.status = Some(disconnected_msg().into());
                 }
                 if std::mem::take(&mut self.panels[idx].reload_after_load) {
                     self.reload_panel(idx, None);
@@ -8009,7 +8006,7 @@ mod tests {
         use crate::config::Mode;
         use crate::remote::{check_argv, master_argv};
         use crate::servers::ServerConfig;
-        use crate::session::{CmdOutput, DISCONNECTED_MSG};
+        use crate::session::{CmdOutput, disconnected_msg};
         use std::collections::HashMap;
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -8500,8 +8497,8 @@ mod tests {
             press(&mut app, KeyCode::Enter); // into sub: ssh dies
             wait_remote(&mut app);
             assert_eq!(app.panels[1].cwd, PathBuf::from("/srv/data"), "stays put");
-            assert_eq!(app.panels[1].error.as_deref(), Some(DISCONNECTED_MSG));
-            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert_eq!(app.panels[1].error.as_deref(), Some(disconnected_msg()));
+            assert_eq!(app.status.as_deref(), Some(disconnected_msg()));
             assert!(!app.panels[1].location.session().unwrap().is_alive());
             // network is back, master gone: Enter asks for auth again
             f.down.store(false, Ordering::SeqCst);
@@ -8748,7 +8745,7 @@ mod tests {
             wait_idle(&mut app);
             assert_eq!(
                 app.status.as_deref(),
-                Some(&format!("오류: {DISCONNECTED_MSG}")[..])
+                Some(&format!("오류: {}", disconnected_msg())[..])
             );
             assert!(!app.panels[1].location.session().unwrap().is_alive());
         }
@@ -9667,10 +9664,10 @@ mod tests {
             connect_prod(&mut app);
             app.panels[1].location.session().unwrap().set_alive(false);
             submit(&mut app, "ls");
-            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert_eq!(app.status.as_deref(), Some(disconnected_msg()));
             assert!(!app.has_pending_shell());
             submit(&mut app, "cd sub");
-            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert_eq!(app.status.as_deref(), Some(disconnected_msg()));
         }
 
         #[test]
@@ -9957,7 +9954,7 @@ mod tests {
             press(&mut app, KeyCode::Tab);
             cursor_to(&mut app, "f.txt");
             press(&mut app, KeyCode::F(5));
-            assert_eq!(app.status.as_deref(), Some(DISCONNECTED_MSG));
+            assert_eq!(app.status.as_deref(), Some(disconnected_msg()));
             assert!(app.dialog.is_none() && app.job.is_none());
         }
 

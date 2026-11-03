@@ -6,8 +6,14 @@ use std::path::{Path, PathBuf};
 
 use crate::{fs_ops, platform};
 
-pub const USAGE: &str = "사용법: hdir [--cwd-file PATH] [START_DIR]\n\n\
-옵션:\n  --cwd-file PATH  종료 시 활성 패널의 디렉터리를 PATH에 기록 (셸 통합용)\n  -h, --help       도움말\n  -V, --version    버전\n";
+pub fn usage() -> &'static str {
+    crate::i18n::t(
+        "사용법: hdir [--cwd-file PATH] [START_DIR]\n\n\
+옵션:\n  --cwd-file PATH  종료 시 활성 패널의 디렉터리를 PATH에 기록 (셸 통합용)\n  -h, --help       도움말\n  -V, --version    버전\n",
+        "Usage: hdir [--cwd-file PATH] [START_DIR]\n\n\
+Options:\n  --cwd-file PATH  on exit, write the active panel's folder to PATH (shell integration)\n  -h, --help       help\n  -V, --version    version\n",
+    )
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {

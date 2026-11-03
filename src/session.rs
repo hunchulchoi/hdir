@@ -28,7 +28,12 @@ use crate::remote::{
 use crate::vfs::Vfs;
 
 /// Status text of a panel whose connection died.
-pub const DISCONNECTED_MSG: &str = "연결 끊김 · Enter로 재연결";
+pub fn disconnected_msg() -> &'static str {
+    crate::i18n::t(
+        "연결 끊김 · Enter로 재연결",
+        "Disconnected · Enter to reconnect",
+    )
+}
 
 /// Result of one finished process. `code` is `None` when it could not be
 /// spawned or was killed by a signal (the reason is in `stderr`).
@@ -52,7 +57,7 @@ pub trait Cmd: Send + Sync {
         self.run(argv)
     }
     /// Like [`run_transfer`](Self::run_transfer), but stopped (with
-    /// [`CANCELLED_MSG`]) as soon as `cancel` is set.
+    /// [`cancelled_msg`]) as soon as `cancel` is set.
     fn run_cancellable(&self, argv: &[OsString], _cancel: &AtomicBool) -> CmdOutput {
         self.run_transfer(argv)
     }
@@ -69,10 +74,14 @@ pub trait Cmd: Send + Sync {
 }
 
 /// Stderr text of a command stopped through its cancel flag.
-pub const CANCELLED_MSG: &str = "취소됨";
+pub fn cancelled_msg() -> &'static str {
+    crate::i18n::t("취소됨", "Cancelled")
+}
 
 /// Stderr text of a command that was killed for running too long.
-pub const TIMEOUT_MSG: &str = "시간 초과";
+pub fn timeout_msg() -> &'static str {
+    crate::i18n::t("시간 초과", "Timed out")
+}
 
 /// Hard limit for any non-interactive command run through [`SystemCmd`].
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,13 +93,13 @@ pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 pub struct SystemCmd;
 
 /// Run `argv` to completion with captured output, killing it after `limit`
-/// (then `code` is `None` and stderr is [`TIMEOUT_MSG`]).
+/// (then `code` is `None` and stderr is [`timeout_msg`]).
 pub fn run_limited(argv: &[OsString], limit: Duration) -> CmdOutput {
     run_with(argv, limit, None)
 }
 
 /// Like [`run_limited`], also stopped once `cancel` is set (then `code` is
-/// `None` and stderr is [`CANCELLED_MSG`]). On unix the command gets its own
+/// `None` and stderr is [`cancelled_msg`]). On unix the command gets its own
 /// process group and the whole group is killed, so helpers it spawned (scp's
 /// ssh) cannot keep the output pipes open.
 pub fn run_cancellable(argv: &[OsString], limit: Duration, cancel: &AtomicBool) -> CmdOutput {
@@ -153,14 +162,14 @@ fn run_with(argv: &[OsString], limit: Duration, cancel: Option<&AtomicBool>) -> 
             stdout,
             stderr,
         },
-        None if cancelled => spawn_failed(CANCELLED_MSG),
-        None => spawn_failed(TIMEOUT_MSG),
+        None if cancelled => spawn_failed(cancelled_msg()),
+        None => spawn_failed(timeout_msg()),
     }
 }
 
 /// Run `from | to` (from's stdout into to's stdin), both killed together
 /// after `limit` or once `cancel` is set (each output then has `code: None`
-/// and [`TIMEOUT_MSG`] / [`CANCELLED_MSG`]). On unix both share one new
+/// and [`timeout_msg`] / [`cancelled_msg`]). On unix both share one new
 /// process group, so helpers they spawned (ssh) die with them.
 pub fn run_pipe_cancellable(
     from: &[OsString],
@@ -246,9 +255,9 @@ pub fn run_pipe_cancellable(
             let _ = a.wait();
             let _ = b.wait();
             break Some(if is_set(cancel) {
-                CANCELLED_MSG
+                cancelled_msg()
             } else {
-                TIMEOUT_MSG
+                timeout_msg()
             });
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -337,9 +346,9 @@ pub fn run_through_files(
                 kill_tree(&mut child, cancel.is_some());
                 let _ = child.wait();
                 break Err(if cancelled {
-                    CANCELLED_MSG
+                    cancelled_msg()
                 } else {
-                    TIMEOUT_MSG
+                    timeout_msg()
                 });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
@@ -475,7 +484,7 @@ pub enum SessionError {
 impl SessionError {
     pub fn message(&self) -> String {
         match self {
-            SessionError::Disconnected => DISCONNECTED_MSG.to_string(),
+            SessionError::Disconnected => disconnected_msg().to_string(),
             SessionError::Spawn(m) => m.clone(),
         }
     }
@@ -1039,7 +1048,7 @@ mod tests {
         let o = run_limited(&argv, std::time::Duration::from_millis(200));
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(o.code, None);
-        assert_eq!(first_line(&o.stderr, ""), TIMEOUT_MSG);
+        assert_eq!(first_line(&o.stderr, ""), timeout_msg());
     }
 
     #[cfg(unix)]
@@ -1061,7 +1070,7 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(o.code, None);
-        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&o.stderr, ""), cancelled_msg());
     }
 
     #[cfg(windows)]
@@ -1113,7 +1122,7 @@ mod tests {
             false,
         );
         assert!(start.elapsed() < Duration::from_secs(10));
-        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&o.stderr, ""), cancelled_msg());
     }
 
     #[cfg(unix)]
@@ -1163,7 +1172,7 @@ mod tests {
             false,
         );
         assert!(start.elapsed() < Duration::from_secs(5));
-        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&o.stderr, ""), cancelled_msg());
     }
 
     #[cfg(unix)]
@@ -1207,8 +1216,8 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
-        assert_eq!(first_line(&oa.stderr, ""), CANCELLED_MSG);
-        assert_eq!(first_line(&ob.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&oa.stderr, ""), cancelled_msg());
+        assert_eq!(first_line(&ob.stderr, ""), cancelled_msg());
     }
 
     #[cfg(unix)]
@@ -1264,7 +1273,7 @@ mod tests {
         let f = Fake::new(|_| CmdOutput {
             code: None,
             stdout: Vec::new(),
-            stderr: TIMEOUT_MSG.as_bytes().to_vec(),
+            stderr: timeout_msg().as_bytes().to_vec(),
         });
         let s = session_with(f, RemoteOs::Linux);
         assert_eq!(s.list(Path::new("/x"), false).unwrap_err(), "시간 초과");
@@ -1440,7 +1449,7 @@ mod tests {
         let before = f.calls();
         assert_eq!(s.exec(b"true").unwrap_err(), SessionError::Disconnected);
         assert_eq!(f.calls(), before, "dead sessions do not spawn ssh");
-        assert_eq!(SessionError::Disconnected.message(), DISCONNECTED_MSG);
+        assert_eq!(SessionError::Disconnected.message(), disconnected_msg());
     }
 
     #[test]
@@ -1529,7 +1538,7 @@ mod tests {
         let s = session_with(f, RemoteOs::Linux);
         assert_eq!(
             s.list(Path::new("/x"), false).unwrap_err(),
-            DISCONNECTED_MSG
+            disconnected_msg()
         );
         assert!(!s.is_alive());
     }

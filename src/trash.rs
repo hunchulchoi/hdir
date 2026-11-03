@@ -193,7 +193,12 @@ pub fn match_items(wanted: &[TrashEntry], fresh: &[TrashItem]) -> (Vec<TrashEntr
 }
 
 pub const UNVERIFIED_MSG: &str = "저장된 항목을 확인할 수 없어 복원 거부";
-pub const SYMLINK_MSG: &str = "심볼릭 링크 항목은 파일 관리자에서 복원하세요";
+pub fn symlink_msg() -> &'static str {
+    crate::i18n::t(
+        "심볼릭 링크 항목은 파일 관리자에서 복원하세요",
+        "Restore symbolic link items from the file manager",
+    )
+}
 
 /// Linux: the stored payload of a trash entry, from its `…/info/X.trashinfo`
 /// id to `…/files/X`.
@@ -253,7 +258,7 @@ pub fn restore_guarded(
     res.errors.extend(
         linked
             .iter()
-            .map(|e| format!("{}: {SYMLINK_MSG}", e.name())),
+            .map(|e| format!("{}: {}", e.name(), symlink_msg())),
     );
     res.errors.extend(
         unknown
@@ -1220,7 +1225,7 @@ mod tests {
         let res = store.restore(&all);
         assert_eq!(res.restored, std::slice::from_ref(&plain));
         assert_eq!(res.errors.len(), 1);
-        assert!(res.errors[0].contains(SYMLINK_MSG), "{:?}", res.errors);
+        assert!(res.errors[0].contains(symlink_msg()), "{:?}", res.errors);
         assert!(res.errors[0].contains("link"));
         assert!(link.symlink_metadata().is_err(), "no stray dir or link");
         assert_eq!(store.count(), 1, "the link stays in the trash");

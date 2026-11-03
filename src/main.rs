@@ -16,7 +16,7 @@ fn main() -> ExitCode {
     let opts = match cli::parse_args(std::env::args_os().skip(1)) {
         Ok(Cli::Run(o)) => o,
         Ok(Cli::Help) => {
-            print!("{}", cli::USAGE);
+            print!("{}", cli::usage());
             return ExitCode::SUCCESS;
         }
         Ok(Cli::Version) => {
@@ -24,7 +24,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            eprintln!("hdir: {e}\n\n{}", cli::USAGE);
+            eprintln!("hdir: {e}\n\n{}", cli::usage());
             return ExitCode::from(2);
         }
     };

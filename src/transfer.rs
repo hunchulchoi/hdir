@@ -1869,7 +1869,7 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
 mod tests {
     use super::*;
     use crate::job::{ConflictAnswer, ConflictPolicy};
-    use crate::session::CANCELLED_MSG;
+    use crate::session::cancelled_msg;
     use crate::testutil::{FakeCmd, code, fail, fake_mktemp, ok, pipe_ends, remote_cmd, session};
     use crate::trash::FakeTrash;
     use std::collections::VecDeque;
@@ -2762,7 +2762,7 @@ mod tests {
                 return CmdOutput {
                     code: None,
                     stdout: vec![],
-                    stderr: CANCELLED_MSG.as_bytes().to_vec(),
+                    stderr: cancelled_msg().as_bytes().to_vec(),
                 };
             }
             answer(
@@ -2805,7 +2805,7 @@ mod tests {
                 return CmdOutput {
                     code: None,
                     stdout: vec![],
-                    stderr: CANCELLED_MSG.as_bytes().to_vec(),
+                    stderr: cancelled_msg().as_bytes().to_vec(),
                 };
             }
             answer(remote_cmd(a).unwrap_or_default(), &[], &[], "")
@@ -3993,7 +3993,7 @@ mod tests {
                 return CmdOutput {
                     code: None,
                     stdout: vec![],
-                    stderr: CANCELLED_MSG.as_bytes().to_vec(),
+                    stderr: cancelled_msg().as_bytes().to_vec(),
                 };
             }
             answer(cm, &[], &[], "0\x000\x00")

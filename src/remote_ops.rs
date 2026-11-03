@@ -29,7 +29,9 @@ pub fn resolve_cd(s: &RemoteSession, cwd: &Path, target: &str) -> Result<PathBuf
 }
 
 /// Text shown for a FIFO, socket or device (same as the local Enter message).
-pub const SPECIAL_FILE: &str = "특수 파일은 열 수 없음";
+pub fn special_file() -> &'static str {
+    crate::i18n::t("특수 파일은 열 수 없음", "Cannot open a special file")
+}
 
 /// A name that is safe to join onto a remote directory.
 pub fn validate_name(name: &str) -> Result<(), String> {
@@ -201,7 +203,7 @@ pub fn probe_text(s: &RemoteSession, path: &Path) -> Result<bool, String> {
         Preview::Binary {
             kind: "특수 파일",
         ..
-        } => Err(SPECIAL_FILE.into()),
+        } => Err(special_file().into()),
         Preview::Binary { .. } => Ok(false),
         Preview::Info(_) => Err("디렉터리".into()),
         Preview::Dir { .. } => Err("디렉터리".into()),
@@ -467,7 +469,7 @@ mod tests {
         let s = session(f);
         assert_eq!(
             mkdir(&s, &p("/srv"), "x").unwrap_err(),
-            crate::session::DISCONNECTED_MSG
+            crate::session::disconnected_msg()
         );
     }
 
@@ -787,7 +789,7 @@ mod tests {
         );
         assert_eq!(
             by(255, ""),
-            Preview::Error(crate::session::DISCONNECTED_MSG.into())
+            Preview::Error(crate::session::disconnected_msg().into())
         );
     }
 
@@ -1010,7 +1012,7 @@ mod tests {
         let s = session(f);
         assert_eq!(
             fetch(&s, &p("/srv/x"), true).unwrap_err(),
-            crate::session::DISCONNECTED_MSG
+            crate::session::disconnected_msg()
         );
         assert!(!s.is_alive());
     }
@@ -2331,7 +2333,7 @@ mod tests {
         let f = FakeCmd::new(|_| code(255));
         assert_eq!(
             resolve_cd(&session(f), &p("/srv"), "x").unwrap_err(),
-            crate::session::DISCONNECTED_MSG
+            crate::session::disconnected_msg()
         );
     }
 }

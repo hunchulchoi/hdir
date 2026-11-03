@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::remote_ops;
-use crate::session::{DISCONNECTED_MSG, RemoteSession};
+use crate::session::{RemoteSession, disconnected_msg};
 use crate::trash::{TrashBackend, TrashEntry, TrashedItem};
 use ::trash::TrashItem;
 
@@ -222,7 +222,7 @@ fn remote_undo(
             retry: None,
         },
         Err(e) => UndoApplied {
-            retry: (e == DISCONNECTED_MSG).then(again),
+            retry: (e == disconnected_msg()).then(again),
             message: Err(format!("되돌릴 수 없음: {e}")),
         },
     }
