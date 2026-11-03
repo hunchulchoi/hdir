@@ -198,7 +198,7 @@ pub fn parse_scan(stdout: &[u8], n: usize) -> Option<Vec<u64>> {
 /// the `cd`, the folder now current must still be that one ([`SRC_MOVED`]
 /// otherwise), and tar reads relative to it, so swapping the folder for a
 /// link can never make it read elsewhere.
-pub fn tar_out_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], id: &[u8]) -> Vec<u8> {
+pub fn tar_out_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], id: &[u8], acls: bool) -> Vec<u8> {
     cat(&[
         b"cd -- ",
         &sh_quote(dir),
@@ -206,9 +206,77 @@ pub fn tar_out_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], id: &[u8]) -> Vec<u8>
         dir_id_fmt(os),
         b".) || exit 1; [ \"$i\" = ",
         &sh_quote(id),
-        b" ] || exit 51; tar -cf - ./",
+        b" ] || exit 51; ",
+        tar_word(acls),
+        b" -cf - ./",
         &sh_quote(name),
     ])
+}
+
+/// `tar`, with `--acls` when POSIX ACLs travel too.
+fn tar_word(acls: bool) -> &'static [u8] {
+    if acls { b"tar --acls" } else { b"tar" }
+}
+
+/// Exit 0 when this side's tar can store and restore POSIX ACLs.
+pub const TAR_ACLS_PROBE: &[u8] = b"tar --acls -cf /dev/null -T /dev/null >/dev/null 2>&1";
+
+/// Prints how many entries in `dir/name` (links not followed) carry an ACL.
+/// `ls` marks them with `+` after the mode, except macOS, which shows `@`
+/// instead when there are xattrs too: there `ls -le` lists the ACL entries
+/// and each ACL's first one (` 0: `) is counted. A name with a newline can
+/// only add a false match, which errs on the safe side.
+pub fn acl_scan_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let q = sh_quote(name);
+    let plus: &[&[u8]] = &[
+        b"n=$(find ./",
+        &q,
+        b" ! -type l -exec ls -dn -- {} + | grep -c '^[^ ]\\{10\\}+')",
+    ];
+    let mut v = cat(&[b"cd -- ", &sh_quote(dir), b" || exit 1; "]);
+    if matches!(os, RemoteOs::Bsd) {
+        v.extend_from_slice(b"if [ \"$(uname)\" = Darwin ]; then n=$(find ./");
+        v.extend_from_slice(&q);
+        v.extend_from_slice(b" ! -type l -exec ls -lden -- {} + | grep -c '^ 0: '); else ");
+        v.extend(cat(plus));
+        v.extend_from_slice(b"; fi");
+    } else {
+        v.extend(cat(plus));
+    }
+    v.extend_from_slice(b"; echo $((n))");
+    v
+}
+
+/// Removes group and other permissions from everything in `stage/name`:
+/// used when ACLs that limited them could not travel.
+pub fn restrict_cmd(stage: &[u8], name: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"cd -- ",
+        &sh_quote(stage),
+        b" || exit 1; find ./",
+        &sh_quote(name),
+        b" ! -type l -exec chmod go-rwx {} +",
+    ])
+}
+
+/// What to do about POSIX ACLs in a tar transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AclPlan {
+    /// The source has none: plain tar.
+    None,
+    /// Both tars handle them: `--acls` on both ends.
+    Keep,
+    /// They cannot travel: strip group and other permissions on arrival, so
+    /// nobody the ACL kept out gets in through the plain mode bits.
+    Restrict,
+}
+
+pub fn acl_plan(has_acls: bool, sender_ok: bool, receiver_ok: bool) -> AclPlan {
+    match (has_acls, sender_ok && receiver_ok) {
+        (false, _) => AclPlan::None,
+        (true, true) => AclPlan::Keep,
+        (true, false) => AclPlan::Restrict,
+    }
 }
 
 /// Exit code of a tar sender whose source folder is no longer the one the
@@ -265,11 +333,13 @@ fn src_dir_id(side: &Side, dir: &Path) -> Result<String, String> {
 
 /// Remote side of a transfer stream: unpack stdin into `stage`, keeping
 /// modes (`-p`) but not the sender's owners (`-o`).
-pub fn tar_in_cmd(stage: &[u8]) -> Vec<u8> {
+pub fn tar_in_cmd(stage: &[u8], acls: bool) -> Vec<u8> {
     cat(&[
         b"cd -- ",
         &sh_quote(stage),
-        b" || exit 1; tar -xpof - || exit 1; ",
+        b" || exit 1; ",
+        tar_word(acls),
+        b" -xpof - || exit 1; ",
         STRIP_SETID,
     ])
 }
@@ -326,7 +396,7 @@ pub fn same_fs_cmd(os: &RemoteOs, a: &[u8], b: &[u8]) -> Vec<u8> {
 /// Like [`tar_out_cmd`], a shell first enters `dir`, checks it is still the
 /// folder `id` names and then runs tar there; the paths travel as arguments
 /// (`$1` folder, `$2` id, `$3` name), never inside the script.
-pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str) -> Vec<OsString> {
+pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str, acls: bool) -> Vec<OsString> {
     if cfg!(windows) {
         // no POSIX shell: Windows' own tar.exe, path based like local
         // copies there
@@ -339,7 +409,10 @@ pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str) -> Vec<OsStri
         return v;
     }
     let (stat, tar) = if cfg!(target_os = "linux") {
-        ("stat -c %d:%i -- .", "tar")
+        (
+            "stat -c %d:%i -- .",
+            if acls { "tar --acls" } else { "tar" },
+        )
     } else if cfg!(target_os = "macos") {
         (
             "stat -f %d:%i -- .",
@@ -422,8 +495,12 @@ fn send_up_packaged(
 }
 
 /// Local `tar` unpacking stdin into `stage`.
-pub fn local_tar_in(stage: &Path) -> Vec<OsString> {
-    let mut v: Vec<OsString> = ["tar", "-xpof", "-", "-C"].map(OsString::from).to_vec();
+pub fn local_tar_in(stage: &Path, acls: bool) -> Vec<OsString> {
+    let mut v: Vec<OsString> = ["tar"].map(OsString::from).to_vec();
+    if acls {
+        v.push("--acls".into());
+    }
+    v.extend(["-xpof", "-", "-C"].map(OsString::from));
     v.push(stage.as_os_str().to_os_string());
     v
 }
@@ -1284,8 +1361,69 @@ fn discard(stage: Stage) -> Option<String> {
     (!ok).then(|| left_behind(&path))
 }
 
+/// Whether `dir/name` on the sending side (`None`: local) carries ACLs
+/// (POSIX, or macOS / BSD ones, which can deny what the mode bits allow).
+/// A check that fails counts as yes.
+fn has_acls(
+    side: Option<&RemoteSession>,
+    dir: &Path,
+    name: &OsString,
+    cancel: &AtomicBool,
+) -> bool {
+    match side {
+        None => crate::platform::tree_has_posix_acl(&dir.join(name), cancel),
+        Some(s) => {
+            match s.exec_cancellable(&acl_scan_cmd(&s.os, &b(dir), &os_bytes(name)), cancel) {
+                Ok(o) if o.code == Some(0) => String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .parse::<u64>()
+                    .map_or(true, |n| n > 0),
+                _ => true,
+            }
+        }
+    }
+}
+
+/// Whether this side's tar can carry POSIX ACLs (`None`: local). Asked
+/// once per connection, and once per run for the local tar.
+fn tar_acls_ok(side: Option<&RemoteSession>) -> bool {
+    static LOCAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match side {
+        None => *LOCAL.get_or_init(|| {
+            cfg!(target_os = "linux")
+                && std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(std::ffi::OsStr::new(
+                        std::str::from_utf8(TAR_ACLS_PROBE).unwrap_or("false"),
+                    ))
+                    .stdin(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|st| st.success())
+        }),
+        Some(s) => s.tar_acls(|| {
+            matches!(s.os, RemoteOs::Linux)
+                && matches!(s.exec(TAR_ACLS_PROBE), Ok(o) if o.code == Some(0))
+        }),
+    }
+}
+
+/// [`restrict_cmd`] on the received item in `stage`.
+fn restrict(stage: &Stage, name: &OsString) -> Result<(), String> {
+    match stage {
+        Stage::Local(t, _) => {
+            crate::platform::strip_group_other(&t.path().join(name)).map_err(|e| e.to_string())
+        }
+        Stage::Remote(s, _, p) => ran(s
+            .exec(&restrict_cmd(p, &os_bytes(name)))
+            .map_err(|e| e.message())?)
+        .map(drop),
+    }
+}
+
 /// Copy `src_dir/name` into `stage` over the route: a tar stream between
-/// the two sides (links stay links), or `cp -Rp` on one server.
+/// the two sides (links stay links), or `cp -Rp` on one server (which
+/// keeps ACLs itself). `Ok(Some(warning))` when ACLs could not travel and
+/// the copy was made private instead.
 fn send(
     route: &Route,
     src_dir: &Path,
@@ -1293,28 +1431,46 @@ fn send(
     name: &OsString,
     stage: &Stage,
     cancel: &AtomicBool,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let (n, sd) = (os_bytes(name).into_owned(), b(src_dir));
+    let plan = match route {
+        Route::Up(d) => Some((None, Some(*d))),
+        Route::Down(s) => Some((Some(*s), None)),
+        Route::Between(s, d) => Some((Some(*s), Some(*d))),
+        Route::SameHost(_) => None,
+    }
+    .map_or(AclPlan::None, |(from, to)| {
+        if has_acls(from, src_dir, name, cancel) {
+            acl_plan(true, tar_acls_ok(from), tar_acls_ok(to))
+        } else {
+            AclPlan::None
+        }
+    });
+    let acls = plan == AclPlan::Keep;
     let remote_in = |d: &RemoteSession| match stage {
-        Stage::Remote(_, _, p) => Ok(exec_argv(&d.target, &tar_in_cmd(p))),
+        Stage::Remote(_, _, p) => Ok(exec_argv(&d.target, &tar_in_cmd(p, acls))),
         Stage::Local(..) => Err(crate::tr!(
             "임시 폴더가 원격이 아님",
             "temp folder is not remote"
         )),
     };
     let local_in = || match stage {
-        Stage::Local(t, _) => Ok(local_tar_in(t.path())),
+        Stage::Local(t, _) => Ok(local_tar_in(t.path(), acls)),
         Stage::Remote(..) => Err(crate::tr!(
             "임시 폴더가 로컬이 아님",
             "temp folder is not local"
         )),
     };
-    let remote_out =
-        |s: &RemoteSession| exec_argv(&s.target, &tar_out_cmd(&s.os, &sd, &n, src_id.as_bytes()));
+    let remote_out = |s: &RemoteSession| {
+        exec_argv(
+            &s.target,
+            &tar_out_cmd(&s.os, &sd, &n, src_id.as_bytes(), acls),
+        )
+    };
     if cfg!(windows) {
         match (route, stage) {
             (Route::Up(d), Stage::Remote(_, _, p)) => {
-                return send_up_packaged(d, src_dir, name, p, cancel);
+                return send_up_packaged(d, src_dir, name, p, cancel).map(|()| None);
             }
             (Route::Between(..), _) => {
                 return Err(crate::tr!(
@@ -1329,7 +1485,7 @@ fn send(
     let (runner, from, from_s, to, to_s) = match route {
         Route::Up(d) => (
             *d,
-            local_tar_out(src_dir, name, src_id),
+            local_tar_out(src_dir, name, src_id, acls),
             None,
             remote_in(d)?,
             Some(*d),
@@ -1351,7 +1507,7 @@ fn send(
                     "Not sent: the source folder changed"
                 ));
             }
-            return ran(out).map(drop);
+            return ran(out).map(|_| None);
         }
     };
     let (oa, ob) = runner.pipe(&from, &to, cancel).map_err(|e| e.message())?;
@@ -1369,15 +1525,38 @@ fn send(
         ));
     }
     match (oa.code, ob.code) {
-        (Some(0), Some(0)) => match stage {
-            Stage::Local(t, _) => strip_setid(t.path()).map_err(|e| {
+        (Some(0), Some(0)) => {
+            if let Stage::Local(t, _) = stage {
+                strip_setid(t.path()).map_err(|e| {
+                    crate::tr!(
+                        "받은 파일 권한 정리 실패: {e}",
+                        "Cannot fix permissions of received files: {e}"
+                    )
+                })?;
+            }
+            if plan != AclPlan::Restrict {
+                return Ok(None);
+            }
+            restrict(stage, name).map_err(|e| {
                 crate::tr!(
-                    "받은 파일 권한 정리 실패: {e}",
-                    "Cannot fix permissions of received files: {e}"
+                    "ACL을 옮길 수 없는데 받은 항목의 권한을 줄이지 못함: {e}",
+                    "ACLs could not travel and the received item could not be made private: {e}"
                 )
-            }),
-            Stage::Remote(..) => Ok(()),
-        },
+            })?;
+            Ok(Some(if cfg!(windows) {
+                crate::tr!(
+                    "ACL을 옮길 수 없음, 받은 폴더의 Windows 권한을 따름: {}",
+                    "ACLs could not travel, the destination folder's Windows permissions apply: {}",
+                    lossy(name)
+                )
+            } else {
+                crate::tr!(
+                    "ACL을 옮길 수 없어 그룹·기타 권한을 뺐음: {}",
+                    "ACLs could not travel, group and other permissions removed: {}",
+                    lossy(name)
+                )
+            }))
+        }
         // the side that failed first; a reader that died leaves the writer
         // with a broken pipe, and a writer that died leaves a short archive
         (Some(0), _) => Err(code_err(&ob)),
@@ -1674,7 +1853,7 @@ fn item(
                 "원본 폴더가 바뀌어 보내지 않음",
                 "Not sent: the source folder changed"
             )),
-            Ok(o) => ran(o).map(drop),
+            Ok(o) => ran(o).map(|_| None),
             Err(e) => Err(e),
         }
     } else {
@@ -1687,6 +1866,7 @@ fn item(
             ctl.cancel_flag(),
         )
     };
+    let sent = sent.map(|w| r.warnings.extend(w));
     if let Err(e) = sent {
         let cancelled = ctl.is_cancelled();
         r.warnings.extend(match (on_host_move, stage) {
@@ -2182,28 +2362,99 @@ mod tests {
             .unwrap();
         assert!(o.contains("'/d/S/p'") && !o.contains("'/d/S/o' ||"), "{o}");
         assert_eq!(
-            tar_out_cmd(&RemoteOs::Linux, b"/s it's", b"-x", b"5:6"),
+            tar_out_cmd(&RemoteOs::Linux, b"/s it's", b"-x", b"5:6", false),
             b"cd -- '/s it'\\''s' || exit 1; i=$(stat -c %d:%i -- .) || exit 1; \
               [ \"$i\" = '5:6' ] || exit 51; tar -cf - ./'-x'"
                 .to_vec()
         );
         assert_eq!(
-            tar_in_cmd(b"/d/.hdir-xfer.1"),
+            tar_in_cmd(b"/d/.hdir-xfer.1", false),
             b"cd -- '/d/.hdir-xfer.1' || exit 1; tar -xpof - || exit 1; \
               find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +"
                 .to_vec()
         );
         // the paths are arguments, never part of the script
-        let out = local_tar_out(Path::new("/s 'x'"), std::ffi::OsStr::new("-x"), "5:6");
+        let out = local_tar_out(
+            Path::new("/s 'x'"),
+            std::ffi::OsStr::new("-x"),
+            "5:6",
+            false,
+        );
         let tail: Vec<&str> = out[3..].iter().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(tail, ["sh", "/s 'x'", "5:6", "-x"]);
         assert!(!out[2].to_str().unwrap().contains("/s"), "{:?}", out[2]);
         assert_eq!(
-            local_tar_in(Path::new("/st")),
+            local_tar_in(Path::new("/st"), false),
             ["tar", "-xpof", "-", "-C", "/st"]
                 .map(OsString::from)
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn acl_commands_carry_acls_or_strip_group_and_other() {
+        let out = tar_out_cmd(&RemoteOs::Linux, b"/s", b"a", b"5:6", true);
+        assert!(
+            out.ends_with(b"tar --acls -cf - ./'a'"),
+            "{}",
+            lossy_b(&out)
+        );
+        let inn = tar_in_cmd(b"/d/S", true);
+        assert!(
+            inn.starts_with(b"cd -- '/d/S' || exit 1; tar --acls -xpof - || exit 1; "),
+            "{}",
+            lossy_b(&inn)
+        );
+        assert_eq!(
+            local_tar_in(Path::new("/st"), true),
+            ["tar", "--acls", "-xpof", "-", "-C", "/st"]
+                .map(OsString::from)
+                .to_vec()
+        );
+        let lo = local_tar_out(Path::new("/s"), std::ffi::OsStr::new("a"), "5:6", true);
+        if cfg!(target_os = "linux") {
+            assert!(
+                lo[2].to_str().unwrap().contains("tar --acls -cf -"),
+                "{lo:?}"
+            );
+        }
+        let bsd = String::from_utf8(acl_scan_cmd(&RemoteOs::Bsd, b"/s", b"a")).unwrap();
+        assert!(
+            bsd.contains("if [ \"$(uname)\" = Darwin ]; then n=$(find ./'a' ! -type l -exec ls -lden -- {} + | grep -c '^ 0: ')"),
+            "{bsd}"
+        );
+        assert!(
+            bsd.contains("else n=$(find ./'a' ! -type l -exec ls -dn -- {} +"),
+            "{bsd}"
+        );
+        assert_eq!(
+            acl_scan_cmd(&RemoteOs::Linux, b"/s it's", b"-a"),
+            b"cd -- '/s it'\\''s' || exit 1; \
+              n=$(find ./'-a' ! -type l -exec ls -dn -- {} + | grep -c '^[^ ]\\{10\\}+'); \
+              echo $((n))"
+                .to_vec()
+        );
+        assert_eq!(
+            restrict_cmd(b"/d/S", b"-a"),
+            b"cd -- '/d/S' || exit 1; find ./'-a' ! -type l -exec chmod go-rwx {} +".to_vec()
+        );
+        assert_eq!(
+            TAR_ACLS_PROBE,
+            b"tar --acls -cf /dev/null -T /dev/null >/dev/null 2>&1"
+        );
+    }
+
+    #[test]
+    fn acl_plan_keeps_acls_only_when_both_tars_can() {
+        assert_eq!(acl_plan(false, false, false), AclPlan::None);
+        assert_eq!(acl_plan(false, true, true), AclPlan::None);
+        assert_eq!(acl_plan(true, true, true), AclPlan::Keep);
+        assert_eq!(acl_plan(true, true, false), AclPlan::Restrict);
+        assert_eq!(acl_plan(true, false, true), AclPlan::Restrict);
+    }
+
+    fn lossy_b(v: &[u8]) -> String {
+        String::from_utf8_lossy(v).into_owned()
     }
 
     #[test]
@@ -2264,6 +2515,79 @@ mod tests {
     }
 
     #[test]
+    fn real_restrict_strips_group_and_other_but_not_through_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("-d x");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("f"), "x").unwrap();
+        fs::set_permissions(d.join("f"), fs::Permissions::from_mode(0o664)).unwrap();
+        fs::write(t.path().join("outside"), "o").unwrap();
+        fs::set_permissions(t.path().join("outside"), fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(t.path().join("outside"), d.join("l")).unwrap();
+        let out = sh(&restrict_cmd(&b(t.path()), b"-d x"));
+        assert!(out.status.success(), "{out:?}");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&d.join("f")), 0o600);
+        assert_eq!(mode(&d) & 0o077, 0);
+        assert_eq!(mode(&t.path().join("outside")), 0o644);
+    }
+
+    #[test]
+    fn real_acl_scan_counts_nothing_in_a_plain_tree() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("-d")).unwrap();
+        fs::write(t.path().join("-d/f\nx"), "x").unwrap();
+        let out = sh(&acl_scan_cmd(
+            &crate::testutil::local_os(),
+            &b(t.path()),
+            b"-d",
+        ));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "{out:?}");
+    }
+
+    /// Linux with ACL support: the scan sees an ACL deep inside, and a
+    /// `--acls` stream carries it while a plain one drops it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_acls_are_found_and_carried_by_tar() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        fs::create_dir_all(src.join("d/e")).unwrap();
+        fs::write(src.join("d/e/f"), "x").unwrap();
+        if crate::platform::set_test_acl(&src.join("d/e/f")).is_err() || !tar_acls_ok(None) {
+            eprintln!("no ACL support here, skipped");
+            return;
+        }
+        let out = sh(&acl_scan_cmd(&crate::testutil::local_os(), &b(&src), b"d"));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1", "{out:?}");
+        let id = src_dir_id(&Side::Local, &src).unwrap();
+        let no = AtomicBool::new(false);
+        for acls in [true, false] {
+            let stage = private_dir(t.path(), if acls { "with" } else { "without" });
+            let (oa, ob) = crate::session::run_pipe_cancellable(
+                &local_tar_out(&src, std::ffi::OsStr::new("d"), &id, acls),
+                &local_tar_in(&stage, acls),
+                std::time::Duration::from_secs(30),
+                &no,
+            );
+            assert_eq!((oa.code, ob.code), (Some(0), Some(0)), "{oa:?} {ob:?}");
+            assert_eq!(
+                crate::platform::tree_has_posix_acl(&stage.join("d"), &no),
+                acls,
+                "acls={acls}"
+            );
+            if acls {
+                // the same entries: the group stays shut out
+                assert_eq!(
+                    crate::platform::test_acl_of(&stage.join("d/e/f")),
+                    Some(crate::platform::test_acl_value(65534))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn real_a_tar_stream_keeps_links_as_links_and_odd_names() {
         let t = tempfile::tempdir().unwrap();
         let src = private_dir(t.path(), "src");
@@ -2282,13 +2606,14 @@ mod tests {
                 &b(&src),
                 b"-d it's",
                 src_dir_id(&Side::Local, &src).unwrap().as_bytes(),
+                false,
             ))
             .to_os_string()
         }];
         let no = AtomicBool::new(false);
         let (oa, ob) = crate::session::run_pipe_cancellable(
             &from,
-            &local_tar_in(&stage),
+            &local_tar_in(&stage, false),
             std::time::Duration::from_secs(30),
             &no,
         );
@@ -2311,13 +2636,14 @@ mod tests {
         let back = private_dir(t.path(), "back");
         let to: Vec<OsString> = vec!["sh".into(), "-c".into(), {
             use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&back))).to_os_string()
+            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&back), false)).to_os_string()
         }];
         let (oa, ob) = crate::session::run_pipe_cancellable(
             &local_tar_out(
                 &src,
                 std::ffi::OsStr::new("-d it's"),
                 &src_dir_id(&Side::Local, &src).unwrap(),
+                false,
             ),
             &to,
             std::time::Duration::from_secs(30),
@@ -2778,6 +3104,9 @@ mod tests {
         if c.contains("| cksum") {
             return ok("1 2\n");
         }
+        if c.contains("ls -dn --") {
+            return ok("0\n"); // no ACLs
+        }
         if c.contains("for f do printf .") {
             return ok("1\n"); // the entry count
         }
@@ -3199,6 +3528,208 @@ mod tests {
         assert!(moved.contains(&mv.unwrap()), "{moved:?}");
         assert!(!moved.iter().any(|c| c.contains("du -sk")), "{moved:?}");
         assert!(!moved.iter().any(|c| c.contains("rm -rf")), "{moved:?}");
+    }
+
+    /// A server whose `/srv` items carry ACLs (`acl_scan` answers that) and
+    /// whose tar answers the `--acls` probe with `probe`.
+    fn acl_host(acl_scan: &'static str, probe: i32) -> Arc<FakeCmd> {
+        FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("ls -dn --") {
+                return ok(acl_scan);
+            }
+            if c.as_bytes() == TAR_ACLS_PROBE {
+                return code(probe);
+            }
+            answer(c, &[], &[], "0\x000\x00")
+        })
+    }
+
+    fn to_other(f: &Arc<FakeCmd>) -> Side {
+        Side::Remote(Arc::new(RemoteSession::new(
+            "other".into(),
+            crate::remote::SshTarget {
+                host: "other-host".into(),
+                port: None,
+                control_path: p("/tmp/hdir-1/cm-other"),
+            },
+            crate::remote::RemoteOs::Linux,
+            crate::remote::ScpMode::Sftp,
+            Arc::clone(f) as Arc<dyn crate::session::Cmd>,
+        )))
+    }
+
+    #[test]
+    fn acls_travel_between_two_servers_whose_tars_can_carry_them() {
+        let (from, to) = (acl_host("2\n", 0), acl_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let joined = from.pipe_calls()[0].join(" ");
+        assert!(joined.contains("tar --acls -cf -"), "{joined}");
+        assert!(joined.contains("tar --acls -xpof -"), "{joined}");
+        assert!(!to.remote_cmds().iter().any(|c| c.contains("go-rwx")));
+    }
+
+    #[test]
+    fn each_server_is_asked_about_tar_acls_once_per_connection() {
+        let (from, to) = (acl_host("1\n", 0), acl_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a", "b"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        assert_eq!(run(&s, &mut Ctl::new()).outcome, OpOutcome::Done);
+        let probe = String::from_utf8(TAR_ACLS_PROBE.to_vec()).unwrap();
+        for f in [&from, &to] {
+            let n = f.remote_cmds().iter().filter(|c| **c == probe).count();
+            assert_eq!(n, 1, "{:?}", f.remote_cmds());
+        }
+    }
+
+    #[test]
+    fn without_acl_support_on_the_receiver_the_copy_is_made_private() {
+        let (from, to) = (acl_host("1\n", 0), acl_host("0\n", 2));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done);
+        let joined = from.pipe_calls()[0].join(" ");
+        assert!(!joined.contains("--acls"), "{joined}");
+        let restrict = String::from_utf8(restrict_cmd(STAGE.as_bytes(), b"a")).unwrap();
+        assert!(
+            to.remote_cmds().contains(&restrict),
+            "{:?}",
+            to.remote_cmds()
+        );
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("ACL"), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_made_private_is_never_placed_or_moved() {
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let from = acl_host("1\n", 0);
+            let to = FakeCmd::new(|a| {
+                let c = remote_cmd(a).unwrap_or_default();
+                if c.contains("chmod go-rwx") {
+                    return code(1);
+                }
+                if c.as_bytes() == TAR_ACLS_PROBE {
+                    return code(2);
+                }
+                answer(c, &[], &[], "0\x000\x00")
+            });
+            let s = spec(
+                kind,
+                Side::Remote(session(Arc::clone(&from))),
+                &p("/srv"),
+                &["a"],
+                to_other(&to),
+                &p("/dst"),
+            );
+            let r = run(&s, &mut Ctl::new());
+            assert!(
+                matches!(&r.outcome, OpOutcome::Failed(m) if m.contains("ACL")),
+                "{kind:?} {:?}",
+                r.outcome
+            );
+            let cmds = to.remote_cmds();
+            assert!(
+                !cmds.iter().any(|c| c.ends_with("|| exit 46")),
+                "never placed: {cmds:?}"
+            );
+            let unstage = String::from_utf8(unstage_cmd(STAGE.as_bytes())).unwrap();
+            assert!(cmds.contains(&unstage), "stage dropped: {cmds:?}");
+            assert!(
+                !from.remote_cmds().iter().any(|c| c.contains(".hdir-del.")),
+                "{kind:?}: source kept: {:?}",
+                from.remote_cmds()
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_without_acls_or_a_failed_scan() {
+        // none: plain tar, no probes
+        let (from, to) = (acl_host("0\n", 0), acl_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(!from.pipe_calls()[0].join(" ").contains("--acls"));
+        let probe = String::from_utf8(TAR_ACLS_PROBE.to_vec()).unwrap();
+        assert!(!to.remote_cmds().contains(&probe));
+        // a scan that answers nonsense counts as ACLs present
+        let (from, to) = (acl_host("", 0), acl_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        run(&s, &mut Ctl::new());
+        assert!(from.pipe_calls()[0].join(" ").contains("tar --acls"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_download_with_acls_is_kept_or_made_private_by_the_local_tar() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let from = acl_host("1\n", 0);
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            Side::Local,
+            t.path(),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done);
+        let joined = from.pipe_calls()[0].join(" ");
+        let mode = fs::metadata(t.path().join("a"))
+            .unwrap()
+            .permissions()
+            .mode();
+        if tar_acls_ok(None) {
+            assert!(joined.contains("tar --acls -cf -"), "{joined}");
+            assert!(joined.contains("--acls -xpof"), "{joined}");
+            assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        } else {
+            assert!(!joined.contains("--acls"), "{joined}");
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+            assert!(r.warnings[0].contains("ACL"), "{:?}", r.warnings);
+        }
     }
 
     #[test]
@@ -3834,6 +4365,9 @@ mod tests {
                 return fake_scp(a);
             }
             let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("ls -dn --") {
+                return ok("0\n"); // no ACLs
+            }
             if c.contains("for f do printf .") {
                 return ok(n);
             }
@@ -3909,6 +4443,9 @@ mod tests {
                     return ok("");
                 }
                 let c = remote_cmd(a).unwrap_or_default();
+                if c.contains("ls -dn --") {
+                    return ok("0\n"); // no ACLs
+                }
                 if c.contains("for f do printf .") {
                     return ok(n);
                 }
@@ -4016,6 +4553,9 @@ mod tests {
                 return ok("");
             }
             let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("ls -dn --") {
+                return ok("0\n"); // no ACLs
+            }
             if c.contains("for f do printf .") {
                 return ok("3\n"); // all arrived
             }
@@ -4736,13 +5276,14 @@ mod tests {
         let shell_in = private_dir(t.path(), "shell-in");
         let to: Vec<OsString> = vec!["sh".into(), "-c".into(), {
             use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&shell_in))).to_os_string()
+            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&shell_in), false)).to_os_string()
         }];
         let (oa, ob) = crate::session::run_pipe_cancellable(
             &local_tar_out(
                 &src,
                 std::ffi::OsStr::new("d"),
                 &src_dir_id(&Side::Local, &src).unwrap(),
+                false,
             ),
             &to,
             std::time::Duration::from_secs(30),
@@ -4758,8 +5299,9 @@ mod tests {
                 &src,
                 std::ffi::OsStr::new("d"),
                 &src_dir_id(&Side::Local, &src).unwrap(),
+                false,
             ),
-            &local_tar_in(&local_in),
+            &local_tar_in(&local_in, false),
             std::time::Duration::from_secs(30),
             &no,
         );
@@ -4955,7 +5497,7 @@ mod tests {
         let no = AtomicBool::new(false);
         let sink: Vec<OsString> = vec!["sh".into(), "-c".into(), "cat".into()];
         let (oa, ob) = crate::session::run_pipe_cancellable(
-            &local_tar_out(&src, std::ffi::OsStr::new("f"), &id),
+            &local_tar_out(&src, std::ffi::OsStr::new("f"), &id, false),
             &sink,
             std::time::Duration::from_secs(30),
             &no,
@@ -4968,6 +5510,7 @@ mod tests {
             &b(&src),
             b"f",
             id.as_bytes(),
+            false,
         ));
         assert_eq!(out.status.code(), Some(SRC_MOVED));
         assert!(out.stdout.is_empty());

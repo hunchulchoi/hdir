@@ -166,7 +166,7 @@ pub fn pipe_ends(a: &[String]) -> (String, String) {
             let cmd = remote_cmd(part).unwrap_or_default();
             let dir = quoted(cmd, "cd -- ");
             if reading {
-                let name = quoted(cmd, "tar -cf - ./");
+                let name = quoted(cmd, " -cf - ./"); // `tar` or `tar --acls`
                 format!("{host}:{dir}/{name}")
             } else {
                 format!("{host}:{dir}")
