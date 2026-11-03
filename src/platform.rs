@@ -1427,10 +1427,57 @@ mod verbatim_tests {
 
 // ---- POSIX ACLs in transfers ----
 
-/// Whether anything in the tree at `path` (links not followed) has a POSIX
-/// ACL. Linux only; elsewhere ACLs never narrow the mode bits, so `false`.
-/// An unreadable entry, or Esc, counts as yes.
+/// Whether anything in the tree at `path` (links not followed) has an ACL:
+/// a POSIX one on Linux, an extended one on macOS (which can deny what the
+/// mode bits allow). Elsewhere `false`. An unreadable entry, or Esc, counts
+/// as yes.
 pub fn tree_has_posix_acl(path: &Path, cancel: &std::sync::atomic::AtomicBool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        unsafe extern "C" {
+            fn acl_get_link_np(path: *const libc::c_char, ty: libc::c_int) -> *mut libc::c_void;
+            fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+        }
+        const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+        let mut todo = vec![path.to_path_buf()];
+        while let Some(q) = todo.pop() {
+            if cancel.load(Ordering::Relaxed) {
+                return true;
+            }
+            let m = match fs::symlink_metadata(&q) {
+                Ok(m) => m,
+                // gone: nothing there to send
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
+            };
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(c) = xattr_sys::cpath(&q) else {
+                return true;
+            };
+            // SAFETY: a NUL-terminated path; a returned ACL is freed once.
+            let acl = unsafe { acl_get_link_np(c.as_ptr(), ACL_TYPE_EXTENDED) };
+            if !acl.is_null() {
+                unsafe { acl_free(acl) };
+                return true;
+            }
+            if io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return true;
+            }
+            if m.is_dir() {
+                let Ok(rd) = fs::read_dir(&q) else {
+                    return true;
+                };
+                for e in rd {
+                    let Ok(e) = e else { return true };
+                    todo.push(e.path());
+                }
+            }
+        }
+        false
+    }
     #[cfg(target_os = "linux")]
     {
         use std::sync::atomic::Ordering;
@@ -1440,8 +1487,11 @@ pub fn tree_has_posix_acl(path: &Path, cancel: &std::sync::atomic::AtomicBool) -
             if cancel.load(Ordering::Relaxed) {
                 return true;
             }
-            let Ok(m) = fs::symlink_metadata(&q) else {
-                return true;
+            let m = match fs::symlink_metadata(&q) {
+                Ok(m) => m,
+                // gone: nothing there to send
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
             };
             if m.file_type().is_symlink() {
                 continue;
@@ -1468,7 +1518,7 @@ pub fn tree_has_posix_acl(path: &Path, cancel: &std::sync::atomic::AtomicBool) -
         }
         false
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (path, cancel);
         false
@@ -1577,6 +1627,45 @@ mod acl_tests {
         fs::create_dir(t.path().join("d")).unwrap();
         fs::write(t.path().join("d/f"), "x").unwrap();
         assert!(!tree_has_posix_acl(
+            &t.path().join("d"),
+            &AtomicBool::new(false)
+        ));
+    }
+
+    /// macOS: a deny ACL counts, even on a file that also has an xattr
+    /// (which hides the `+` in `ls -l`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_acl_deep_inside_is_found() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("d/e")).unwrap();
+        let f = t.path().join("d/e/f");
+        fs::write(&f, "x").unwrap();
+        let run = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new(args[0])
+                .args(&args[1..])
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(run(&[
+            "xattr".as_ref(),
+            "-w".as_ref(),
+            "com.hdir.t".as_ref(),
+            "v".as_ref(),
+            f.as_os_str()
+        ]));
+        assert!(!tree_has_posix_acl(
+            &t.path().join("d"),
+            &AtomicBool::new(false)
+        ));
+        assert!(run(&[
+            "chmod".as_ref(),
+            "+a".as_ref(),
+            "group:staff deny read".as_ref(),
+            f.as_os_str()
+        ]));
+        assert!(tree_has_posix_acl(
             &t.path().join("d"),
             &AtomicBool::new(false)
         ));

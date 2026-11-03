@@ -221,17 +221,30 @@ fn tar_word(acls: bool) -> &'static [u8] {
 /// Exit 0 when this side's tar can store and restore POSIX ACLs.
 pub const TAR_ACLS_PROBE: &[u8] = b"tar --acls -cf /dev/null -T /dev/null >/dev/null 2>&1";
 
-/// Prints how many entries in `dir/name` (links not followed) carry a POSIX
-/// ACL: GNU `ls` marks them with `+` after the mode. A name with a newline
-/// can only add a false match, which errs on the safe side.
-pub fn acl_scan_cmd(dir: &[u8], name: &[u8]) -> Vec<u8> {
-    cat(&[
-        b"cd -- ",
-        &sh_quote(dir),
-        b" || exit 1; n=$(find ./",
-        &sh_quote(name),
-        b" ! -type l -exec ls -dn -- {} + | grep -c '^[^ ]\\{10\\}+'); echo $((n))",
-    ])
+/// Prints how many entries in `dir/name` (links not followed) carry an ACL.
+/// `ls` marks them with `+` after the mode, except macOS, which shows `@`
+/// instead when there are xattrs too: there `ls -le` lists the ACL entries
+/// and each ACL's first one (` 0: `) is counted. A name with a newline can
+/// only add a false match, which errs on the safe side.
+pub fn acl_scan_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let q = sh_quote(name);
+    let plus: &[&[u8]] = &[
+        b"n=$(find ./",
+        &q,
+        b" ! -type l -exec ls -dn -- {} + | grep -c '^[^ ]\\{10\\}+')",
+    ];
+    let mut v = cat(&[b"cd -- ", &sh_quote(dir), b" || exit 1; "]);
+    if matches!(os, RemoteOs::Bsd) {
+        v.extend_from_slice(b"if [ \"$(uname)\" = Darwin ]; then n=$(find ./");
+        v.extend_from_slice(&q);
+        v.extend_from_slice(b" ! -type l -exec ls -lden -- {} + | grep -c '^ 0: '); else ");
+        v.extend(cat(plus));
+        v.extend_from_slice(b"; fi");
+    } else {
+        v.extend(cat(plus));
+    }
+    v.extend_from_slice(b"; echo $((n))");
+    v
 }
 
 /// Removes group and other permissions from everything in `stage/name`:
@@ -1348,9 +1361,9 @@ fn discard(stage: Stage) -> Option<String> {
     (!ok).then(|| left_behind(&path))
 }
 
-/// Whether `dir/name` on the sending side (`None`: local) carries POSIX
-/// ACLs. Only Linux senders are checked: elsewhere ACLs do not narrow the
-/// mode bits that tar sends. A check that fails counts as yes.
+/// Whether `dir/name` on the sending side (`None`: local) carries ACLs
+/// (POSIX, or macOS / BSD ones, which can deny what the mode bits allow).
+/// A check that fails counts as yes.
 fn has_acls(
     side: Option<&RemoteSession>,
     dir: &Path,
@@ -1359,8 +1372,8 @@ fn has_acls(
 ) -> bool {
     match side {
         None => crate::platform::tree_has_posix_acl(&dir.join(name), cancel),
-        Some(s) if matches!(s.os, RemoteOs::Linux) => {
-            match s.exec_cancellable(&acl_scan_cmd(&b(dir), &os_bytes(name)), cancel) {
+        Some(s) => {
+            match s.exec_cancellable(&acl_scan_cmd(&s.os, &b(dir), &os_bytes(name)), cancel) {
                 Ok(o) if o.code == Some(0) => String::from_utf8_lossy(&o.stdout)
                     .trim()
                     .parse::<u64>()
@@ -1368,7 +1381,6 @@ fn has_acls(
                 _ => true,
             }
         }
-        Some(_) => false,
     }
 }
 
@@ -1427,7 +1439,6 @@ fn send(
         Route::Between(s, d) => Some((Some(*s), Some(*d))),
         Route::SameHost(_) => None,
     }
-    .filter(|_| !cfg!(windows))
     .map_or(AclPlan::None, |(from, to)| {
         if has_acls(from, src_dir, name, cancel) {
             acl_plan(true, tar_acls_ok(from), tar_acls_ok(to))
@@ -1532,11 +1543,19 @@ fn send(
                     "ACLs could not travel and the received item could not be made private: {e}"
                 )
             })?;
-            Ok(Some(crate::tr!(
-                "ACL을 옮길 수 없어 그룹·기타 권한을 뺐음: {}",
-                "ACLs could not travel, group and other permissions removed: {}",
-                lossy(name)
-            )))
+            Ok(Some(if cfg!(windows) {
+                crate::tr!(
+                    "ACL을 옮길 수 없음, 받은 폴더의 Windows 권한을 따름: {}",
+                    "ACLs could not travel, the destination folder's Windows permissions apply: {}",
+                    lossy(name)
+                )
+            } else {
+                crate::tr!(
+                    "ACL을 옮길 수 없어 그룹·기타 권한을 뺐음: {}",
+                    "ACLs could not travel, group and other permissions removed: {}",
+                    lossy(name)
+                )
+            }))
         }
         // the side that failed first; a reader that died leaves the writer
         // with a broken pipe, and a writer that died leaves a short archive
@@ -2399,8 +2418,17 @@ mod tests {
                 "{lo:?}"
             );
         }
+        let bsd = String::from_utf8(acl_scan_cmd(&RemoteOs::Bsd, b"/s", b"a")).unwrap();
+        assert!(
+            bsd.contains("if [ \"$(uname)\" = Darwin ]; then n=$(find ./'a' ! -type l -exec ls -lden -- {} + | grep -c '^ 0: ')"),
+            "{bsd}"
+        );
+        assert!(
+            bsd.contains("else n=$(find ./'a' ! -type l -exec ls -dn -- {} +"),
+            "{bsd}"
+        );
         assert_eq!(
-            acl_scan_cmd(b"/s it's", b"-a"),
+            acl_scan_cmd(&RemoteOs::Linux, b"/s it's", b"-a"),
             b"cd -- '/s it'\\''s' || exit 1; \
               n=$(find ./'-a' ! -type l -exec ls -dn -- {} + | grep -c '^[^ ]\\{10\\}+'); \
               echo $((n))"
@@ -2510,7 +2538,11 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         fs::create_dir(t.path().join("-d")).unwrap();
         fs::write(t.path().join("-d/f\nx"), "x").unwrap();
-        let out = sh(&acl_scan_cmd(&b(t.path()), b"-d"));
+        let out = sh(&acl_scan_cmd(
+            &crate::testutil::local_os(),
+            &b(t.path()),
+            b"-d",
+        ));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "0", "{out:?}");
     }
 
@@ -2527,7 +2559,7 @@ mod tests {
             eprintln!("no ACL support here, skipped");
             return;
         }
-        let out = sh(&acl_scan_cmd(&b(&src), b"d"));
+        let out = sh(&acl_scan_cmd(&crate::testutil::local_os(), &b(&src), b"d"));
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1", "{out:?}");
         let id = src_dir_id(&Side::Local, &src).unwrap();
         let no = AtomicBool::new(false);
@@ -3592,6 +3624,46 @@ mod tests {
         );
         assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
         assert!(r.warnings[0].contains("ACL"), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_made_private_is_never_placed_or_moved() {
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let from = acl_host("1\n", 0);
+            let to = FakeCmd::new(|a| {
+                let c = remote_cmd(a).unwrap_or_default();
+                if c.contains("chmod go-rwx") {
+                    return code(1);
+                }
+                if c.as_bytes() == TAR_ACLS_PROBE {
+                    return code(2);
+                }
+                answer(c, &[], &[], "0\x000\x00")
+            });
+            let s = spec(
+                kind,
+                Side::Remote(session(Arc::clone(&from))),
+                &p("/srv"),
+                &["a"],
+                to_other(&to),
+                &p("/dst"),
+            );
+            let r = run(&s, &mut Ctl::new());
+            assert!(
+                matches!(&r.outcome, OpOutcome::Failed(m) if m.contains("ACL")),
+                "{kind:?} {:?}",
+                r.outcome
+            );
+            let cmds = to.remote_cmds();
+            assert!(!cmds.iter().any(|c| c.ends_with("|| exit 46")), "never placed: {cmds:?}");
+            let unstage = String::from_utf8(unstage_cmd(STAGE.as_bytes())).unwrap();
+            assert!(cmds.contains(&unstage), "stage dropped: {cmds:?}");
+            assert!(
+                !from.remote_cmds().iter().any(|c| c.contains(".hdir-del.")),
+                "{kind:?}: source kept: {:?}",
+                from.remote_cmds()
+            );
+        }
     }
 
     #[test]
