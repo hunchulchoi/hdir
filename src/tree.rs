@@ -97,7 +97,7 @@ impl TreeView {
         out
     }
 
-    /// A listing of `dir` arrived.
+    /// A listing of `dir` arrived, already in [`sort_subs`] order.
     pub fn loaded(&mut self, dir: &Path, result: Result<Vec<Sub>, String>) {
         let c = match result {
             Ok(mut subs) => {
@@ -108,21 +108,17 @@ impl TreeView {
                     .find(|a| a.parent() == Some(dir))
                     .filter(|n| !subs.iter().any(|s| s.path == *n))
                 {
-                    subs.push(Sub {
+                    let s = Sub {
                         name: next
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default(),
                         path: next.to_path_buf(),
                         link: false,
-                    });
+                    };
+                    let at = subs.partition_point(|x| sort_key(x) < sort_key(&s));
+                    subs.insert(at, s);
                 }
-                subs.sort_by(|a, b| {
-                    a.name
-                        .to_lowercase()
-                        .cmp(&b.name.to_lowercase())
-                        .then_with(|| a.name.cmp(&b.name))
-                });
                 Children::Ready(subs)
             }
             Err(e) => Children::Failed(e),
@@ -252,8 +248,18 @@ impl TreeView {
     }
 }
 
-/// The subfolders of `dir` (and links to folders), hidden ones only with
-/// `hidden`. Blocking: call off the UI thread.
+fn sort_key(s: &Sub) -> (String, String) {
+    (s.name.to_lowercase(), s.name.clone())
+}
+
+/// Case-insensitive name order (on the worker: a big folder is not sorted
+/// on the UI thread).
+pub fn sort_subs(subs: &mut [Sub]) {
+    subs.sort_by_cached_key(sort_key);
+}
+
+/// The subfolders of `dir` (and links to folders) in [`sort_subs`] order,
+/// hidden ones only with `hidden`. Blocking: call off the UI thread.
 pub fn read_subdirs(dir: &Path, hidden: bool) -> Result<Vec<Sub>, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -279,6 +285,7 @@ pub fn read_subdirs(dir: &Path, hidden: bool) -> Result<Vec<Sub>, String> {
         }
         out.push(Sub { name, path, link });
     }
+    sort_subs(&mut out);
     Ok(out)
 }
 
@@ -374,6 +381,11 @@ pub fn render(
 mod tests {
     use super::*;
 
+    fn sorted(mut v: Vec<Sub>) -> Result<Vec<Sub>, String> {
+        sort_subs(&mut v);
+        Ok(v)
+    }
+
     fn sub(parent: &str, name: &str) -> Sub {
         Sub {
             name: name.into(),
@@ -388,12 +400,15 @@ mod tests {
         let mut want = t.wanted();
         want.sort();
         assert_eq!(want, ["/", "/home", "/home/me"].map(PathBuf::from));
-        t.loaded(Path::new("/"), Ok(vec![sub("/", "usr"), sub("/", "home")]));
+        t.loaded(
+            Path::new("/"),
+            sorted(vec![sub("/", "usr"), sub("/", "home")]),
+        );
         t.loaded(
             Path::new("/home"),
             Ok(vec![sub("/home", "me"), sub("/home", "공유 폴더")]),
         );
-        t.loaded(Path::new("/home/me"), Ok(vec![sub("/home/me", "src")]));
+        t.loaded(Path::new("/home/me"), sorted(vec![sub("/home/me", "src")]));
         t
     }
 
@@ -431,7 +446,7 @@ mod tests {
     fn moving_skips_placeholders_and_stays_in_bounds() {
         let mut t = TreeView::new(Path::new("/a"));
         t.wanted();
-        t.loaded(Path::new("/"), Ok(vec![sub("/", "a"), sub("/", "b")]));
+        t.loaded(Path::new("/"), sorted(vec![sub("/", "a"), sub("/", "b")]));
         // /a is still loading: its placeholder row is not a stop
         assert!(matches!(t.rows()[2].kind, RowKind::Loading));
         t.move_by(1);
@@ -453,7 +468,7 @@ mod tests {
         assert_eq!(t.cursor(), Path::new("/home/me/src"));
         assert_eq!(t.expand(), [PathBuf::from("/home/me/src")]);
         assert!(t.expand().is_empty(), "already being read");
-        t.loaded(Path::new("/home/me/src"), Ok(vec![]));
+        t.loaded(Path::new("/home/me/src"), sorted(vec![]));
         assert!(names(&t).contains(&"      src".to_string()));
         t.collapse(); // closes src
         assert!(t.expand() == [PathBuf::from("/home/me/src")], "read afresh");
@@ -472,7 +487,7 @@ mod tests {
         t.wanted();
         let mut l = sub("/", "loop");
         l.link = true;
-        t.loaded(Path::new("/"), Ok(vec![l, sub("/", "locked")]));
+        t.loaded(Path::new("/"), sorted(vec![l, sub("/", "locked")]));
         t.move_by(1); // locked (sorted first)
         assert_eq!(t.cursor(), Path::new("/locked"));
         t.move_by(1);
@@ -534,13 +549,13 @@ mod tests {
     fn a_hidden_folder_on_the_way_to_the_start_is_shown() {
         let mut t = TreeView::new(Path::new("/home/.config/app"));
         t.wanted();
-        t.loaded(Path::new("/"), Ok(vec![sub("/", "home")]));
-        t.loaded(Path::new("/home"), Ok(vec![sub("/home", "docs")]));
+        t.loaded(Path::new("/"), sorted(vec![sub("/", "home")]));
+        t.loaded(Path::new("/home"), sorted(vec![sub("/home", "docs")]));
         t.loaded(
             Path::new("/home/.config"),
             Ok(vec![sub("/home/.config", "app")]),
         );
-        t.loaded(Path::new("/home/.config/app"), Ok(vec![]));
+        t.loaded(Path::new("/home/.config/app"), sorted(vec![]));
         assert_eq!(
             names(&t),
             ["/", "  home", "    .config", "      app", "    docs"]
@@ -550,6 +565,67 @@ mod tests {
             rows[t.cursor_index(&rows)].path,
             Path::new("/home/.config/app")
         );
+    }
+
+    fn draw(t: &mut TreeView, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        let theme = crate::theme::builtin("mdir").unwrap();
+        term.draw(|f| render(f, t, &theme, "Esc")).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn text_rows(b: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..b.area.height)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < b.area.width {
+                    let sym = b[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tree_screen_snapshot_with_cursor_and_styles() {
+        let theme = crate::theme::builtin("mdir").unwrap();
+        let mut t = tree();
+        let b = crate::i18n::with_lang(crate::i18n::Lang::En, || draw(&mut t, 30, 9));
+        assert_eq!(
+            text_rows(&b),
+            [
+                "┌ Directory tree ────────────┐",
+                "│-/                          │",
+                "│├─-home                     │",
+                "││ ├─-me                     │",
+                "││ │ └─+src                  │",
+                "││ └─+공유 폴더              │",
+                "│└─+usr                      │",
+                "│                            │",
+                "└ Esc ───────────────────────┘",
+            ]
+        );
+        assert_eq!(b[(5, 3)].bg, theme.cursor_bg, "cursor on me");
+        assert_eq!(b[(5, 2)].fg, theme.dir);
+        assert_eq!(b[(5, 7)].bg, theme.bg);
+    }
+
+    #[test]
+    fn a_short_screen_scrolls_to_the_cursor() {
+        let theme = crate::theme::builtin("mdir").unwrap();
+        let mut t = tree();
+        t.end(); // usr, the last row
+        let b = draw(&mut t, 30, 4);
+        let rows = text_rows(&b);
+        assert!(rows[2].contains("usr"), "{rows:?}");
+        assert_eq!(b[(5, 2)].bg, theme.cursor_bg);
+        // tiny screens never panic
+        for (w, h) in [(0, 0), (1, 1), (5, 2), (3, 10)] {
+            draw(&mut t, w, h);
+        }
     }
 
     #[test]

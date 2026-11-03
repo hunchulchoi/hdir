@@ -153,6 +153,13 @@ enum OpenChoice {
 /// A tree listing from a worker: (tree generation, folder, its subfolders).
 type TreeListing = (u64, PathBuf, Result<Vec<crate::tree::Sub>, String>);
 
+pub type TreeReader =
+    Arc<dyn Fn(&Path, bool) -> Result<Vec<crate::tree::Sub>, String> + Send + Sync>;
+
+/// Tree folders read at once; the rest wait (a slow mount never piles up
+/// threads).
+const TREE_READERS: usize = 4;
+
 /// The open popup menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenMenu {
@@ -657,10 +664,17 @@ pub struct App {
     tree_gen: u64,
     tree_tx: Sender<TreeListing>,
     tree_rx: Receiver<TreeListing>,
+    /// Reads a tree folder (blocking, on a worker); replaceable in tests.
+    pub tree_reader: TreeReader,
+    /// Tree folders waiting for a reader, and readers running (any tree).
+    tree_queue: VecDeque<PathBuf>,
+    tree_running: usize,
     /// Each panel's folder as last recorded in `history`.
     seen: [Option<PathBuf>; 2],
     /// The one worker that writes favorites, in order (started on first use).
     fav_saver: Option<Sender<(PathBuf, Vec<PathBuf>)>>,
+    /// Favorites saves sent but not written yet.
+    fav_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Results of checking a chosen local folder for a remote panel:
     /// (panel, its connection generation, folder, is a folder).
     place_tx: Sender<(usize, u64, PathBuf, bool)>,
@@ -793,7 +807,11 @@ impl App {
             tree_gen: 0,
             tree_tx,
             tree_rx,
+            tree_reader: Arc::new(crate::tree::read_subdirs),
+            tree_queue: VecDeque::new(),
+            tree_running: 0,
             fav_saver: None,
+            fav_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             place_tx,
             place_rx,
             clock: std::time::SystemTime::now,
@@ -1014,13 +1032,16 @@ impl App {
         if self.fav_saver.is_none() {
             let (tx, rx) = mpsc::channel::<(PathBuf, Vec<PathBuf>)>();
             let report = self.spawn_tx.clone();
+            let pending = Arc::clone(&self.fav_pending);
             let started = std::thread::Builder::new()
                 .name("hdir-favorites".into())
                 .spawn(move || {
                     // one write at a time, always the newest list
                     while let Ok(mut job) = rx.recv() {
+                        let mut taken = 1;
                         while let Ok(newer) = rx.try_recv() {
                             job = newer;
+                            taken += 1;
                         }
                         if let Err(e) = crate::places::save_favorites(&job.0, &job.1) {
                             let _ = report.send(crate::tr!(
@@ -1028,6 +1049,7 @@ impl App {
                                 "Favorites not saved: {e}"
                             ));
                         }
+                        pending.fetch_sub(taken, Ordering::SeqCst);
                     }
                 });
             match started {
@@ -1042,8 +1064,24 @@ impl App {
             }
         }
         if let Some(tx) = &self.fav_saver {
-            let _ = tx.send((dir, self.favorites.clone()));
+            self.fav_pending.fetch_add(1, Ordering::SeqCst);
+            if tx.send((dir, self.favorites.clone())).is_err() {
+                self.fav_pending.fetch_sub(1, Ordering::SeqCst);
+            }
         }
+    }
+
+    /// Wait (at most `max`) for favorites saves still in flight, before
+    /// the program ends. `false` when some did not finish.
+    pub fn flush_favorites(&self, max: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while self.fav_pending.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() >= max {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
     }
 
     /// Take the active panel to the local folder `dir`. A missing folder is
@@ -1063,7 +1101,8 @@ impl App {
         let started = std::thread::Builder::new()
             .name("hdir-place".into())
             .spawn(move || {
-                let ok = dir.is_dir();
+                // listable, not just there: a locked folder keeps the panel
+                let ok = std::fs::read_dir(&dir).is_ok();
                 let _ = tx.send((idx, generation, dir, ok));
             });
         if let Err(e) = started {
@@ -1086,27 +1125,43 @@ impl App {
         self.status = None;
         self.invalidate_probe();
         self.tree_gen += 1;
+        // what an earlier tree still waits for is no longer wanted
+        self.tree_queue.clear();
         let mut tree = crate::tree::TreeView::new(&self.active_panel().cwd);
         let wanted = tree.wanted();
         self.tree = Some(tree);
         self.read_tree(wanted);
     }
 
-    /// Read these tree folders on workers; results arrive in `tick_tree`.
+    /// Queue these tree folders; at most [`TREE_READERS`] are read at
+    /// once and results arrive in `tick_tree`.
     fn read_tree(&mut self, dirs: Vec<PathBuf>) {
+        self.tree_queue.extend(dirs);
+        self.pump_tree();
+    }
+
+    fn pump_tree(&mut self) {
         let hidden = self.active_panel().show_hidden;
-        for dir in dirs {
+        while self.tree_running < TREE_READERS {
+            let Some(dir) = self.tree_queue.pop_front() else {
+                return;
+            };
             let (tx, generation) = (self.tree_tx.clone(), self.tree_gen);
+            let read = Arc::clone(&self.tree_reader);
+            let at = dir.clone();
             let started = std::thread::Builder::new()
                 .name("hdir-tree".into())
                 .spawn(move || {
-                    let r = crate::tree::read_subdirs(&dir, hidden);
-                    let _ = tx.send((generation, dir, r));
+                    let r = read(&at, hidden);
+                    let _ = tx.send((generation, at, r));
                 });
-            if let Err(e) = started
-                && let Some(t) = self.tree.as_mut()
-            {
-                t.loaded(Path::new(""), Err(e.to_string()));
+            match started {
+                Ok(_) => self.tree_running += 1,
+                Err(e) => {
+                    if let Some(t) = self.tree.as_mut() {
+                        t.loaded(&dir, Err(e.to_string()));
+                    }
+                }
             }
         }
     }
@@ -1114,6 +1169,7 @@ impl App {
     fn tick_tree(&mut self) -> bool {
         let mut changed = false;
         while let Ok((generation, dir, result)) = self.tree_rx.try_recv() {
+            self.tree_running = self.tree_running.saturating_sub(1);
             if generation != self.tree_gen {
                 continue;
             }
@@ -1122,6 +1178,7 @@ impl App {
                 changed = true;
             }
         }
+        self.pump_tree();
         changed
     }
 
@@ -5891,6 +5948,21 @@ mod tests {
     }
 
     #[test]
+    fn quitting_right_after_a_change_waits_for_the_save() {
+        let (_t, mut app) = fixture();
+        let cfg = tempfile::tempdir().unwrap();
+        app.configure(Some(cfg.path().to_path_buf()), None);
+        app.add_favorite();
+        assert!(app.flush_favorites(Duration::from_secs(5)));
+        assert_eq!(
+            crate::places::load_favorites(Some(cfg.path())).0,
+            app.favorites,
+            "written by the time flush returns"
+        );
+        assert!(app.flush_favorites(Duration::ZERO), "nothing pending");
+    }
+
+    #[test]
     fn a_favorite_takes_the_active_panel_there_and_can_be_deleted() {
         let (t, mut app) = fixture();
         let target = t.path().join("한글 폴더 a");
@@ -5997,6 +6069,66 @@ mod tests {
         press_mods(app, KeyCode::F(10), KeyModifiers::ALT);
     }
 
+    /// Tree reads stay inside `root`: folders above it list as empty.
+    fn tree_inside(app: &mut App, root: &Path) {
+        let root = crate::platform::canonicalize(root).unwrap();
+        app.tree_reader = Arc::new(move |p: &Path, h: bool| {
+            if p.starts_with(&root) {
+                crate::tree::read_subdirs(p, h)
+            } else {
+                Ok(Vec::new())
+            }
+        });
+    }
+
+    #[test]
+    fn tree_reads_run_at_most_four_at_once_and_all_finish() {
+        let (t, mut app) = fixture();
+        let mut deep = t.path().to_path_buf();
+        for i in 0..8 {
+            deep = deep.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        app.panels[0] = Panel::new(&deep);
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let (now, max) = (
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let (g, n, m) = (Arc::clone(&gate), Arc::clone(&now), Arc::clone(&max));
+        app.tree_reader = Arc::new(move |_p: &Path, _h: bool| {
+            let k = n.fetch_add(1, Ordering::SeqCst) + 1;
+            m.fetch_max(k, Ordering::SeqCst);
+            drop(g.lock().unwrap());
+            n.fetch_sub(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        alt_f10(&mut app);
+        std::thread::sleep(Duration::from_millis(50));
+        app.tick();
+        assert!(max.load(Ordering::SeqCst) <= TREE_READERS);
+        assert!(!app.tree_queue.is_empty(), "the rest wait");
+        drop(held);
+        settle_tree(&mut app);
+        assert!(max.load(Ordering::SeqCst) <= TREE_READERS);
+        assert!(app.tree_queue.is_empty());
+        // reopening drops what an older tree still waited for
+        let held = gate.lock().unwrap();
+        let chain = crate::platform::canonicalize(&deep)
+            .unwrap()
+            .ancestors()
+            .count();
+        for _ in 0..3 {
+            alt_f10(&mut app); // closes
+            alt_f10(&mut app); // opens again
+        }
+        assert!(app.tree_queue.len() <= chain, "only the newest tree waits");
+        assert!(max.load(Ordering::SeqCst) <= TREE_READERS);
+        drop(held);
+        settle_tree(&mut app);
+    }
+
     #[test]
     fn alt_f10_opens_the_tree_on_the_current_folder_and_enter_goes_there() {
         let (t, mut app) = fixture();
@@ -6006,6 +6138,7 @@ mod tests {
         settle(&mut app);
         let adir = root.join("adir");
         assert_eq!(app.panels[0].cwd, adir);
+        tree_inside(&mut app, t.path());
         alt_f10(&mut app);
         settle_tree(&mut app);
         let tree = app.tree.as_ref().expect("tree open");
@@ -6039,6 +6172,8 @@ mod tests {
     fn esc_closes_the_tree_and_the_panel_stays() {
         let (_t, mut app) = fixture();
         let root = app.panels[0].cwd.clone();
+        let here = app.panels[0].cwd.clone();
+        tree_inside(&mut app, &here);
         alt_f10(&mut app);
         settle_tree(&mut app);
         press(&mut app, KeyCode::Down);
@@ -6052,6 +6187,8 @@ mod tests {
     fn a_folder_gone_since_it_was_listed_keeps_the_panel_and_says_so() {
         let (t, mut app) = fixture();
         let root = app.panels[0].cwd.clone();
+        let here = app.panels[0].cwd.clone();
+        tree_inside(&mut app, &here);
         alt_f10(&mut app);
         settle_tree(&mut app);
         press(&mut app, KeyCode::Right); // root is open; open it again is a no-op
@@ -10814,6 +10951,29 @@ mod tests {
                 app.status
             );
             assert!(app.panels[1].location.is_remote(), "the panel stays");
+            // a folder that exists but cannot be listed also keeps the panel
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let locked = t.path().join("locked");
+                fs::create_dir(&locked).unwrap();
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+                if fs::read_dir(&locked).is_err() {
+                    app.status = None;
+                    app.go_to_place(locked.clone());
+                    let start = Instant::now();
+                    while app.status.is_none() {
+                        assert!(start.elapsed() < Duration::from_secs(5));
+                        app.tick();
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    assert!(
+                        app.panels[1].location.is_remote(),
+                        "locked: the panel stays"
+                    );
+                }
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             press(&mut app, KeyCode::F(11));
             press(&mut app, KeyCode::Down);
             press(&mut app, KeyCode::Down);
