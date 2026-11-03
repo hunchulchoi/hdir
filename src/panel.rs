@@ -128,7 +128,12 @@ impl Panel {
 
     fn apply_listing(&mut self, (entries, skipped): (Vec<Entry>, usize)) {
         self.entries = entries;
-        self.error = (skipped > 0).then(|| format!("{skipped}개 항목을 읽지 못함"));
+        self.error = (skipped > 0).then(|| {
+            crate::tr!(
+                "{skipped}개 항목을 읽지 못함",
+                "Could not read {skipped} items"
+            )
+        });
     }
 
     /// Point the panel at another location: the old listing, selection and any

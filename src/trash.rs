@@ -64,8 +64,15 @@ pub struct RestoreResult {
     pub changed: usize,
 }
 
-pub const CHANGED_MSG: &str = "휴지통 항목이 바뀌어 건너뜀";
-pub const COLLISION_MSG: &str = "원래 위치에 같은 이름이 있어 건너뜀";
+pub fn changed_msg() -> &'static str {
+    crate::i18n::t("휴지통 항목이 바뀌어 건너뜀", "Skipped, trash item changed")
+}
+pub fn collision_msg() -> &'static str {
+    crate::i18n::t(
+        "원래 위치에 같은 이름이 있어 건너뜀",
+        "Skipped, same name exists at original location",
+    )
+}
 
 impl RestoreResult {
     /// One status line, e.g. `복원: 2개` or
@@ -77,20 +84,32 @@ impl RestoreResult {
         {
             // nothing restored: only the problems matter
         } else {
-            parts.push(format!("복원: {}개", self.restored.len()));
+            parts.push(crate::tr!(
+                "복원: {}개",
+                "Restored: {}",
+                self.restored.len()
+            ));
         }
         if let Some(first) = self.collisions.first() {
-            let mut s = format!("{COLLISION_MSG}: {}", first.to_string_lossy());
+            let mut s = format!("{}: {}", collision_msg(), first.to_string_lossy());
             if self.collisions.len() > 1 {
-                s.push_str(&format!(" 외 {}개", self.collisions.len() - 1));
+                s.push_str(&crate::tr!(
+                    " 외 {}개",
+                    " (+{} more)",
+                    self.collisions.len() - 1
+                ));
             }
             parts.push(s);
         }
         if self.changed > 0 {
-            parts.push(format!("{CHANGED_MSG}: {}개", self.changed));
+            parts.push(format!("{}: {}", changed_msg(), self.changed));
         }
         if let Some(first) = self.errors.first() {
-            parts.push(format!("실패 {}개: {first}", self.errors.len()));
+            parts.push(crate::tr!(
+                "실패 {}개: {first}",
+                "Failed {}: {first}",
+                self.errors.len()
+            ));
         }
         parts.join(" · ")
     }
@@ -192,7 +211,12 @@ pub fn match_items(wanted: &[TrashEntry], fresh: &[TrashItem]) -> (Vec<TrashEntr
     (keep, skipped)
 }
 
-pub const UNVERIFIED_MSG: &str = "저장된 항목을 확인할 수 없어 복원 거부";
+pub fn unverified_msg() -> &'static str {
+    crate::i18n::t(
+        "저장된 항목을 확인할 수 없어 복원 거부",
+        "Restore refused: cannot verify the stored item",
+    )
+}
 pub fn symlink_msg() -> &'static str {
     crate::i18n::t(
         "심볼릭 링크 항목은 파일 관리자에서 복원하세요",
@@ -224,7 +248,8 @@ pub fn payload_path(id: &OsStr) -> Option<PathBuf> {
 /// definite answer (or a plain NotFound) is an error.
 #[cfg(unix)]
 pub fn payload_is_link(id: &OsStr) -> Result<bool, String> {
-    let p = payload_path(id).ok_or("저장 위치를 알 수 없음")?;
+    let p = payload_path(id)
+        .ok_or_else(|| crate::i18n::t("저장 위치를 알 수 없음", "Storage location unknown"))?;
     match p.symlink_metadata() {
         Ok(m) => Ok(m.file_type().is_symlink()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -263,7 +288,7 @@ pub fn restore_guarded(
     res.errors.extend(
         unknown
             .iter()
-            .map(|(e, m)| format!("{}: {UNVERIFIED_MSG} ({m})", e.name())),
+            .map(|(e, m)| format!("{}: {} ({m})", e.name(), unverified_msg())),
     );
     res
 }
@@ -475,7 +500,11 @@ impl TrashBackend for SystemTrash {
 
     #[cfg(not(any(target_os = "linux", windows)))]
     fn list(&self) -> Result<Vec<TrashEntry>, String> {
-        Err("이 OS는 휴지통 목록을 지원하지 않음".into())
+        Err(crate::i18n::t(
+            "이 OS는 휴지통 목록을 지원하지 않음",
+            "Listing the trash is not supported on this OS",
+        )
+        .into())
     }
 
     #[cfg(target_os = "linux")]
@@ -501,7 +530,13 @@ impl TrashBackend for SystemTrash {
     #[cfg(not(any(target_os = "linux", windows)))]
     fn restore(&self, _items: &[TrashEntry]) -> RestoreResult {
         RestoreResult {
-            errors: vec!["이 OS는 복원을 지원하지 않음".into()],
+            errors: vec![
+                crate::i18n::t(
+                    "이 OS는 복원을 지원하지 않음",
+                    "Restoring is not supported on this OS",
+                )
+                .into(),
+            ],
             ..Default::default()
         }
     }
@@ -513,13 +548,19 @@ impl TrashBackend for SystemTrash {
 
     #[cfg(not(any(target_os = "linux", windows)))]
     fn purge(&self, _items: &[TrashEntry]) -> Result<(), String> {
-        Err("이 OS는 영구 삭제를 지원하지 않음".into())
+        Err(crate::i18n::t(
+            "이 OS는 영구 삭제를 지원하지 않음",
+            "Permanent delete is not supported on this OS",
+        )
+        .into())
     }
 
     #[cfg(target_os = "macos")]
     fn open_os_trash(&self) -> Result<(), String> {
         let dir = dirs::home_dir()
-            .ok_or("홈 디렉터리를 찾을 수 없음")?
+            .ok_or_else(|| {
+                crate::i18n::t("홈 디렉터리를 찾을 수 없음", "Home directory not found")
+            })?
             .join(".Trash");
         let status = std::process::Command::new("open")
             .arg(dir)
@@ -528,13 +569,17 @@ impl TrashBackend for SystemTrash {
         if status.success() {
             Ok(())
         } else {
-            Err(format!("open 실패: {status}"))
+            Err(crate::tr!("open 실패: {status}", "open failed: {status}"))
         }
     }
 
     #[cfg(not(target_os = "macos"))]
     fn open_os_trash(&self) -> Result<(), String> {
-        Err("이 OS는 휴지통 열기를 지원하지 않음".into())
+        Err(crate::i18n::t(
+            "이 OS는 휴지통 열기를 지원하지 않음",
+            "Opening the trash is not supported on this OS",
+        )
+        .into())
     }
 
     fn supports_view(&self) -> bool {
@@ -1444,7 +1489,7 @@ mod tests {
             |_| panic!("must not reach the backend"),
         );
         assert!(res.restored.is_empty());
-        assert!(res.errors[0].contains(UNVERIFIED_MSG), "{res:?}");
+        assert!(res.errors[0].contains(unverified_msg()), "{res:?}");
     }
 
     // ---- verified restore / cheap listing ----
@@ -1467,7 +1512,7 @@ mod tests {
         assert_eq!(res.restored, std::slice::from_ref(&b));
         assert_eq!(res.changed, 1);
         assert!(!a.exists());
-        assert!(res.summary().contains(CHANGED_MSG), "{}", res.summary());
+        assert!(res.summary().contains(changed_msg()), "{}", res.summary());
     }
 
     #[test]
@@ -1546,5 +1591,22 @@ mod tests {
             assert_eq!(format_local(ts), want, "ts {ts}");
         }
         assert_eq!(format_local(i64::MIN), "-");
+    }
+
+    #[test]
+    fn restore_summary_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let r = RestoreResult {
+                restored: vec!["/a".into()],
+                collisions: vec!["/b".into(), "/c".into()],
+                changed: 1,
+                errors: vec!["boom".into()],
+            };
+            assert_eq!(
+                r.summary(),
+                "Restored: 1 · Skipped, same name exists at original location: /b (+1 more) \
+                 · Skipped, trash item changed: 1 · Failed 1: boom"
+            );
+        });
     }
 }

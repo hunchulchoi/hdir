@@ -170,7 +170,10 @@ pub fn canonical_dir(p: &Path) -> std::io::Result<PathBuf> {
     // use the folded, existence-checked path there.
     let c = crate::platform::canonicalize(if cfg!(windows) { acc.as_path() } else { p })?;
     if !c.is_dir() {
-        return Err(std::io::Error::other("디렉터리가 아님"));
+        return Err(std::io::Error::other(crate::i18n::t(
+            "디렉터리가 아님",
+            "Not a directory",
+        )));
     }
     Ok(c)
 }
@@ -205,12 +208,12 @@ pub fn resolve_cd(
     prev: Option<&Path>,
 ) -> Result<PathBuf, String> {
     match target {
-        CdTarget::Home => home
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "홈 디렉터리를 알 수 없음".to_string()),
-        CdTarget::Prev => prev
-            .map(Path::to_path_buf)
-            .ok_or_else(|| "이전 디렉터리 없음".to_string()),
+        CdTarget::Home => home.map(Path::to_path_buf).ok_or_else(|| {
+            crate::i18n::t("홈 디렉터리를 알 수 없음", "Home directory unknown").to_string()
+        }),
+        CdTarget::Prev => prev.map(Path::to_path_buf).ok_or_else(|| {
+            crate::i18n::t("이전 디렉터리 없음", "No previous directory").to_string()
+        }),
         CdTarget::Path(p) => {
             let p = &drive_root(p, cfg!(windows));
             let full = join_raw(cwd, p);
@@ -695,5 +698,20 @@ mod drive_tests {
         for p in ["D:\\x", "DD:", "1:", "x"] {
             assert_eq!(drive_root(Path::new(p), true), PathBuf::from(p));
         }
+    }
+
+    #[test]
+    fn cd_errors_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let cwd = Path::new("/");
+            assert_eq!(
+                resolve_cd(cwd, &CdTarget::Home, None, None).unwrap_err(),
+                "Home directory unknown"
+            );
+            assert_eq!(
+                resolve_cd(cwd, &CdTarget::Prev, None, None).unwrap_err(),
+                "No previous directory"
+            );
+        });
     }
 }

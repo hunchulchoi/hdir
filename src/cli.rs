@@ -55,12 +55,15 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Cli, Stri
         } else if text == "-V" || text == "--version" {
             return Ok(Cli::Version);
         } else if text == "--cwd-file" {
-            let v = args.next().ok_or("--cwd-file: 경로가 필요함")?;
+            let v = args.next().ok_or_else(cwd_file_needs_path)?;
             set_cwd_file(&mut opts, v)?;
         } else if text.starts_with("--cwd-file=") {
             set_cwd_file(&mut opts, value_after_eq(&arg, "--cwd-file=".len()))?;
         } else {
-            return Err(format!("알 수 없는 옵션: {text}"));
+            return Err(crate::tr!(
+                "알 수 없는 옵션: {text}",
+                "Unknown option: {text}"
+            ));
         }
     }
     Ok(Cli::Run(opts))
@@ -80,19 +83,29 @@ fn value_after_eq(arg: &OsString, skip: usize) -> OsString {
     }
 }
 
+fn cwd_file_needs_path() -> String {
+    crate::tr!("--cwd-file: 경로가 필요함", "--cwd-file: path required")
+}
+
 fn set_start(opts: &mut Options, v: OsString) -> Result<(), String> {
     if opts.start_dir.replace(PathBuf::from(v)).is_some() {
-        return Err("시작 디렉터리는 하나만 지정할 수 있음".into());
+        return Err(crate::tr!(
+            "시작 디렉터리는 하나만 지정할 수 있음",
+            "Only one start directory allowed"
+        ));
     }
     Ok(())
 }
 
 fn set_cwd_file(opts: &mut Options, v: OsString) -> Result<(), String> {
     if v.is_empty() {
-        return Err("--cwd-file: 경로가 필요함".into());
+        return Err(cwd_file_needs_path());
     }
     if opts.cwd_file.replace(PathBuf::from(v)).is_some() {
-        return Err("--cwd-file은 한 번만 지정할 수 있음".into());
+        return Err(crate::tr!(
+            "--cwd-file은 한 번만 지정할 수 있음",
+            "--cwd-file can only be given once"
+        ));
     }
     Ok(())
 }
@@ -137,7 +150,10 @@ fn create_temp(next: &mut dyn FnMut() -> PathBuf) -> io::Result<(PathBuf, std::f
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "임시 파일 이름을 정하지 못함",
+        crate::i18n::t(
+            "임시 파일 이름을 정하지 못함",
+            "Could not pick a temporary file name",
+        ),
     ))
 }
 
@@ -327,5 +343,15 @@ mod tests {
         );
         assert!(start_dir(Some(&raw(&base, "missing/.."))).is_err());
         assert!(start_dir(Some(&base.join("real/file"))).is_err());
+    }
+
+    #[test]
+    fn parse_errors_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let e = super::parse_args(["--bogus".into()]).unwrap_err();
+            assert_eq!(e, "Unknown option: --bogus");
+            let e = super::parse_args(["a".into(), "b".into()]).unwrap_err();
+            assert_eq!(e, "Only one start directory allowed");
+        });
     }
 }

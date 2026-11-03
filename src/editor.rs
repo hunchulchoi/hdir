@@ -10,6 +10,10 @@ pub type EditResult = Result<(), String>;
 /// Runs an argv (program first) to completion; tests inject fakes.
 pub type EditorRunner = Arc<dyn Fn(&[OsString]) -> EditResult + Send + Sync>;
 
+fn unclosed_quote() -> &'static str {
+    crate::i18n::t("닫히지 않은 따옴표", "Unclosed quote")
+}
+
 /// Split `s` with POSIX shell-words rules: whitespace separates, `\` escapes
 /// outside quotes, `'...'` is literal, `"..."` honors `\"` `\\` `\$` `` \` ``.
 /// On Windows a `\` is always literal (see [`split_words`]).
@@ -34,7 +38,11 @@ pub fn split_words(s: &str, escapes: bool) -> Result<Vec<String>, String> {
                 }
             }
             '\\' if escapes => {
-                cur.push(chars.next().ok_or("끝에 남은 역슬래시")?);
+                cur.push(
+                    chars.next().ok_or_else(|| {
+                        crate::i18n::t("끝에 남은 역슬래시", "Trailing backslash")
+                    })?,
+                );
                 started = true;
             }
             '\'' => {
@@ -43,7 +51,7 @@ pub fn split_words(s: &str, escapes: bool) -> Result<Vec<String>, String> {
                     match chars.next() {
                         Some('\'') => break,
                         Some(c) => cur.push(c),
-                        None => return Err("닫히지 않은 따옴표".into()),
+                        None => return Err(unclosed_quote().into()),
                     }
                 }
             }
@@ -58,10 +66,10 @@ pub fn split_words(s: &str, escapes: bool) -> Result<Vec<String>, String> {
                                 cur.push('\\');
                                 cur.push(e);
                             }
-                            None => return Err("닫히지 않은 따옴표".into()),
+                            None => return Err(unclosed_quote().into()),
                         },
                         Some(c) => cur.push(c),
-                        None => return Err("닫히지 않은 따옴표".into()),
+                        None => return Err(unclosed_quote().into()),
                     }
                 }
             }
@@ -92,7 +100,8 @@ pub fn editor_argv(
         (None, Some(e)) => ("EDITOR", e),
         (None, None) => ("EDITOR", if cfg!(windows) { "notepad" } else { "vi" }),
     };
-    let words = split_command(spec).map_err(|e| format!("${name} 해석 실패: {e}"))?;
+    let words = split_command(spec)
+        .map_err(|e| crate::tr!("${name} 해석 실패: {e}", "Could not parse ${name}: {e}"))?;
     let mut argv: Vec<OsString> = words.into_iter().map(OsString::from).collect();
     argv.push(path.as_os_str().to_os_string());
     Ok(argv)
@@ -100,17 +109,31 @@ pub fn editor_argv(
 
 /// Spawn `argv[0]` with the rest as arguments and wait for it.
 pub fn run_argv(argv: &[OsString]) -> EditResult {
-    let (prog, args) = argv.split_first().ok_or("편집기 명령이 비어 있음")?;
+    let (prog, args) = argv
+        .split_first()
+        .ok_or_else(|| crate::i18n::t("편집기 명령이 비어 있음", "Editor command is empty"))?;
     let status = std::process::Command::new(prog)
         .args(args)
         .status()
-        .map_err(|e| format!("편집기 실행 실패: {} ({e})", prog.to_string_lossy()))?;
+        .map_err(|e| {
+            crate::tr!(
+                "편집기 실행 실패: {} ({e})",
+                "Could not run editor: {} ({e})",
+                prog.to_string_lossy()
+            )
+        })?;
     if status.success() {
         Ok(())
     } else {
         match status.code() {
-            Some(c) => Err(format!("편집기가 오류로 종료됨 (종료 코드 {c})")),
-            None => Err("편집기가 신호로 종료됨".to_string()),
+            Some(c) => Err(crate::tr!(
+                "편집기가 오류로 종료됨 (종료 코드 {c})",
+                "Editor exited with an error (exit code {c})"
+            )),
+            None => Err(
+                crate::i18n::t("편집기가 신호로 종료됨", "Editor was killed by a signal")
+                    .to_string(),
+            ),
         }
     }
 }
@@ -216,5 +239,13 @@ mod tests {
         let missing = run_argv(&["/no/such/editor-xyz".into()]).unwrap_err();
         assert!(missing.contains("실행 실패"), "{missing}");
         assert!(run_argv(&[]).is_err());
+    }
+
+    #[test]
+    fn editor_errors_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            assert_eq!(split_command("a 'b").unwrap_err(), "Unclosed quote");
+            assert_eq!(run_argv(&[]).unwrap_err(), "Editor command is empty");
+        });
     }
 }
