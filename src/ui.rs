@@ -228,13 +228,13 @@ fn title_for(panel: &Panel, width: usize) -> String {
         Location::Remote(sess) => {
             let mut t = format!("{}:{}", sess.name, panel.cwd.to_string_lossy());
             if !sess.is_alive() {
-                t.push_str(" [끊김]");
+                t.push_str(crate::i18n::t(" [끊김]", " [disconnected]"));
             }
             t
         }
     };
     if panel.loading.is_some() {
-        s.push_str(" 읽는 중…");
+        s.push_str(crate::i18n::t(" 읽는 중…", " Loading…"));
     }
     tail_width(&s, width)
 }
@@ -392,9 +392,9 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool,
     } else {
         theme.border
     };
-    let mut title = "휴지통".to_string();
+    let mut title = crate::i18n::t("휴지통", "Trash").to_string();
     if tv.loading {
-        title.push_str(" 읽는 중…");
+        title.push_str(crate::i18n::t(" 읽는 중…", " Loading…"));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -448,25 +448,27 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool,
 
 fn trash_status(tv: &TrashView) -> String {
     if tv.loading {
-        return "읽는 중…".to_string();
+        return crate::i18n::t("읽는 중…", "Loading…").to_string();
     }
     let place = match tv.current() {
         Some(e) => match e.original_path() {
-            Some(p) => format!("원래 위치: {} · ", tilde(&p)),
-            None => "원래 위치: 알 수 없음 · ".to_string(),
+            Some(p) => crate::tr!("원래 위치: {} · ", "Original: {} · ", tilde(&p)),
+            None => crate::i18n::t("원래 위치: 알 수 없음 · ", "Original: unknown · ").to_string(),
         },
         None => String::new(),
     };
-    let mut s = format!("{place}휴지통 {}개", tv.entries.len());
+    let n = tv.entries.len();
+    let mut s = crate::tr!("{place}휴지통 {n}개", "{place}{n} in trash");
     if !tv.selected.is_empty() {
-        s.push_str(&format!(" · 선택 {}개", tv.selected.len()));
+        let k = tv.selected.len();
+        s.push_str(&crate::tr!(" · 선택 {k}개", " · {k} selected"));
     }
     s
 }
 
 fn default_status(panel: &Panel) -> String {
     if panel.loading.is_some() {
-        return "읽는 중…".to_string();
+        return crate::i18n::t("읽는 중…", "Loading…").to_string();
     }
     let dirs = panel.entries.iter().filter(|e| is_dirlike(e)).count();
     let files = panel
@@ -673,15 +675,18 @@ pub fn draw(frame: &mut Frame, view: &View) {
 fn preview_lines(p: &Preview) -> Vec<String> {
     match p {
         Preview::Text { lines, .. } => lines.clone(),
-        Preview::Binary {
-            kind: "특수 파일",
-        ..
-        } => vec!["특수 파일".to_string()],
-        Preview::Binary { size, kind } => {
-            vec![format!("바이너리 파일 ({kind}, {})", human_size(*size))]
+        Preview::Binary { kind, .. } if *kind == crate::preview::special_file_kind() => {
+            vec![kind.to_string()]
         }
-        Preview::Empty => vec!["빈 파일".to_string()],
-        Preview::Error(e) => vec![format!("오류: {e}")],
+        Preview::Binary { size, kind } => {
+            vec![crate::tr!(
+                "바이너리 파일 ({kind}, {})",
+                "Binary file ({kind}, {})",
+                human_size(*size)
+            )]
+        }
+        Preview::Empty => vec![crate::i18n::t("빈 파일", "Empty file").to_string()],
+        Preview::Error(e) => vec![crate::tr!("오류: {e}", "Error: {e}")],
         Preview::Info(m) => vec![m.clone()],
         Preview::Dir {
             files,
@@ -691,14 +696,23 @@ fn preview_lines(p: &Preview) -> Vec<String> {
             errors,
         } => {
             let mut v = vec![
-                format!("폴더 {dirs}개, 파일 {files}개"),
-                format!("총 크기 {}", human_size(*total_size)),
+                crate::tr!(
+                    "폴더 {dirs}개, 파일 {files}개",
+                    "{dirs} folders, {files} files"
+                ),
+                crate::tr!("총 크기 {}", "Total size {}", human_size(*total_size)),
             ];
             if *errors > 0 {
-                v.push(format!("읽지 못함 {errors}개"));
+                v.push(crate::tr!("읽지 못함 {errors}개", "{errors} unreadable"));
             }
             if *truncated {
-                v.push("일부만 집계됨 (항목이 너무 많음)".to_string());
+                v.push(
+                    crate::i18n::t(
+                        "일부만 집계됨 (항목이 너무 많음)",
+                        "Partial count (too many entries)",
+                    )
+                    .to_string(),
+                );
             }
             v
         }
@@ -708,7 +722,7 @@ fn preview_lines(p: &Preview) -> Vec<String> {
 /// The Dev-mode preview area.
 fn draw_preview(frame: &mut Frame, area: Rect, pv: Option<&PreviewView>, theme: &Theme) {
     let base = Style::default().fg(theme.fg).bg(theme.preview_bg);
-    let mut title = " 미리보기".to_string();
+    let mut title = crate::i18n::t(" 미리보기", " Preview").to_string();
     if let Some(pv) = pv {
         if !pv.title.is_empty() {
             title.push_str(": ");
@@ -718,7 +732,7 @@ fn draw_preview(frame: &mut Frame, area: Rect, pv: Option<&PreviewView>, theme: 
             truncated: true, ..
         }) = pv.body
         {
-            title.push_str(" · 잘림");
+            title.push_str(crate::i18n::t(" · 잘림", " · truncated"));
         }
     }
     title.push(' ');
@@ -735,7 +749,10 @@ fn draw_preview(frame: &mut Frame, area: Rect, pv: Option<&PreviewView>, theme: 
     let w = inner.width as usize;
     let (text, style) = match pv.body {
         PreviewBody::Idle => return,
-        PreviewBody::Loading => (vec!["읽는 중…".to_string()], base),
+        PreviewBody::Loading => (
+            vec![crate::i18n::t("읽는 중…", "Loading…").to_string()],
+            base,
+        ),
         PreviewBody::Ready(p @ Preview::Error(_)) => (preview_lines(p), base.fg(theme.error)),
         PreviewBody::Ready(p) => (preview_lines(p), base),
     };
@@ -1941,5 +1958,77 @@ mod tilde_tests {
         );
         assert_eq!(tilde_with(Path::new("/home/ab"), Some(home)), "/home/ab");
         assert_eq!(tilde_with(Path::new("/srv"), None), "/srv");
+    }
+}
+
+#[cfg(test)]
+mod en_tests {
+    use super::*;
+    use crate::i18n::{Lang, with_lang};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn english_preview_lines() {
+        with_lang(Lang::En, || {
+            assert_eq!(
+                preview_lines(&Preview::Binary {
+                    size: 5,
+                    kind: "ELF executable"
+                }),
+                ["Binary file (ELF executable, 5B)"]
+            );
+            assert_eq!(
+                preview_lines(&Preview::Binary {
+                    size: 0,
+                    kind: crate::preview::special_file_kind()
+                }),
+                ["Special file"]
+            );
+            assert_eq!(preview_lines(&Preview::Empty), ["Empty file"]);
+            assert_eq!(
+                preview_lines(&Preview::Error("boom".into())),
+                ["Error: boom"]
+            );
+            let dir = preview_lines(&Preview::Dir {
+                files: 3,
+                dirs: 2,
+                total_size: 10,
+                truncated: true,
+                errors: 1,
+            });
+            assert_eq!(dir[0], "2 folders, 3 files");
+            assert!(dir[1].starts_with("Total size "));
+            assert_eq!(dir[2], "1 unreadable");
+            assert_eq!(dir[3], "Partial count (too many entries)");
+        });
+    }
+
+    #[test]
+    fn english_preview_panel_title_and_binary_label_render() {
+        with_lang(Lang::En, || {
+            let th = crate::theme::builtin("mdir").unwrap();
+            let p = Preview::Binary {
+                size: 5,
+                kind: "ELF executable",
+            };
+            let pv = PreviewView {
+                title: "a.out".into(),
+                body: PreviewBody::Ready(&p),
+            };
+            let mut t = Terminal::new(TestBackend::new(50, 6)).unwrap();
+            t.draw(|f| draw_preview(f, f.area(), Some(&pv), &th))
+                .unwrap();
+            let buf = t.backend().buffer().clone();
+            let r: Vec<String> = (0..6u16)
+                .map(|y| (0..50u16).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            assert!(r[0].contains(" Preview: a.out "), "{:?}", r[0]);
+            assert!(
+                r[1].contains("Binary file (ELF executable, 5B)"),
+                "{:?}",
+                r[1]
+            );
+        });
     }
 }

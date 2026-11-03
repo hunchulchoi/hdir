@@ -12,6 +12,7 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::i18n::t;
 use crate::keymap::Action;
 use crate::preview::Preview;
 use crate::theme::Theme;
@@ -119,12 +120,16 @@ impl Viewer {
                 self.max_width = lines.iter().map(|l| l.width()).max().unwrap_or(0);
                 Content::Text { lines, truncated }
             }
-            Preview::Binary { size, kind } => {
-                Content::Message(format!("바이너리 파일 ({kind}, {})", human_size(size)))
+            Preview::Binary { size, kind } => Content::Message(crate::tr!(
+                "바이너리 파일 ({kind}, {})",
+                "Binary file ({kind}, {})",
+                human_size(size)
+            )),
+            Preview::Empty => Content::Message(t("빈 파일", "Empty file").to_string()),
+            Preview::Dir { .. } => {
+                Content::Message(t("디렉터리는 볼 수 없음", "Cannot view a directory").to_string())
             }
-            Preview::Empty => Content::Message("빈 파일".to_string()),
-            Preview::Dir { .. } => Content::Message("디렉터리는 볼 수 없음".to_string()),
-            Preview::Error(e) => Content::Message(format!("오류: {e}")),
+            Preview::Error(e) => Content::Message(crate::tr!("오류: {e}", "Error: {e}")),
             Preview::Info(m) => Content::Message(m),
         };
     }
@@ -191,7 +196,7 @@ impl Viewer {
                 self.scroll = idx.min(self.max_scroll());
                 self.notice = None;
             }
-            None => self.notice = Some(format!("찾을 수 없음: {q}")),
+            None => self.notice = Some(crate::tr!("찾을 수 없음: {q}", "Not found: {q}")),
         }
     }
 
@@ -225,7 +230,7 @@ impl Viewer {
         let n = (self.scroll + 1).min(lines.len());
         let mut s = format!("{n}/{}", lines.len());
         if *truncated {
-            s.push_str(" · 잘림");
+            s.push_str(t(" · 잘림", " · truncated"));
         }
         s
     }
@@ -348,7 +353,10 @@ pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str
                 lines.push(Line::styled(row, style));
             }
         }
-        Content::Loading => lines.push(Line::styled(fit_width(" 읽는 중…", w), base)),
+        Content::Loading => lines.push(Line::styled(
+            fit_width(t(" 읽는 중…", " Loading…"), w),
+            base,
+        )),
         Content::Message(m) => lines.push(Line::styled(fit_width(&format!(" {m}"), w), base)),
     }
     if h >= 2 {
@@ -721,5 +729,64 @@ mod tests {
         draw(&mut v, 3, 2);
         draw(&mut v, 1, 1);
         draw(&mut v, 0, 0);
+    }
+}
+
+#[cfg(test)]
+mod en_tests {
+    use super::*;
+    use crate::i18n::{Lang, with_lang};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn draw(v: &mut Viewer, w: u16, h: u16) -> Vec<String> {
+        let th = crate::theme::builtin("mdir").unwrap();
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render(f, v, &th, "Esc/q/F3/F10: close"))
+            .unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn english_footer_hint_loading_and_truncated_header() {
+        with_lang(Lang::En, || {
+            let mut v = Viewer::loading(PathBuf::from("/tmp/a.txt"));
+            let r = draw(&mut v, 40, 5);
+            assert!(r[1].starts_with(" Loading…"), "{:?}", r[1]);
+            assert!(r[4].starts_with(" Esc/q/F3/F10: close"), "{:?}", r[4]);
+            v.set_preview(Preview::Text {
+                lines: vec!["a".into(), "b".into()],
+                truncated: true,
+            });
+            let r = draw(&mut v, 40, 5);
+            assert!(r[0].contains("1/2 · truncated"), "{:?}", r[0]);
+        });
+    }
+
+    #[test]
+    fn english_messages_and_not_found() {
+        with_lang(Lang::En, || {
+            let mut v = Viewer::loading(PathBuf::from("/x"));
+            v.set_preview(Preview::Binary {
+                size: 5,
+                kind: "ELF executable",
+            });
+            assert_eq!(
+                v.content,
+                Content::Message("Binary file (ELF executable, 5B)".into())
+            );
+            v.set_preview(Preview::Empty);
+            assert_eq!(v.content, Content::Message("Empty file".into()));
+            v.set_preview(Preview::Text {
+                lines: vec!["abc".into()],
+                truncated: false,
+            });
+            v.query = Some("zzz".into());
+            v.apply(Action::SearchNext);
+            assert_eq!(v.notice.as_deref(), Some("Not found: zzz"));
+        });
     }
 }

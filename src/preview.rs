@@ -5,6 +5,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
+use crate::i18n::t;
+
 pub const MAX_BYTES: usize = 64 * 1024;
 pub const MAX_LINES: usize = 200;
 const DIR_LIMIT: usize = 10_000;
@@ -60,7 +62,7 @@ pub fn preview_path_with(path: &Path, limits: Limits) -> Preview {
         Ok(m) => m,
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_ok() {
-                return Preview::Error("깨진 링크".to_string());
+                return Preview::Error(t("깨진 링크", "Broken link").to_string());
             }
             return Preview::Error(e.to_string());
         }
@@ -78,7 +80,7 @@ pub fn preview_path_with(path: &Path, limits: Limits) -> Preview {
         // fifo / socket / device: opening could block forever or have side effects
         return Preview::Binary {
             size: meta.len(),
-            kind: "특수 파일",
+            kind: special_file_kind(),
         };
     }
     let mut buf = Vec::new();
@@ -99,24 +101,33 @@ fn binary_kind(b: &[u8]) -> &'static str {
         [0xCA, 0xFE, 0xBA, 0xBE],
     ];
     if b.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "PNG 이미지"
+        t("PNG 이미지", "PNG image")
     } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        "JPEG 이미지"
+        t("JPEG 이미지", "JPEG image")
     } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
-        "GIF 이미지"
+        t("GIF 이미지", "GIF image")
     } else if b.starts_with(b"%PDF-") {
-        "PDF 문서"
+        t("PDF 문서", "PDF document")
     } else if b.starts_with(b"PK\x03\x04") {
-        "ZIP 압축"
+        t("ZIP 압축", "ZIP archive")
     } else if b.starts_with(&[0x1f, 0x8b]) {
-        "GZIP 압축"
+        t("GZIP 압축", "GZIP archive")
     } else if b.starts_with(b"\x7fELF") {
-        "ELF 실행파일"
+        t("ELF 실행파일", "ELF executable")
     } else if MACHO.iter().any(|m| b.starts_with(m)) {
-        "Mach-O 실행파일"
+        t("Mach-O 실행파일", "Mach-O executable")
     } else {
-        "바이너리"
+        generic_kind()
     }
+}
+
+/// The `kind` of a fifo, socket or device.
+pub fn special_file_kind() -> &'static str {
+    t("특수 파일", "Special file")
+}
+
+fn generic_kind() -> &'static str {
+    t("바이너리", "Binary")
 }
 
 fn clean_line(line: &str) -> String {
@@ -142,7 +153,7 @@ pub fn classify_with(bytes: &[u8], file_size: u64, limits: Limits) -> Preview {
         } else {
             Preview::Binary {
                 size: file_size,
-                kind: "바이너리",
+                kind: generic_kind(),
             }
         };
     }
@@ -151,7 +162,7 @@ pub fn classify_with(bytes: &[u8], file_size: u64, limits: Limits) -> Preview {
         size: file_size,
         kind,
     };
-    if kind != "바이너리" || bytes[..bytes.len().min(8192)].contains(&0) {
+    if kind != generic_kind() || bytes[..bytes.len().min(8192)].contains(&0) {
         return binary;
     }
     // Cut at limits.max_bytes, extending over continuation bytes of a split char.
@@ -537,5 +548,25 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod en_tests {
+    use super::*;
+    use crate::i18n::{Lang, with_lang};
+
+    #[test]
+    fn english_binary_kinds() {
+        with_lang(Lang::En, || {
+            let kind = |p: Preview| match p {
+                Preview::Binary { kind, .. } => kind,
+                o => panic!("{o:?}"),
+            };
+            assert_eq!(kind(classify(b"\x7fELF\0\0", 6)), "ELF executable");
+            assert_eq!(kind(classify(b"%PDF-1.4", 8)), "PDF document");
+            assert_eq!(kind(classify(b"ab\0cd", 5)), "Binary");
+            assert_eq!(special_file_kind(), "Special file");
+        });
     }
 }

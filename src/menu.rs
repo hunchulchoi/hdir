@@ -209,3 +209,40 @@ mod tests {
         draw(&menu(0), 40, 10);
     }
 }
+
+#[cfg(test)]
+mod en_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn english_menu_box_is_sized_and_aligned() {
+        let th = crate::theme::builtin("mdir").unwrap();
+        let m = Menu::new(
+            "Menu",
+            vec!["Reload config".into(), "Key settings".into()],
+            0,
+        );
+        let mut t = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        t.draw(|f| render(f, f.area(), &m, &th)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let row = |y: u16| (0..60u16).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let rows: Vec<String> = (0..10).map(row).collect();
+        let top = rows.iter().position(|r| r.contains("┌")).unwrap();
+        assert!(rows[top].contains(" Menu "), "{:?}", rows[top]);
+        assert!(
+            rows[top + 1].contains("│ Reload config"),
+            "{:?}",
+            rows[top + 1]
+        );
+        assert!(
+            rows[top + 2].contains("│ Key settings"),
+            "{:?}",
+            rows[top + 2]
+        );
+        assert!(rows[top + 3].contains("└"));
+        let c = |r: &str, ch: char| r.chars().position(|x| x == ch).unwrap();
+        assert_eq!(c(&rows[top], '┌'), c(&rows[top + 3], '└'));
+    }
+}
