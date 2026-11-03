@@ -2165,6 +2165,7 @@ impl App {
             | Action::ScrollRight
             | Action::Expand
             | Action::Collapse
+            | Action::ToggleMarkdown
             | Action::Search
             | Action::SearchNext => {}
         }

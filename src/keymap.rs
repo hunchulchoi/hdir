@@ -62,6 +62,8 @@ pub enum Action {
     History,
     /// The directory tree view (Alt+F10).
     Tree,
+    /// Viewer: formatted Markdown / its source.
+    ToggleMarkdown,
     /// Tree: open / close the folder under the cursor.
     Expand,
     Collapse,
@@ -299,6 +301,7 @@ const MDIR_VIEWER: &[(Action, &[&str])] = &[
     (A::ScrollRight, &["Right"]),
     (A::Search, &["/"]),
     (A::SearchNext, &["n"]),
+    (A::ToggleMarkdown, &["m"]),
     (A::Edit, &["F4"]),
     (A::Help, &["F1"]),
     (A::Quit, &["Esc", "q", "F3", "F10"]),
