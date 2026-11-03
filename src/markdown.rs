@@ -111,8 +111,9 @@ struct Builder {
     italic: usize,
     strike: usize,
     heading: Option<u8>,
-    /// Targets of the open links / images.
-    links: Vec<String>,
+    /// Targets of the open links / images, and where their text starts
+    /// (segment index, byte offset in it) in the current inline buffer.
+    links: Vec<(String, usize, usize)>,
     in_image: usize,
     code: Option<String>,
     table: Option<Table>,
@@ -164,6 +165,19 @@ impl Builder {
             bold: self.bold > 0 || matches!(kind, Kind::Heading(_)),
             italic: self.italic > 0,
             strike: self.strike > 0,
+        }
+    }
+
+    /// Where the next text goes in the current buffer: (segment, offset).
+    fn text_mark(&self) -> (usize, usize) {
+        let target = if self.table.is_some() {
+            &self.cell
+        } else {
+            &self.inline
+        };
+        match target.last() {
+            Some((t, _)) => (target.len() - 1, t.len()),
+            None => (0, 0),
         }
     }
 
@@ -397,9 +411,13 @@ impl Builder {
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
-            Tag::Link { dest_url, .. } => self.links.push(dest_url.to_string()),
+            Tag::Link { dest_url, .. } => {
+                let at = self.text_mark();
+                self.links.push((dest_url.to_string(), at.0, at.1));
+            }
             Tag::Image { dest_url, .. } => {
-                self.links.push(dest_url.to_string());
+                let at = self.text_mark();
+                self.links.push((dest_url.to_string(), at.0, at.1));
                 self.in_image += 1;
                 self.push_text(crate::i18n::t("[그림: ", "[image: "), Kind::Marker);
             }
@@ -490,17 +508,27 @@ impl Builder {
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
             TagEnd::Strikethrough => self.strike = self.strike.saturating_sub(1),
             TagEnd::Link => {
-                let url = self.links.pop().unwrap_or_default();
-                let text = match self.table {
-                    Some(_) => plain(&self.cell),
-                    None => plain(&self.inline),
+                let (url, seg, off) = self.links.pop().unwrap_or_default();
+                // only the link's own text (never the whole paragraph)
+                let target = if self.table.is_some() {
+                    &self.cell
+                } else {
+                    &self.inline
                 };
-                if !url.is_empty() && !text.ends_with(&url) {
+                let mut text = String::new();
+                for (i, (t, _)) in target.iter().enumerate().skip(seg) {
+                    text.push_str(if i == seg {
+                        t.get(off..).unwrap_or("")
+                    } else {
+                        t
+                    });
+                }
+                if !url.is_empty() && text != url {
                     self.push_text(&format!(" ({url})"), Kind::Url);
                 }
             }
             TagEnd::Image => {
-                let url = self.links.pop().unwrap_or_default();
+                let (url, ..) = self.links.pop().unwrap_or_default();
                 self.in_image = self.in_image.saturating_sub(1);
                 self.push_text("] ", Kind::Marker);
                 self.push_text(&url, Kind::Url);
@@ -787,6 +815,24 @@ mod tests {
         let lines = render(&head, 80);
         let widest = lines.iter().map(|l| plain(l).width()).max().unwrap();
         assert!(widest <= TABLE_MAX_WIDTH + 4, "{widest}");
+    }
+
+    #[test]
+    fn many_links_in_one_paragraph_render_quickly() {
+        let src = "[x](u) ".repeat(50_000);
+        let start = std::time::Instant::now();
+        let lines = render(&src, 80);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(plain(&lines[0]).starts_with("x (u) x (u)"));
+        // a bare link is not repeated after its text
+        assert_eq!(
+            text("<https://a.b> and [https://c.d](https://c.d)", 80),
+            ["https://a.b and https://c.d"]
+        );
     }
 
     #[test]
