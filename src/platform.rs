@@ -1424,3 +1424,175 @@ mod verbatim_tests {
         );
     }
 }
+
+// ---- POSIX ACLs in transfers ----
+
+/// Whether anything in the tree at `path` (links not followed) has a POSIX
+/// ACL. Linux only; elsewhere ACLs never narrow the mode bits, so `false`.
+/// An unreadable entry, or Esc, counts as yes.
+pub fn tree_has_posix_acl(path: &Path, cancel: &std::sync::atomic::AtomicBool) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::atomic::Ordering;
+        let names = [c"system.posix_acl_access", c"system.posix_acl_default"];
+        let mut todo = vec![path.to_path_buf()];
+        while let Some(q) = todo.pop() {
+            if cancel.load(Ordering::Relaxed) {
+                return true;
+            }
+            let Ok(m) = fs::symlink_metadata(&q) else {
+                return true;
+            };
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(c) = xattr_sys::cpath(&q) else {
+                return true;
+            };
+            for n in names {
+                match xattr_sys::get(xattr_sys::On::Path(&c), n) {
+                    Ok(_) => return true,
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::ENODATA | libc::ENOTSUP)) => {}
+                    Err(_) => return true,
+                }
+            }
+            if m.is_dir() {
+                let Ok(rd) = fs::read_dir(&q) else {
+                    return true;
+                };
+                for e in rd {
+                    let Ok(e) = e else { return true };
+                    todo.push(e.path());
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, cancel);
+        false
+    }
+}
+
+/// Remove group and other permissions from everything in the tree at
+/// `path` (links not followed). Nothing to do off unix.
+pub fn strip_group_other(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut todo = vec![path.to_path_buf()];
+        while let Some(q) = todo.pop() {
+            let m = fs::symlink_metadata(&q)?;
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            let mode = m.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                fs::set_permissions(&q, fs::Permissions::from_mode(mode & !0o077))?;
+            }
+            if m.is_dir() {
+                for e in fs::read_dir(&q)? {
+                    todo.push(e?.path());
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// A POSIX ACL value giving `uid` read access and the owning group none,
+/// as `setfacl -m u:<uid>:r--,g::---` would store it.
+#[cfg(all(test, target_os = "linux"))]
+pub fn test_acl_value(uid: u32) -> Vec<u8> {
+    let undef = u32::MAX;
+    // (tag, perm, id): USER_OBJ rw, USER r, GROUP_OBJ none, MASK r, OTHER none
+    let entries = [
+        (1u16, 6u16, undef),
+        (2, 4, uid),
+        (4, 0, undef),
+        (0x10, 4, undef),
+        (0x20, 0, undef),
+    ];
+    let mut v = 2u32.to_le_bytes().to_vec();
+    for (t, p, id) in entries {
+        v.extend(t.to_le_bytes());
+        v.extend(p.to_le_bytes());
+        v.extend(id.to_le_bytes());
+    }
+    v
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub fn set_test_acl(path: &Path) -> io::Result<()> {
+    let c = xattr_sys::cpath(path)?;
+    xattr_sys::set(
+        xattr_sys::On::Path(&c),
+        c"system.posix_acl_access",
+        &test_acl_value(65534),
+    )
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[cfg(unix)]
+    #[test]
+    fn strip_group_other_makes_the_tree_private_and_skips_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("f"), "x").unwrap();
+        fs::set_permissions(d.join("f"), fs::Permissions::from_mode(0o4755)).unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o775)).unwrap();
+        let outside = t.path().join("outside");
+        fs::write(&outside, "o").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("l")).unwrap();
+        strip_group_other(&d).unwrap();
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode(&d), 0o700);
+        assert_eq!(mode(&d.join("f")), 0o4700);
+        assert_eq!(mode(&outside), 0o644, "a link's target is left alone");
+    }
+
+    #[test]
+    fn a_plain_tree_has_no_acl() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("d")).unwrap();
+        fs::write(t.path().join("d/f"), "x").unwrap();
+        assert!(!tree_has_posix_acl(
+            &t.path().join("d"),
+            &AtomicBool::new(false)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_acl_deep_inside_is_found() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("d/e")).unwrap();
+        fs::write(t.path().join("d/e/f"), "x").unwrap();
+        if set_test_acl(&t.path().join("d/e/f")).is_err() {
+            eprintln!("no ACL support here, skipped");
+            return;
+        }
+        assert!(tree_has_posix_acl(
+            &t.path().join("d"),
+            &AtomicBool::new(false)
+        ));
+        // cancelled: unknown, so yes
+        assert!(tree_has_posix_acl(
+            &t.path().join("d"),
+            &AtomicBool::new(true)
+        ));
+    }
+}
