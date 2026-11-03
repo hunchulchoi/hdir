@@ -1425,6 +1425,38 @@ mod verbatim_tests {
     }
 }
 
+// ---- disk space ----
+
+/// `(available to this user, total)` bytes of the filesystem holding
+/// `path`. Blocking (a network mount can stall): call off the UI thread.
+#[cfg(unix)]
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `st` is plain data; statvfs only writes into it.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid out pointer.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let unit = st.f_frsize as u64;
+    Some((
+        (st.f_bavail as u64).saturating_mul(unit),
+        (st.f_blocks as u64).saturating_mul(unit),
+    ))
+}
+
+#[cfg(windows)]
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: a NUL-terminated wide path and valid out pointers.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    (ok != 0).then_some((avail, total))
+}
+
 // ---- POSIX ACLs in transfers ----
 
 /// Whether anything in the tree at `path` (links not followed) has an ACL:
@@ -1619,6 +1651,14 @@ mod acl_tests {
         assert_eq!(mode(&d), 0o700);
         assert_eq!(mode(&d.join("f")), 0o4700);
         assert_eq!(mode(&outside), 0o644, "a link's target is left alone");
+    }
+
+    #[test]
+    fn disk_space_of_a_real_folder_and_a_missing_one() {
+        let t = tempfile::tempdir().unwrap();
+        let (free, total) = disk_space(t.path()).expect("space");
+        assert!(total > 0 && free <= total, "{free} {total}");
+        assert_eq!(disk_space(&t.path().join("missing")), None);
     }
 
     #[test]

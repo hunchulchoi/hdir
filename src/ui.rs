@@ -54,6 +54,8 @@ pub struct View<'a> {
     pub fkeys: &'a [(String, String)],
     /// The open `:` line as (text, cursor char index).
     pub cmdline: Option<(&'a str, usize)>,
+    /// Now, for the Classic info bar's date and clock.
+    pub now: Option<crate::clock::LocalTime>,
 }
 
 /// F-key bar slots: the action each slot stands for and its label.
@@ -83,6 +85,27 @@ const TRASH_BAR: [Option<(Action, &str)>; 10] = [
     Some((Action::Cancel, "Back")),
     Some((Action::Quit, "Quit")),
 ];
+
+/// A bar label in the screen language (Mdir's own words in Korean).
+fn bar_label(l: &str) -> &str {
+    use crate::i18n::t;
+    match l {
+        "Help" => t("도움", "Help"),
+        "Rename" => t("이름", "Rename"),
+        "View" => t("보기", "View"),
+        "Edit" => t("편집", "Edit"),
+        "Copy" => t("복사", "Copy"),
+        "Move" => t("이동", "Move"),
+        "Mkdir" => t("새폴더", "Mkdir"),
+        "Del" => t("삭제", "Del"),
+        "Menu" => t("메뉴", "Menu"),
+        "Quit" => t("종료", "Quit"),
+        "Restore" => t("복원", "Restore"),
+        "Purge" => t("삭제", "Purge"),
+        "Back" => t("뒤로", "Back"),
+        other => other,
+    }
+}
 
 /// The key to show for `action`: a plain F-key if bound (shown as its number),
 /// else the shortest binding. `None` when the action has no key.
@@ -118,7 +141,7 @@ pub fn fkey_bar(km: &Keymap, ctx: Context) -> Vec<(String, String)> {
         .map(|(i, slot)| match slot {
             None => ((i + 1).to_string(), String::new()),
             Some((action, label)) => match key_label(km, ctx, *action) {
-                Some(k) => (k, (*label).to_string()),
+                Some(k) => (k, bar_label(label).to_string()),
                 None => (String::new(), String::new()),
             },
         })
@@ -317,8 +340,22 @@ fn draw_panel(
         .style(Style::default().fg(theme.fg).bg(theme.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let w = inner.width as usize;
-    let mut rows = inner.height as usize;
+    let lines = panel_lines(panel, active, assoc, theme, inner, false);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The visible entry rows of `panel` in `area`, plus its error on the last
+/// row. `classic`: Mdir columns (selection by color), else name + size.
+fn panel_lines(
+    panel: &Panel,
+    active: bool,
+    assoc: &AssocTable,
+    theme: &Theme,
+    area: Rect,
+    classic: bool,
+) -> Vec<Line<'static>> {
+    let w = area.width as usize;
+    let mut rows = area.height as usize;
     let err_row = panel.error.is_some() && rows > 0;
     if err_row {
         rows -= 1;
@@ -334,10 +371,18 @@ fn draw_panel(
             let sel = panel.selected.contains(&e.os_name);
             let has_rule = e.kind == EntryKind::File && assoc.find(&e.os_name).is_some();
             let mut style = entry_style(e, sel, has_rule, theme);
+            if classic && sel {
+                style = style.add_modifier(Modifier::BOLD);
+            }
             if active && i == panel.cursor {
                 style = style.bg(theme.cursor_bg).fg(theme.cursor_fg);
             }
-            Line::from(Span::styled(row_text(e, sel, w), style))
+            let text = if classic {
+                crate::classic::row_local(e, w)
+            } else {
+                row_text(e, sel, w)
+            };
+            Line::from(Span::styled(text, style))
         })
         .collect();
     if let (true, Some(err)) = (err_row, &panel.error) {
@@ -349,7 +394,7 @@ fn draw_panel(
             Style::default().fg(theme.error).bg(theme.bg),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines
 }
 
 const TIME_W: usize = 16;
@@ -403,8 +448,13 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool,
         .style(Style::default().fg(theme.fg).bg(theme.bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let w = inner.width as usize;
-    let mut rows = inner.height as usize;
+    frame.render_widget(Paragraph::new(trash_lines(tv, active, theme, inner)), inner);
+}
+
+/// The visible rows of a trash view in `area`, plus its error.
+fn trash_lines(tv: &TrashView, active: bool, theme: &Theme, area: Rect) -> Vec<Line<'static>> {
+    let w = area.width as usize;
+    let mut rows = area.height as usize;
     let err_row = tv.error.is_some() && rows > 0;
     if err_row {
         rows -= 1;
@@ -443,7 +493,7 @@ fn draw_trash_panel(frame: &mut Frame, area: Rect, tv: &TrashView, active: bool,
             Style::default().fg(theme.error).bg(theme.bg),
         )));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    lines
 }
 
 fn trash_status(tv: &TrashView) -> String {
@@ -577,11 +627,17 @@ pub fn layout(mode: Mode, area: Rect) -> Areas {
 
 /// Visible entry rows inside a panel for a terminal of `total_height` rows.
 pub fn panel_rows(mode: Mode, total_height: u16) -> usize {
+    if mode == Mode::Classic {
+        return total_height.saturating_sub(CLASSIC_FIXED) as usize;
+    }
     let body = total_height.saturating_sub(fixed_rows(mode));
     body_split(mode, body).0.saturating_sub(2) as usize
 }
 
 pub fn draw(frame: &mut Frame, view: &View) {
+    if view.mode == Mode::Classic {
+        return draw_classic(frame, view);
+    }
     let area = frame.area();
     let theme = view.theme;
     let areas = layout(view.mode, area);
@@ -764,8 +820,395 @@ fn draw_preview(frame: &mut Frame, area: Rect, pv: Option<&PreviewView>, theme: 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+// ---- Classic (Mdir) screen ----
+
+/// Rows of the Classic screen, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassicAreas {
+    /// F2-F9 bar.
+    pub fkeys: Rect,
+    /// Each panel's path.
+    pub path: Rect,
+    pub top_line: Rect,
+    /// The lists (each with its scroll bar).
+    pub body: Rect,
+    pub bottom_line: Rect,
+    /// Counts and free space, a message, or the `:` line.
+    pub status: Rect,
+    /// The current entry, today, the clock, F1 / F10.
+    pub info: Rect,
+}
+
+/// Rows around the Classic body.
+const CLASSIC_FIXED: u16 = 6;
+
+pub fn classic_areas(area: Rect) -> ClassicAreas {
+    let r = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    ClassicAreas {
+        fkeys: r[0],
+        path: r[1],
+        top_line: r[2],
+        body: r[3],
+        bottom_line: r[4],
+        status: r[5],
+        info: r[6],
+    }
+}
+
+/// The two panel columns of a row.
+fn halves(r: Rect) -> [Rect; 2] {
+    let left = r.width / 2;
+    [
+        Rect { width: left, ..r },
+        Rect {
+            x: r.x + left,
+            width: r.width - left,
+            ..r
+        },
+    ]
+}
+
+/// `rwxr-xr-x` of the low nine mode bits.
+pub fn mode_text(mode: u32) -> String {
+    let mut s = String::with_capacity(9);
+    for shift in [6, 3, 0] {
+        let b = (mode >> shift) & 7;
+        s.push(if b & 4 != 0 { 'r' } else { '-' });
+        s.push(if b & 2 != 0 { 'w' } else { '-' });
+        s.push(if b & 1 != 0 { 'x' } else { '-' });
+    }
+    s
+}
+
+/// What the current entry is, Mdir-style ("압축파일", "폴더", ...).
+pub fn kind_text(e: &Entry, theme: &Theme) -> &'static str {
+    use crate::i18n::t;
+    match e.kind {
+        EntryKind::Parent => return t("상위폴더", "Parent"),
+        EntryKind::Dir => return t("폴더", "Folder"),
+        EntryKind::Symlink { .. } => return t("링크", "Link"),
+        _ => {}
+    }
+    match theme.group_for_ext(&e.name).map(|g| g.name.as_str()) {
+        Some("archive") => t("압축파일", "Archive"),
+        Some("image") => t("그림파일", "Image"),
+        Some("doc") => t("문서", "Document"),
+        Some("code") => t("소스", "Source"),
+        Some("script") => t("배치파일", "Script"),
+        Some("exec") => t("실행파일", "Program"),
+        Some("binary") => t("바이너리", "Binary"),
+        _ if e.kind == EntryKind::File && e.mode & 0o111 != 0 => t("실행파일", "Program"),
+        _ => t("파일", "File"),
+    }
+}
+
+/// Status row: `16 File  5 Dir  19,973,961 Byte.` and, for a local panel,
+/// the free space; with a selection, its count and size instead.
+pub fn classic_status(panel: &Panel) -> String {
+    use crate::clock::group_digits;
+    if panel.loading.is_some() {
+        return crate::i18n::t("읽는 중…", "Loading…").to_string();
+    }
+    let real = || panel.entries.iter().filter(|e| e.kind != EntryKind::Parent);
+    let mut s = if panel.selected.is_empty() {
+        let dirs = real().filter(|e| is_dirlike(e)).count();
+        let files: Vec<&Entry> = real().filter(|e| !is_dirlike(e)).collect();
+        let bytes: u64 = files.iter().map(|e| e.size).sum();
+        format!(
+            "{} File  {dirs} Dir  {} Byte.",
+            files.len(),
+            group_digits(bytes)
+        )
+    } else {
+        let sel: Vec<&Entry> = real()
+            .filter(|e| panel.selected.contains(&e.os_name))
+            .collect();
+        let bytes: u64 = sel.iter().filter(|e| !is_dirlike(e)).map(|e| e.size).sum();
+        format!("{} Selected  {} Byte.", sel.len(), group_digits(bytes))
+    };
+    if let (Location::Local, Some((free, total))) = (&panel.location, panel.space) {
+        let pct = (free as u128 * 100).checked_div(total as u128).unwrap_or(0);
+        s.push_str(&format!(
+            "  {}({pct}%)byte free. ({})",
+            group_digits(free),
+            human_size(free)
+        ));
+    }
+    s
+}
+
+/// The bottom bar: the current entry's kind, date, time and mode, today and
+/// the clock, then the F1 / F10 slots.
+fn info_line(view: &View, entry: Option<&Entry>, width: usize, theme: &Theme) -> Line<'static> {
+    let bar = Style::default()
+        .fg(theme.fkey_label_fg)
+        .bg(theme.fkey_label_bg);
+    let key = Style::default()
+        .fg(theme.fkey_num_fg)
+        .bg(theme.fkey_label_bg);
+    let sep = Style::default().fg(theme.bg).bg(theme.fkey_label_bg);
+    let mut left: Vec<String> = Vec::new();
+    if let Some(e) = entry {
+        left.push(kind_text(e, theme).to_string());
+        let when = (e.kind != EntryKind::Parent)
+            .then_some(e.modified)
+            .flatten()
+            .and_then(|t| crate::clock::local(crate::clock::unix_secs(t)));
+        if let Some(l) = when {
+            left.push(l.short_date());
+            left.push(format!("{:02}:{:02}", l.hour, l.minute));
+        }
+        if e.kind != EntryKind::Parent {
+            left.push(mode_text(e.mode));
+        }
+    }
+    if let Some(now) = view.now {
+        left.push(now.short_date());
+        left.push(now.weekday_name().to_string());
+        left.push(format!("{}m", now.short_time()));
+    }
+    // F1 and F10, as `F1=도움`
+    let hint = |i: usize| {
+        view.fkeys
+            .get(i)
+            .filter(|(k, l)| !k.is_empty() && !l.is_empty())
+            .map(|(k, l)| {
+                let k = if k.chars().all(|c| c.is_ascii_digit()) {
+                    format!("F{k}")
+                } else {
+                    k.clone()
+                };
+                (k, format!("={l}"))
+            })
+    };
+    let hints: Vec<(String, String)> = [hint(0), hint(9)].into_iter().flatten().collect();
+    let hints_w: usize = hints.iter().map(|(k, l)| 1 + k.width() + l.width()).sum();
+    let mut spans = Vec::new();
+    let mut used = 0;
+    let room = width.saturating_sub(hints_w);
+    for part in left {
+        let piece = format!(" {part} ");
+        if used + piece.width() + 1 > room {
+            break;
+        }
+        used += piece.width() + 1;
+        spans.push(Span::styled(piece, bar));
+        spans.push(Span::styled("│", sep));
+    }
+    spans.push(Span::styled(" ".repeat(room.saturating_sub(used)), bar));
+    used = room.saturating_sub(used) + used;
+    for (k, l) in hints {
+        if used + 1 + k.width() + l.width() > width {
+            break;
+        }
+        used += 1 + k.width() + l.width();
+        spans.push(Span::styled("│", sep));
+        spans.push(Span::styled(k, key));
+        spans.push(Span::styled(l, bar));
+    }
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), bar));
+    Line::from(spans)
+}
+
+/// Mdir's top bar: `2이름│3보기│…`, each slot a number and its label
+/// with a divider between slots.
+fn classic_fkey_line(width: usize, keys: &[(String, String)], theme: &Theme) -> Line<'static> {
+    let label = Style::default()
+        .fg(theme.fkey_label_fg)
+        .bg(theme.fkey_label_bg);
+    let num = Style::default()
+        .fg(theme.fkey_num_fg)
+        .bg(theme.fkey_label_bg);
+    let sep = Style::default().fg(theme.bg).bg(theme.fkey_label_bg);
+    let n = keys.len().max(1);
+    let slot = width / n;
+    let mut spans = Vec::new();
+    for (i, (k, l)) in keys.iter().enumerate() {
+        let last = i + 1 == keys.len();
+        let w = if last { width - slot * i } else { slot };
+        // the divider takes the slot's last cell
+        let body = if last { w } else { w.saturating_sub(1) };
+        let key_w = k.width().min(body);
+        spans.push(Span::styled(fit_width(k, key_w), num));
+        spans.push(Span::styled(fit_width(l, body - key_w), label));
+        if !last && w > 0 {
+            spans.push(Span::styled("│", sep));
+        }
+    }
+    Line::from(spans)
+}
+
+/// A one-column scroll bar: ▲ / ▼ ends and a thumb at the list position.
+fn draw_scrollbar(
+    frame: &mut Frame,
+    r: Rect,
+    total: usize,
+    offset: usize,
+    rows: usize,
+    theme: &Theme,
+) {
+    let h = r.height as usize;
+    if h == 0 || r.width == 0 {
+        return;
+    }
+    let track = Style::default().fg(theme.fkey_label_fg).bg(theme.border);
+    let arrow = Style::default().fg(theme.fkey_num_fg).bg(theme.border);
+    let mut cells: Vec<Line> = vec![Line::from(Span::styled(" ", track)); h];
+    if h >= 3 {
+        cells[0] = Line::from(Span::styled("▲", arrow));
+        cells[h - 1] = Line::from(Span::styled("▼", arrow));
+        let inner = h - 2;
+        if total > rows && inner > 0 {
+            let size = (inner * rows / total).clamp(1, inner);
+            let span = total - rows;
+            let pos = ((inner - size) * offset.min(span))
+                .checked_div(span)
+                .unwrap_or(0);
+            for c in cells.iter_mut().skip(1 + pos).take(size) {
+                *c = Line::from(Span::styled("█", track));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(cells), r);
+}
+
+fn hline(width: u16, theme: &Theme) -> Paragraph<'static> {
+    Paragraph::new("─".repeat(width as usize)).style(Style::default().fg(theme.border).bg(theme.bg))
+}
+
+/// The Classic (Mdir) screen.
+fn draw_classic(frame: &mut Frame, view: &View) {
+    let area = frame.area();
+    let theme = view.theme;
+    let a = classic_areas(area);
+    let w = area.width as usize;
+
+    let top: Vec<(String, String)> = view.fkeys.iter().skip(1).take(8).cloned().collect();
+    frame.render_widget(Paragraph::new(classic_fkey_line(w, &top, theme)), a.fkeys);
+
+    let path_style = Style::default().fg(theme.status_fg).bg(theme.status_bg);
+    for (i, r) in halves(a.path).into_iter().enumerate() {
+        let label = crate::i18n::t("경로 ", "Path ");
+        let room = (r.width as usize).saturating_sub(label.width() + 1);
+        let place = match view.trash[i] {
+            Some(_) => crate::i18n::t("휴지통", "Trash").to_string(),
+            None => title_for(view.panels[i], room),
+        };
+        let mut style = path_style;
+        if i == view.active {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        frame.render_widget(
+            Paragraph::new(fit_width(&format!(" {label}{place}"), r.width as usize)).style(style),
+            r,
+        );
+    }
+    frame.render_widget(hline(area.width, theme), a.top_line);
+    frame.render_widget(hline(area.width, theme), a.bottom_line);
+
+    let rows = a.body.height as usize;
+    for (i, r) in halves(a.body).into_iter().enumerate() {
+        let pt = view.panel_themes[i];
+        let list = Rect {
+            width: r.width.saturating_sub(1),
+            ..r
+        };
+        let bar = Rect {
+            x: r.x + list.width,
+            width: r.width - list.width,
+            ..r
+        };
+        let active = view.active == i;
+        let (lines, total, cursor, scroll) = match view.trash[i] {
+            Some(tv) => (
+                trash_lines(tv, active, pt, list),
+                tv.entries.len(),
+                tv.cursor,
+                tv.scroll,
+            ),
+            None => {
+                let p = view.panels[i];
+                (
+                    panel_lines(p, active, view.assoc, pt, list, true),
+                    p.entries.len(),
+                    p.cursor,
+                    p.scroll,
+                )
+            }
+        };
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().fg(pt.fg).bg(pt.bg)),
+            list,
+        );
+        draw_scrollbar(
+            frame,
+            bar,
+            total,
+            visible_offset(cursor, scroll, rows),
+            rows,
+            theme,
+        );
+    }
+
+    let active = view.active.min(1);
+    let (avail, line, cursor_col) = cmdline_window(view, a.status.width as usize, 1, ": ");
+    let _ = avail;
+    let status = match (view.status, view.trash[active]) {
+        _ if view.cmdline.is_some() => format!(": {line}"),
+        (Some(s), _) => s.to_string(),
+        (None, Some(tv)) => trash_status(tv),
+        (None, None) => classic_status(view.panels[active]),
+    };
+    frame.render_widget(
+        Paragraph::new(fit_width(&format!(" {status}"), w))
+            .style(Style::default().fg(theme.status_fg).bg(theme.status_bg)),
+        a.status,
+    );
+    let current = match view.trash[active] {
+        Some(_) => None,
+        None => view.panels[active].current(),
+    };
+    frame.render_widget(Paragraph::new(info_line(view, current, w, theme)), a.info);
+    if view.cmdline.is_some() {
+        let x = 1 + UnicodeWidthStr::width(": ") + cursor_col;
+        let x = a.status.x + (x as u16).min(a.status.width.saturating_sub(1));
+        frame.set_cursor_position((x, a.status.y));
+    }
+}
+
+/// The visible part of the `:` line in a row `width` wide that starts with
+/// `lead` cells and `prompt`: (room, text, cursor column within the text).
+fn cmdline_window(view: &View, width: usize, lead: usize, prompt: &str) -> (usize, String, usize) {
+    let avail = width.saturating_sub(lead + UnicodeWidthStr::width(prompt));
+    let (line, col) = view.cmdline.map_or((String::new(), 0), |(v, c)| {
+        let start = crate::dialog::input_window_start(v, c, avail);
+        let before: usize = v
+            .chars()
+            .skip(start)
+            .take(c.saturating_sub(start))
+            .map(|ch| ch.width().unwrap_or(0))
+            .sum();
+        (v.chars().skip(start).collect(), before)
+    });
+    (avail, line, col)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Layout of the tests that check the shared list styles: the boxed
+    /// panels (Dev). Classic has its own tests below.
+    const BOXED: Mode = Mode::Dev;
     use super::*;
     use crate::keymap::{Context, Keymap};
     use ratatui::Terminal;
@@ -844,6 +1287,18 @@ mod tests {
     }
 
     fn render(a: &Panel, b: &Panel, active: usize, status: Option<&str>, w: u16, h: u16) -> Buffer {
+        render_in(BOXED, a, b, active, status, w, h)
+    }
+
+    fn render_in(
+        mode: Mode,
+        a: &Panel,
+        b: &Panel,
+        active: usize,
+        status: Option<&str>,
+        w: u16,
+        h: u16,
+    ) -> Buffer {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         let view = View {
             panels: [a, b],
@@ -852,13 +1307,14 @@ mod tests {
             shell: "zsh",
             assoc: &AssocTable::default(),
             os: "macos",
-            mode: Mode::Classic,
+            mode,
             preview: None,
             trash: [None, None],
             theme: &th(),
             panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -882,6 +1338,7 @@ mod tests {
             panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: Some((text, cursor)),
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         let pos = t.get_cursor_position().unwrap();
@@ -947,14 +1404,25 @@ mod tests {
     fn draw_basic_layout() {
         let (a, b) = setup();
         let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
-        let buf = render(&pa, &pb, 0, None, 100, 24);
+        let buf = crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            render_in(Mode::Classic, &pa, &pb, 0, None, 100, 24)
+        });
         let all: String = (0..24).map(|y| row(&buf, y)).collect();
-        assert!(row(&buf, 0).contains("hdir"));
-        assert!(all.contains("<DIR>"));
-        assert!(all.contains("<UP-DIR>"));
-        assert!(row(&buf, 23).contains("Copy"));
-        assert!(row(&buf, 23).contains("Quit"));
-        assert!(row(&buf, 22).contains("2 files · 1 dirs"));
+        // F2-F9 on top, F1 / F10 at the bottom
+        assert!(row(&buf, 0).contains("5Copy") && !row(&buf, 0).contains("Quit"));
+        assert!(row(&buf, 1).starts_with(" Path "), "{}", row(&buf, 1));
+        assert!(row(&buf, 2).starts_with("──"));
+        assert!(all.contains("[ SubDir ]"));
+        assert!(all.contains("[ UpDir ]"));
+        assert!(row(&buf, 21).starts_with("──"));
+        assert!(
+            row(&buf, 22).starts_with(" 2 File  1 Dir  10 Byte."),
+            "{}",
+            row(&buf, 22)
+        );
+        assert!(row(&buf, 22).contains("byte free."), "{}", row(&buf, 22));
+        assert!(row(&buf, 23).contains("F1=Help"), "{}", row(&buf, 23));
+        assert!(row(&buf, 23).ends_with("F10=Quit"), "{}", row(&buf, 23));
     }
 
     #[test]
@@ -988,9 +1456,12 @@ mod tests {
         let mut pa = Panel::new(a.path());
         pa.error = Some("boom failure".into());
         let pb = Panel::new(b.path());
-        let buf = render(&pa, &pb, 0, Some("custom msg"), 80, 24);
-        assert!(row(&buf, 22).contains("custom msg"));
-        assert!(row(&buf, 20).contains("boom failure"));
+        for mode in [Mode::Classic, BOXED] {
+            let buf = render_in(mode, &pa, &pb, 0, Some("custom msg"), 80, 24);
+            assert!(row(&buf, 22).contains("custom msg"), "{mode:?}");
+            let last = if mode == Mode::Classic { 20 } else { 13 };
+            assert!(row(&buf, last).contains("boom failure"), "{mode:?}");
+        }
     }
 
     fn fixed_panel(cwd: &str, names: &[(&str, EntryKind, u64)]) -> Panel {
@@ -1025,6 +1496,7 @@ mod tests {
             error: None,
             loading: None,
             reload_after_load: false,
+            space: None,
         }
     }
 
@@ -1040,33 +1512,44 @@ mod tests {
         );
         pa.selected.insert("b.bin".into());
         let pb = fixed_panel("/tmp/b", &[("docs", EntryKind::Dir, 0)]);
-        let buf = render(&pa, &pb, 0, None, 60, 12);
+        let buf = crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            render_in(Mode::Classic, &pa, &pb, 0, None, 60, 12)
+        });
         let got: Vec<String> = (0..12).map(|y| row(&buf, y)).collect();
         let expected = [
-            format!(" ■ hdir {} · zsh · macos · UTF-8", crate::VERSION),
-            "┌/tmp/a──────────────────────┐┌/tmp/b──────────────────────┐".to_string(),
-            "│ ..                 <UP-DIR>││ ..                 <UP-DIR>│".to_string(),
-            "│ src                   <DIR>││ docs                  <DIR>│".to_string(),
-            "│ a.txt                    5B││                            │".to_string(),
-            "│*b.bin                  1.5K││                            │".to_string(),
-            "│                            ││                            │".to_string(),
-            "│                            ││                            │".to_string(),
-            "│                            ││                            │".to_string(),
-            "└────────────────────────────┘└────────────────────────────┘".to_string(),
-            " 2 files · 1 dirs".to_string(),
-            "1Help 2Rena…3View 4Edit 5Copy 6Move 7Mkdir8Del  9Menu 10Quit".to_string(),
+            "2Rena…│3View │4Edit │5Copy │6Move │7Mkdir│8Del  │9Menu",
+            " Path /tmp/a                   Path /tmp/b",
+            &"─".repeat(60),
+            "..                  [ UpDir ]▲..                  [ UpDir ]▲",
+            "src                [ SubDir ] docs               [ SubDir ]",
+            "a              txt          5",
+            "b              bin      1,536",
+            "",
+            "                             ▼                             ▼",
+            &"─".repeat(60),
+            " 1 Selected  1,536 Byte.",
+            " Parent │                                  │F1=Help│F10=Quit",
         ]
-        .map(|l| fit_width(&l, 60));
+        .map(|l| fit_width(l, 60));
         assert_eq!(got.join("\n"), expected.join("\n"));
 
-        // active cursor row, directory, and selected styles
-        assert_eq!(buf[(2, 2)].bg, th().cursor_bg);
-        assert_eq!(buf[(2, 2)].fg, th().cursor_fg);
-        assert_eq!(buf[(2, 3)].fg, th().dir);
-        assert_eq!(buf[(2, 3)].bg, th().bg);
-        assert_eq!(buf[(2, 5)].fg, th().selected);
-        // inactive panel has no cursor background
-        assert_ne!(buf[(32, 2)].bg, th().cursor_bg);
+        // cursor row, folder, selection and the scroll bar
+        assert_eq!(buf[(2, 3)].bg, th().cursor_bg);
+        assert_eq!(buf[(2, 3)].fg, th().cursor_fg);
+        assert_eq!(buf[(2, 4)].fg, th().dir);
+        assert_eq!(buf[(2, 4)].bg, th().bg);
+        assert_eq!(buf[(0, 6)].fg, th().selected);
+        assert!(buf[(0, 6)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(29, 5)].bg, th().border, "scroll bar track");
+        assert_eq!(buf[(29, 3)].fg, th().fkey_num_fg, "scroll bar arrow");
+        // only the active panel has a cursor row
+        assert_ne!(buf[(32, 3)].bg, th().cursor_bg);
+        // bars: cyan key bar with yellow numbers, gray path and status
+        assert_eq!(buf[(0, 0)].fg, th().fkey_num_fg);
+        assert_eq!(buf[(1, 0)].bg, th().fkey_label_bg);
+        assert_eq!(buf[(3, 1)].bg, th().status_bg);
+        assert_eq!(buf[(3, 10)].bg, th().status_bg);
+        assert_eq!(buf[(5, 2)].fg, th().border, "cyan line");
     }
 
     // ---- HDIR-21/22/23: theme-driven colors ----
@@ -1098,13 +1581,14 @@ mod tests {
             shell: "zsh",
             assoc: &AssocTable::default(),
             os: "macos",
-            mode: Mode::Classic,
+            mode: BOXED,
             preview: None,
             trash: [None, None],
             theme: if active == 0 { ta } else { tb },
             panel_themes: [ta, tb],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -1156,13 +1640,14 @@ mod tests {
             shell: "zsh",
             assoc,
             os: "macos",
-            mode: Mode::Classic,
+            mode: BOXED,
             preview: None,
             trash: [None, None],
             theme,
             panel_themes: [theme, theme],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -1198,7 +1683,7 @@ mod tests {
             &[
                 ("a.zip", EntryKind::File, 1),
                 ("b.TXT", EntryKind::File, 1),
-                ("c.bin", EntryKind::File, 1),
+                ("c.xyz", EntryKind::File, 1),
                 ("noext", EntryKind::File, 1),
             ],
         );
@@ -1207,7 +1692,7 @@ mod tests {
         assert_eq!(name_fg(&buf, 1), Color::Rgb(0xFF, 0x55, 0xFF), "archive");
         assert_eq!(
             name_fg(&buf, 2),
-            Color::Rgb(0x55, 0xFF, 0xFF),
+            Color::Rgb(0xFF, 0xFF, 0xFF),
             "doc, case-insensitive"
         );
         assert_eq!(name_fg(&buf, 3), theme.file, "unknown ext");
@@ -1319,6 +1804,7 @@ mod tests {
         let mut theme = th();
         let pa = fixed_panel("/tmp/a", &[("sub", EntryKind::Dir, 0)]);
         let pb = fixed_panel("/tmp/b", &[]);
+        theme.dir_bold = true;
         let buf = render_themed(&pa, &pb, &theme);
         assert!(buf[(2, 3)].modifier.contains(Modifier::BOLD));
         theme.dir_bold = false;
@@ -1347,7 +1833,12 @@ mod tests {
         crate::keymap::build(&cfg).0
     }
 
+    /// The bar with its English labels.
     fn bar(km: &Keymap, ctx: Context) -> Vec<(String, String)> {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || bar_ko(km, ctx))
+    }
+
+    fn bar_ko(km: &Keymap, ctx: Context) -> Vec<(String, String)> {
         fkey_bar(km, ctx)
     }
 
@@ -1407,7 +1898,7 @@ mod tests {
         let km = km_with("[bind]\ncopy = [\"c\"]\n");
         let pa = fixed_panel("/tmp/a", &[]);
         let pb = fixed_panel("/tmp/b", &[]);
-        let fkeys = fkey_bar(&km, Context::Panel);
+        let fkeys = crate::i18n::with_lang(crate::i18n::Lang::En, || fkey_bar(&km, Context::Panel));
         let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let view = View {
             panels: [&pa, &pb],
@@ -1416,13 +1907,14 @@ mod tests {
             shell: "zsh",
             assoc: &AssocTable::default(),
             os: "macos",
-            mode: Mode::Classic,
+            mode: BOXED,
             preview: None,
             trash: [None, None],
             theme: &th(),
             panel_themes: [&th(), &th()],
             fkeys: &fkeys,
             cmdline: None,
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         let row11 = row(t.backend().buffer(), 11);
@@ -1441,8 +1933,15 @@ mod tests {
         .unwrap();
         let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
         let buf = render(&pa, &pb, 0, None, 80, 24);
-        for y in 2..21 {
+        for y in 2..14 {
             assert_eq!(buf[(39, y)].symbol(), "│", "row {y}: {}", row(&buf, y));
+        }
+        // Classic: every list row ends right before the scroll bar
+        let buf = render_in(Mode::Classic, &pa, &pb, 0, None, 80, 24);
+        for y in 3..21 {
+            let r = cells(&buf, y, 0, 40);
+            assert_eq!(r.width(), 40, "row {y}: {r}");
+            assert_eq!(buf[(39, y)].bg, th().border, "scroll bar at row {y}");
         }
     }
 
@@ -1456,37 +1955,23 @@ mod tests {
             kind: crate::panel::LoadKind::Enter,
         });
         let pb = fixed_panel("/tmp/b", &[("docs", EntryKind::Dir, 0)]);
-        let buf = render(&pa, &pb, 0, None, 60, 12);
+        let buf = render_in(Mode::Classic, &pa, &pb, 0, None, 60, 12);
         let got: Vec<String> = (0..12).map(|y| row(&buf, y)).collect();
         // Wide glyphs leave blank continuation cells in the buffer.
-        let expected = [
-            format!(" ■ hdir {} · zsh · macos · UTF-8", crate::VERSION),
-            "┌/tmp/a 읽 는  중 …─────────────┐┌/tmp/b──────────────────────┐".to_string(),
-            "│ ..                 <UP-DIR>││ ..                 <UP-DIR>│".to_string(),
-            "│ src                   <DIR>││ docs                  <DIR>│".to_string(),
-            "│                            ││                            │".to_string(),
-            "│                            ││                            │".to_string(),
-            "│                            ││                            │".to_string(),
-            "│                            ││                            │".to_string(),
-            "│                            ││                            │".to_string(),
-            "└────────────────────────────┘└────────────────────────────┘".to_string(),
-            " 읽 는  중 …".to_string(),
-            "1Help 2Rena…3View 4Edit 5Copy 6Move 7Mkdir8Del  9Menu 10Quit".to_string(),
-        ]
-        .map(|l| format!("{l:<60}"));
-        assert_eq!(got.join("\n"), expected.join("\n"));
-
-        // Marker styles: title in the active border colors, status bar colors.
-        for x in [8, 10, 13, 15] {
-            assert_eq!(buf[(x, 1)].fg, th().border_active, "title x={x}");
-            assert_eq!(buf[(x, 1)].bg, th().bg, "title x={x}");
-        }
-        for x in [1, 3, 6, 8] {
-            assert_eq!(buf[(x, 10)].fg, th().status_fg, "status x={x}");
-            assert_eq!(buf[(x, 10)].bg, th().status_bg, "status x={x}");
-        }
-        // The idle panel carries no marker.
-        assert!(!row(&buf, 1).chars().skip(30).any(|c| c == '읽'));
+        assert_eq!(
+            got[1],
+            " 경 로  /tmp/a 읽 는  중 …          경 로  /tmp/b                  "
+        );
+        assert!(got[10].starts_with(" 읽 는  중 …"), "{}", got[10]);
+        assert!(
+            got[4].starts_with("src"),
+            "the old listing stays: {}",
+            got[4]
+        );
+        // the active panel's path is bold, the idle one carries no marker
+        assert!(buf[(1, 1)].modifier.contains(Modifier::BOLD));
+        assert!(!buf[(31, 1)].modifier.contains(Modifier::BOLD));
+        assert!(!got[1].chars().skip(30).any(|c| c == '읽'));
     }
 
     // ---- HDIR-62: trash view ----
@@ -1526,13 +2011,14 @@ mod tests {
             shell: "zsh",
             assoc: &AssocTable::default(),
             os: "macos",
-            mode: Mode::Classic,
+            mode: BOXED,
             preview: None,
             trash: [Some(tv), None],
             theme: &th(),
             panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Trash),
             cmdline: None,
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()
@@ -1580,10 +2066,11 @@ mod tests {
         );
         assert_eq!(left_half(&buf, 5), format!("│{}│", " ".repeat(38)));
         let keys = trow(&buf, 23);
-        for want in ["5Restore", "8Purge", "EscBack", "10Quit"] {
+        for want in ["5복원", "8삭제", "Esc뒤로", "10종료"] {
             assert!(keys.contains(want), "{want} missing in {keys}");
         }
-        assert!(!keys.contains("Copy") && !keys.contains("Mkdir"));
+        assert!(!keys.contains("복사") && !keys.contains("새폴더"));
+        assert!(!keys.contains('…'), "{keys}");
         // the other half is a normal panel
         assert!(cells(&buf, 2, 40, 80).contains(".."));
     }
@@ -1633,7 +2120,7 @@ mod tests {
         v.error = Some("휴지통 접근 권한 없음".into());
         let buf = render_trash(&v, 0, 80);
         assert!(!left_half(&buf, 1).contains("읽는 중"));
-        assert!(left_half(&buf, 20).contains("휴지통 접근 권한 없음"));
+        assert!(left_half(&buf, 13).contains("휴지통 접근 권한 없음"));
         assert!(trow(&buf, 22).contains("휴지통 0개"));
     }
 
@@ -1672,6 +2159,7 @@ mod tests {
             panel_themes: [&th(), &th()],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         rows_of(t.backend().buffer())
@@ -1680,24 +2168,24 @@ mod tests {
     #[test]
     fn classic_layout_has_no_preview_or_command_row() {
         let rows = render_mode(Mode::Classic, 100, 30);
-        assert!(rows[0].contains("hdir"));
-        assert!(rows[1].starts_with('┌'));
-        assert!(rows[28].contains("files"), "status: {:?}", rows[28]);
-        assert!(rows[29].contains("Copy"));
-        assert!(
-            rows[27].starts_with('└'),
-            "panels run down to the status row"
-        );
+        // (wide characters are followed by a blank filler cell)
+        let packed = |i: usize| rows[i].replace(' ', "");
+        assert!(packed(0).contains("5복사"), "{:?}", rows[0]);
+        assert!(packed(1).starts_with("경로"), "{:?}", rows[1]);
+        assert!(rows[2].starts_with("──") && rows[27].starts_with("──"));
+        assert!(rows[28].contains("File"), "status: {:?}", rows[28]);
+        assert!(packed(29).contains("F1=도움"), "{:?}", rows[29]);
         assert!(!rows.iter().any(|r| r.starts_with("> ")));
         assert!(!rows.iter().any(|r| r.contains("미리보기")));
-        let a = layout(Mode::Classic, Rect::new(0, 0, 100, 30));
-        assert_eq!((a.preview, a.command), (None, None));
-        assert_eq!(a.panels.height, 27);
+        let a = classic_areas(Rect::new(0, 0, 100, 30));
+        assert_eq!((a.body.y, a.body.height), (3, 24));
+        assert_eq!((a.status.y, a.info.y), (28, 29));
     }
 
     #[test]
     fn dev_layout_adds_preview_area_and_command_prompt() {
-        let rows = render_mode(Mode::Dev, 100, 30);
+        let rows =
+            crate::i18n::with_lang(crate::i18n::Lang::En, || render_mode(Mode::Dev, 100, 30));
         assert!(rows[0].contains("hdir"));
         assert!(rows[27].starts_with("> "), "command row: {:?}", rows[27]);
         assert!(rows[28].contains("files"), "status: {:?}", rows[28]);
@@ -1708,7 +2196,7 @@ mod tests {
         assert_eq!(pv.y, a.panels.y + a.panels.height);
         assert_eq!(a.command.unwrap().y, 27);
         assert!(
-            rows[pv.y as usize].replace(' ', "").contains("미리보기"),
+            rows[pv.y as usize].contains("Preview"),
             "{:?}",
             rows[pv.y as usize]
         );
@@ -1719,14 +2207,22 @@ mod tests {
 
     #[test]
     fn panel_rows_follow_the_active_layout() {
-        assert_eq!(panel_rows(Mode::Classic, 24), 19);
+        assert_eq!(panel_rows(Mode::Classic, 24), 18);
         assert_eq!(panel_rows(Mode::Classic, 3), 0);
         assert_eq!(panel_rows(Mode::Classic, 0), 0);
+        for h in 0..80u16 {
+            let a = classic_areas(Rect::new(0, 0, 80, h));
+            assert_eq!(
+                a.body.height as usize,
+                panel_rows(Mode::Classic, h),
+                "h={h}"
+            );
+        }
         assert_eq!(panel_rows(Mode::Dev, 30), 16);
         assert_eq!(panel_rows(Mode::Dev, 0), 0);
         // small terminals drop the preview area but keep the command row
         assert_eq!(panel_rows(Mode::Dev, 14), 14 - 4 - 2);
-        for mode in [Mode::Classic, Mode::Dev] {
+        for mode in [Mode::Dev] {
             for h in 6..80u16 {
                 let a = layout(mode, Rect::new(0, 0, 80, h));
                 assert_eq!(
@@ -1741,6 +2237,201 @@ mod tests {
                     + 2;
                 assert_eq!(used, h, "{mode:?} h={h}: regions tile the screen");
             }
+        }
+    }
+
+    // ---- Classic (Mdir) screen ----
+
+    fn now() -> crate::clock::LocalTime {
+        crate::clock::LocalTime {
+            year: 2026,
+            month: 10,
+            day: 27,
+            hour: 21,
+            minute: 0,
+            weekday: 2,
+        }
+    }
+
+    #[test]
+    fn classic_status_counts_bytes_free_space_and_selection() {
+        let mut p = fixed_panel(
+            "/tmp/a",
+            &[
+                ("d", EntryKind::Dir, 0),
+                ("a.zip", EntryKind::File, 1_000),
+                ("b", EntryKind::File, 234),
+            ],
+        );
+        assert_eq!(classic_status(&p), "2 File  1 Dir  1,234 Byte.");
+        p.space = Some((202_584_666_112, 1_066_235_084_800));
+        assert_eq!(
+            classic_status(&p),
+            "2 File  1 Dir  1,234 Byte.  202,584,666,112(19%)byte free. (188.7G)"
+        );
+        p.selected.insert("a.zip".into());
+        p.selected.insert("d".into());
+        assert!(classic_status(&p).starts_with("2 Selected  1,000 Byte."));
+        p.location =
+            crate::vfs::Location::Remote(std::sync::Arc::new(crate::session::RemoteSession::new(
+                "srv".into(),
+                crate::remote::SshTarget {
+                    host: "h".into(),
+                    port: None,
+                    control_path: PathBuf::new(),
+                },
+                crate::remote::RemoteOs::Linux,
+                crate::remote::ScpMode::Sftp,
+                std::sync::Arc::new(crate::session::SystemCmd),
+            )));
+        assert!(
+            !classic_status(&p).contains("free"),
+            "no local space for a remote panel"
+        );
+    }
+
+    #[test]
+    fn kinds_and_modes_for_the_info_bar() {
+        let t = th();
+        let e = |n: &str, k: EntryKind, mode: u32| Entry {
+            name: n.into(),
+            os_name: n.into(),
+            kind: k,
+            size: 0,
+            modified: None,
+            mode,
+            hidden: false,
+        };
+        assert_eq!(
+            kind_text(&e("a.ZIP", EntryKind::File, 0o644), &t),
+            "압축파일"
+        );
+        assert_eq!(
+            kind_text(&e("a.jpg", EntryKind::File, 0o644), &t),
+            "그림파일"
+        );
+        assert_eq!(kind_text(&e("run", EntryKind::File, 0o755), &t), "실행파일");
+        assert_eq!(kind_text(&e("x", EntryKind::Dir, 0o755), &t), "폴더");
+        assert_eq!(kind_text(&e("..", EntryKind::Parent, 0), &t), "상위폴더");
+        assert_eq!(kind_text(&e("notes", EntryKind::File, 0o600), &t), "파일");
+        let en = crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            kind_text(&e("a.zip", EntryKind::File, 0o644), &t)
+        });
+        assert_eq!(en, "Archive");
+        assert_eq!(mode_text(0o754), "rwxr-xr--");
+        assert_eq!(mode_text(0o4755), "rwxr-xr-x");
+    }
+
+    fn render_classic_now(a: &Panel, b: &Panel, w: u16, h: u16) -> Buffer {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let view = View {
+            panels: [a, b],
+            active: 0,
+            status: None,
+            shell: "zsh",
+            assoc: &AssocTable::default(),
+            os: "macos",
+            mode: Mode::Classic,
+            preview: None,
+            trash: [None, None],
+            theme: &th(),
+            panel_themes: [&th(), &th()],
+            fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
+            cmdline: None,
+            now: Some(now()),
+        };
+        t.draw(|f| draw(f, &view)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    #[test]
+    fn the_info_bar_describes_the_current_entry_and_today() {
+        let mut pa = fixed_panel("/tmp/a", &[("ARJ.ZIP", EntryKind::File, 1)]);
+        pa.cursor = 1;
+        pa.entries[1].mode = 0o644;
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_classic_now(&pa, &pb, 100, 12);
+        let info = cells(&buf, 11, 0, 100);
+        for want in [
+            "압축파일",
+            "rw-r--r--",
+            "26-10-27",
+            "화",
+            "9:00pm",
+            "F1=도움",
+            "F10=종료",
+        ] {
+            assert!(info.contains(want), "{want} missing: {info}");
+        }
+        assert!(info.find("압축파일") < info.find("26-10-27"));
+        assert_eq!(buf[(1, 11)].bg, th().fkey_label_bg);
+        let f1 = info.find("F1").unwrap();
+        // the cell holding `F` of F1
+        let x = (0..100u16).find(|&x| buf[(x, 11)].symbol() == "F").unwrap();
+        assert_eq!(buf[(x, 11)].fg, th().fkey_num_fg, "{f1}");
+        // a narrow bar drops the tail of the left part, never the keys
+        let buf = render_classic_now(&pa, &pb, 50, 12);
+        let info = cells(&buf, 11, 0, 50);
+        assert!(
+            info.contains("F1=도움") && info.contains("F10=종료"),
+            "{info}"
+        );
+        assert!(info.contains("압축파일"), "{info}");
+    }
+
+    #[test]
+    fn the_scroll_bar_thumb_follows_the_list_position() {
+        let names: Vec<String> = (0..60).map(|i| format!("f{i:02}")).collect();
+        let list: Vec<(&str, EntryKind, u64)> = names
+            .iter()
+            .map(|n| (n.as_str(), EntryKind::File, 1))
+            .collect();
+        let mut pa = fixed_panel("/tmp/a", &list);
+        let pb = fixed_panel("/tmp/b", &[]);
+        let thumb = |buf: &Buffer| -> Vec<u16> {
+            (3..21).filter(|&y| buf[(39, y)].symbol() == "█").collect()
+        };
+        let buf = render_in(Mode::Classic, &pa, &pb, 0, None, 80, 24);
+        assert_eq!(buf[(39, 3)].symbol(), "▲");
+        assert_eq!(buf[(39, 20)].symbol(), "▼");
+        let top = thumb(&buf);
+        assert_eq!(top.first(), Some(&4), "{top:?}");
+        pa.cursor = 60;
+        pa.scroll = 60;
+        let bottom = thumb(&render_in(Mode::Classic, &pa, &pb, 0, None, 80, 24));
+        assert_eq!(bottom.last(), Some(&19), "{bottom:?}");
+        assert_eq!(top.len(), bottom.len());
+        // everything fits: no thumb
+        let empty = render_in(Mode::Classic, &pb, &pb, 0, None, 80, 24);
+        assert!(thumb(&empty).is_empty());
+    }
+
+    #[test]
+    fn classic_rows_keep_their_columns_for_korean_names_at_any_size() {
+        let (a, b) = setup();
+        fs::write(
+            a.path().join("아주아주긴한글파일이름입니다아주아주.한글"),
+            "x",
+        )
+        .unwrap();
+        fs::create_dir(a.path().join("한글 폴더 이름이 긴 경우")).unwrap();
+        let (pa, pb) = (Panel::new(a.path()), Panel::new(b.path()));
+        for (w, h) in [(80, 24), (60, 12), (120, 40), (41, 10), (200, 50), (20, 8)] {
+            let buf = render_in(Mode::Classic, &pa, &pb, 0, None, w, h);
+            let half = w / 2;
+            for y in 3..h.saturating_sub(3) {
+                let left = cells(&buf, y, 0, half - 1);
+                assert_eq!(left.width(), (half - 1) as usize, "{w}x{h} row {y}: {left}");
+                assert_eq!(buf[(half - 1, y)].bg, th().border, "{w}x{h} bar at row {y}");
+                assert_eq!(
+                    buf[(w - 1, y)].bg,
+                    th().border,
+                    "{w}x{h} right bar at row {y}"
+                );
+            }
+        }
+        for (w, h) in [(0, 0), (1, 1), (10, 3), (30, 5), (100, 7)] {
+            render_in(Mode::Classic, &pa, &pb, 0, None, w, h);
         }
     }
 
@@ -1819,6 +2510,7 @@ mod tests {
             panel_themes: [theme, theme],
             fkeys: &fkey_bar(&Keymap::preset("mdir").unwrap(), Context::Panel),
             cmdline: None,
+            now: None,
         };
         t.draw(|f| draw(f, &view)).unwrap();
         t.backend().buffer().clone()

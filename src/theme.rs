@@ -152,15 +152,17 @@ impl Theme {
     /// Color for a file name's last extension (case-insensitive); `.tar.gz` -> "gz".
     /// Dotfiles without a further extension (`.zip`) and trailing dots have none.
     pub fn color_for_ext(&self, name: &str) -> Option<Color> {
+        self.group_for_ext(name).map(|g| g.color)
+    }
+
+    /// The first extension group listing `name`'s extension.
+    pub fn group_for_ext(&self, name: &str) -> Option<&ExtGroup> {
         let (stem, ext) = name.rsplit_once('.')?;
         if stem.is_empty() || ext.is_empty() {
             return None;
         }
         let ext = ext.to_lowercase();
-        self.ext_colors
-            .iter()
-            .find(|g| g.exts.contains(&ext))
-            .map(|g| g.color)
+        self.ext_colors.iter().find(|g| g.exts.contains(&ext))
     }
 }
 
@@ -338,8 +340,9 @@ fn parse_group(name: &str, v: &toml::Value) -> Result<ExtGroup, String> {
     })
 }
 
-const BUILTINS: [(&str, &str); 5] = [
+const BUILTINS: [(&str, &str); 6] = [
     ("mdir", include_str!("../themes/mdir.toml")),
+    ("mdir-blue", include_str!("../themes/mdir-blue.toml")),
     ("mdir-red", include_str!("../themes/mdir-red.toml")),
     ("mdir-green", include_str!("../themes/mdir-green.toml")),
     ("dark", include_str!("../themes/dark.toml")),
@@ -567,10 +570,32 @@ mod tests {
     }
 
     #[test]
-    fn mdir_matches_ui_palette() {
-        // Expected values copied from ui.rs `mod palette`.
+    fn mdir_matches_the_dos_mdir_screen() {
         let t = builtin("mdir").unwrap();
         assert_eq!(t.name, "mdir");
+        assert_eq!(t.bg, rgb(0, 0, 0), "black list");
+        assert_eq!(t.border, rgb(0x00, 0xAA, 0xAA), "cyan lines");
+        assert_eq!(t.dir, rgb(0xFF, 0x55, 0x55), "red folders");
+        assert!(!t.dir_bold);
+        assert_eq!(t.cursor_bg, rgb(0xFF, 0x55, 0x55), "red cursor row");
+        assert_eq!(t.cursor_fg, rgb(0xAA, 0x00, 0x00));
+        assert_eq!(t.status_bg, rgb(0xAA, 0xAA, 0xAA), "gray path and status");
+        assert_eq!(t.status_fg, rgb(0, 0, 0));
+        assert_eq!(t.fkey_label_bg, rgb(0x00, 0xAA, 0xAA), "cyan key bar");
+        assert_eq!(t.fkey_num_fg, rgb(0xFF, 0xFF, 0x55), "yellow key numbers");
+        assert_eq!(t.color_for_ext("a.EXE"), Some(rgb(0x55, 0xFF, 0x55)));
+        assert_eq!(t.color_for_ext("a.com"), Some(rgb(0x55, 0xFF, 0xFF)));
+        assert_eq!(t.color_for_ext("a.bat"), Some(rgb(0xFF, 0xFF, 0x55)));
+        assert_eq!(t.color_for_ext("a.zip"), Some(rgb(0xFF, 0x55, 0xFF)));
+        assert_eq!(t.color_for_ext("a.jpg"), Some(rgb(0x55, 0x55, 0xFF)));
+        assert_eq!(t.color_for_ext("a.hwp"), Some(rgb(0xFF, 0xFF, 0xFF)));
+        assert_eq!(t.file, rgb(0xAA, 0xAA, 0xAA), "other files gray");
+    }
+
+    #[test]
+    fn mdir_blue_keeps_the_earlier_look() {
+        let t = builtin("mdir-blue").unwrap();
+        assert_eq!(t.name, "mdir-blue");
         assert_eq!(t.bg, rgb(0x00, 0x00, 0xAA));
         assert_eq!(t.fg, rgb(0xAA, 0xAA, 0xAA));
         assert_eq!(t.border, rgb(0x55, 0xFF, 0xFF));
@@ -660,22 +685,22 @@ mod tests {
     #[test]
     fn ext_group_override_and_add() {
         let src = "[ext_colors.archive]\nexts = [\"ZIP\", \".Rar\"]\ncolor = \"red\"\n\
-                   [ext_colors.img]\nexts = [\"png\"]\ncolor = \"#F80\"\n";
+                   [ext_colors.img]\nexts = [\"xyz\"]\ncolor = \"#F80\"\n";
         let (t, w) = from_toml(src, builtin);
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(t.color_for_ext("a.zip"), Some(Color::Red));
         assert_eq!(t.color_for_ext("a.rar"), Some(Color::Red));
         assert_eq!(t.color_for_ext("a.tar"), None); // replaced group
-        assert_eq!(t.color_for_ext("x.PNG"), Some(rgb(0xFF, 0x88, 0)));
-        assert_eq!(t.color_for_ext("a.sh"), Some(rgb(0x55, 0xFF, 0x55)));
+        assert_eq!(t.color_for_ext("x.XYZ"), Some(rgb(0xFF, 0x88, 0)));
+        assert_eq!(t.color_for_ext("a.sh"), Some(rgb(0xFF, 0xFF, 0x55)));
     }
 
     #[test]
     fn ext_group_invalid_color_warns() {
-        let src = "[ext_colors.img]\nexts = [\"png\"]\ncolor = \"zzz\"\n";
+        let src = "[ext_colors.img]\nexts = [\"xyz\"]\ncolor = \"zzz\"\n";
         let (t, w) = from_toml(src, builtin);
         assert_eq!(w.len(), 1);
-        assert_eq!(t.color_for_ext("a.png"), None);
+        assert_eq!(t.color_for_ext("a.xyz"), None);
     }
 
     #[test]
@@ -689,7 +714,7 @@ mod tests {
     fn color_for_ext_rules() {
         let t = builtin("mdir").unwrap();
         assert_eq!(t.color_for_ext("a.tar.gz"), Some(rgb(0xFF, 0x55, 0xFF)));
-        assert_eq!(t.color_for_ext("README.MD"), Some(rgb(0x55, 0xFF, 0xFF)));
+        assert_eq!(t.color_for_ext("README.MD"), Some(rgb(0xFF, 0xFF, 0xFF)));
         assert_eq!(t.color_for_ext("noext"), None);
         assert_eq!(t.color_for_ext(".zip"), None); // dotfile, no extension
         assert_eq!(t.color_for_ext("trailing."), None);

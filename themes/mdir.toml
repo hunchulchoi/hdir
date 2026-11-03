@@ -1,42 +1,60 @@
 name = "mdir"
 
+# DOS Mdir: black list, cyan bars and lines, gray path/status rows,
+# red folders and a red cursor row.
 [colors]
-bg = "#0000AA"
+bg = "#000000"
 fg = "#AAAAAA"
-border = "#55FFFF"
-border_active = "#FFFFFF"
+border = "#00AAAA"
+border_active = "#55FFFF"
 title = "#FFFFFF"
-dir = "#FFFFFF"
+dir = "#FF5555"
 file = "#AAAAAA"
 exec = "#55FF55"
 symlink = "#55FFFF"
 hidden = "#555555"
-assoc_file = "#55FFFF"
+assoc_file = "#FFFFFF"
 selected = "#FFFF55"
-cursor_bg = "#00AAAA"
-cursor_fg = "#000000"
-status_bg = "#00AAAA"
+cursor_bg = "#FF5555"
+cursor_fg = "#AA0000"
+status_bg = "#AAAAAA"
 status_fg = "#000000"
-fkey_num_fg = "#FFFFFF"
-fkey_num_bg = "#000000"
-fkey_label_fg = "#000000"
+fkey_num_fg = "#FFFF55"
+fkey_num_bg = "#00AAAA"
+fkey_label_fg = "#FFFFFF"
 fkey_label_bg = "#00AAAA"
 dialog_bg = "#AAAAAA"
 dialog_fg = "#000000"
 danger_bg = "#AA0000"
 danger_fg = "#FFFFFF"
-preview_bg = "#0000AA"
+preview_bg = "#000000"
 error = "#FF5555"
-dir_bold = true
+dir_bold = false
 
 [ext_colors.exec]
-exts = ["sh", "command"]
+exts = ["exe", "msi", "app", "appimage"]
 color = "#55FF55"
 
+[ext_colors.binary]
+exts = ["com", "dll", "so", "dylib", "bin"]
+color = "#55FFFF"
+
+[ext_colors.script]
+exts = ["bat", "cmd", "sh", "bash", "zsh", "fish", "ps1", "command"]
+color = "#FFFF55"
+
 [ext_colors.archive]
-exts = ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar"]
+exts = ["zip", "tar", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "arj", "lzh"]
 color = "#FF55FF"
 
+[ext_colors.image]
+exts = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "heic", "tif", "tiff"]
+color = "#5555FF"
+
 [ext_colors.doc]
-exts = ["md", "txt", "rs", "toml", "json", "yaml", "yml", "js", "ts", "py", "go", "java", "c", "h"]
+exts = ["txt", "md", "hwp", "hwpx", "doc", "docx", "pdf", "rtf", "odt", "csv"]
+color = "#FFFFFF"
+
+[ext_colors.code]
+exts = ["rs", "toml", "json", "yaml", "yml", "js", "ts", "py", "go", "java", "c", "h"]
 color = "#55FFFF"
