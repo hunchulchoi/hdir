@@ -10219,6 +10219,37 @@ mod tests {
     }
 
     #[test]
+    fn english_full_screens_fit_at_normal_and_narrow_sizes() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let (tmp, mut app, fake) = fixture_trash();
+            let root = app.panels[0].cwd.clone();
+            app.undo();
+            for (w, h) in [(80, 24), (40, 12)] {
+                let text = draw_text(&mut app, w, h);
+                assert!(text.contains("Nothing to undo"), "{w}x{h}\n{text}");
+                assert!(!text.chars().any(|c| ('가'..='힣').contains(&c)), "{text}");
+            }
+            trash_files(&fake, &[root.join("f.txt")]);
+            alt_f8(&mut app);
+            wait_idle(&mut app);
+            for (w, h) in [(80, 24), (40, 12)] {
+                let text = draw_text(&mut app, w, h);
+                assert!(text.contains("Trash"), "{w}x{h}\n{text}");
+                assert!(text.contains("f.txt"), "{w}x{h}\n{text}");
+                assert!(!text.chars().any(|c| ('가'..='힣').contains(&c)), "{text}");
+                for row in text.lines() {
+                    assert_eq!(
+                        unicode_width::UnicodeWidthStr::width(row),
+                        w as usize,
+                        "{row}"
+                    );
+                }
+            }
+            let _ = tmp;
+        });
+    }
+
+    #[test]
     fn english_menu_and_nothing_to_undo_status() {
         crate::i18n::with_lang(crate::i18n::Lang::En, || {
             let (_t, mut app) = fixture();
