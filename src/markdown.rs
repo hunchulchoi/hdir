@@ -9,6 +9,12 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Par
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+/// Longest link target shown (`…` after); a huge URL used many times
+/// cannot blow up the screen.
+pub const URL_MAX: usize = 200;
+/// Text rendered at most; the rest is left out with a note.
+pub const MAX_OUTPUT: usize = 8 << 20;
+
 /// Widest a table column gets; longer cells are cut with `…`.
 pub const COL_MAX_WIDTH: usize = 80;
 /// Widest a table line gets; columns past it are left out (`…`).
@@ -118,6 +124,9 @@ struct Builder {
     code: Option<String>,
     table: Option<Table>,
     cell: MdLine,
+    /// Bytes of text taken in so far, and whether [`MAX_OUTPUT`] was hit.
+    size: usize,
+    stopped: bool,
 }
 
 /// Lines for `src` laid out `width` cells wide (at least 10).
@@ -138,17 +147,35 @@ pub fn render(src: &str, width: usize) -> Vec<MdLine> {
         code: None,
         table: None,
         cell: Vec::new(),
+        size: 0,
+        stopped: false,
     };
     let opts = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES;
     for ev in Parser::new_ext(src, opts) {
+        if b.stopped {
+            break;
+        }
         b.event(ev);
     }
+    b.code = None;
+    b.table = None;
     b.flush();
     while b.out.last().is_some_and(|l| l.is_empty()) {
         b.out.pop();
+    }
+    if b.stopped {
+        b.out.push(Vec::new());
+        b.out.push(vec![(
+            crate::i18n::t(
+                "… 문서가 길어 여기까지 표시함",
+                "… the document is too long, shown up to here",
+            )
+            .to_string(),
+            Style::of(Kind::Url),
+        )]);
     }
     b.out
 }
@@ -181,7 +208,33 @@ impl Builder {
         }
     }
 
+    /// Count `n` more bytes toward [`MAX_OUTPUT`].
+    fn grow(&mut self, n: usize) {
+        self.size += n;
+        if self.size > MAX_OUTPUT {
+            self.stopped = true;
+        }
+    }
+
     fn push_text(&mut self, text: &str, kind: Kind) {
+        if self.stopped {
+            return;
+        }
+        // never more than the budget left, cut on a character boundary
+        let room = MAX_OUTPUT.saturating_sub(self.size);
+        let text = if text.len() > room {
+            let mut end = room;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        } else {
+            text
+        };
+        self.grow(text.len());
+        if self.size >= MAX_OUTPUT {
+            self.stopped = true;
+        }
         let st = self.style(kind);
         let target = if self.table.is_some() {
             &mut self.cell
@@ -308,6 +361,7 @@ impl Builder {
             Event::Text(t) => {
                 if let Some(code) = self.code.as_mut() {
                     code.push_str(&t);
+                    self.grow(t.len());
                 } else {
                     self.push_text(&t, Kind::Text);
                 }
@@ -524,14 +578,14 @@ impl Builder {
                     });
                 }
                 if !url.is_empty() && text != url {
-                    self.push_text(&format!(" ({url})"), Kind::Url);
+                    self.push_text(&format!(" ({})", short_url(&url)), Kind::Url);
                 }
             }
             TagEnd::Image => {
                 let (url, ..) = self.links.pop().unwrap_or_default();
                 self.in_image = self.in_image.saturating_sub(1);
                 self.push_text("] ", Kind::Marker);
-                self.push_text(&url, Kind::Url);
+                self.push_text(&short_url(&url), Kind::Url);
             }
             TagEnd::TableCell => {
                 let cell = std::mem::take(&mut self.cell);
@@ -625,6 +679,24 @@ impl Builder {
         line.push((rule("└", "┴", "┘"), bar));
         self.out.push(line);
     }
+}
+
+/// `url` cut to [`URL_MAX`] columns with `…`.
+fn short_url(url: &str) -> String {
+    if url.width() <= URL_MAX {
+        return url.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for g in url.graphemes(true) {
+        if used + g.width() > URL_MAX - 1 {
+            break;
+        }
+        used += g.width();
+        out.push_str(g);
+    }
+    out.push('…');
+    out
 }
 
 fn push_seg(line: &mut MdLine, text: &str, st: Style) {
@@ -832,6 +904,35 @@ mod tests {
         assert_eq!(
             text("<https://a.b> and [https://c.d](https://c.d)", 80),
             ["https://a.b and https://c.d"]
+        );
+    }
+
+    #[test]
+    fn huge_urls_and_endless_output_are_capped() {
+        // a 1 MiB link target referenced many times
+        let url = "u".repeat(1 << 20);
+        let mut src = format!("[r]: {url}\n\n");
+        for _ in 0..3_000 {
+            src.push_str("[a][r] ");
+        }
+        let lines = render(&src, 80);
+        let total: usize = lines.iter().map(|l| plain(l).len()).sum();
+        assert!(total <= MAX_OUTPUT + 1024, "{total}");
+        let all: String = lines.iter().map(plain).collect();
+        assert!(
+            all.contains(&format!("({}…)", "u".repeat(URL_MAX - 1))),
+            "a cut URL is still shown"
+        );
+        assert!(!all.contains(&"u".repeat(URL_MAX + 1)));
+        // endless text stops with a note
+        let long = "word ".repeat(3_000_000);
+        let lines = render(&long, 80);
+        let total: usize = lines.iter().map(|l| plain(l).len()).sum();
+        assert!(total <= MAX_OUTPUT + 1024, "{total}");
+        assert!(
+            plain(lines.last().unwrap()).contains("…"),
+            "{:?}",
+            lines.last()
         );
     }
 
