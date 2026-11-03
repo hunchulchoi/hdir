@@ -3655,7 +3655,10 @@ mod tests {
                 r.outcome
             );
             let cmds = to.remote_cmds();
-            assert!(!cmds.iter().any(|c| c.ends_with("|| exit 46")), "never placed: {cmds:?}");
+            assert!(
+                !cmds.iter().any(|c| c.ends_with("|| exit 46")),
+                "never placed: {cmds:?}"
+            );
             let unstage = String::from_utf8(unstage_cmd(STAGE.as_bytes())).unwrap();
             assert!(cmds.contains(&unstage), "stage dropped: {cmds:?}");
             assert!(
