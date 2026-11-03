@@ -2380,6 +2380,38 @@ mod tests {
     }
 
     #[test]
+    fn classic_korean_rows_snapshot() {
+        let pa = fixed_panel(
+            "/tmp/a",
+            &[
+                ("문서", EntryKind::Dir, 0),
+                ("이력서.HWP", EntryKind::File, 45_056),
+                ("2026 여행 계획.docx", EntryKind::File, 28_734),
+                ("졸업앨범.zip", EntryKind::File, 5_242_880),
+            ],
+        );
+        let pb = fixed_panel("/tmp/b", &[]);
+        let buf = render_in(Mode::Classic, &pa, &pb, 0, None, 80, 12);
+        let got: Vec<String> = (3..8).map(|y| cells(&buf, y, 0, 40)).collect();
+        assert_eq!(
+            got,
+            [
+                "..            [ UpDir ]                ▲",
+                "문서         [ SubDir ]                 ",
+                "이력서   HWP     45,056                 ",
+                "2026 여~ do~     28,734                 ",
+                "졸업앨범 zip  5,242,880                 ",
+            ]
+        );
+        // the extension column starts at the same cell on every file row
+        for y in 5..8 {
+            assert_eq!(buf[(9, y)].fg, buf[(10, y)].fg, "row {y}");
+        }
+        assert_eq!(buf[(0, 4)].fg, th().dir);
+        assert_eq!(buf[(0, 7)].fg, th().color_for_ext("a.zip").unwrap());
+    }
+
+    #[test]
     fn the_scroll_bar_thumb_follows_the_list_position() {
         let names: Vec<String> = (0..60).map(|i| format!("f{i:02}")).collect();
         let list: Vec<(&str, EntryKind, u64)> = names

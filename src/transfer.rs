@@ -2555,7 +2555,7 @@ mod tests {
         let src = private_dir(t.path(), "src");
         fs::create_dir_all(src.join("d/e")).unwrap();
         fs::write(src.join("d/e/f"), "x").unwrap();
-        if crate::platform::set_test_acl(&src.join("d/e/f")).is_err() || !tar_acls_ok(None) {
+        if !crate::platform::try_test_acl(&src.join("d/e/f")) || !tar_acls_ok(None) {
             eprintln!("no ACL support here, skipped");
             return;
         }

@@ -1620,6 +1620,17 @@ pub fn set_test_acl(path: &Path) -> io::Result<()> {
     )
 }
 
+/// [`set_test_acl`]: `false` when the filesystem has no ACL support
+/// (the test then skips); any other failure fails the test.
+#[cfg(all(test, target_os = "linux"))]
+pub fn try_test_acl(path: &Path) -> bool {
+    match set_test_acl(path) {
+        Ok(()) => true,
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => false,
+        Err(e) => panic!("setting a test ACL on {} failed: {e}", path.display()),
+    }
+}
+
 /// The access ACL stored on `path`, if any.
 #[cfg(all(test, target_os = "linux"))]
 pub fn test_acl_of(path: &Path) -> Option<Vec<u8>> {
@@ -1717,7 +1728,7 @@ mod acl_tests {
         let t = tempfile::tempdir().unwrap();
         fs::create_dir_all(t.path().join("d/e")).unwrap();
         fs::write(t.path().join("d/e/f"), "x").unwrap();
-        if set_test_acl(&t.path().join("d/e/f")).is_err() {
+        if !try_test_acl(&t.path().join("d/e/f")) {
             eprintln!("no ACL support here, skipped");
             return;
         }
