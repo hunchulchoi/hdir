@@ -402,7 +402,8 @@ mod tests {
     fn wait_events(h: &JobHandle, stop: impl Fn(&[JobEvent]) -> bool) -> Vec<JobEvent> {
         let mut all = Vec::new();
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(10) {
+        // generous: a loaded CI box runs the whole suite in parallel
+        while start.elapsed() < Duration::from_secs(30) {
             all.extend(h.try_events());
             if stop(&all) {
                 return all;
@@ -436,7 +437,8 @@ mod tests {
         let h = JobHandle::spawn(spec);
         let mut all = Vec::new();
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(10) {
+        // generous: a loaded CI box runs the whole suite in parallel
+        while start.elapsed() < Duration::from_secs(30) {
             for e in h.try_events() {
                 if matches!(e, JobEvent::Conflict { .. }) {
                     h.answer(ans);
