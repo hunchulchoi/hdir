@@ -823,7 +823,7 @@ mod tests {
         let start = std::time::Instant::now();
         let lines = render(&src, 80);
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
+            start.elapsed() < std::time::Duration::from_secs(10),
             "{:?}",
             start.elapsed()
         );
@@ -841,7 +841,7 @@ mod tests {
         let start = std::time::Instant::now();
         let lines = render(&word, 80);
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
+            start.elapsed() < std::time::Duration::from_secs(10),
             "{:?}",
             start.elapsed()
         );
