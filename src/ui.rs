@@ -1062,7 +1062,7 @@ fn draw_scrollbar(
     if h == 0 || r.width == 0 {
         return;
     }
-    let track = Style::default().fg(theme.fkey_label_fg).bg(theme.border);
+    let track = Style::default().fg(theme.status_bg).bg(theme.border);
     let arrow = Style::default().fg(theme.fkey_num_fg).bg(theme.border);
     let mut cells: Vec<Line> = vec![Line::from(Span::styled(" ", track)); h];
     if h >= 3 {
