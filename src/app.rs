@@ -2427,7 +2427,9 @@ impl App {
         let (s2, r2, l2) = (Arc::clone(&session), remote.clone(), local.clone());
         let (up, ab) = (Arc::clone(&self.uploader), Arc::clone(&abandon));
         std::thread::spawn(move || {
-            let (result, unchanged) = match stamp.differs(&l2) {
+            // no stamp (never for an edit): treat it as changed and upload
+            let changed = stamp.map_or(Ok(true), |s| s.differs(&l2));
+            let (result, unchanged) = match changed {
                 Ok(false) => (Ok(()), true),
                 Ok(true) => (up(&s2, &l2, &r2, &remote_st), false),
                 Err(e) => (
