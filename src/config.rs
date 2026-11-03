@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::assoc::{AssocRule, AssocTable};
+use crate::i18n::{self, Lang};
 use crate::keymap::{self, Keymap, KeysConfig};
 use crate::servers::ServerConfig;
 use crate::theme::{self, Theme};
@@ -71,6 +72,8 @@ pub struct Config {
     pub keys: KeysConfig,
     pub assoc: Vec<AssocRule>,
     pub servers: Vec<ServerConfig>,
+    /// `ko`, `en` or `auto`; see [`crate::i18n`].
+    pub lang: Option<String>,
 }
 
 /// `$XDG_CONFIG_HOME/hdir` if set (and non-empty), else `<home>/.config/hdir`.
@@ -149,6 +152,8 @@ pub struct Settings {
     pub classic: Theme,
     pub dev: Theme,
     pub assoc: AssocTable,
+    /// Screen language from the config; `None` keeps the startup language.
+    pub lang: Option<Lang>,
     /// config, keymap, theme and assoc warnings, in that order.
     pub warnings: Vec<String>,
 }
@@ -164,6 +169,14 @@ impl Settings {
 
 pub fn load_settings(dir: Option<&Path>) -> Settings {
     let (config, mut warnings) = load_config(dir);
+    let lang = match config.lang.as_deref().map(i18n::parse_setting) {
+        Some(Ok(l)) => l,
+        Some(Err(e)) => {
+            warnings.push(format!("config: {e}"));
+            None
+        }
+        None => None,
+    };
     let (keymap, w) = keymap::build(&config.keys);
     warnings.extend(w);
     let (user_themes, w) = match dir {
@@ -188,6 +201,7 @@ pub fn load_settings(dir: Option<&Path>) -> Settings {
         classic,
         dev,
         assoc,
+        lang,
         warnings,
     }
 }
@@ -481,6 +495,27 @@ cmd = "x {}"
         assert_eq!(
             s.keymap.lookup(keymap::Context::Panel, &ev),
             Some(keymap::Action::Copy)
+        );
+    }
+
+    #[test]
+    fn lang_setting_is_read_and_a_bad_one_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "lang = \"en\"\n");
+        let s = load_settings(Some(tmp.path()));
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.lang, Some(crate::i18n::Lang::En));
+
+        write_cfg(tmp.path(), "lang = \"auto\"\n");
+        assert_eq!(load_settings(Some(tmp.path())).lang, None);
+
+        write_cfg(tmp.path(), "lang = \"fr\"\n");
+        let s = load_settings(Some(tmp.path()));
+        assert_eq!(s.lang, None);
+        assert!(
+            s.warnings.iter().any(|w| w.contains("fr")),
+            "{:?}",
+            s.warnings
         );
     }
 

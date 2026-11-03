@@ -22,6 +22,17 @@ pub enum Cli {
     Version,
 }
 
+/// Why the screen cannot open, if stdin or stdout is not a terminal
+/// (a pipe, a file, or a tool's command runner).
+pub fn no_terminal(stdin_tty: bool, stdout_tty: bool) -> Option<String> {
+    (!stdin_tty || !stdout_tty).then(|| {
+        crate::tr!(
+            "터미널에서 실행해야 함 (입력이나 출력이 터미널이 아님)",
+            "must be run in a terminal (input or output is not a terminal)"
+        )
+    })
+}
+
 /// Parse the arguments after the program name.
 pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Cli, String> {
     let mut opts = Options::default();
@@ -137,6 +148,16 @@ pub fn start_dir(arg: Option<&Path>) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_screen_needs_a_terminal_on_both_ends() {
+        assert_eq!(super::no_terminal(true, true), None);
+        assert!(super::no_terminal(false, true).is_some());
+        assert!(super::no_terminal(true, false).is_some());
+        let msg =
+            crate::i18n::with_lang(crate::i18n::Lang::En, || super::no_terminal(false, false));
+        assert!(msg.unwrap().contains("terminal"));
+    }
+
     use super::*;
     use std::fs;
 

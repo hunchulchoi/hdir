@@ -1,14 +1,18 @@
 use std::time::Duration;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use hdir::app::App;
 use hdir::cli::{self, Cli};
 use hdir::config;
+use hdir::i18n;
 use hdir::term;
 use ratatui::crossterm::event;
 
 fn main() -> ExitCode {
+    let lang = i18n::detect(|k| std::env::var(k).ok(), i18n::os_lang());
+    i18n::set_lang(lang);
     let opts = match cli::parse_args(std::env::args_os().skip(1)) {
         Ok(Cli::Run(o)) => o,
         Ok(Cli::Help) => {
@@ -32,8 +36,16 @@ fn main() -> ExitCode {
         }
     };
     let cwd_file = opts.cwd_file;
+    if let Some(e) = cli::no_terminal(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        eprintln!("hdir: {e}");
+        return ExitCode::from(2);
+    }
 
     let mut app = App::new(start.clone(), start);
+    app.base_lang = lang;
     app.ssh_config_path = dirs::home_dir().map(|h| h.join(".ssh").join("config"));
     let result = run_app(&mut app);
     // An edited remote file may still be uploading.

@@ -8,6 +8,7 @@ pub mod config;
 pub mod dialog;
 pub mod editor;
 pub mod fs_ops;
+pub mod i18n;
 pub mod job;
 pub mod keymap;
 pub mod launcher;

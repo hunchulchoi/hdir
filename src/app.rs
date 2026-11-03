@@ -638,6 +638,8 @@ pub struct App {
     connect_rx: Receiver<ConnectMsg>,
     /// Connects that need the terminal for ssh's prompts, in request order.
     pending_master: VecDeque<ConnectJob>,
+    /// Language detected at startup; used when the config has no `lang`.
+    pub base_lang: crate::i18n::Lang,
 }
 
 /// A prompt answered after its panels moved (a connect or a load landed).
@@ -750,6 +752,7 @@ impl App {
             connect_tx,
             connect_rx,
             pending_master: VecDeque::new(),
+            base_lang: crate::i18n::Lang::default(),
         }
     }
 
@@ -777,6 +780,7 @@ impl App {
     fn reload_settings(&mut self) {
         self.settings = config::load_settings(self.config_dir.as_deref());
         self.apply_theme();
+        self.apply_lang();
     }
 
     /// Re-read config, themes, keymap and assoc on the background runner; the
@@ -813,7 +817,7 @@ impl App {
     /// F1: every binding of the current keymap.
     pub fn open_help(&mut self) {
         let lines = screen::help_lines(&self.settings.keymap);
-        self.open_screen("도움말", lines);
+        self.open_screen(crate::i18n::t("도움말", "Help"), lines);
     }
 
     /// Config file location plus the current bindings.
@@ -1027,6 +1031,11 @@ impl App {
     pub fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         self.apply_theme();
+    }
+
+    /// The config's `lang`, or the startup language when it has none.
+    fn apply_lang(&self) {
+        crate::i18n::set_lang(self.settings.lang.unwrap_or(self.base_lang));
     }
 
     fn apply_theme(&mut self) {
@@ -2881,6 +2890,7 @@ impl App {
             (BgKind::ConfigReload, Some(BgResult::Settings(settings))) => {
                 self.settings = *settings;
                 self.apply_theme();
+                self.apply_lang();
                 self.status = Some(
                     config::warning_summary(&self.settings.warnings)
                         .unwrap_or_else(|| "설정을 다시 읽었음".to_string()),
@@ -3744,6 +3754,19 @@ mod tests {
         assert_eq!(app.theme, theme::builtin("light").unwrap());
         app.set_mode(crate::config::Mode::Classic);
         assert_eq!(app.theme.name, "dark");
+    }
+
+    #[test]
+    fn the_config_lang_switches_the_screen_language_and_auto_restores_it() {
+        use crate::i18n::{Lang, lang, with_lang};
+        with_lang(Lang::Ko, || {
+            let (_t, mut app) = configured("lang = \"en\"\n", None);
+            assert_eq!(lang(), Lang::En);
+            app.open_help();
+            assert_eq!(app.screen.as_ref().unwrap().title, "Help");
+            let (_t, _app) = configured("lang = \"auto\"\n", None);
+            assert_eq!(lang(), Lang::Ko, "auto goes back to the startup language");
+        });
     }
 
     #[test]
