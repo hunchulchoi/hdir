@@ -64,11 +64,23 @@ pub const NO_SAFE_RENAME: i32 = 49;
 pub const STAGE_PREFIX: &str = ".hdir-xfer.";
 
 /// Shown when the destination (or a parent) could be tampered with.
-pub const UNSAFE_MSG: &str = "다른 사용자가 바꿀 수 있는 폴더라 보내지 않음";
+pub fn unsafe_msg() -> &'static str {
+    crate::i18n::t(
+        "다른 사용자가 바꿀 수 있는 폴더라 보내지 않음",
+        "Not sent: a folder other users can change",
+    )
+}
 
-const SPECIAL_MSG: &str = "특수 파일은 옮기지 않음";
+fn special_msg() -> &'static str {
+    crate::i18n::t("특수 파일은 옮기지 않음", "Special files are not moved")
+}
 
-const APPEARED_MSG: &str = "대상에 같은 이름이 새로 생겨 건너뜀";
+fn appeared_msg() -> &'static str {
+    crate::i18n::t(
+        "대상에 같은 이름이 새로 생겨 건너뜀",
+        "Skipped: the same name just appeared in the destination",
+    )
+}
 
 /// Where one side of a transfer lives.
 #[derive(Clone)]
@@ -213,7 +225,12 @@ fn dir_id_fmt(os: &RemoteOs) -> &'static [u8] {
 
 /// `dev:inode` of the folder `dir` itself (followed), on its side.
 fn src_dir_id(side: &Side, dir: &Path) -> Result<String, String> {
-    let err = |e: String| format!("원본 폴더를 확인할 수 없음: {e}");
+    let err = |e: String| {
+        crate::tr!(
+            "원본 폴더를 확인할 수 없음: {e}",
+            "Cannot check the source folder: {e}"
+        )
+    };
     match side {
         Side::Local => {
             #[cfg(unix)]
@@ -239,7 +256,7 @@ fn src_dir_id(side: &Side, dir: &Path) -> Result<String, String> {
             let out = ran(s.exec(&cmd).map_err(|e| err(e.message()))?).map_err(err)?;
             let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if id.is_empty() {
-                return Err(err("빈 응답".into()));
+                return Err(err(crate::i18n::t("빈 응답", "empty response").into()));
             }
             Ok(id)
         }
@@ -379,7 +396,12 @@ fn send_up_packaged(
         .prefix("hdir-pkg-")
         .suffix(".tar")
         .tempfile()
-        .map_err(|e| format!("임시 파일을 만들 수 없음: {e}"))?;
+        .map_err(|e| {
+            crate::tr!(
+                "임시 파일을 만들 수 없음: {e}",
+                "Cannot create temp file: {e}"
+            )
+        })?;
     let mut item = OsString::from("./");
     item.push(name);
     let mut tar: Vec<OsString> = ["tar", "-cf"].map(OsString::from).to_vec();
@@ -797,7 +819,12 @@ enum Route<'a> {
 
 fn route(spec: &TransferSpec) -> Result<Route<'_>, String> {
     Ok(match (spec.src.session(), spec.dst.session()) {
-        (None, None) => return Err("로컬 간 복사는 원격 전송이 아님".into()),
+        (None, None) => {
+            return Err(crate::tr!(
+                "로컬 간 복사는 원격 전송이 아님",
+                "Copying between local folders is not a remote transfer"
+            ));
+        }
         (None, Some(d)) => Route::Up(d),
         (Some(s), None) => Route::Down(s),
         (Some(s), Some(d)) if std::ptr::eq(s, d) => Route::SameHost(s),
@@ -813,7 +840,7 @@ fn b(p: &Path) -> Vec<u8> {
 fn code_err(out: &CmdOutput) -> String {
     first_line(
         &out.stderr,
-        &format!("종료 코드 {}", out.code.unwrap_or(-1)),
+        &crate::tr!("종료 코드 {}", "exit code {}", out.code.unwrap_or(-1)),
     )
 }
 
@@ -858,7 +885,7 @@ fn dest_dir_ok(side: &Side, dir: &Path) -> Result<Option<PathBuf>, String> {
     match side {
         Side::Local => {
             if !dir.is_dir() {
-                return Err("대상 폴더 없음".into());
+                return Err(crate::tr!("대상 폴더 없음", "Destination folder missing"));
             }
             let real = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
             local_dest_safe(&real)?;
@@ -868,7 +895,7 @@ fn dest_dir_ok(side: &Side, dir: &Path) -> Result<Option<PathBuf>, String> {
             let out = s.exec(&is_dir_cmd(&b(dir))).map_err(|e| e.message())?;
             match out.code {
                 Some(0) => Ok(None),
-                Some(NOT_THERE) => Err("대상 폴더 없음".into()),
+                Some(NOT_THERE) => Err(crate::tr!("대상 폴더 없음", "Destination folder missing")),
                 _ => Err(code_err(&out)),
             }
         }
@@ -892,13 +919,19 @@ fn local_dest_safe(real: &Path) -> Result<(), String> {
         .arg(std::ffi::OsStr::from_bytes(&script))
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("대상 폴더를 확인할 수 없음: {e}"))?;
+        .map_err(|e| {
+            crate::tr!(
+                "대상 폴더를 확인할 수 없음: {e}",
+                "Cannot check the destination folder: {e}"
+            )
+        })?;
     match out.status.code() {
         Some(0) => Ok(()),
-        Some(UNSAFE_DIR) => Err(UNSAFE_MSG.into()),
-        _ => Err(format!(
+        Some(UNSAFE_DIR) => Err(unsafe_msg().into()),
+        _ => Err(crate::tr!(
             "대상 폴더를 확인할 수 없음: {}",
-            first_line(&out.stderr, "검사 실패")
+            "Cannot check the destination folder: {}",
+            first_line(&out.stderr, crate::i18n::t("검사 실패", "check failed"))
         )),
     }
 }
@@ -910,7 +943,12 @@ fn local_dest_safe(_real: &Path) -> Result<(), String> {
 
 /// `dev:inode` of the destination and all its parents, on its side.
 fn dest_chain(side: &Side, dir: &Path) -> Result<Vec<String>, String> {
-    let err = |e: String| format!("대상 폴더를 확인할 수 없음: {e}");
+    let err = |e: String| {
+        crate::tr!(
+            "대상 폴더를 확인할 수 없음: {e}",
+            "Cannot check the destination folder: {e}"
+        )
+    };
     match side {
         Side::Local => {
             #[cfg(unix)]
@@ -1027,7 +1065,10 @@ fn scan(
             let out = ran(res.map_err(|e| e.message())?)?;
             match parse_scan(&out.stdout, n) {
                 Some(v) => Ok(Some(v)),
-                None => Err("원격 항목을 확인할 수 없음".into()),
+                None => Err(crate::tr!(
+                    "원격 항목을 확인할 수 없음",
+                    "Cannot check the remote items"
+                )),
             }
         }
     }
@@ -1049,30 +1090,55 @@ fn make_stage<'a>(
 ) -> Result<Stage<'a>, String> {
     match dst {
         Side::Local => {
-            let real = real.ok_or("대상 폴더를 확인하지 않음")?.to_path_buf();
+            let real = real
+                .ok_or_else(|| {
+                    crate::tr!(
+                        "대상 폴더를 확인하지 않음",
+                        "Destination folder not checked"
+                    )
+                })?
+                .to_path_buf();
             tempfile::Builder::new()
                 .prefix(STAGE_PREFIX)
                 .tempdir_in(&real)
                 .map(|t| Stage::Local(t, real))
-                .map_err(|e| format!("임시 폴더를 만들 수 없음: {e}"))
+                .map_err(|e| {
+                    crate::tr!(
+                        "임시 폴더를 만들 수 없음: {e}",
+                        "Cannot create temp folder: {e}"
+                    )
+                })
         }
         Side::Remote(s) => {
             let out = s
                 .exec(&stage_cmd(&s.os, &b(dest_dir)))
                 .map_err(|e| e.message())?;
             if out.code == Some(UNSAFE_DIR) {
-                return Err(UNSAFE_MSG.into());
+                return Err(unsafe_msg().into());
             }
-            let out = ran(out).map_err(|e| format!("임시 폴더를 만들 수 없음: {e}"))?;
+            let out = ran(out).map_err(|e| {
+                crate::tr!(
+                    "임시 폴더를 만들 수 없음: {e}",
+                    "Cannot create temp folder: {e}"
+                )
+            })?;
             parse_stage(&out.stdout)
                 .map(|(dir, p)| Stage::Remote(s, dir, p))
-                .ok_or_else(|| "임시 폴더 경로를 알 수 없음".into())
+                .ok_or_else(|| {
+                    crate::tr!(
+                        "임시 폴더 경로를 알 수 없음",
+                        "Cannot determine the temp folder path"
+                    )
+                })
         }
     }
 }
 
 fn left_behind(path: &str) -> String {
-    format!("임시 폴더가 남음: {path}")
+    crate::tr!(
+        "임시 폴더가 남음: {path}",
+        "Temp folder left behind: {path}"
+    )
 }
 
 /// How placing went.
@@ -1148,11 +1214,17 @@ fn place(
                 _ => {}
             }
             let e = match out.code {
-                Some(APPEARED) => APPEARED_MSG.to_string(),
-                Some(DIR_APPEARED) => "대상에 폴더가 생겨 옮기지 않음".to_string(),
-                Some(NO_SAFE_RENAME) => {
-                    "이 파일시스템은 안전한 이름 변경을 지원하지 않음".to_string()
-                }
+                Some(APPEARED) => appeared_msg().to_string(),
+                Some(DIR_APPEARED) => crate::i18n::t(
+                    "대상에 폴더가 생겨 옮기지 않음",
+                    "Not moved: a folder appeared in the destination",
+                )
+                .to_string(),
+                Some(NO_SAFE_RENAME) => crate::i18n::t(
+                    "이 파일시스템은 안전한 이름 변경을 지원하지 않음",
+                    "This filesystem does not support safe renaming",
+                )
+                .to_string(),
                 _ => code_err(&out),
             };
             if restore.is_some() {
@@ -1189,8 +1261,9 @@ fn unmove_or_name(
     let cmd = unmove_cmd(&s.os, stage, &os_bytes(name), &b(back));
     match s.exec(&cmd) {
         Ok(o) if o.code == Some(0) => e,
-        _ => format!(
+        _ => crate::tr!(
             "{e} · 옮기던 항목이 임시 폴더에 남음: {}",
+            "{e} · The item being moved stayed in the temp folder: {}",
             String::from_utf8_lossy(&cat(&[&into_dir(stage), &os_bytes(name)]))
         ),
     }
@@ -1224,11 +1297,17 @@ fn send(
     let (n, sd) = (os_bytes(name).into_owned(), b(src_dir));
     let remote_in = |d: &RemoteSession| match stage {
         Stage::Remote(_, _, p) => Ok(exec_argv(&d.target, &tar_in_cmd(p))),
-        Stage::Local(..) => Err("임시 폴더가 원격이 아님".to_string()),
+        Stage::Local(..) => Err(crate::tr!(
+            "임시 폴더가 원격이 아님",
+            "temp folder is not remote"
+        )),
     };
     let local_in = || match stage {
         Stage::Local(t, _) => Ok(local_tar_in(t.path())),
-        Stage::Remote(..) => Err("임시 폴더가 로컬이 아님".to_string()),
+        Stage::Remote(..) => Err(crate::tr!(
+            "임시 폴더가 로컬이 아님",
+            "temp folder is not local"
+        )),
     };
     let remote_out =
         |s: &RemoteSession| exec_argv(&s.target, &tar_out_cmd(&s.os, &sd, &n, src_id.as_bytes()));
@@ -1238,10 +1317,10 @@ fn send(
                 return send_up_packaged(d, src_dir, name, p, cancel);
             }
             (Route::Between(..), _) => {
-                return Err(
-                    "Windows에서는 서버 간 직접 전송을 지원하지 않음: 로컬을 거쳐 복사하세요"
-                        .into(),
-                );
+                return Err(crate::tr!(
+                    "Windows에서는 서버 간 직접 전송을 지원하지 않음: 로컬을 거쳐 복사하세요",
+                    "Direct server-to-server transfer is not supported on Windows: copy via a local folder"
+                ));
             }
             _ => {}
         }
@@ -1259,12 +1338,18 @@ fn send(
         Route::Between(s, d) => (*s, remote_out(s), Some(*s), remote_in(d)?, Some(*d)),
         Route::SameHost(s) => {
             let Stage::Remote(_, _, p) = stage else {
-                return Err("임시 폴더가 원격이 아님".into());
+                return Err(crate::tr!(
+                    "임시 폴더가 원격이 아님",
+                    "temp folder is not remote"
+                ));
             };
             let cmd = cp_cmd(&s.os, &b(src_dir), &os_bytes(name), src_id.as_bytes(), p);
             let out = s.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?;
             if out.code == Some(SRC_MOVED) {
-                return Err("원본 폴더가 바뀌어 보내지 않음".into());
+                return Err(crate::tr!(
+                    "원본 폴더가 바뀌어 보내지 않음",
+                    "Not sent: the source folder changed"
+                ));
             }
             return ran(out).map(drop);
         }
@@ -1278,13 +1363,19 @@ fn send(
         }
     }
     if oa.code == Some(SRC_MOVED) {
-        return Err("원본 폴더가 바뀌어 보내지 않음".into());
+        return Err(crate::tr!(
+            "원본 폴더가 바뀌어 보내지 않음",
+            "Not sent: the source folder changed"
+        ));
     }
     match (oa.code, ob.code) {
         (Some(0), Some(0)) => match stage {
-            Stage::Local(t, _) => {
-                strip_setid(t.path()).map_err(|e| format!("받은 파일 권한 정리 실패: {e}"))
-            }
+            Stage::Local(t, _) => strip_setid(t.path()).map_err(|e| {
+                crate::tr!(
+                    "받은 파일 권한 정리 실패: {e}",
+                    "Cannot fix permissions of received files: {e}"
+                )
+            }),
             Stage::Remote(..) => Ok(()),
         },
         // the side that failed first; a reader that died leaves the writer
@@ -1452,7 +1543,10 @@ fn delete_source(spec: &TransferSpec, name: &OsString) -> Result<(), String> {
             let src = spec.src_dir.join(name);
             match spec.trash.delete(std::slice::from_ref(&src)).pop() {
                 Some((_, r)) => r,
-                None => Err("휴지통 이동 결과 없음".into()),
+                None => Err(crate::tr!(
+                    "휴지통 이동 결과 없음",
+                    "No result from moving to trash"
+                )),
             }
         }
         Side::Remote(s) => remote_ops::delete(s, &spec.src_dir, std::slice::from_ref(name)),
@@ -1503,8 +1597,9 @@ fn item(
                 Err(e) => return fail(e),
             };
             if dk == Kind::Dir || sk == Kind::Dir {
-                return Step::Skipped(Some(format!(
+                return Step::Skipped(Some(crate::tr!(
                     "폴더는 덮어쓸 수 없어 건너뜀: {}",
+                    "Skipped: a folder cannot be overwritten: {}",
                     lossy(name)
                 )));
             }
@@ -1520,7 +1615,12 @@ fn item(
     // A folder sent into itself (one machine seen through two names, ssh
     // to localhost): the copy would keep copying its own stage.
     match dir_id(&spec.src, &src) {
-        Ok(Some(id)) if chain.contains(&id) => return fail("폴더를 그 안으로 보낼 수 없음".into()),
+        Ok(Some(id)) if chain.contains(&id) => {
+            return fail(crate::tr!(
+                "폴더를 그 안으로 보낼 수 없음",
+                "Cannot send a folder into itself"
+            ));
+        }
         Ok(_) => {}
         Err(e) => return fail(e),
     }
@@ -1553,7 +1653,10 @@ fn item(
     // an existing target is never written over in place.
     let sent = if on_host_move {
         let Stage::Remote(s, _, p) = &stage else {
-            return fail("임시 폴더가 원격이 아님".into());
+            return fail(crate::tr!(
+                "임시 폴더가 원격이 아님",
+                "temp folder is not remote"
+            ));
         };
         let into = cat(&[&into_dir(p), &os_bytes(name)]);
         let cmd = host_mv_cmd(
@@ -1566,8 +1669,11 @@ fn item(
         // Not cancellable: a killed client could leave the server's mv
         // running while the stage is cleaned up.
         match s.exec_long(&cmd).map_err(|e| e.message()) {
-            Ok(o) if o.code == Some(SPECIAL) => Err(SPECIAL_MSG.to_string()),
-            Ok(o) if o.code == Some(SRC_MOVED) => Err("원본 폴더가 바뀌어 보내지 않음".into()),
+            Ok(o) if o.code == Some(SPECIAL) => Err(special_msg().to_string()),
+            Ok(o) if o.code == Some(SRC_MOVED) => Err(crate::tr!(
+                "원본 폴더가 바뀌어 보내지 않음",
+                "Not sent: the source folder changed"
+            )),
             Ok(o) => ran(o).map(drop),
             Err(e) => Err(e),
         }
@@ -1588,8 +1694,9 @@ fn item(
             (true, Stage::Remote(s, _, p)) => {
                 let cmd = unmove_cmd(&s.os, &p, &os_bytes(name), &b(&src));
                 (!matches!(s.exec(&cmd), Ok(o) if o.code == Some(0))).then(|| {
-                    format!(
+                    crate::tr!(
                         "옮기던 항목이 임시 폴더에 남았을 수 있음: {}",
+                        "The item being moved may have stayed in the temp folder: {}",
                         String::from_utf8_lossy(&p)
                     )
                 })
@@ -1598,8 +1705,8 @@ fn item(
         });
         return if cancelled {
             Step::Stop(OpOutcome::Cancelled)
-        } else if e == SPECIAL_MSG {
-            Step::Skipped(Some(format!("{SPECIAL_MSG}: {}", lossy(name))))
+        } else if e == special_msg() {
+            Step::Skipped(Some(format!("{}: {}", special_msg(), lossy(name))))
         } else {
             fail(e)
         };
@@ -1613,8 +1720,9 @@ fn item(
             (Some(back), Stage::Remote(s, _, p)) => {
                 let cmd = unmove_cmd(&s.os, &p, &os_bytes(name), &b(back));
                 (!matches!(s.exec(&cmd), Ok(o) if o.code == Some(0))).then(|| {
-                    format!(
+                    crate::tr!(
                         "옮기던 항목이 임시 폴더에 남았을 수 있음: {}",
+                        "The item being moved may have stayed in the temp folder: {}",
                         String::from_utf8_lossy(&p)
                     )
                 })
@@ -1626,17 +1734,32 @@ fn item(
     match place(stage, name, overwrite, restore) {
         Ok(Placed::Done(w)) => r.warnings.extend(w),
         Ok(Placed::Taken) => {
-            return Step::Skipped(Some(format!("{APPEARED_MSG}: {}", lossy(name))));
+            return Step::Skipped(Some(format!("{}: {}", appeared_msg(), lossy(name))));
         }
-        Err(e) => return fail(format!("제자리로 옮기지 못함: {e}")),
+        Err(e) => {
+            return fail(crate::tr!(
+                "제자리로 옮기지 못함: {e}",
+                "Cannot move into place: {e}"
+            ));
+        }
     }
     r.overwritten += usize::from(overwrite);
     let Some(before) = before else {
         return Step::Done;
     };
     match kind(&spec.dst, &dest) {
-        Ok(Kind::Missing) => return fail("전송 후 대상이 없어 원본을 지우지 않음".into()),
-        Err(e) => return fail(format!("전송 확인 실패, 원본을 지우지 않음 ({e})")),
+        Ok(Kind::Missing) => {
+            return fail(crate::tr!(
+                "전송 후 대상이 없어 원본을 지우지 않음",
+                "Source kept: the destination is missing after the transfer"
+            ));
+        }
+        Err(e) => {
+            return fail(crate::tr!(
+                "전송 확인 실패, 원본을 지우지 않음 ({e})",
+                "Transfer check failed, source kept ({e})"
+            ));
+        }
         Ok(_) => {}
     }
     // A remote source is deleted for good, so it is first set aside in a
@@ -1648,11 +1771,16 @@ fn item(
     let sent = count(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
     let got = count(&spec.dst, &spec.dest_dir, name, ctl.cancel_flag());
     if ctl.is_cancelled() {
-        return Step::Partial(format!("취소되어 원본을 지우지 않음: {}", lossy(name)));
+        return Step::Partial(crate::tr!(
+            "취소되어 원본을 지우지 않음: {}",
+            "Cancelled, source kept: {}",
+            lossy(name)
+        ));
     }
     if sent.is_none() || got != sent {
-        return Step::Partial(format!(
+        return Step::Partial(crate::tr!(
             "받은 항목 수를 원본과 맞춰 보지 못해(대소문자만 다른 이름 등) 원본을 지우지 않음: {}",
+            "Source kept: cannot match the received item count to the source (names differing only in case?): {}",
             lossy(name)
         ));
     }
@@ -1661,14 +1789,22 @@ fn item(
     }
     let after = stamp(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
     if ctl.is_cancelled() {
-        return Step::Partial(format!("취소되어 원본을 지우지 않음: {}", lossy(name)));
+        return Step::Partial(crate::tr!(
+            "취소되어 원본을 지우지 않음: {}",
+            "Cancelled, source kept: {}",
+            lossy(name)
+        ));
     }
     if before.is_none() || after != before {
         return Step::Partial(changed_msg(name));
     }
     match delete_source(spec, name) {
         Ok(()) => Step::Done,
-        Err(e) => Step::Partial(format!("원본을 지우지 못함: {} ({e})", lossy(name))),
+        Err(e) => Step::Partial(crate::tr!(
+            "원본을 지우지 못함: {} ({e})",
+            "Cannot delete the source: {} ({e})",
+            lossy(name)
+        )),
     }
 }
 
@@ -1690,16 +1826,18 @@ fn put_back(
     );
     match s.exec(&back) {
         Ok(o) if o.code == Some(0) => why,
-        _ => format!(
+        _ => crate::tr!(
             "{why} · 원본이 격리 폴더에 남음: {}",
+            "{why} · The source stayed in the quarantine folder: {}",
             qdir.join(name).to_string_lossy()
         ),
     }
 }
 
 fn changed_msg(name: &OsString) -> String {
-    format!(
+    crate::tr!(
         "원본이 전송 중 바뀌었거나 대상과 같은 파일이라 원본을 지우지 않음: {}",
+        "Source kept: it changed during the transfer or is the same file as the target: {}",
         lossy(name)
     )
 }
@@ -1725,35 +1863,40 @@ fn delete_remote_source(
         Ok(o) if o.code == Some(0) => o,
         Ok(o) if o.code == Some(SOURCE_CHANGED) => return keep(changed_msg(name)),
         Ok(o) if o.code == Some(crate::remote::DELETE_PROTECTED) => {
-            return keep(format!(
+            return keep(crate::tr!(
                 "삭제 거부: 홈 디렉터리 또는 그 상위라 원본을 지우지 않음: {}",
+                "Delete refused: the source is the home directory or above, kept: {}",
                 lossy(name)
             ));
         }
         Ok(o) if o.code == Some(UNSAFE_DIR) => {
-            return keep(format!(
+            return keep(crate::tr!(
                 "다른 사용자가 바꿀 수 있는 폴더라 원본을 지우지 않음: {}",
+                "Source kept: a folder other users can change: {}",
                 lossy(name)
             ));
         }
         Ok(o) => {
-            return keep(format!(
+            return keep(crate::tr!(
                 "원본을 지우지 못함: {} ({})",
+                "Cannot delete the source: {} ({})",
                 lossy(name),
                 code_err(&o)
             ));
         }
         Err(e) => {
-            return keep(format!(
+            return keep(crate::tr!(
                 "원본을 지우지 못함: {} ({})",
+                "Cannot delete the source: {} ({})",
                 lossy(name),
                 e.message()
             ));
         }
     };
     let Some(q) = parse_quarantine(&out.stdout) else {
-        return keep(format!(
+        return keep(crate::tr!(
             "원본을 지우지 못함: {} (격리 폴더를 알 수 없음)",
+            "Cannot delete the source: {} (quarantine folder unknown)",
             lossy(name)
         ));
     };
@@ -1765,14 +1908,22 @@ fn delete_remote_source(
         .map(|(_, t)| t);
     if ctl.is_cancelled() || tree != Some(t0) {
         let why = if ctl.is_cancelled() {
-            format!("취소되어 원본을 지우지 않음: {}", lossy(name))
+            crate::tr!(
+                "취소되어 원본을 지우지 않음: {}",
+                "Cancelled, source kept: {}",
+                lossy(name)
+            )
         } else {
             changed_msg(name)
         };
         return keep(put_back(s, spec, &qdir, name, why));
     }
     if let Err(e) = remote_ops::delete(s, &qdir, std::slice::from_ref(name)) {
-        let why = format!("원본을 지우지 못함: {} ({e})", lossy(name));
+        let why = crate::tr!(
+            "원본을 지우지 못함: {} ({e})",
+            "Cannot delete the source: {} ({e})",
+            lossy(name)
+        );
         return keep(put_back(s, spec, &qdir, name, why));
     }
     // The item is gone; an empty dir left behind is only cosmetic.
@@ -1792,7 +1943,10 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
         _ => false,
     };
     if same_target && spec.dest_dir == spec.src_dir {
-        return OpReport::failed("같은 폴더로는 보낼 수 없음");
+        return OpReport::failed(crate::tr!(
+            "같은 폴더로는 보낼 수 없음",
+            "Cannot send into the same folder"
+        ));
     }
     if same_target
         && spec
@@ -1800,7 +1954,10 @@ pub fn run(spec: &TransferSpec, ctl: &mut dyn TransferCtl) -> OpReport {
             .iter()
             .any(|n| spec.dest_dir.starts_with(spec.src_dir.join(n)))
     {
-        return OpReport::failed("폴더를 그 안으로 보낼 수 없음");
+        return OpReport::failed(crate::tr!(
+            "폴더를 그 안으로 보낼 수 없음",
+            "Cannot send a folder into itself"
+        ));
     }
     let real = match dest_dir_ok(&spec.dst, &spec.dest_dir) {
         Ok(r) => r,
@@ -2371,7 +2528,7 @@ mod tests {
             let out = sh(&stage_cmd(&crate::testutil::local_os(), &b(d)));
             assert_eq!(out.status.code(), Some(UNSAFE_DIR), "{d:?}");
             assert!(
-                matches!(local_dest_safe(d), Err(m) if m == UNSAFE_MSG),
+                matches!(local_dest_safe(d), Err(m) if m == unsafe_msg()),
                 "{d:?}"
             );
         }
@@ -3542,7 +3699,7 @@ mod tests {
             &p("/dst"),
         );
         let r = run(&s, &mut Ctl::new());
-        assert_eq!(r.outcome, OpOutcome::Failed(format!("a: {UNSAFE_MSG}")));
+        assert_eq!(r.outcome, OpOutcome::Failed(format!("a: {}", unsafe_msg())));
         assert!(f.pipe_calls().is_empty());
         // locally too
         use std::os::unix::fs::PermissionsExt;
@@ -3560,7 +3717,7 @@ mod tests {
         let r = run(&s, &mut Ctl::new());
         assert_eq!(
             r.outcome,
-            OpOutcome::Failed(UNSAFE_MSG.into()),
+            OpOutcome::Failed(unsafe_msg().into()),
             "checked once, up front"
         );
         assert!(f.pipe_calls().is_empty());
@@ -3589,7 +3746,7 @@ mod tests {
         let r = run(&s, &mut c);
         assert_eq!((r.outcome, r.copied, r.skipped), (OpOutcome::Done, 0, 1));
         assert!(c.conflicts.is_empty(), "it was free when checked");
-        assert_eq!(r.warnings, vec![format!("{APPEARED_MSG}: a")]);
+        assert_eq!(r.warnings, vec![format!("{}: a", appeared_msg())]);
         assert_eq!(fs::read(t.path().join("a")).unwrap(), b"theirs");
         assert_eq!(stages_in(t.path()), 0);
     }
@@ -3618,7 +3775,7 @@ mod tests {
         );
         let r = run(&s, &mut Ctl::new());
         assert_eq!((r.outcome, r.skipped), (OpOutcome::Done, 1));
-        assert_eq!(r.warnings, vec![format!("{APPEARED_MSG}: a")]);
+        assert_eq!(r.warnings, vec![format!("{}: a", appeared_msg())]);
         assert!(t.path().join("a").exists(), "source kept");
         let unstage = String::from_utf8(unstage_cmd(STAGE.as_bytes())).unwrap();
         assert_eq!(f.remote_cmds().last(), Some(&unstage));
@@ -4997,5 +5154,26 @@ mod windows_place_tests {
         );
         assert!(matches!(r, Ok(Placed::Done(None))), "{r:?}");
         assert_eq!(fs::read(&old).unwrap(), b"new");
+    }
+
+    #[test]
+    fn transfer_messages_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            assert_eq!(unsafe_msg(), "Not sent: a folder other users can change");
+            assert_eq!(left_behind("/t/x y"), "Temp folder left behind: /t/x y");
+            let name = OsString::from("한글 'a'.txt");
+            assert_eq!(
+                changed_msg(&name),
+                "Source kept: it changed during the transfer or is the same file as the target: 한글 'a'.txt"
+            );
+            let d = tempfile::tempdir().unwrap();
+            let gone = d.path().join("none");
+            assert_eq!(
+                dest_dir_ok(&Side::Local, &gone).unwrap_err(),
+                "Destination folder missing"
+            );
+        });
+        // the default language is still Korean
+        assert_eq!(left_behind("/t"), "임시 폴더가 남음: /t");
     }
 }

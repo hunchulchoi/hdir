@@ -311,11 +311,21 @@ pub fn run_through_files(
     let files = tempfile::tempfile().and_then(|o| Ok((o, tempfile::tempfile()?)));
     let (mut out, mut err) = match files {
         Ok(f) => f,
-        Err(e) => return (spawn_failed(&format!("임시 파일: {e}")), None),
+        Err(e) => {
+            return (
+                spawn_failed(&crate::tr!("임시 파일: {e}", "temp file: {e}")),
+                None,
+            );
+        }
     };
     let (o2, e2) = match (out.try_clone(), err.try_clone()) {
         (Ok(a), Ok(b)) => (a, b),
-        (Err(e), _) | (_, Err(e)) => return (spawn_failed(&format!("임시 파일: {e}")), None),
+        (Err(e), _) | (_, Err(e)) => {
+            return (
+                spawn_failed(&crate::tr!("임시 파일: {e}", "temp file: {e}")),
+                None,
+            );
+        }
     };
     let mut command = Command::new(prog);
     command.args(args).stdout(o2).stderr(e2);
@@ -352,7 +362,7 @@ pub fn run_through_files(
                 });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(_) => break Err("실행 실패"),
+            Err(_) => break Err(crate::i18n::t("실행 실패", "Failed to run")),
         }
     };
     let read_all = |f: &mut std::fs::File| -> Vec<u8> {
@@ -574,7 +584,7 @@ impl RemoteSession {
             }
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
-                "ssh 실행 실패",
+                &crate::tr!("ssh 실행 실패", "Failed to run ssh"),
             ))),
             Some(_) => Ok(out),
         }
@@ -594,7 +604,7 @@ impl RemoteSession {
             }
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
-                "scp 실행 실패",
+                &crate::tr!("scp 실행 실패", "Failed to run scp"),
             ))),
             Some(_) => Ok(out),
         }
@@ -632,7 +642,7 @@ impl RemoteSession {
             }
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
-                "scp 실행 실패",
+                &crate::tr!("scp 실행 실패", "Failed to run scp"),
             ))),
             Some(_) => Ok(out),
         }
@@ -676,7 +686,7 @@ impl RemoteSession {
         if failed && out.stdout.is_empty() {
             return Err(first_line(
                 &out.stderr,
-                &format!("종료 코드 {}", out.code.unwrap_or(-1)),
+                &crate::tr!("종료 코드 {}", "exit code {}", out.code.unwrap_or(-1)),
             ));
         }
         let (mut entries, bad) = parse_listing(&self.os, &out.stdout);
@@ -768,14 +778,20 @@ fn check_private_dir(m: &std::fs::Metadata, dir: &Path) -> std::io::Result<()> {
         ))
     };
     if !m.is_dir() {
-        return deny("실제 디렉터리가 아님");
+        return deny(crate::i18n::t(
+            "실제 디렉터리가 아님",
+            "not a real directory",
+        ));
     }
     // SAFETY: getuid has no preconditions and cannot fail.
     if m.uid() != unsafe { libc::getuid() } {
-        return deny("소유자가 다름");
+        return deny(crate::i18n::t("소유자가 다름", "owned by someone else"));
     }
     if m.permissions().mode() & 0o077 != 0 {
-        return deny("권한이 너무 넓음 (0700 필요)");
+        return deny(crate::i18n::t(
+            "권한이 너무 넓음 (0700 필요)",
+            "permissions too open (0700 required)",
+        ));
     }
     Ok(())
 }
@@ -790,8 +806,14 @@ pub fn start_master(cmd: &dyn Cmd, t: &SshTarget) -> Result<(), String> {
     let out = cmd.run_interactive(&master_argv(t));
     match out.code {
         Some(0) => Ok(()),
-        Some(c) => Err(format!("ssh 연결 실패 (종료 코드 {c})")),
-        None => Err(first_line(&out.stderr, "ssh 실행 실패")),
+        Some(c) => Err(crate::tr!(
+            "ssh 연결 실패 (종료 코드 {c})",
+            "ssh connection failed (exit code {c})"
+        )),
+        None => Err(first_line(
+            &out.stderr,
+            &crate::tr!("ssh 실행 실패", "Failed to run ssh"),
+        )),
     }
 }
 
@@ -850,14 +872,24 @@ pub fn establish(
     let uname = cmd.run(&exec_argv(&target, b"uname -s"));
     match uname.code {
         Some(0) => {}
-        Some(255) => return Err(first_line(&uname.stderr, "ssh 연결 실패")),
+        Some(255) => {
+            return Err(first_line(
+                &uname.stderr,
+                &crate::tr!("ssh 연결 실패", "ssh connection failed"),
+            ));
+        }
         Some(c) => {
             return Err(first_line(
                 &uname.stderr,
-                &format!("uname 실패 (종료 코드 {c})"),
+                &crate::tr!("uname 실패 (종료 코드 {c})", "uname failed (exit code {c})"),
             ));
         }
-        None => return Err(first_line(&uname.stderr, "ssh 실행 실패")),
+        None => {
+            return Err(first_line(
+                &uname.stderr,
+                &crate::tr!("ssh 실행 실패", "Failed to run ssh"),
+            ));
+        }
     }
     let os = parse_uname(&String::from_utf8_lossy(&uname.stdout));
     // `ssh -V` prints to stderr; failing to run it is not fatal (assume sftp).
@@ -878,13 +910,22 @@ pub fn establish(
         .exec(&start_path_cmd(start_path.unwrap_or("")))
         .map_err(|e| e.message())?;
     if out.code != Some(0) {
-        return Err(first_line(&out.stderr, "시작 경로를 열 수 없음"));
+        return Err(first_line(
+            &out.stderr,
+            &crate::tr!("시작 경로를 열 수 없음", "Cannot open the start path"),
+        ));
     }
     let Some(end) = out.stdout.iter().position(|&b| b == 0) else {
-        return Err("시작 경로를 알 수 없음".to_string());
+        return Err(crate::tr!(
+            "시작 경로를 알 수 없음",
+            "Cannot determine the start path"
+        ));
     };
     if end == 0 {
-        return Err("시작 경로를 알 수 없음".to_string());
+        return Err(crate::tr!(
+            "시작 경로를 알 수 없음",
+            "Cannot determine the start path"
+        ));
     }
     let start = PathBuf::from(os_from_bytes(out.stdout[..end].to_vec()));
     Ok(Established { session, start })
@@ -1550,5 +1591,33 @@ mod tests {
         let vfs = SshVfs { session: s };
         assert_eq!(vfs.display_path(Path::new("/var/log")), "web:/var/log");
         assert!(vfs.list(Path::new("/var"), false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_refusal_in_english() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let m = std::fs::symlink_metadata(d.path()).unwrap();
+        let e = crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            check_private_dir(&m, d.path()).unwrap_err().to_string()
+        });
+        assert!(e.contains("permissions too open (0700 required)"), "{e}");
+        let ko = check_private_dir(&m, d.path()).unwrap_err().to_string();
+        assert!(ko.contains("권한이 너무 넓음"), "{ko}");
+    }
+
+    #[test]
+    fn spawn_error_texts_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let out = spawn_failed(&crate::tr!("임시 파일: {}", "temp file: {}", "x"));
+            assert_eq!(String::from_utf8_lossy(&out.stderr), "temp file: x");
+            assert_eq!(
+                first_line(b"", &crate::tr!("종료 코드 {}", "exit code {}", 3)),
+                "exit code 3"
+            );
+            assert_eq!(disconnected_msg(), "Disconnected · Enter to reconnect");
+        });
     }
 }

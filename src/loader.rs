@@ -156,12 +156,15 @@ fn pump(inner: &Arc<Inner>) {
     for (key, epoch, req) in to_run {
         let inner = Arc::clone(inner);
         std::thread::spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &req.vfs {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match &req.vfs {
                     Some(vfs) => vfs.list(&req.dir, req.hidden),
                     None => (inner.reader)(&req.dir, req.hidden),
-                }))
-                .unwrap_or_else(|_| Err("디렉터리 읽기 실패".to_string()));
+                }
+            }))
+            .unwrap_or_else(|_| {
+                Err(crate::i18n::t("디렉터리 읽기 실패", "Failed to read directory").to_string())
+            });
             if let Ok(mut st) = inner.state.lock() {
                 let current = st.slots.get(&key).is_some_and(|s| s.epoch == epoch);
                 if !current {
