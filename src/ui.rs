@@ -231,6 +231,11 @@ pub(crate) fn human_size(size: u64) -> String {
 }
 
 /// `path` with a leading home directory shortened to `~`.
+pub fn tilde_path(path: &std::path::Path) -> String {
+    tilde(path)
+}
+
+/// `path` with a leading home directory shortened to `~`.
 fn tilde(path: &std::path::Path) -> String {
     tilde_with(path, dirs::home_dir().as_deref())
 }

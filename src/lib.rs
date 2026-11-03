@@ -17,6 +17,7 @@ pub mod launcher;
 pub mod loader;
 pub mod menu;
 pub mod panel;
+pub mod places;
 pub mod platform;
 pub mod preview;
 pub mod remote;
