@@ -198,6 +198,29 @@ pub fn measure(sources: &[PathBuf]) -> io::Result<Totals> {
     Ok(measure_cancellable(sources, &|| false)?.unwrap_or(Totals { files: 0, bytes: 0 }))
 }
 
+pub use crate::platform::LIST_POLL;
+
+/// The names in folder `src` (through `dir` when open), asking `stop`
+/// every [`LIST_POLL`] names so Esc works while a huge folder is listed;
+/// `None` when it said stop.
+pub fn list_names(
+    dir: Option<&crate::platform::DirFd>,
+    src: &Path,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Option<Vec<OsString>>> {
+    if let Some(d) = dir {
+        return d.entries_until(stop);
+    }
+    let mut out = Vec::new();
+    for e in fs::read_dir(src)? {
+        if out.len() % LIST_POLL == 0 && stop() {
+            return Ok(None);
+        }
+        out.push(e?.file_name());
+    }
+    Ok(Some(out))
+}
+
 /// Like [`measure`] but polls `is_cancelled`; `Ok(None)` means cancelled.
 pub fn measure_cancellable(
     sources: &[PathBuf],
@@ -584,11 +607,9 @@ fn copy_dir(
     let skipped_before = acc.skipped;
     let mut xattr_err = None;
     let mut run = || -> io::Result<Step> {
-        let names: Vec<OsString> = match dir {
-            Some(d) => d.entries()?,
-            None => fs::read_dir(src)?
-                .map(|e| e.map(|e| e.file_name()))
-                .collect::<io::Result<_>>()?,
+        let stop = || ctl.is_cancelled();
+        let Some(names) = list_names(dir, src, &stop)? else {
+            return Ok(Step::Cancelled);
         };
         for name in names {
             if copy_entry_in(
@@ -883,10 +904,10 @@ fn move_entry(
         let dest_dir = is_real_dir(dest);
         if src_dir && dest_dir {
             // Merge: cannot rename over a directory. Move children one by one.
-            let mut children = Vec::new();
-            for e in fs::read_dir(src)? {
-                children.push(e?.file_name());
-            }
+            let stop = || ctl.is_cancelled();
+            let Some(children) = list_names(None, src, &stop)? else {
+                return Ok(Step::Cancelled);
+            };
             let mut complete = true;
             for name in children {
                 let (cs, cd) = (src.join(&name), dest.join(&name));
@@ -1229,6 +1250,51 @@ mod tests {
 
     fn ctl() -> Ctl {
         Ctl::new(ConflictAction::Cancel)
+    }
+
+    #[test]
+    fn listing_a_big_folder_stops_when_esc_is_pressed() {
+        use std::cell::Cell;
+        let t = tempfile::tempdir().unwrap();
+        for i in 0..1000 {
+            fs::write(t.path().join(format!("f{i:04}")), "").unwrap();
+        }
+        let polls = Cell::new(0usize);
+        let never = || {
+            polls.set(polls.get() + 1);
+            false
+        };
+        let all = list_names(None, t.path(), &never)
+            .unwrap()
+            .expect("not cancelled");
+        assert_eq!(all.len(), 1000);
+        assert!(
+            polls.get() >= 1000 / LIST_POLL,
+            "polled while listing: {}",
+            polls.get()
+        );
+        // Esc after the first poll: the listing gives up
+        let calls = Cell::new(0usize);
+        let soon = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+        assert_eq!(list_names(None, t.path(), &soon).unwrap(), None);
+        #[cfg(unix)]
+        {
+            let d = crate::platform::open_src_dir(None, t.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                list_names(Some(&d), t.path(), &never)
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                1000
+            );
+            calls.set(0);
+            assert_eq!(list_names(Some(&d), t.path(), &soon).unwrap(), None);
+        }
     }
 
     #[test]

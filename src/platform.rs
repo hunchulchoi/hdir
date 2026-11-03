@@ -828,7 +828,7 @@ impl DirFd {
     pub fn metadata(&self) -> io::Result<fs::Metadata> {
         match *self {}
     }
-    pub fn entries(&self) -> io::Result<Vec<OsString>> {
+    pub fn entries_until(&self, _stop: &dyn Fn() -> bool) -> io::Result<Option<Vec<OsString>>> {
         match *self {}
     }
     pub fn copy_xattrs_to(&self, _to: &Path) -> io::Result<()> {
@@ -876,8 +876,9 @@ impl DirFd {
         f.metadata()
     }
 
-    /// Names in the folder, without `.` and `..`.
-    pub fn entries(&self) -> io::Result<Vec<OsString>> {
+    /// Names in the folder, without `.` and `..`; `None` once `stop`
+    /// (asked every [`LIST_POLL`] names) says so.
+    pub fn entries_until(&self, stop: &dyn Fn() -> bool) -> io::Result<Option<Vec<OsString>>> {
         use std::os::fd::IntoRawFd;
         use std::os::unix::ffi::OsStrExt;
         let dup = self.0.try_clone()?.into_raw_fd();
@@ -892,7 +893,12 @@ impl DirFd {
         // SAFETY: rewind so a reused description starts at the beginning.
         unsafe { libc::rewinddir(dir) };
         let mut out = Vec::new();
+        let mut stopped = false;
         let res = loop {
+            if out.len() % LIST_POLL == 0 && stop() {
+                stopped = true;
+                break Ok(());
+            }
             // SAFETY: errno is reset to tell the end from an error.
             unsafe { *errno_ptr() = 0 };
             let ent = unsafe { libc::readdir(dir) };
@@ -913,7 +919,7 @@ impl DirFd {
         };
         // SAFETY: opened above.
         unsafe { libc::closedir(dir) };
-        res.map(|()| out)
+        res.map(|()| (!stopped).then_some(out))
     }
 
     /// Copy this folder's extended attributes onto `to` (not followed).
@@ -1017,6 +1023,9 @@ fn kind_of(ft: &fs::FileType) -> SrcKind {
     }
 }
 
+/// Names read between two Esc checks while listing a folder.
+pub const LIST_POLL: usize = 256;
+
 /// Open a source folder without following links (`None`: no longer a real
 /// folder). Off unix there is nothing to open: `None` always.
 pub fn open_src_dir(parent: Option<&DirFd>, path: &Path) -> io::Result<Option<DirFd>> {
@@ -1114,7 +1123,7 @@ mod src_at_tests {
         fs::create_dir(d.join("sub")).unwrap();
         std::os::unix::fs::symlink("../elsewhere", d.join("ln")).unwrap();
         let dir = open_src_dir(None, &d).unwrap().expect("a real folder");
-        let mut names = dir.entries().unwrap();
+        let mut names = dir.entries_until(&|| false).unwrap().unwrap();
         names.sort();
         let mut want = vec![
             OsString::from("ln"),
@@ -1123,7 +1132,11 @@ mod src_at_tests {
         ];
         want.sort();
         assert_eq!(names, want);
-        assert_eq!(dir.entries().unwrap().len(), 3, "readable again");
+        assert_eq!(
+            dir.entries_until(&|| false).unwrap().unwrap().len(),
+            3,
+            "readable again"
+        );
         let kind = |n: &OsStr| src_kind(Some(&dir), &d.join(n)).unwrap().0;
         assert_eq!(kind(odd), SrcKind::File);
         assert_eq!(kind(OsStr::new("sub")), SrcKind::Dir);
@@ -1143,7 +1156,7 @@ mod src_at_tests {
         // the handle keeps pointing at the folder after it was renamed away
         fs::rename(&d, t.path().join("moved")).unwrap();
         std::os::unix::fs::symlink(t.path(), &d).unwrap();
-        assert_eq!(dir.entries().unwrap().len(), 3);
+        assert_eq!(dir.entries_until(&|| false).unwrap().unwrap().len(), 3);
         assert_eq!(kind(odd), SrcKind::File);
         assert!(open_src_dir(None, &d).unwrap().is_none(), "a link: refused");
     }
