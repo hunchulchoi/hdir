@@ -10,6 +10,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::i18n::t;
 use crate::keymap::{Action, Context, Keymap};
 use crate::theme::Theme;
 use crate::ui::fit_width;
@@ -81,55 +82,55 @@ pub fn render(frame: &mut Frame, screen: &mut TextScreen, theme: &Theme) {
     frame.render_widget(Paragraph::new(lines).style(base), inner);
 }
 
-/// Korean display name of an action (help screen).
+/// Display name of an action (help screen).
 pub fn action_label(a: Action) -> &'static str {
     match a {
-        Action::CursorUp => "위로 이동",
-        Action::CursorDown => "아래로 이동",
-        Action::PageUp => "페이지 위로",
-        Action::PageDown => "페이지 아래로",
-        Action::Home => "처음으로",
-        Action::End => "끝으로",
-        Action::Enter => "열기 / 실행",
-        Action::Parent => "상위 디렉터리",
-        Action::SwitchPanel => "패널 전환",
-        Action::ToggleSelect => "선택 토글",
-        Action::ToggleHidden => "숨김 파일 토글",
-        Action::View => "보기",
-        Action::Edit => "편집",
-        Action::Copy => "복사",
-        Action::Move => "이동",
-        Action::Mkdir => "새 폴더",
-        Action::Rename => "이름 변경",
-        Action::Delete => "삭제 (휴지통)",
-        Action::TrashView => "휴지통 보기",
-        Action::Menu => "메뉴",
-        Action::Help => "도움말",
-        Action::Quit => "종료",
-        Action::QuitNoCd => "종료 (cd 안 함)",
-        Action::Undo => "되돌리기",
-        Action::CommandLine => "명령줄",
-        Action::ToggleMode => "모드 전환",
-        Action::ConnectLeft => "왼쪽 패널 연결",
-        Action::ConnectRight => "오른쪽 패널 연결",
-        Action::OpenWith => "연결 프로그램 선택",
-        Action::CancelJob => "작업 취소",
-        Action::ScrollLeft => "왼쪽으로 스크롤",
-        Action::ScrollRight => "오른쪽으로 스크롤",
-        Action::Search => "검색",
-        Action::SearchNext => "다음 검색 결과",
-        Action::Confirm => "확인",
-        Action::Cancel => "취소",
+        Action::CursorUp => t("위로 이동", "Move up"),
+        Action::CursorDown => t("아래로 이동", "Move down"),
+        Action::PageUp => t("페이지 위로", "Page up"),
+        Action::PageDown => t("페이지 아래로", "Page down"),
+        Action::Home => t("처음으로", "Go to top"),
+        Action::End => t("끝으로", "Go to end"),
+        Action::Enter => t("열기 / 실행", "Open / run"),
+        Action::Parent => t("상위 디렉터리", "Parent directory"),
+        Action::SwitchPanel => t("패널 전환", "Switch panel"),
+        Action::ToggleSelect => t("선택 토글", "Toggle selection"),
+        Action::ToggleHidden => t("숨김 파일 토글", "Toggle hidden files"),
+        Action::View => t("보기", "View"),
+        Action::Edit => t("편집", "Edit"),
+        Action::Copy => t("복사", "Copy"),
+        Action::Move => t("이동", "Move"),
+        Action::Mkdir => t("새 폴더", "New folder"),
+        Action::Rename => t("이름 변경", "Rename"),
+        Action::Delete => t("삭제 (휴지통)", "Delete (to trash)"),
+        Action::TrashView => t("휴지통 보기", "View trash"),
+        Action::Menu => t("메뉴", "Menu"),
+        Action::Help => t("도움말", "Help"),
+        Action::Quit => t("종료", "Quit"),
+        Action::QuitNoCd => t("종료 (cd 안 함)", "Quit (no cd)"),
+        Action::Undo => t("되돌리기", "Undo"),
+        Action::CommandLine => t("명령줄", "Command line"),
+        Action::ToggleMode => t("모드 전환", "Switch mode"),
+        Action::ConnectLeft => t("왼쪽 패널 연결", "Connect left panel"),
+        Action::ConnectRight => t("오른쪽 패널 연결", "Connect right panel"),
+        Action::OpenWith => t("연결 프로그램 선택", "Choose program"),
+        Action::CancelJob => t("작업 취소", "Cancel job"),
+        Action::ScrollLeft => t("왼쪽으로 스크롤", "Scroll left"),
+        Action::ScrollRight => t("오른쪽으로 스크롤", "Scroll right"),
+        Action::Search => t("검색", "Search"),
+        Action::SearchNext => t("다음 검색 결과", "Next match"),
+        Action::Confirm => t("확인", "OK"),
+        Action::Cancel => t("취소", "Cancel"),
     }
 }
 
 fn context_label(c: Context) -> &'static str {
     match c {
-        Context::Panel => "패널",
-        Context::Trash => "휴지통",
-        Context::Viewer => "뷰어 / 도움말",
-        Context::Dialog => "대화상자",
-        Context::Menu => "메뉴",
+        Context::Panel => t("패널", "Panel"),
+        Context::Trash => t("휴지통", "Trash"),
+        Context::Viewer => t("뷰어 / 도움말", "Viewer / help"),
+        Context::Dialog => t("대화상자", "Dialog"),
+        Context::Menu => t("메뉴", "Menu"),
     }
 }
 
@@ -181,15 +182,30 @@ pub fn key_settings_lines(
 ) -> Vec<String> {
     let mut out = Vec::new();
     match config_path {
-        Some(p) if file_exists => out.push(format!("설정 파일: {}", p.display())),
-        Some(p) => out.push(format!(
+        Some(p) if file_exists => {
+            out.push(crate::tr!("설정 파일: {}", "Config file: {}", p.display()))
+        }
+        Some(p) => out.push(crate::tr!(
             "설정 파일: {} (파일 없음 - 기본값 사용)",
+            "Config file: {} (not found - using defaults)",
             p.display()
         )),
-        None => out.push("설정 파일: (설정 디렉터리를 알 수 없음)".to_string()),
+        None => out.push(
+            t(
+                "설정 파일: (설정 디렉터리를 알 수 없음)",
+                "Config file: (config directory unknown)",
+            )
+            .to_string(),
+        ),
     }
-    out.push(format!("키 프리셋: {preset}"));
-    out.push("[keys.bind] 등으로 재정의하고 '설정 다시 읽기'로 적용".to_string());
+    out.push(crate::tr!("키 프리셋: {preset}", "Key preset: {preset}"));
+    out.push(
+        t(
+            "[keys.bind] 등으로 재정의하고 '설정 다시 읽기'로 적용",
+            "Override with [keys.bind] etc., apply with 'Reload config'",
+        )
+        .to_string(),
+    );
     out.push(String::new());
     out.extend(help_lines(km));
     out
@@ -342,5 +358,67 @@ mod tests {
         assert_eq!(l[1], "키 프리셋: vim");
         let l = key_settings_lines(None, false, "mdir", &k);
         assert!(l[0].contains("알 수 없음"));
+    }
+}
+
+#[cfg(test)]
+mod en_tests {
+    use super::*;
+    use crate::i18n::{Lang, with_lang};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use unicode_width::UnicodeWidthStr;
+
+    fn rows(s: &mut TextScreen, w: u16, h: u16) -> Vec<String> {
+        let th = crate::theme::builtin("mdir").unwrap();
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| render(f, s, &th)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn english_help_screen_snapshot() {
+        with_lang(Lang::En, || {
+            let km = crate::keymap::build(&Default::default()).0;
+            let mut s = TextScreen::new("Help", help_lines(&km), "Esc/q/F3/F10: close".into());
+            let r = rows(&mut s, 50, 8);
+            assert!(r[0].starts_with("┌ Help "), "{:?}", r[0]);
+            assert_eq!(r[1].trim_matches(['│', ' ']), "[Panel]");
+            assert!(r[2].contains("Move up"), "{:?}", r[2]);
+            assert!(r[7].contains("Esc/q/F3/F10: close"), "{:?}", r[7]);
+        });
+    }
+
+    #[test]
+    fn english_help_descriptions_start_in_one_column() {
+        with_lang(Lang::En, || {
+            let km = crate::keymap::build(&Default::default()).0;
+            let lines = help_lines(&km);
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| !l.chars().any(|c| ('가'..='힣').contains(&c)))
+            );
+            for l in lines.iter().filter(|l| l.starts_with("  ")) {
+                // keys are padded to KEY_COL after the 2-space indent
+                let desc_col = 2 + KEY_COL;
+                assert!(UnicodeWidthStr::width(l.as_str()) > desc_col, "{l:?}");
+            }
+            assert!(lines.contains(&"[Dialog]".to_string()));
+            assert!(lines.iter().any(|l| l.ends_with("Toggle hidden files")));
+        });
+    }
+
+    #[test]
+    fn english_key_settings_header() {
+        with_lang(Lang::En, || {
+            let km = crate::keymap::build(&Default::default()).0;
+            let l = key_settings_lines(None, false, "mdir", &km);
+            assert_eq!(l[0], "Config file: (config directory unknown)");
+            assert_eq!(l[1], "Key preset: mdir");
+        });
     }
 }

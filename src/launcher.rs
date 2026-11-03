@@ -8,7 +8,22 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 /// Prompt shown after a `wait` association finished.
-pub const PRESS_ANY_KEY: &str = "계속하려면 아무 키나 누르세요";
+pub fn press_any_key() -> &'static str {
+    crate::i18n::t("계속하려면 아무 키나 누르세요", "Press any key to continue")
+}
+
+/// `Err` text of a failed run. [`exit_code_of`] reads it back in either
+/// language, so a message made before a language switch still matches.
+fn exit_code_msg(code: i32) -> String {
+    crate::tr!("종료 코드 {code}", "Exit code {code}")
+}
+
+fn exit_code_of(msg: &str) -> Option<i32> {
+    ["종료 코드 ", "Exit code "]
+        .iter()
+        .find_map(|p| msg.strip_prefix(p))
+        .and_then(|c| c.parse().ok())
+}
 
 /// Starts external programs. `Err` carries the user-facing reason.
 pub trait Launcher: Send + Sync {
@@ -17,7 +32,7 @@ pub trait Launcher: Send + Sync {
     fn run(&self, argv: &[OsString], cwd: &Path) -> Result<(), String>;
     /// Start `argv` in `cwd` with null stdio and do not wait for it.
     fn spawn_detached(&self, argv: &[OsString], cwd: &Path) -> Result<(), String>;
-    /// Print [`PRESS_ANY_KEY`] and block until a key is pressed.
+    /// Print [`press_any_key`] and block until a key is pressed.
     fn wait_key(&self);
 
     /// Like [`run`](Self::run) but reports the exit code instead of turning a
@@ -25,14 +40,14 @@ pub trait Launcher: Send + Sync {
     fn run_shell(&self, argv: &[OsString], cwd: &Path) -> Result<i32, String> {
         match self.run(argv, cwd) {
             Ok(()) => Ok(0),
-            Err(e) => match e.strip_prefix("종료 코드 ").and_then(|c| c.parse().ok()) {
+            Err(e) => match exit_code_of(&e) {
                 Some(code) => Ok(code),
                 None => Err(e),
             },
         }
     }
 
-    /// Show `[종료 코드 N]` plus the key prompt and wait for a key.
+    /// Show `[exit code N]` plus the key prompt and wait for a key.
     fn wait_key_after(&self, _code: i32) {
         self.wait_key();
     }
@@ -40,7 +55,7 @@ pub trait Launcher: Send + Sync {
 
 /// Text printed before waiting for a key after a command line command.
 pub fn exit_prompt(code: i32) -> String {
-    format!("\r\n[종료 코드 {code}] {PRESS_ANY_KEY}")
+    format!("\r\n[{}] {}", exit_code_msg(code), press_any_key())
 }
 
 pub type SharedLauncher = Arc<dyn Launcher>;
@@ -53,7 +68,9 @@ pub fn system_launcher() -> SharedLauncher {
 }
 
 fn command(argv: &[OsString], cwd: &Path) -> Result<Command, String> {
-    let (prog, args) = argv.split_first().ok_or("빈 명령")?;
+    let (prog, args) = argv
+        .split_first()
+        .ok_or_else(|| crate::i18n::t("빈 명령", "Empty command"))?;
     let mut c = Command::new(prog);
     c.args(args).current_dir(cwd);
     Ok(c)
@@ -66,8 +83,8 @@ impl Launcher for SystemLauncher {
             Ok(())
         } else {
             Err(match status.code() {
-                Some(c) => format!("종료 코드 {c}"),
-                None => "신호로 종료됨".to_string(),
+                Some(c) => exit_code_msg(c),
+                None => crate::i18n::t("신호로 종료됨", "Killed by a signal").to_string(),
             })
         }
     }
@@ -92,7 +109,7 @@ impl Launcher for SystemLauncher {
     }
 
     fn wait_key(&self) {
-        wait_for_key(&format!("\r\n{PRESS_ANY_KEY}"));
+        wait_for_key(&format!("\r\n{}", press_any_key()));
     }
 
     fn wait_key_after(&self, code: i32) {
@@ -195,5 +212,21 @@ mod tests {
         assert!(SystemLauncher.spawn_detached(&bad, t.path()).is_err());
         assert!(SystemLauncher.run(&bad, t.path()).is_err());
         assert!(SystemLauncher.run(&[], t.path()).is_err());
+    }
+
+    #[test]
+    fn prompts_and_exit_codes_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            assert_eq!(
+                exit_prompt(2),
+                "\r\n[Exit code 2] Press any key to continue"
+            );
+            let t = tempfile::tempdir().unwrap();
+            assert_eq!(
+                SystemLauncher.run(&sh("exit 3"), t.path()),
+                Err("Exit code 3".to_string())
+            );
+            assert_eq!(SystemLauncher.run_shell(&sh("exit 3"), t.path()), Ok(3));
+        });
     }
 }

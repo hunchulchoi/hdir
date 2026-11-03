@@ -191,7 +191,10 @@ impl TransferCtl for Worker {
 fn run(spec: &JobSpec, w: &mut Worker) -> OpReport {
     // Checked here (not on the UI thread): the path may sit on a slow mount.
     if !spec.dest_dir.is_dir() {
-        return OpReport::failed("대상 폴더 없음");
+        return OpReport::failed(crate::i18n::t(
+            "대상 폴더 없음",
+            "Destination folder missing",
+        ));
     }
     let totals = match spec.kind {
         // Moves are renames: progress by top-level item, no deep walk.
@@ -367,8 +370,8 @@ impl ProgressView {
 
     pub fn status_line(&self) -> String {
         let verb = match self.kind {
-            JobKind::Copy => "복사 중",
-            JobKind::Move => "이동 중",
+            JobKind::Copy => crate::i18n::t("복사 중", "Copying"),
+            JobKind::Move => crate::i18n::t("이동 중", "Moving"),
         };
         let mut s = format!(
             "{verb} {}/{} · {}%",
@@ -860,5 +863,26 @@ mod transfer_tests {
             matches!(ev.last(), Some(JobEvent::Finished { report }) if report.outcome == OpOutcome::Cancelled)
         );
         assert!(f.pipe_calls().is_empty());
+    }
+
+    #[test]
+    fn progress_status_line_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let mut v = ProgressView::new(JobKind::Copy);
+            v.apply(&JobEvent::Started {
+                totals: fs_ops::Totals {
+                    files: 12,
+                    bytes: 200,
+                },
+            });
+            v.apply(&JobEvent::Progress {
+                files_done: 3,
+                bytes_done: 90,
+                current: PathBuf::from("/x/name.txt"),
+            });
+            assert_eq!(v.status_line(), "Copying 3/12 · 45% · name.txt");
+            let mv = ProgressView::new(JobKind::Move);
+            assert!(mv.status_line().starts_with("Moving "));
+        });
     }
 }

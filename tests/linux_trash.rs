@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
-use hdir::trash::{SYMLINK_MSG, SystemTrash, TrashBackend, TrashEntry};
+use hdir::trash::{SystemTrash, TrashBackend, TrashEntry, symlink_msg};
 
 /// Fresh sandbox: `XDG_DATA_HOME` -> `<tmp>/xdg`, work files in `<tmp>/work`.
 fn sandbox() -> (tempfile::TempDir, PathBuf) {
@@ -80,7 +80,7 @@ fn non_utf8_symlink_to_dir_is_still_guarded() {
     assert_eq!(found.len(), 1);
     let r = store.restore(&found);
     assert!(r.restored.is_empty(), "{r:?}");
-    assert!(r.errors[0].contains(SYMLINK_MSG), "{r:?}");
+    assert!(r.errors[0].contains(symlink_msg()), "{r:?}");
     assert!(link.symlink_metadata().is_err(), "no stray dir");
     assert_eq!(find(&store, &link).len(), 1, "stays in the trash");
 }
@@ -102,7 +102,7 @@ fn symlink_to_dir_is_refused_and_left_in_the_trash() {
     assert!(!found[0].is_dir, "listed as a symlink, not a directory");
     let r = store.restore(&found);
     assert!(r.restored.is_empty(), "{r:?}");
-    assert!(r.errors[0].contains(SYMLINK_MSG), "{r:?}");
+    assert!(r.errors[0].contains(symlink_msg()), "{r:?}");
     assert!(link.symlink_metadata().is_err(), "no stray empty dir");
     assert_eq!(find(&store, &link).len(), 1);
     assert!(target.join("inner").exists());

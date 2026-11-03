@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::assoc::{AssocRule, AssocTable};
+use crate::i18n::{self, Lang};
 use crate::keymap::{self, Keymap, KeysConfig};
 use crate::servers::ServerConfig;
 use crate::theme::{self, Theme};
@@ -71,6 +72,8 @@ pub struct Config {
     pub keys: KeysConfig,
     pub assoc: Vec<AssocRule>,
     pub servers: Vec<ServerConfig>,
+    /// `ko`, `en` or `auto`; see [`crate::i18n`].
+    pub lang: Option<String>,
 }
 
 /// `$XDG_CONFIG_HOME/hdir` if set (and non-empty), else `<home>/.config/hdir`.
@@ -120,7 +123,11 @@ pub fn load_config(dir: Option<&Path>) -> (Config, Vec<String>) {
         Err(e) => {
             return (
                 Config::default(),
-                vec![format!("config: {} 읽기 실패: {e}", path.display())],
+                vec![crate::tr!(
+                    "config: {} 읽기 실패: {e}",
+                    "config: could not read {}: {e}",
+                    path.display()
+                )],
             );
         }
     };
@@ -131,8 +138,9 @@ pub fn load_config(dir: Option<&Path>) -> (Config, Vec<String>) {
             let first = msg.lines().next().unwrap_or("parse error");
             (
                 Config::default(),
-                vec![format!(
+                vec![crate::tr!(
                     "config: {} 해석 실패, 기본값 사용: {first}",
+                    "config: could not parse {}, using defaults: {first}",
                     path.display()
                 )],
             )
@@ -149,6 +157,8 @@ pub struct Settings {
     pub classic: Theme,
     pub dev: Theme,
     pub assoc: AssocTable,
+    /// Screen language from the config; `None` keeps the startup language.
+    pub lang: Option<Lang>,
     /// config, keymap, theme and assoc warnings, in that order.
     pub warnings: Vec<String>,
 }
@@ -164,6 +174,14 @@ impl Settings {
 
 pub fn load_settings(dir: Option<&Path>) -> Settings {
     let (config, mut warnings) = load_config(dir);
+    let lang = match config.lang.as_deref().map(i18n::parse_setting) {
+        Some(Ok(l)) => l,
+        Some(Err(e)) => {
+            warnings.push(format!("config: {e}"));
+            None
+        }
+        None => None,
+    };
     let (keymap, w) = keymap::build(&config.keys);
     warnings.extend(w);
     let (user_themes, w) = match dir {
@@ -188,6 +206,7 @@ pub fn load_settings(dir: Option<&Path>) -> Settings {
         classic,
         dev,
         assoc,
+        lang,
         warnings,
     }
 }
@@ -196,8 +215,11 @@ pub fn load_settings(dir: Option<&Path>) -> Settings {
 pub fn warning_summary(warnings: &[String]) -> Option<String> {
     let first = warnings.first()?;
     Some(match warnings.len() - 1 {
-        0 => format!("설정 경고: {first}"),
-        n => format!("설정 경고: {first} (외 {n}개)"),
+        0 => crate::tr!("설정 경고: {first}", "Config warning: {first}"),
+        n => crate::tr!(
+            "설정 경고: {first} (외 {n}개)",
+            "Config warning: {first} (+{n} more)"
+        ),
     })
 }
 
@@ -208,8 +230,12 @@ pub fn warning_summary(warnings: &[String]) -> Option<String> {
 /// should be written.
 pub fn set_theme_in_text(text: &str, key: &str, name: &str) -> Result<String, String> {
     use toml_edit::{DocumentMut, Item, Table, value};
-    let fail =
-        |why: &str| format!("config.toml을 자동 수정할 수 없음 ({why}); 직접 [theme] 수정 필요");
+    let fail = |why: &str| {
+        crate::tr!(
+            "config.toml을 자동 수정할 수 없음 ({why}); 직접 [theme] 수정 필요",
+            "Cannot edit config.toml automatically ({why}); edit [theme] by hand"
+        )
+    };
     let mut doc: DocumentMut = text
         .parse()
         .map_err(|e: toml_edit::TomlError| fail(e.message()))?;
@@ -244,7 +270,12 @@ pub fn set_theme_in_text(text: &str, key: &str, name: &str) -> Result<String, St
     }
     match item.as_table_like_mut() {
         Some(t) => set(t, key, name),
-        None => return Err(fail("theme이 테이블이 아님")),
+        None => {
+            return Err(fail(crate::i18n::t(
+                "theme이 테이블이 아님",
+                "theme is not a table",
+            )));
+        }
     }
     let mut out = doc.to_string();
     if text.contains("\r\n") {
@@ -264,11 +295,20 @@ fn real_config_path(path: &Path) -> Result<PathBuf, String> {
         Ok(p) => Ok(p),
         // Dangling link: create the file it points to.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let target = std::fs::read_link(path)
-                .map_err(|e| format!("{} 링크 읽기 실패: {e}", path.display()))?;
+            let target = std::fs::read_link(path).map_err(|e| {
+                crate::tr!(
+                    "{} 링크 읽기 실패: {e}",
+                    "could not read link {}: {e}",
+                    path.display()
+                )
+            })?;
             Ok(path.parent().map_or(target.clone(), |p| p.join(&target)))
         }
-        Err(e) => Err(format!("{} 경로 확인 실패: {e}", path.display())),
+        Err(e) => Err(crate::tr!(
+            "{} 경로 확인 실패: {e}",
+            "could not resolve {}: {e}",
+            path.display()
+        )),
     }
 }
 
@@ -277,7 +317,7 @@ fn real_config_path(path: &Path) -> Result<PathBuf, String> {
 /// existing file's permissions, then atomically replace.
 fn write_atomic(real: &Path, text: &str) -> Result<(), String> {
     use std::io::Write;
-    let err = |e: std::io::Error| format!("저장 실패: {e}");
+    let err = |e: std::io::Error| crate::tr!("저장 실패: {e}", "Save failed: {e}");
     let (tmp, mut file) = (0..16)
         .find_map(|_| {
             let tmp = crate::fs_ops::temp_sibling(real);
@@ -290,7 +330,10 @@ fn write_atomic(real: &Path, text: &str) -> Result<(), String> {
         .unwrap_or_else(|| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "임시 파일 이름을 정하지 못함",
+                crate::i18n::t(
+                    "임시 파일 이름을 정하지 못함",
+                    "Could not pick a temporary file name",
+                ),
             ))
         })
         .map_err(err)?;
@@ -317,12 +360,23 @@ pub fn save_theme(dir: &Path, mode: Mode, name: &str) -> Result<(), String> {
     let existing = match std::fs::read_to_string(&real) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("{} 읽기 실패: {e}", real.display())),
+        Err(e) => {
+            return Err(crate::tr!(
+                "{} 읽기 실패: {e}",
+                "could not read {}: {e}",
+                real.display()
+            ));
+        }
     };
     let updated = set_theme_in_text(&existing, mode.key(), name)?;
     if let Some(parent) = real.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{} 생성 실패: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            crate::tr!(
+                "{} 생성 실패: {e}",
+                "could not create {}: {e}",
+                parent.display()
+            )
+        })?;
     }
     write_atomic(&real, &updated)
 }
@@ -481,6 +535,27 @@ cmd = "x {}"
         assert_eq!(
             s.keymap.lookup(keymap::Context::Panel, &ev),
             Some(keymap::Action::Copy)
+        );
+    }
+
+    #[test]
+    fn lang_setting_is_read_and_a_bad_one_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_cfg(tmp.path(), "lang = \"en\"\n");
+        let s = load_settings(Some(tmp.path()));
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.lang, Some(crate::i18n::Lang::En));
+
+        write_cfg(tmp.path(), "lang = \"auto\"\n");
+        assert_eq!(load_settings(Some(tmp.path())).lang, None);
+
+        write_cfg(tmp.path(), "lang = \"fr\"\n");
+        let s = load_settings(Some(tmp.path()));
+        assert_eq!(s.lang, None);
+        assert!(
+            s.warnings.iter().any(|w| w.contains("fr")),
+            "{:?}",
+            s.warnings
         );
     }
 
@@ -706,5 +781,16 @@ cmd = "x {}"
         assert_eq!(Mode::default(), Mode::Classic);
         assert_eq!(Mode::Classic.toggled(), Mode::Dev);
         assert_eq!(Mode::Dev.key(), "dev");
+    }
+
+    #[test]
+    fn warning_summary_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            assert_eq!(warning_summary(&["a".into()]).unwrap(), "Config warning: a");
+            assert_eq!(
+                warning_summary(&["a".into(), "b".into(), "c".into()]).unwrap(),
+                "Config warning: a (+2 more)"
+            );
+        });
     }
 }

@@ -28,7 +28,12 @@ use crate::remote::{
 use crate::vfs::Vfs;
 
 /// Status text of a panel whose connection died.
-pub const DISCONNECTED_MSG: &str = "연결 끊김 · Enter로 재연결";
+pub fn disconnected_msg() -> &'static str {
+    crate::i18n::t(
+        "연결 끊김 · Enter로 재연결",
+        "Disconnected · Enter to reconnect",
+    )
+}
 
 /// Result of one finished process. `code` is `None` when it could not be
 /// spawned or was killed by a signal (the reason is in `stderr`).
@@ -52,7 +57,7 @@ pub trait Cmd: Send + Sync {
         self.run(argv)
     }
     /// Like [`run_transfer`](Self::run_transfer), but stopped (with
-    /// [`CANCELLED_MSG`]) as soon as `cancel` is set.
+    /// [`cancelled_msg`]) as soon as `cancel` is set.
     fn run_cancellable(&self, argv: &[OsString], _cancel: &AtomicBool) -> CmdOutput {
         self.run_transfer(argv)
     }
@@ -69,10 +74,14 @@ pub trait Cmd: Send + Sync {
 }
 
 /// Stderr text of a command stopped through its cancel flag.
-pub const CANCELLED_MSG: &str = "취소됨";
+pub fn cancelled_msg() -> &'static str {
+    crate::i18n::t("취소됨", "Cancelled")
+}
 
 /// Stderr text of a command that was killed for running too long.
-pub const TIMEOUT_MSG: &str = "시간 초과";
+pub fn timeout_msg() -> &'static str {
+    crate::i18n::t("시간 초과", "Timed out")
+}
 
 /// Hard limit for any non-interactive command run through [`SystemCmd`].
 pub const CMD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,13 +93,13 @@ pub const TRANSFER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 pub struct SystemCmd;
 
 /// Run `argv` to completion with captured output, killing it after `limit`
-/// (then `code` is `None` and stderr is [`TIMEOUT_MSG`]).
+/// (then `code` is `None` and stderr is [`timeout_msg`]).
 pub fn run_limited(argv: &[OsString], limit: Duration) -> CmdOutput {
     run_with(argv, limit, None)
 }
 
 /// Like [`run_limited`], also stopped once `cancel` is set (then `code` is
-/// `None` and stderr is [`CANCELLED_MSG`]). On unix the command gets its own
+/// `None` and stderr is [`cancelled_msg`]). On unix the command gets its own
 /// process group and the whole group is killed, so helpers it spawned (scp's
 /// ssh) cannot keep the output pipes open.
 pub fn run_cancellable(argv: &[OsString], limit: Duration, cancel: &AtomicBool) -> CmdOutput {
@@ -153,14 +162,14 @@ fn run_with(argv: &[OsString], limit: Duration, cancel: Option<&AtomicBool>) -> 
             stdout,
             stderr,
         },
-        None if cancelled => spawn_failed(CANCELLED_MSG),
-        None => spawn_failed(TIMEOUT_MSG),
+        None if cancelled => spawn_failed(cancelled_msg()),
+        None => spawn_failed(timeout_msg()),
     }
 }
 
 /// Run `from | to` (from's stdout into to's stdin), both killed together
 /// after `limit` or once `cancel` is set (each output then has `code: None`
-/// and [`TIMEOUT_MSG`] / [`CANCELLED_MSG`]). On unix both share one new
+/// and [`timeout_msg`] / [`cancelled_msg`]). On unix both share one new
 /// process group, so helpers they spawned (ssh) die with them.
 pub fn run_pipe_cancellable(
     from: &[OsString],
@@ -246,9 +255,9 @@ pub fn run_pipe_cancellable(
             let _ = a.wait();
             let _ = b.wait();
             break Some(if is_set(cancel) {
-                CANCELLED_MSG
+                cancelled_msg()
             } else {
-                TIMEOUT_MSG
+                timeout_msg()
             });
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -302,11 +311,21 @@ pub fn run_through_files(
     let files = tempfile::tempfile().and_then(|o| Ok((o, tempfile::tempfile()?)));
     let (mut out, mut err) = match files {
         Ok(f) => f,
-        Err(e) => return (spawn_failed(&format!("임시 파일: {e}")), None),
+        Err(e) => {
+            return (
+                spawn_failed(&crate::tr!("임시 파일: {e}", "temp file: {e}")),
+                None,
+            );
+        }
     };
     let (o2, e2) = match (out.try_clone(), err.try_clone()) {
         (Ok(a), Ok(b)) => (a, b),
-        (Err(e), _) | (_, Err(e)) => return (spawn_failed(&format!("임시 파일: {e}")), None),
+        (Err(e), _) | (_, Err(e)) => {
+            return (
+                spawn_failed(&crate::tr!("임시 파일: {e}", "temp file: {e}")),
+                None,
+            );
+        }
     };
     let mut command = Command::new(prog);
     command.args(args).stdout(o2).stderr(e2);
@@ -337,13 +356,13 @@ pub fn run_through_files(
                 kill_tree(&mut child, cancel.is_some());
                 let _ = child.wait();
                 break Err(if cancelled {
-                    CANCELLED_MSG
+                    cancelled_msg()
                 } else {
-                    TIMEOUT_MSG
+                    timeout_msg()
                 });
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(_) => break Err("실행 실패"),
+            Err(_) => break Err(crate::i18n::t("실행 실패", "Failed to run")),
         }
     };
     let read_all = |f: &mut std::fs::File| -> Vec<u8> {
@@ -475,7 +494,7 @@ pub enum SessionError {
 impl SessionError {
     pub fn message(&self) -> String {
         match self {
-            SessionError::Disconnected => DISCONNECTED_MSG.to_string(),
+            SessionError::Disconnected => disconnected_msg().to_string(),
             SessionError::Spawn(m) => m.clone(),
         }
     }
@@ -565,7 +584,7 @@ impl RemoteSession {
             }
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
-                "ssh 실행 실패",
+                &crate::tr!("ssh 실행 실패", "Failed to run ssh"),
             ))),
             Some(_) => Ok(out),
         }
@@ -585,7 +604,7 @@ impl RemoteSession {
             }
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
-                "scp 실행 실패",
+                &crate::tr!("scp 실행 실패", "Failed to run scp"),
             ))),
             Some(_) => Ok(out),
         }
@@ -623,7 +642,7 @@ impl RemoteSession {
             }
             None => Err(SessionError::Spawn(first_line(
                 &out.stderr,
-                "scp 실행 실패",
+                &crate::tr!("scp 실행 실패", "Failed to run scp"),
             ))),
             Some(_) => Ok(out),
         }
@@ -667,7 +686,7 @@ impl RemoteSession {
         if failed && out.stdout.is_empty() {
             return Err(first_line(
                 &out.stderr,
-                &format!("종료 코드 {}", out.code.unwrap_or(-1)),
+                &crate::tr!("종료 코드 {}", "exit code {}", out.code.unwrap_or(-1)),
             ));
         }
         let (mut entries, bad) = parse_listing(&self.os, &out.stdout);
@@ -759,14 +778,20 @@ fn check_private_dir(m: &std::fs::Metadata, dir: &Path) -> std::io::Result<()> {
         ))
     };
     if !m.is_dir() {
-        return deny("실제 디렉터리가 아님");
+        return deny(crate::i18n::t(
+            "실제 디렉터리가 아님",
+            "not a real directory",
+        ));
     }
     // SAFETY: getuid has no preconditions and cannot fail.
     if m.uid() != unsafe { libc::getuid() } {
-        return deny("소유자가 다름");
+        return deny(crate::i18n::t("소유자가 다름", "owned by someone else"));
     }
     if m.permissions().mode() & 0o077 != 0 {
-        return deny("권한이 너무 넓음 (0700 필요)");
+        return deny(crate::i18n::t(
+            "권한이 너무 넓음 (0700 필요)",
+            "permissions too open (0700 required)",
+        ));
     }
     Ok(())
 }
@@ -781,8 +806,14 @@ pub fn start_master(cmd: &dyn Cmd, t: &SshTarget) -> Result<(), String> {
     let out = cmd.run_interactive(&master_argv(t));
     match out.code {
         Some(0) => Ok(()),
-        Some(c) => Err(format!("ssh 연결 실패 (종료 코드 {c})")),
-        None => Err(first_line(&out.stderr, "ssh 실행 실패")),
+        Some(c) => Err(crate::tr!(
+            "ssh 연결 실패 (종료 코드 {c})",
+            "ssh connection failed (exit code {c})"
+        )),
+        None => Err(first_line(
+            &out.stderr,
+            &crate::tr!("ssh 실행 실패", "Failed to run ssh"),
+        )),
     }
 }
 
@@ -841,14 +872,24 @@ pub fn establish(
     let uname = cmd.run(&exec_argv(&target, b"uname -s"));
     match uname.code {
         Some(0) => {}
-        Some(255) => return Err(first_line(&uname.stderr, "ssh 연결 실패")),
+        Some(255) => {
+            return Err(first_line(
+                &uname.stderr,
+                &crate::tr!("ssh 연결 실패", "ssh connection failed"),
+            ));
+        }
         Some(c) => {
             return Err(first_line(
                 &uname.stderr,
-                &format!("uname 실패 (종료 코드 {c})"),
+                &crate::tr!("uname 실패 (종료 코드 {c})", "uname failed (exit code {c})"),
             ));
         }
-        None => return Err(first_line(&uname.stderr, "ssh 실행 실패")),
+        None => {
+            return Err(first_line(
+                &uname.stderr,
+                &crate::tr!("ssh 실행 실패", "Failed to run ssh"),
+            ));
+        }
     }
     let os = parse_uname(&String::from_utf8_lossy(&uname.stdout));
     // `ssh -V` prints to stderr; failing to run it is not fatal (assume sftp).
@@ -869,13 +910,22 @@ pub fn establish(
         .exec(&start_path_cmd(start_path.unwrap_or("")))
         .map_err(|e| e.message())?;
     if out.code != Some(0) {
-        return Err(first_line(&out.stderr, "시작 경로를 열 수 없음"));
+        return Err(first_line(
+            &out.stderr,
+            &crate::tr!("시작 경로를 열 수 없음", "Cannot open the start path"),
+        ));
     }
     let Some(end) = out.stdout.iter().position(|&b| b == 0) else {
-        return Err("시작 경로를 알 수 없음".to_string());
+        return Err(crate::tr!(
+            "시작 경로를 알 수 없음",
+            "Cannot determine the start path"
+        ));
     };
     if end == 0 {
-        return Err("시작 경로를 알 수 없음".to_string());
+        return Err(crate::tr!(
+            "시작 경로를 알 수 없음",
+            "Cannot determine the start path"
+        ));
     }
     let start = PathBuf::from(os_from_bytes(out.stdout[..end].to_vec()));
     Ok(Established { session, start })
@@ -1039,7 +1089,7 @@ mod tests {
         let o = run_limited(&argv, std::time::Duration::from_millis(200));
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(o.code, None);
-        assert_eq!(first_line(&o.stderr, ""), TIMEOUT_MSG);
+        assert_eq!(first_line(&o.stderr, ""), timeout_msg());
     }
 
     #[cfg(unix)]
@@ -1061,7 +1111,7 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(o.code, None);
-        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&o.stderr, ""), cancelled_msg());
     }
 
     #[cfg(windows)]
@@ -1113,7 +1163,7 @@ mod tests {
             false,
         );
         assert!(start.elapsed() < Duration::from_secs(10));
-        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&o.stderr, ""), cancelled_msg());
     }
 
     #[cfg(unix)]
@@ -1163,7 +1213,7 @@ mod tests {
             false,
         );
         assert!(start.elapsed() < Duration::from_secs(5));
-        assert_eq!(first_line(&o.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&o.stderr, ""), cancelled_msg());
     }
 
     #[cfg(unix)]
@@ -1207,8 +1257,8 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
-        assert_eq!(first_line(&oa.stderr, ""), CANCELLED_MSG);
-        assert_eq!(first_line(&ob.stderr, ""), CANCELLED_MSG);
+        assert_eq!(first_line(&oa.stderr, ""), cancelled_msg());
+        assert_eq!(first_line(&ob.stderr, ""), cancelled_msg());
     }
 
     #[cfg(unix)]
@@ -1264,7 +1314,7 @@ mod tests {
         let f = Fake::new(|_| CmdOutput {
             code: None,
             stdout: Vec::new(),
-            stderr: TIMEOUT_MSG.as_bytes().to_vec(),
+            stderr: timeout_msg().as_bytes().to_vec(),
         });
         let s = session_with(f, RemoteOs::Linux);
         assert_eq!(s.list(Path::new("/x"), false).unwrap_err(), "시간 초과");
@@ -1440,7 +1490,7 @@ mod tests {
         let before = f.calls();
         assert_eq!(s.exec(b"true").unwrap_err(), SessionError::Disconnected);
         assert_eq!(f.calls(), before, "dead sessions do not spawn ssh");
-        assert_eq!(SessionError::Disconnected.message(), DISCONNECTED_MSG);
+        assert_eq!(SessionError::Disconnected.message(), disconnected_msg());
     }
 
     #[test]
@@ -1529,7 +1579,7 @@ mod tests {
         let s = session_with(f, RemoteOs::Linux);
         assert_eq!(
             s.list(Path::new("/x"), false).unwrap_err(),
-            DISCONNECTED_MSG
+            disconnected_msg()
         );
         assert!(!s.is_alive());
     }
@@ -1541,5 +1591,33 @@ mod tests {
         let vfs = SshVfs { session: s };
         assert_eq!(vfs.display_path(Path::new("/var/log")), "web:/var/log");
         assert!(vfs.list(Path::new("/var"), false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_refusal_in_english() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let m = std::fs::symlink_metadata(d.path()).unwrap();
+        let e = crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            check_private_dir(&m, d.path()).unwrap_err().to_string()
+        });
+        assert!(e.contains("permissions too open (0700 required)"), "{e}");
+        let ko = check_private_dir(&m, d.path()).unwrap_err().to_string();
+        assert!(ko.contains("권한이 너무 넓음"), "{ko}");
+    }
+
+    #[test]
+    fn spawn_error_texts_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let out = spawn_failed(&crate::tr!("임시 파일: {}", "temp file: {}", "x"));
+            assert_eq!(String::from_utf8_lossy(&out.stderr), "temp file: x");
+            assert_eq!(
+                first_line(b"", &crate::tr!("종료 코드 {}", "exit code {}", 3)),
+                "exit code 3"
+            );
+            assert_eq!(disconnected_msg(), "Disconnected · Enter to reconnect");
+        });
     }
 }

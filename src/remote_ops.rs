@@ -23,22 +23,27 @@ pub fn resolve_cd(s: &RemoteSession, cwd: &Path, target: &str) -> Result<PathBuf
     let out = run_ok(s, &cd_cmd(&remote_bytes(cwd.as_os_str()), target))?;
     let end = out.stdout.iter().position(|&b| b == 0).unwrap_or(0);
     if end == 0 || out.stdout[0] != b'/' {
-        return Err("원격 경로를 알 수 없음".into());
+        return Err(crate::tr!(
+            "원격 경로를 알 수 없음",
+            "Cannot determine the remote path"
+        ));
     }
     Ok(PathBuf::from(os_from_bytes(out.stdout[..end].to_vec())))
 }
 
 /// Text shown for a FIFO, socket or device (same as the local Enter message).
-pub const SPECIAL_FILE: &str = "특수 파일은 열 수 없음";
+pub fn special_file() -> &'static str {
+    crate::i18n::t("특수 파일은 열 수 없음", "Cannot open a special file")
+}
 
 /// A name that is safe to join onto a remote directory.
 pub fn validate_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
-        return Err("잘못된 이름".into());
+        return Err(crate::tr!("잘못된 이름", "Invalid name"));
     }
     // joined on Windows, these would leave the current remote folder
     if !crate::platform::plain_remote_name(std::ffi::OsStr::new(name)) {
-        return Err("잘못된 이름".into());
+        return Err(crate::tr!("잘못된 이름", "Invalid name"));
     }
     Ok(())
 }
@@ -54,7 +59,7 @@ fn ok_or_stderr(out: CmdOutput) -> Result<CmdOutput, String> {
     }
     Err(first_line(
         &out.stderr,
-        &format!("종료 코드 {}", out.code.unwrap_or(-1)),
+        &crate::tr!("종료 코드 {}", "exit code {}", out.code.unwrap_or(-1)),
     ))
 }
 
@@ -77,10 +82,13 @@ pub fn rename(s: &RemoteSession, from: &Path, new_name: &str) -> Result<PathBuf,
     let out = s.exec(&cmd).map_err(|e| e.message())?;
     match out.code {
         Some(0) => Ok(to),
-        Some(RENAME_EXISTS) => Err(format!("이미 존재함: {new_name}")),
+        Some(RENAME_EXISTS) => Err(crate::tr!(
+            "이미 존재함: {new_name}",
+            "Already exists: {new_name}"
+        )),
         c => Err(first_line(
             &out.stderr,
-            &format!("종료 코드 {}", c.unwrap_or(-1)),
+            &crate::tr!("종료 코드 {}", "exit code {}", c.unwrap_or(-1)),
         )),
     }
 }
@@ -95,17 +103,21 @@ pub fn rmdir(s: &RemoteSession, path: &Path) -> Result<(), String> {
 fn delete_args(cwd: &Path, names: &[OsString]) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
     let base = remote_bytes(cwd.as_os_str()).into_owned();
     if base.first() != Some(&b'/') {
-        return Err("삭제 거부: 절대 경로가 아님".into());
+        return Err(crate::tr!(
+            "삭제 거부: 절대 경로가 아님",
+            "Delete refused: not an absolute path"
+        ));
     }
     if names.is_empty() {
-        return Err("삭제할 항목 없음".into());
+        return Err(crate::tr!("삭제할 항목 없음", "Nothing to delete"));
     }
     let mut out = Vec::with_capacity(names.len());
     for n in names {
         let n = os_bytes(n).into_owned();
         if n.is_empty() || n == b"." || n == b".." || n.contains(&b'/') || n.contains(&0) {
-            return Err(format!(
+            return Err(crate::tr!(
                 "삭제 거부: 잘못된 이름 {:?}",
+                "Delete refused: invalid name {:?}",
                 String::from_utf8_lossy(&n)
             ));
         }
@@ -124,14 +136,21 @@ pub fn delete(s: &RemoteSession, cwd: &Path, names: &[OsString]) -> Result<(), S
     let out = s.exec(&delete_cmd(&base, &refs)).map_err(|e| e.message())?;
     match out.code {
         Some(0) => Ok(()),
-        Some(DELETE_PROTECTED) => {
-            Err("삭제 거부: 원격 홈 디렉터리(또는 상위)는 지울 수 없음".into())
-        }
-        Some(DELETE_NO_HOME) => Err("삭제 거부: 원격 홈 디렉터리를 알 수 없음".into()),
-        Some(DELETE_NO_CWD) => Err("삭제 거부: 원격 현재 경로를 확인할 수 없음".into()),
+        Some(DELETE_PROTECTED) => Err(crate::tr!(
+            "삭제 거부: 원격 홈 디렉터리(또는 상위)는 지울 수 없음",
+            "Delete refused: the remote home directory (or above) cannot be deleted"
+        )),
+        Some(DELETE_NO_HOME) => Err(crate::tr!(
+            "삭제 거부: 원격 홈 디렉터리를 알 수 없음",
+            "Delete refused: remote home directory unknown"
+        )),
+        Some(DELETE_NO_CWD) => Err(crate::tr!(
+            "삭제 거부: 원격 현재 경로를 확인할 수 없음",
+            "Delete refused: cannot check the remote current path"
+        )),
         c => Err(first_line(
             &out.stderr,
-            &format!("종료 코드 {}", c.unwrap_or(-1)),
+            &crate::tr!("종료 코드 {}", "exit code {}", c.unwrap_or(-1)),
         )),
     }
 }
@@ -151,15 +170,15 @@ pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
         Some(PREVIEW_SPECIAL) => {
             return Preview::Binary {
                 size: 0,
-                kind: "특수 파일",
+                kind: crate::preview::special_file_kind(),
             };
         }
-        Some(PREVIEW_MISSING) => return Preview::Error("파일 없음".into()),
-        Some(PREVIEW_BROKEN) => return Preview::Error("깨진 링크".into()),
+        Some(PREVIEW_MISSING) => return Preview::Error(crate::tr!("파일 없음", "File not found")),
+        Some(PREVIEW_BROKEN) => return Preview::Error(crate::tr!("깨진 링크", "Broken link")),
         c => {
             return Preview::Error(first_line(
                 &out.stderr,
-                &format!("종료 코드 {}", c.unwrap_or(-1)),
+                &crate::tr!("종료 코드 {}", "exit code {}", c.unwrap_or(-1)),
             ));
         }
     }
@@ -168,7 +187,10 @@ pub fn preview(s: &RemoteSession, path: &Path, limits: Limits) -> Preview {
         .and_then(|i| std::str::from_utf8(&out.stdout[..i]).ok())
         .and_then(|t| t.trim().parse::<u64>().ok());
     let (Some(nl), Some(size)) = (nl, size) else {
-        return Preview::Error("원격 응답을 해석할 수 없음".into());
+        return Preview::Error(crate::tr!(
+            "원격 응답을 해석할 수 없음",
+            "Cannot parse the remote response"
+        ));
     };
     preview::classify_with(&out.stdout[nl + 1..], size, limits)
 }
@@ -181,11 +203,18 @@ fn remote_dir_info(stdout: &[u8]) -> Preview {
         .ok()
         .and_then(|t| t.trim().parse::<usize>().ok());
     match n {
-        Some(n) if n > REMOTE_DIR_CAP => {
-            Preview::Info(format!("원격 디렉터리 · 항목 {REMOTE_DIR_CAP}개 이상"))
-        }
-        Some(n) => Preview::Info(format!("원격 디렉터리 · 항목 {n}개")),
-        None => Preview::Error("원격 응답을 해석할 수 없음".into()),
+        Some(n) if n > REMOTE_DIR_CAP => Preview::Info(crate::tr!(
+            "원격 디렉터리 · 항목 {REMOTE_DIR_CAP}개 이상",
+            "Remote directory · {REMOTE_DIR_CAP}+ items"
+        )),
+        Some(n) => Preview::Info(crate::tr!(
+            "원격 디렉터리 · 항목 {n}개",
+            "Remote directory · {n} items"
+        )),
+        None => Preview::Error(crate::tr!(
+            "원격 응답을 해석할 수 없음",
+            "Cannot parse the remote response"
+        )),
     }
 }
 
@@ -198,13 +227,12 @@ pub fn probe_text(s: &RemoteSession, path: &Path) -> Result<bool, String> {
     };
     match preview(s, path, limits) {
         Preview::Text { .. } | Preview::Empty => Ok(true),
-        Preview::Binary {
-            kind: "특수 파일",
-        ..
-        } => Err(SPECIAL_FILE.into()),
+        Preview::Binary { kind, .. } if kind == crate::preview::special_file_kind() => {
+            Err(special_file().into())
+        }
         Preview::Binary { .. } => Ok(false),
-        Preview::Info(_) => Err("디렉터리".into()),
-        Preview::Dir { .. } => Err("디렉터리".into()),
+        Preview::Info(_) => Err(crate::i18n::t("디렉터리", "Directory").into()),
+        Preview::Dir { .. } => Err(crate::i18n::t("디렉터리", "Directory").into()),
         Preview::Error(e) => Err(e),
     }
 }
@@ -271,7 +299,11 @@ fn scp_run(s: &RemoteSession, argv: Result<Vec<OsString>, String>) -> Result<(),
     }
     Err(first_line(
         &out.stderr,
-        &format!("scp 종료 코드 {}", out.code.unwrap_or(-1)),
+        &crate::tr!(
+            "scp 종료 코드 {}",
+            "scp exit code {}",
+            out.code.unwrap_or(-1)
+        ),
     ))
 }
 
@@ -280,7 +312,10 @@ pub fn remote_stamp(s: &RemoteSession, path: &Path) -> Result<Vec<u8>, String> {
     let cmd = stamp_cmd(&s.os, &remote_bytes(path.as_os_str()));
     let out = ok_or_stderr(s.exec_long(&cmd).map_err(|e| e.message())?)?;
     if out.stdout.is_empty() {
-        return Err("원격 파일 상태를 알 수 없음".into());
+        return Err(crate::tr!(
+            "원격 파일 상태를 알 수 없음",
+            "Cannot determine the remote file state"
+        ));
     }
     Ok(out.stdout)
 }
@@ -290,7 +325,9 @@ pub fn remote_stamp(s: &RemoteSession, path: &Path) -> Result<Vec<u8>, String> {
 /// is stamped first (so a change during the download also counts as a
 /// change); a copy that is only opened skips that full read.
 pub fn fetch(s: &RemoteSession, remote: &Path, for_edit: bool) -> Result<EditCopy, String> {
-    let name = remote.file_name().ok_or("잘못된 경로")?;
+    let name = remote
+        .file_name()
+        .ok_or_else(|| crate::tr!("잘못된 경로", "Invalid path"))?;
     let mut builder = tempfile::Builder::new();
     builder.prefix("hdir-remote-");
     #[cfg(unix)]
@@ -301,7 +338,7 @@ pub fn fetch(s: &RemoteSession, remote: &Path, for_edit: bool) -> Result<EditCop
     }
     let dir = builder
         .tempdir()
-        .map_err(|e| format!("임시 폴더 생성 실패: {e}"))?;
+        .map_err(|e| crate::tr!("임시 폴더 생성 실패: {e}", "Cannot create temp folder: {e}"))?;
     let remote_st = if for_edit {
         remote_stamp(s, remote)?
     } else {
@@ -314,7 +351,12 @@ pub fn fetch(s: &RemoteSession, remote: &Path, for_edit: bool) -> Result<EditCop
     );
     scp_run(s, argv)?;
     let local = dir.path().join(name);
-    let stamp = FileStamp::of(&local).map_err(|e| format!("내려받은 파일을 읽을 수 없음: {e}"))?;
+    let stamp = FileStamp::of(&local).map_err(|e| {
+        crate::tr!(
+            "내려받은 파일을 읽을 수 없음: {e}",
+            "Cannot read the downloaded file: {e}"
+        )
+    })?;
     Ok(EditCopy {
         dir,
         local,
@@ -327,7 +369,10 @@ pub fn fetch(s: &RemoteSession, remote: &Path, for_edit: bool) -> Result<EditCop
 fn nul_path(out: &CmdOutput) -> Result<Vec<u8>, String> {
     let end = out.stdout.iter().position(|&b| b == 0).unwrap_or(0);
     if end == 0 || out.stdout[0] != b'/' {
-        return Err("원격 경로를 알 수 없음".into());
+        return Err(crate::tr!(
+            "원격 경로를 알 수 없음",
+            "Cannot determine the remote path"
+        ));
     }
     Ok(out.stdout[..end].to_vec())
 }
@@ -354,7 +399,12 @@ pub fn upload_replace(
     expect: &[u8],
 ) -> Result<(), String> {
     let size = std::fs::metadata(local)
-        .map_err(|e| format!("편집한 파일을 읽을 수 없음: {e}"))?
+        .map_err(|e| {
+            crate::tr!(
+                "편집한 파일을 읽을 수 없음: {e}",
+                "Cannot read the edited file: {e}"
+            )
+        })?
         .len();
     let phys = nul_path(&run_ok(s, &resolve_cmd(&remote_bytes(remote.as_os_str())))?)?;
     let dir = phys
@@ -363,7 +413,10 @@ pub fn upload_replace(
         .map_or(&b"/"[..], |i| if i == 0 { &b"/"[..] } else { &phys[..i] });
     let made = s.exec(&mktemp_cmd(&s.os, dir)).map_err(|e| e.message())?;
     if made.code == Some(UNSAFE_DIR) {
-        return Err("다른 사용자가 쓸 수 있는 디렉터리라 저장하지 않음 (sticky 아님)".into());
+        return Err(crate::tr!(
+            "다른 사용자가 쓸 수 있는 디렉터리라 저장하지 않음 (sticky 아님)",
+            "Not saved: a directory other users can write to (not sticky)"
+        ));
     }
     let tmp_b = nul_path(&ok_or_stderr(made)?)?;
     let argv = scp_argv(
@@ -382,25 +435,27 @@ pub fn upload_replace(
             Some(0) => Ok(()),
             Some(REPLACE_NOT_OWNER) => {
                 keep_tmp = true;
-                Err(format!(
-                    "원격 파일의 소유자가 달라 교체하지 않음 (원격 임시 파일: {tmp_s})"
+                Err(crate::tr!(
+                    "원격 파일의 소유자가 달라 교체하지 않음 (원격 임시 파일: {tmp_s})",
+                    "Not replaced: the remote file has a different owner (remote temp file: {tmp_s})"
                 ))
             }
-            Some(REPLACE_SIZE) => Err("업로드된 파일 크기가 맞지 않음".into()),
-            Some(REPLACE_CHANGED) => Err("편집하는 동안 원격 파일이 바뀌어 교체하지 않음".into()),
-            Some(REPLACE_GROUP) => Err("원격 파일의 그룹을 유지할 수 없어 교체하지 않음".into()),
-            Some(REPLACE_RESTORED) => Err("원격 파일 쓰기 실패, 원본을 복원함".into()),
+            Some(REPLACE_SIZE) => Err(crate::tr!("업로드된 파일 크기가 맞지 않음", "Uploaded file size does not match")),
+            Some(REPLACE_CHANGED) => Err(crate::tr!("편집하는 동안 원격 파일이 바뀌어 교체하지 않음", "Not replaced: the remote file changed during editing")),
+            Some(REPLACE_GROUP) => Err(crate::tr!("원격 파일의 그룹을 유지할 수 없어 교체하지 않음", "Not replaced: cannot keep the remote file group")),
+            Some(REPLACE_RESTORED) => Err(crate::tr!("원격 파일 쓰기 실패, 원본을 복원함", "Remote write failed, original restored")),
             Some(REPLACE_BACKUP_KEPT) => {
                 keep_tmp = true;
                 let bak = out.stdout.split(|&b| b == 0).next().unwrap_or_default();
-                Err(format!(
+                Err(crate::tr!(
                     "원격 파일 쓰기와 복원 모두 실패 (원본 백업: {}, 원격 임시 파일: {tmp_s})",
+                    "Remote write and restore both failed (original backup: {}, remote temp file: {tmp_s})",
                     String::from_utf8_lossy(bak)
                 ))
             }
             c => Err(first_line(
                 &out.stderr,
-                &format!("종료 코드 {}", c.unwrap_or(-1)),
+                &crate::tr!("종료 코드 {}", "exit code {}", c.unwrap_or(-1)),
             )),
         }
     });
@@ -467,7 +522,7 @@ mod tests {
         let s = session(f);
         assert_eq!(
             mkdir(&s, &p("/srv"), "x").unwrap_err(),
-            crate::session::DISCONNECTED_MSG
+            crate::session::disconnected_msg()
         );
     }
 
@@ -787,7 +842,7 @@ mod tests {
         );
         assert_eq!(
             by(255, ""),
-            Preview::Error(crate::session::DISCONNECTED_MSG.into())
+            Preview::Error(crate::session::disconnected_msg().into())
         );
     }
 
@@ -1010,7 +1065,7 @@ mod tests {
         let s = session(f);
         assert_eq!(
             fetch(&s, &p("/srv/x"), true).unwrap_err(),
-            crate::session::DISCONNECTED_MSG
+            crate::session::disconnected_msg()
         );
         assert!(!s.is_alive());
     }
@@ -2331,7 +2386,38 @@ mod tests {
         let f = FakeCmd::new(|_| code(255));
         assert_eq!(
             resolve_cd(&session(f), &p("/srv"), "x").unwrap_err(),
-            crate::session::DISCONNECTED_MSG
+            crate::session::disconnected_msg()
         );
+    }
+
+    #[test]
+    fn remote_op_messages_in_english() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            assert_eq!(validate_name("a/b").unwrap_err(), "Invalid name");
+            assert_eq!(
+                delete_args(Path::new("rel"), &[OsString::from("x")]).unwrap_err(),
+                "Delete refused: not an absolute path"
+            );
+            assert_eq!(
+                delete_args(Path::new("/r"), &[]).unwrap_err(),
+                "Nothing to delete"
+            );
+            assert_eq!(
+                delete_args(Path::new("/r"), &[OsString::from("a/b")]).unwrap_err(),
+                "Delete refused: invalid name \"a/b\""
+            );
+            assert_eq!(
+                remote_dir_info(b"7\n"),
+                Preview::Info("Remote directory · 7 items".into())
+            );
+            assert_eq!(
+                ok_or_stderr(CmdOutput {
+                    code: Some(5),
+                    ..Default::default()
+                })
+                .unwrap_err(),
+                "exit code 5"
+            );
+        });
     }
 }

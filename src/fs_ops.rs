@@ -160,15 +160,17 @@ fn validate_name(name: &str) -> io::Result<()> {
         (comps.next(), comps.next()),
         (Some(std::path::Component::Normal(_)), None)
     ) {
-        return Err(invalid(UNUSABLE_NAME));
+        return Err(invalid(unusable_name()));
     }
     if cfg!(windows) && !windows_name_ok(name) {
-        return Err(invalid(UNUSABLE_NAME));
+        return Err(invalid(unusable_name()));
     }
     Ok(())
 }
 
-const UNUSABLE_NAME: &str = "사용할 수 없는 이름";
+fn unusable_name() -> &'static str {
+    crate::i18n::t("사용할 수 없는 이름", "Unusable name")
+}
 
 /// Windows file-name rules: no `:` (drive-relative paths, alternate data
 /// streams), no `<>"|?*`, no control chars, no trailing `.`/space, no reserved
@@ -290,7 +292,7 @@ fn park_aside_with(dest: &Path, next: &mut dyn FnMut() -> PathBuf) -> io::Result
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "백업 이름을 정하지 못함",
+        crate::i18n::t("백업 이름을 정하지 못함", "Could not pick a backup name"),
     ))
 }
 
@@ -393,16 +395,18 @@ fn copy_file_in(
 }
 
 fn xattr_warning(dest: &Path, e: &io::Error) -> String {
-    format!(
+    crate::tr!(
         "{}: 확장 속성·접근 권한 일부를 복사하지 못함 ({e})",
+        "{}: could not copy some extended attributes or permissions ({e})",
         dest.display()
     )
 }
 
 fn skip_changed(src: &Path, acc: &mut Acc) -> io::Result<Step> {
     acc.skipped += 1;
-    acc.warnings.push(format!(
+    acc.warnings.push(crate::tr!(
         "{}: 복사 중 파일 종류가 바뀌어 건너뜀",
+        "{}: skipped, file type changed during copy",
         src.display()
     ));
     Ok(Step::Skipped)
@@ -484,8 +488,9 @@ fn copy_symlink_with(
     if let Err(e) = create(&read(src)?, &tmp, src) {
         if is_symlink_privilege_error(&e) {
             acc.skipped += 1;
-            acc.warnings.push(format!(
+            acc.warnings.push(crate::tr!(
                 "{}: symlink 생성 권한 없음 (개발자 모드 필요)",
+                "{}: no permission to create symlinks (Developer Mode required)",
                 src.display()
             ));
             return Ok(Step::Skipped);
@@ -507,16 +512,18 @@ fn copy_symlink_with(
 fn restore_backup(backup: &Path, dest: &Path, acc: &mut Acc) -> io::Result<()> {
     if exists(dest) {
         if !acc.created.iter().any(|c| c == dest) {
-            return Err(io::Error::other(format!(
+            return Err(io::Error::other(crate::tr!(
                 "대상에 다른 항목이 있어 원본을 복원하지 못함. 원본 백업: {}",
+                "Could not restore the original: another item is in the way. Original backup: {}",
                 backup.display()
             )));
         }
         let _ = remove_source(dest);
     }
     rename_noreplace(backup, dest).map_err(|e| {
-        io::Error::other(format!(
+        io::Error::other(crate::tr!(
             "원본 복원 실패: {e}. 원본 백업: {}",
+            "Could not restore the original: {e}. Original backup: {}",
             backup.display()
         ))
     })
@@ -625,8 +632,9 @@ fn copy_dir(
             let _ = remove_source(dest);
             acc.created.retain(|c| c != dest);
             restore_backup(&b, dest, acc)?;
-            acc.warnings.push(format!(
+            acc.warnings.push(crate::tr!(
                 "{}: 일부 항목을 건너뛰어 복사하지 않고 원본 파일을 유지함",
+                "{}: some items were skipped, so the original was kept and not replaced",
                 dest.display()
             ));
             res = Ok(Step::Partial);

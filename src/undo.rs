@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::remote_ops;
-use crate::session::{DISCONNECTED_MSG, RemoteSession};
+use crate::session::{RemoteSession, disconnected_msg};
 use crate::trash::{TrashBackend, TrashEntry, TrashedItem};
 use ::trash::TrashItem;
 
@@ -86,7 +86,9 @@ impl UndoStack {
     /// that failed parts of a move are pushed back for a retry. Existing files
     /// are never overwritten.
     pub fn undo(&mut self) -> Result<String, String> {
-        let op = self.pop().ok_or("되돌릴 작업 없음")?;
+        let op = self
+            .pop()
+            .ok_or_else(|| crate::i18n::t("되돌릴 작업 없음", "Nothing to undo"))?;
         let UndoApplied { message, retry } = Self::apply(op);
         if let Some(r) = retry {
             self.push(r);
@@ -129,14 +131,24 @@ fn apply_with(
     match op {
         UndoOp::Mkdir { path } => done(
             fs::remove_dir(&path)
-                .map(|()| format!("되돌림: 폴더 생성 취소 {}", base(&path)))
-                .map_err(|e| format!("되돌릴 수 없음: {e}")),
+                .map(|()| {
+                    crate::tr!(
+                        "되돌림: 폴더 생성 취소 {}",
+                        "Undone: created folder {}",
+                        base(&path)
+                    )
+                })
+                .map_err(|e| crate::tr!("되돌릴 수 없음: {e}", "Cannot undo: {e}")),
         ),
         UndoOp::RemoteMkdir { session, path } => {
             let res = remote_ops::rmdir(&session, &path);
             remote_undo(
                 res,
-                format!("되돌림: 폴더 생성 취소 {}", base(&path)),
+                crate::tr!(
+                    "되돌림: 폴더 생성 취소 {}",
+                    "Undone: created folder {}",
+                    base(&path)
+                ),
                 || UndoOp::RemoteMkdir {
                     session: Arc::clone(&session),
                     path: path.clone(),
@@ -145,7 +157,12 @@ fn apply_with(
         }
         UndoOp::RemoteRename { session, from, to } => {
             let res = remote_ops::rename(&session, &to, &base(&from)).map(|_| ());
-            let ok_msg = format!("되돌림: 이름 변경 {} → {}", base(&to), base(&from));
+            let ok_msg = crate::tr!(
+                "되돌림: 이름 변경 {} → {}",
+                "Undone: rename {} → {}",
+                base(&to),
+                base(&from)
+            );
             remote_undo(res, ok_msg, || UndoOp::RemoteRename {
                 session: Arc::clone(&session),
                 from: from.clone(),
@@ -154,7 +171,14 @@ fn apply_with(
         }
         UndoOp::Rename { from, to } => done(
             restore(&to, &from)
-                .map(|()| format!("되돌림: 이름 변경 {} → {}", base(&to), base(&from)))
+                .map(|()| {
+                    crate::tr!(
+                        "되돌림: 이름 변경 {} → {}",
+                        "Undone: rename {} → {}",
+                        base(&to),
+                        base(&from)
+                    )
+                })
                 .map_err(Restore::into_msg),
         ),
         UndoOp::Move {
@@ -168,7 +192,7 @@ fn apply_with(
             // Merged-away source directories first, so they exist again.
             for dir in removed_dirs {
                 if let Err(e) = create_dir(&dir) {
-                    errors.push(format!("되돌릴 수 없음: {e}"));
+                    errors.push(crate::tr!("되돌릴 수 없음: {e}", "Cannot undo: {e}"));
                     failed_dirs.push(dir);
                 }
             }
@@ -185,10 +209,17 @@ fn apply_with(
                 }
             }
             if errors.is_empty() {
-                return done(Ok(format!("되돌림: 이동 {total}개")));
+                return done(Ok(crate::tr!(
+                    "되돌림: 이동 {total}개",
+                    "Undone: move of {total}"
+                )));
             }
             let ok = total.saturating_sub(errors.len());
-            let msg = format!("되돌림 일부 실패 ({ok}/{total}): {}", errors[0]);
+            let msg = crate::tr!(
+                "되돌림 일부 실패 ({ok}/{total}): {}",
+                "Undo partly failed ({ok}/{total}): {}",
+                errors[0]
+            );
             // Keep only what failed so the user can retry.
             let retry =
                 (!failed_pairs.is_empty() || !failed_dirs.is_empty()).then_some(UndoOp::Move {
@@ -202,7 +233,11 @@ fn apply_with(
         }
         UndoOp::Trash { items } => {
             let Some(store) = store else {
-                return done(Err("휴지통을 사용할 수 없음".into()));
+                return done(Err(crate::i18n::t(
+                    "휴지통을 사용할 수 없음",
+                    "Trash unavailable",
+                )
+                .into()));
             };
             undo_trash(store, items)
         }
@@ -222,8 +257,8 @@ fn remote_undo(
             retry: None,
         },
         Err(e) => UndoApplied {
-            retry: (e == DISCONNECTED_MSG).then(again),
-            message: Err(format!("되돌릴 수 없음: {e}")),
+            retry: (e == disconnected_msg()).then(again),
+            message: Err(crate::tr!("되돌릴 수 없음: {e}", "Cannot undo: {e}")),
         },
     }
 }
@@ -235,9 +270,13 @@ fn remote_undo(
 fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied {
     if !store.supports_view() {
         return UndoApplied {
-            message: store
-                .open_os_trash()
-                .map(|()| "Finder 휴지통에서 '되돌려 놓기'로 복원하세요".to_string()),
+            message: store.open_os_trash().map(|()| {
+                crate::i18n::t(
+                    "Finder 휴지통에서 '되돌려 놓기'로 복원하세요",
+                    "Use 'Put Back' in the Finder trash to restore",
+                )
+                .to_string()
+            }),
             retry: None,
         };
     }
@@ -245,7 +284,7 @@ fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied 
         Ok(l) => l,
         Err(e) => {
             return UndoApplied {
-                message: Err(format!("되돌릴 수 없음: {e}")),
+                message: Err(crate::tr!("되돌릴 수 없음: {e}", "Cannot undo: {e}")),
                 retry: Some(UndoOp::Trash { items }),
             };
         }
@@ -268,10 +307,18 @@ fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied 
         let entries: Vec<TrashEntry> = found.iter().map(|(e, _)| e.clone()).collect();
         let res = store.restore(&entries);
         if res.collisions.is_empty() && res.errors.is_empty() {
-            parts.push(format!("되돌림: 휴지통 복원 {}개", res.restored.len()));
+            parts.push(crate::tr!(
+                "되돌림: 휴지통 복원 {}개",
+                "Undone: restored {} from trash",
+                res.restored.len()
+            ));
         } else {
             problem = true;
-            parts.push(format!("되돌림 일부 실패: {}", res.summary()));
+            parts.push(crate::tr!(
+                "되돌림 일부 실패: {}",
+                "Undo partly failed: {}",
+                res.summary()
+            ));
             // Everything not restored (collision, error, refusal) stays.
             retry_items.extend(
                 found
@@ -282,8 +329,9 @@ fn undo_trash(store: &dyn TrashBackend, items: Vec<TrashedItem>) -> UndoApplied 
         }
     }
     if !missing.is_empty() {
-        parts.push(format!(
+        parts.push(crate::tr!(
             "일부 항목을 휴지통에서 찾지 못함: {}개",
+            "Some items not found in trash: {}",
             missing.len()
         ));
         retry_items.extend(missing);
@@ -319,14 +367,16 @@ impl Restore {
 fn restore(current: &Path, target: &Path) -> Result<(), Restore> {
     let fail = |m: String| Restore::Failed(m);
     if target.symlink_metadata().is_ok() {
-        return Err(fail(format!(
+        return Err(fail(crate::tr!(
             "되돌릴 수 없음: {} 이미 존재",
+            "Cannot undo: {} already exists",
             target.to_string_lossy()
         )));
     }
     // A merged-away source directory may be gone; recreate its parent chain.
     if let Some(parent) = target.parent().filter(|p| !p.exists()) {
-        fs::create_dir_all(parent).map_err(|e| fail(format!("되돌릴 수 없음: {e}")))?;
+        fs::create_dir_all(parent)
+            .map_err(|e| fail(crate::tr!("되돌릴 수 없음: {e}", "Cannot undo: {e}")))?;
     }
     // Falls back to copy + remove across devices; never overwrites.
     crate::fs_ops::move_path_no_overwrite(current, target).map_err(|e| {
@@ -334,11 +384,12 @@ fn restore(current: &Path, target: &Path) -> Result<(), Restore> {
             .get_ref()
             .and_then(|x| x.downcast_ref::<crate::fs_ops::CleanupFailed>())
         {
-            Some(c) => Restore::Dirty(format!(
+            Some(c) => Restore::Dirty(crate::tr!(
                 "되돌림: 복사는 됐지만 원래 위치 정리 실패: {}",
+                "Undone: copied back, but cleaning up the old location failed: {}",
                 c.0.to_string_lossy()
             )),
-            None => fail(format!("되돌릴 수 없음: {e}")),
+            None => fail(crate::tr!("되돌릴 수 없음: {e}", "Cannot undo: {e}")),
         }
     })
 }
@@ -898,5 +949,30 @@ mod tests {
         assert!(u.undo().is_ok());
         assert!(gone.is_dir() && nested.is_dir());
         assert!(u.is_empty());
+    }
+
+    #[test]
+    fn english_undo_messages() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let mut u = UndoStack::default();
+            assert_eq!(u.undo().unwrap_err(), "Nothing to undo");
+            let t = tempfile::tempdir().unwrap();
+            let d = t.path().join("새 폴더");
+            std::fs::create_dir(&d).unwrap();
+            u.push(UndoOp::Mkdir { path: d.clone() });
+            assert_eq!(u.undo().unwrap(), "Undone: created folder 새 폴더");
+            let (a, b) = (t.path().join("a"), t.path().join("b"));
+            std::fs::write(&a, "").unwrap();
+            std::fs::write(&b, "").unwrap();
+            u.push(UndoOp::Rename {
+                from: a.clone(),
+                to: b.clone(),
+            });
+            let e = u.undo().unwrap_err();
+            assert!(
+                e.starts_with("Cannot undo: ") && e.ends_with("already exists"),
+                "{e}"
+            );
+        });
     }
 }

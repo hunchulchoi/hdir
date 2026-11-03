@@ -881,3 +881,26 @@ mod tests {
         assert_eq!(rows_50x12(&d), expected);
     }
 }
+
+#[cfg(test)]
+mod en_tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn english_confirm_dialog_snapshot() {
+        let d = Dialog::confirm("Delete", vec!["Move 3 items to the trash?".into()]);
+        let mut t = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        t.draw(|f| render(f, f.area(), &d)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows: Vec<String> = (0..12u16)
+            .map(|y| (0..60u16).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let top = rows.iter().position(|r| r.contains("┌")).unwrap();
+        assert!(rows[top].contains(" Delete "), "{:?}", rows[top]);
+        assert!(rows[top + 1].contains("│ Move 3 items to the trash?"));
+        assert!(rows[top + 3].contains("Enter: Yes   N/Esc: No"));
+        assert!(rows[top + 4].contains("└"));
+    }
+}

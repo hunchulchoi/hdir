@@ -86,6 +86,9 @@ F키가 터미널에서 막히면 Alt+숫자(Alt+3 = F3 …)로도 됩니다. `v
 
 <!-- example: config.toml -->
 ```toml
+# 화면 언어: "ko", "en", "auto"(기본, 로케일을 따름)
+lang = "ko"
+
 # 테마: 모드별 (classic = 기본 화면, dev = Ctrl+T 개발자 모드)
 [theme]
 classic = "my-blue"     # 아래 사용자 테마
@@ -140,6 +143,17 @@ theme = "mdir-red"                 # 이 서버를 보는 패널의 테마
 match = "stg-*"                    # host 없이 match만: ssh 별칭에 테마만 지정
 theme = "mdir-green"
 ```
+
+### 언어
+
+화면 문구는 한국어와 영어를 지원합니다. 다음 순서로 고릅니다.
+1. 설정 파일의 `lang` (`ko`, `en`, `auto`)
+2. 환경 변수 `HDIR_LANG` (`ko`, `en`)
+3. 로케일 `LC_ALL` → `LC_MESSAGES` → `LANG`: `ko`로 시작하면 한국어, 그 밖에는 영어
+4. Windows에서 로케일 변수가 없으면 Windows 표시 언어
+5. 아무것도 없으면 영어
+
+macOS 터미널은 시스템 언어가 영어면 `LANG=en_US.UTF-8`이라 영어로 뜹니다. 한국어로 쓰려면 `lang = "ko"`를 설정하세요.
 
 ### 테마
 

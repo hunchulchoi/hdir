@@ -303,7 +303,13 @@ pub fn render_ps(template: &str) -> Result<String, String> {
         false
     }
     const PH: [(&str, usize); 3] = [("{}", 0), ("{dir}", 1), ("{name}", 2)];
-    let refused = || "PowerShell: 작은따옴표나 따옴표가 섞인 단어 안의 {}는 쓸 수 없음".to_string();
+    let refused = || {
+        crate::i18n::t(
+            "PowerShell: 작은따옴표나 따옴표가 섞인 단어 안의 {}는 쓸 수 없음",
+            "PowerShell: {} cannot be used inside a word that mixes quotes",
+        )
+        .to_string()
+    };
     let placeholder = |s: &str| {
         PH.iter()
             .find_map(|(p, n)| s.strip_prefix(p).map(|r| (r.len(), *n)))
@@ -455,16 +461,28 @@ fn shell_argv(
         .prefix("hdir-assoc-")
         .suffix(".ps1")
         .tempfile()
-        .map_err(|e| format!("임시 스크립트를 만들 수 없음: {e}"))?;
+        .map_err(|e| {
+            crate::tr!(
+                "임시 스크립트를 만들 수 없음: {e}",
+                "Could not create temporary script: {e}"
+            )
+        })?;
     // BOM: Windows PowerShell reads a BOM-less script as the ANSI code page
     let script = format!(
         "\u{feff}Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue\r\n{body}\r\n"
     );
-    f.write_all(script.as_bytes())
-        .map_err(|e| format!("임시 스크립트를 쓸 수 없음: {e}"))?;
-    let (_, script_path) = f
-        .keep()
-        .map_err(|e| format!("임시 스크립트를 둘 수 없음: {e}"))?;
+    f.write_all(script.as_bytes()).map_err(|e| {
+        crate::tr!(
+            "임시 스크립트를 쓸 수 없음: {e}",
+            "Could not write temporary script: {e}"
+        )
+    })?;
+    let (_, script_path) = f.keep().map_err(|e| {
+        crate::tr!(
+            "임시 스크립트를 둘 수 없음: {e}",
+            "Could not keep temporary script: {e}"
+        )
+    })?;
     let ps = if matches!(
         Path::new(shell)
             .file_stem()
