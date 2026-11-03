@@ -357,9 +357,10 @@ fn remote_file_operations_round_trip() {
     assert_eq!(mode_before, "640");
     let copy = ops::fetch(&s, &d.join("edit me.txt"), true).expect("download");
     assert_eq!(std::fs::read_to_string(&copy.local).unwrap(), "original");
-    assert!(!copy.stamp.differs(&copy.local).unwrap());
+    let stamp = copy.stamp.as_ref().expect("stamped for editing");
+    assert!(!stamp.differs(&copy.local).unwrap());
     std::fs::write(&copy.local, "changed on the server").unwrap();
-    assert!(copy.stamp.differs(&copy.local).unwrap());
+    assert!(stamp.differs(&copy.local).unwrap());
     ops::upload_replace(&s, &copy.local, &d.join("edit me.txt"), &copy.remote).expect("upload");
     assert_eq!(run("cat 'edit me.txt'"), "changed on the server");
     assert_eq!(

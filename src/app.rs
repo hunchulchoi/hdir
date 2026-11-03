@@ -676,9 +676,11 @@ pub struct App {
     /// Favorites saves sent but not written yet.
     fav_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Results of checking a chosen local folder for a remote panel:
-    /// (panel, its connection generation, folder, is a folder).
-    place_tx: Sender<(usize, u64, PathBuf, bool)>,
-    place_rx: Receiver<(usize, u64, PathBuf, bool)>,
+    /// (panel, connection generation, request number, folder, listable).
+    place_tx: Sender<(usize, u64, u64, PathBuf, bool)>,
+    place_rx: Receiver<(usize, u64, u64, PathBuf, bool)>,
+    /// Number of the latest such request: older answers are dropped.
+    place_seq: u64,
     /// The time source of the Classic clock (fixed in tests).
     pub clock: fn() -> std::time::SystemTime,
     /// Minute (since the epoch) the clock last showed.
@@ -814,6 +816,7 @@ impl App {
             fav_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             place_tx,
             place_rx,
+            place_seq: 0,
             clock: std::time::SystemTime::now,
             drawn_minute: None,
         }
@@ -1097,13 +1100,15 @@ impl App {
         // hang on a dead mount), so a bad choice keeps the remote panel
         self.status = None;
         let generation = self.connect_gen;
+        self.place_seq += 1;
+        let seq = self.place_seq;
         let tx = self.place_tx.clone();
         let started = std::thread::Builder::new()
             .name("hdir-place".into())
             .spawn(move || {
                 // listable, not just there: a locked folder keeps the panel
                 let ok = std::fs::read_dir(&dir).is_ok();
-                let _ = tx.send((idx, generation, dir, ok));
+                let _ = tx.send((idx, generation, seq, dir, ok));
             });
         if let Err(e) = started {
             self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
@@ -1217,9 +1222,12 @@ impl App {
     /// Apply finished folder checks from [`App::go_to_place`].
     fn tick_place(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((idx, generation, dir, ok)) = self.place_rx.try_recv() {
-            // the panel was reconnected or switched meanwhile: drop it
-            if generation != self.connect_gen || !self.panels[idx].location.is_remote() {
+        while let Ok((idx, generation, seq, dir, ok)) = self.place_rx.try_recv() {
+            // a newer choice, a reconnect or a switch meanwhile: drop it
+            if seq != self.place_seq
+                || generation != self.connect_gen
+                || !self.panels[idx].location.is_remote()
+            {
                 continue;
             }
             changed = true;
@@ -2427,7 +2435,9 @@ impl App {
         let (s2, r2, l2) = (Arc::clone(&session), remote.clone(), local.clone());
         let (up, ab) = (Arc::clone(&self.uploader), Arc::clone(&abandon));
         std::thread::spawn(move || {
-            let (result, unchanged) = match stamp.differs(&l2) {
+            // no stamp (never for an edit): treat it as changed and upload
+            let changed = stamp.map_or(Ok(true), |s| s.differs(&l2));
+            let (result, unchanged) = match changed {
                 Ok(false) => (Ok(()), true),
                 Ok(true) => (up(&s2, &l2, &r2, &remote_st), false),
                 Err(e) => (
@@ -10986,6 +10996,27 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
             }
             assert_eq!(app.panels[1].cwd, there);
+        }
+
+        #[test]
+        fn only_the_latest_place_chosen_on_a_remote_panel_is_applied() {
+            let (t, mut app, _f) = env();
+            connect_prod(&mut app);
+            let (a, b) = (t.path().join("adir"), t.path().join("bdir"));
+            let b = crate::platform::canonicalize(&b).unwrap();
+            app.go_to_place(a);
+            app.go_to_place(b.clone());
+            let start = Instant::now();
+            while app.panels[1].location.is_remote() || app.panels[1].loading.is_some() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                app.tick();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // let any late result of the first choice arrive too
+            std::thread::sleep(Duration::from_millis(50));
+            app.tick();
+            settle(&mut app);
+            assert_eq!(app.panels[1].cwd, b, "the second choice wins");
         }
 
         #[test]

@@ -231,16 +231,22 @@ pub const TAR_ACLS_PROBE: &[u8] = b"tar --acls -cf /dev/null -T /dev/null >/dev/
 /// only add a false match, which errs on the safe side.
 pub fn acl_scan_cmd(os: &RemoteOs, dir: &[u8], name: &[u8]) -> Vec<u8> {
     let q = sh_quote(name);
+    // a find or ls that fails (an unreadable folder, a vanished item)
+    // prints a marker that is counted too: unknown is never "none"
     let plus: &[&[u8]] = &[
-        b"n=$(find ./",
+        b"n=$({ find ./",
         &q,
-        b" ! -type l -exec ls -dn -- {} + | grep -c '^[^ ]\\{10\\}+')",
+        b" ! -type l -exec ls -dn -- {} + || echo hdir-scan-failed; } \
+          | grep -c -e '^[^ ]\\{10\\}+' -e '^hdir-scan-failed$')",
     ];
     let mut v = cat(&[b"cd -- ", &sh_quote(dir), b" || exit 1; "]);
     if matches!(os, RemoteOs::Bsd) {
-        v.extend_from_slice(b"if [ \"$(uname)\" = Darwin ]; then n=$(find ./");
+        v.extend_from_slice(b"if [ \"$(uname)\" = Darwin ]; then n=$({ find ./");
         v.extend_from_slice(&q);
-        v.extend_from_slice(b" ! -type l -exec ls -lden -- {} + | grep -c '^ 0: '); else ");
+        v.extend_from_slice(
+            b" ! -type l -exec ls -lden -- {} + || echo hdir-scan-failed; } \
+              | grep -c -e '^ 0: ' -e '^hdir-scan-failed$'); else ",
+        );
         v.extend(cat(plus));
         v.extend_from_slice(b"; fi");
     } else {
@@ -2465,17 +2471,22 @@ mod tests {
         }
         let bsd = String::from_utf8(acl_scan_cmd(&RemoteOs::Bsd, b"/s", b"a")).unwrap();
         assert!(
-            bsd.contains("if [ \"$(uname)\" = Darwin ]; then n=$(find ./'a' ! -type l -exec ls -lden -- {} + | grep -c '^ 0: ')"),
+            bsd.contains(
+                "if [ \"$(uname)\" = Darwin ]; then n=$({ find ./'a' ! -type l \
+                 -exec ls -lden -- {} + || echo hdir-scan-failed; } \
+                 | grep -c -e '^ 0: ' -e '^hdir-scan-failed$')"
+            ),
             "{bsd}"
         );
         assert!(
-            bsd.contains("else n=$(find ./'a' ! -type l -exec ls -dn -- {} +"),
+            bsd.contains("else n=$({ find ./'a' ! -type l -exec ls -dn -- {} +"),
             "{bsd}"
         );
         assert_eq!(
             acl_scan_cmd(&RemoteOs::Linux, b"/s it's", b"-a"),
             b"cd -- '/s it'\\''s' || exit 1; \
-              n=$(find ./'-a' ! -type l -exec ls -dn -- {} + | grep -c '^[^ ]\\{10\\}+'); \
+              n=$({ find ./'-a' ! -type l -exec ls -dn -- {} + || echo hdir-scan-failed; } \
+              | grep -c -e '^[^ ]\\{10\\}+' -e '^hdir-scan-failed$'); \
               echo $((n))"
                 .to_vec()
         );
@@ -2576,6 +2587,39 @@ mod tests {
         assert_eq!(mode(&d.join("f")), 0o600);
         assert_eq!(mode(&d) & 0o077, 0);
         assert_eq!(mode(&t.path().join("outside")), 0o644);
+    }
+
+    /// A tree the scan cannot fully read counts as having ACLs (never "none"
+    /// because `find` or `ls` failed).
+    #[cfg(unix)]
+    #[test]
+    fn real_acl_scan_that_cannot_read_everything_counts_as_acls() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join("d/locked/inner")).unwrap();
+        fs::set_permissions(t.path().join("d/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(t.path().join("d/locked")).is_ok() {
+            // root reads everything: nothing to check
+            fs::set_permissions(t.path().join("d/locked"), fs::Permissions::from_mode(0o700))
+                .unwrap();
+            return;
+        }
+        for os in [RemoteOs::Linux, RemoteOs::Bsd] {
+            let out = sh(&acl_scan_cmd(&os, &b(t.path()), b"d"));
+            let n: u64 = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            assert!(n > 0, "{os:?}: {out:?}");
+        }
+        // a missing item also counts
+        let out = sh(&acl_scan_cmd(&RemoteOs::Linux, &b(t.path()), b"gone"));
+        let n: u64 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(1);
+        assert!(n > 0 || out.status.code() != Some(0), "{out:?}");
+        fs::set_permissions(t.path().join("d/locked"), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

@@ -286,7 +286,9 @@ pub struct EditCopy {
     /// removes the copy.
     pub dir: tempfile::TempDir,
     pub local: PathBuf,
-    pub stamp: FileStamp,
+    /// Fingerprint of the downloaded copy (only when fetched for editing:
+    /// a copy that is only opened is never read in full).
+    pub stamp: Option<FileStamp>,
     /// [`remote_stamp`] of the remote file, taken before downloading it
     /// (empty unless fetched for editing).
     pub remote: Vec<u8>,
@@ -351,12 +353,18 @@ pub fn fetch(s: &RemoteSession, remote: &Path, for_edit: bool) -> Result<EditCop
     );
     scp_run(s, argv)?;
     let local = dir.path().join(name);
-    let stamp = FileStamp::of(&local).map_err(|e| {
+    let unreadable = |e: std::io::Error| {
         crate::tr!(
             "내려받은 파일을 읽을 수 없음: {e}",
             "Cannot read the downloaded file: {e}"
         )
-    })?;
+    };
+    let stamp = if for_edit {
+        Some(FileStamp::of(&local).map_err(unreadable)?)
+    } else {
+        std::fs::metadata(&local).map_err(unreadable)?;
+        None
+    };
     Ok(EditCopy {
         dir,
         local,
@@ -1036,7 +1044,7 @@ mod tests {
         assert!(a.contains(&"BatchMode=yes".to_string()));
         assert_eq!(a[a.len() - 2], "prod-web:/srv/it's a.txt");
         assert_eq!(a[a.len() - 1], copy.dir.path().to_string_lossy());
-        assert!(!copy.stamp.differs(&copy.local).unwrap());
+        assert!(!copy.stamp.as_ref().unwrap().differs(&copy.local).unwrap());
     }
 
     #[test]
@@ -2036,6 +2044,8 @@ mod tests {
         let (f, _) = scp_fake("orig", ok(""), ok(""));
         let copy = fetch(&session(Arc::clone(&f)), &p("/srv/a"), false).unwrap();
         assert!(copy.remote.is_empty());
+        assert!(copy.stamp.is_none(), "a copy only opened is never hashed");
+        assert_eq!(std::fs::read(&copy.local).unwrap(), b"orig");
         assert!(!f.remote_cmds().iter().any(|c| c.starts_with("f=")));
     }
 
