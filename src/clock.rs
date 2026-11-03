@@ -107,7 +107,7 @@ pub fn local(ts: i64) -> Option<LocalTime> {
         FileTimeToSystemTime(&utc, &mut utc_st) != 0
             && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut st) != 0
     };
-    ok.then(|| LocalTime {
+    ok.then_some(LocalTime {
         year: st.wYear as i32,
         month: st.wMonth as u32,
         day: st.wDay as u32,
