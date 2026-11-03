@@ -521,8 +521,8 @@ fn conflict_dialog(dest: &std::path::Path) -> Dialog {
         .unwrap_or_default();
     // Default to Skip so a stray Enter never destroys data.
     Dialog::choice_with_default(
-        "덮어쓰기 확인",
-        vec![format!("이미 존재: {name}")],
+        crate::i18n::t("덮어쓰기 확인", "Confirm overwrite"),
+        vec![crate::tr!("이미 존재: {name}", "Already exists: {name}")],
         ["Overwrite", "Skip", "Overwrite all", "Skip all", "Cancel"]
             .map(String::from)
             .to_vec(),
@@ -640,7 +640,9 @@ pub struct App {
 }
 
 /// A prompt answered after its panels moved (a connect or a load landed).
-const PANELS_CHANGED_MSG: &str = "패널이 바뀌어 작업을 취소함";
+fn panels_changed_msg() -> &'static str {
+    crate::i18n::t("패널이 바뀌어 작업을 취소함", "Panels changed, cancelled")
+}
 
 /// Which panel was active and where each one was (server and folder).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -784,14 +786,14 @@ impl App {
     /// result is applied from [`App::tick`].
     pub fn reload_config(&mut self) {
         if self.task.is_some() {
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         let dir = self.config_dir.clone();
         self.task = Some(BgTask::spawn(BgKind::ConfigReload, move || {
             BgResult::Settings(Box::new(config::load_settings(dir.as_deref())))
         }));
-        self.status = Some("설정 읽는 중…".into());
+        self.status = Some(crate::i18n::t("설정 읽는 중…", "Reloading config…").into());
     }
 
     fn close_hint(&self) -> String {
@@ -802,7 +804,7 @@ impl App {
             .iter()
             .map(ToString::to_string)
             .collect();
-        format!("{}: 닫기", keys.join("/"))
+        crate::tr!("{}: 닫기", "{}: close", keys.join("/"))
     }
 
     fn open_screen(&mut self, title: &str, lines: Vec<String>) {
@@ -830,36 +832,36 @@ impl App {
             .unwrap_or_else(|| "mdir".to_string());
         let lines =
             screen::key_settings_lines(path.as_deref(), exists, &preset, &self.settings.keymap);
-        self.open_screen("키 설정", lines);
+        self.open_screen(crate::i18n::t("키 설정", "Key settings"), lines);
     }
 
     pub fn open_warnings(&mut self) {
         let lines = if self.settings.warnings.is_empty() {
-            vec!["경고 없음".to_string()]
+            vec![crate::i18n::t("경고 없음", "No warnings").to_string()]
         } else {
             self.settings.warnings.clone()
         };
-        self.open_screen("설정 경고", lines);
+        self.open_screen(crate::i18n::t("설정 경고", "Config warnings"), lines);
     }
 
     pub fn open_main_menu(&mut self) {
-        let mut warnings = "설정 경고 보기".to_string();
+        let mut warnings = crate::i18n::t("설정 경고 보기", "View config warnings").to_string();
         if !self.settings.warnings.is_empty() {
             warnings.push_str(&format!(" ({})", self.settings.warnings.len()));
         }
         let mut items: Vec<String> = [
-            "테마 선택",
-            "숨김 파일 보기 토글",
-            "키 설정 보기",
-            "설정 다시 읽기",
+            crate::i18n::t("테마 선택", "Choose theme"),
+            crate::i18n::t("숨김 파일 보기 토글", "Toggle hidden files"),
+            crate::i18n::t("키 설정 보기", "View key settings"),
+            crate::i18n::t("설정 다시 읽기", "Reload config"),
         ]
         .map(String::from)
         .to_vec();
         items.push(warnings);
-        items.push("연결 프로그램 선택".to_string());
+        items.push(crate::i18n::t("연결 프로그램 선택", "Choose program").to_string());
         self.status = None;
         self.menu = Some(OpenMenu {
-            menu: Menu::new("메뉴", items, 0),
+            menu: Menu::new(crate::i18n::t("메뉴", "Menu"), items, 0),
             kind: MenuKind::Main,
         });
     }
@@ -878,7 +880,7 @@ impl App {
         let cursor = names.iter().position(|n| n == current).unwrap_or(0);
         self.menu = Some(OpenMenu {
             menu: Menu::new(
-                &format!("테마 선택 ({})", self.mode.key()),
+                &crate::tr!("테마 선택 ({})", "Choose theme ({})", self.mode.key()),
                 names.clone(),
                 cursor,
             ),
@@ -896,7 +898,7 @@ impl App {
         if self.task.is_some() {
             // Leave the picker's preview and keep the saved choice.
             self.apply_theme();
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         let (t, _) = theme::resolve(name, &self.settings.user_themes);
@@ -912,7 +914,13 @@ impl App {
         }
         self.apply_theme();
         let Some(dir) = self.config_dir.clone() else {
-            self.status = Some("테마 저장 실패: 설정 디렉터리를 알 수 없음".into());
+            self.status = Some(
+                crate::i18n::t(
+                    "테마 저장 실패: 설정 디렉터리를 알 수 없음",
+                    "Theme save failed: config directory unknown",
+                )
+                .into(),
+            );
             return;
         };
         let (mode, owned) = (self.mode, name.to_string());
@@ -923,7 +931,7 @@ impl App {
             },
             move || BgResult::ThemeSaved(config::save_theme(&dir, mode, &owned)),
         ));
-        self.status = Some("테마 저장 중…".into());
+        self.status = Some(crate::i18n::t("테마 저장 중…", "Saving theme…").into());
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
@@ -1171,7 +1179,12 @@ impl App {
             match lc {
                 LocationCmd::Local => self.switch_local(self.active),
                 LocationCmd::Ssh { host, path } => self.connect_by_name(self.active, &host, path),
-                LocationCmd::SshUsage => self.status = Some("사용법: ssh 호스트[:경로]".into()),
+                LocationCmd::SshUsage => {
+                    self.status = Some(
+                        crate::i18n::t("사용법: ssh 호스트[:경로]", "Usage: ssh host[:path]")
+                            .into(),
+                    )
+                }
             }
             return;
         }
@@ -1213,14 +1226,18 @@ impl App {
                     CdTarget::Prev => match &self.prev_dirs[self.active] {
                         Some(p) => p.to_string_lossy().into_owned(),
                         None => {
-                            self.status = Some("이전 디렉터리 없음".into());
+                            self.status = Some(
+                                crate::i18n::t("이전 디렉터리 없음", "No previous directory")
+                                    .into(),
+                            );
                             return;
                         }
                     },
                     CdTarget::Path(p) => p.to_string_lossy().into_owned(),
                 };
                 if self.busy() {
-                    self.status = Some("작업 진행 중".into());
+                    self.status =
+                        Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
                     return;
                 }
                 let sess = Arc::clone(&session);
@@ -1231,7 +1248,7 @@ impl App {
                     },
                     move || BgResult::RemoteCd(remote_ops::resolve_cd(&sess, &cwd, &text)),
                 ));
-                self.status = Some("이동 중…".into());
+                self.status = Some(crate::i18n::t("이동 중…", "Moving…").into());
             }
         }
     }
@@ -1262,8 +1279,12 @@ impl App {
     fn open_location_menu(&mut self, idx: usize) {
         let servers = self.servers();
         let drives = self.drives.clone();
-        let mut items = vec!["로컬".to_string()];
-        items.extend(drives.iter().map(|d| format!("{}  드라이브", d.display())));
+        let mut items = vec![crate::i18n::t("로컬", "Local").to_string()];
+        items.extend(
+            drives
+                .iter()
+                .map(|d| crate::tr!("{}  드라이브", "{}  drive", d.display())),
+        );
         items.extend(servers.iter().map(|s| {
             // ssh aliases show where they point (user@hostname) when known.
             let detail = self
@@ -1285,9 +1306,9 @@ impl App {
             }
         }));
         let title = if idx == 0 {
-            "왼쪽 패널"
+            crate::i18n::t("왼쪽 패널", "Left panel")
         } else {
-            "오른쪽 패널"
+            crate::i18n::t("오른쪽 패널", "Right panel")
         };
         self.status = None;
         self.menu = Some(OpenMenu {
@@ -1337,7 +1358,7 @@ impl App {
         };
         self.connecting[idx] = Some(job.attempt);
         self.pending_master.retain(|j| j.idx != idx);
-        self.status = Some(format!("연결 중… {}", job.target.host));
+        self.status = Some(crate::tr!("연결 중… {}", "Connecting… {}", job.target.host));
         self.spawn_connect(job, false);
     }
 
@@ -1350,7 +1371,7 @@ impl App {
             let (idx, attempt) = (job.idx, job.attempt);
             if !authed {
                 if let Err(e) = session::ensure_control_dir(&job.target.control_path) {
-                    let result = Err(format!("소켓 디렉터리: {e}"));
+                    let result = Err(crate::tr!("소켓 디렉터리: {e}", "Socket directory: {e}"));
                     let _ = tx.send(ConnectMsg::Done {
                         idx,
                         attempt,
@@ -1372,7 +1393,7 @@ impl App {
                     if s.revive() {
                         Ok(ConnectDone::Revived)
                     } else {
-                        Err("연결 끊김".to_string())
+                        Err(crate::i18n::t("연결 끊김", "Connection lost").to_string())
                     }
                 }
             };
@@ -1382,8 +1403,8 @@ impl App {
                 if remote::uses_master(&job.target) {
                     e
                 } else {
-                    format!(
-                        "{e} · 이 OS의 ssh는 연결 유지를 지원하지 않아 키 인증(ssh-agent)이 필요함"
+                    crate::tr!(
+                        "{e} · 이 OS의 ssh는 연결 유지를 지원하지 않아 키 인증(ssh-agent)이 필요함", "{e} · ssh on this OS cannot keep connections open, so key auth (ssh-agent) is required"
                     )
                 }
             });
@@ -1419,7 +1440,7 @@ impl App {
             } // else superseded
         };
         let cmd = Arc::clone(&self.cmd);
-        let mut result: EditResult = Err("실행되지 않음".into());
+        let mut result: EditResult = Err(crate::i18n::t("실행되지 않음", "Not run").into());
         let outcome = suspend(&mut || {
             result = session::start_master(&*cmd, &job.target);
             result.clone()
@@ -1427,15 +1448,18 @@ impl App {
         match (outcome, result) {
             (Err(e), _) => {
                 self.connecting[job.idx] = None;
-                self.status = Some(format!("터미널 복귀 실패: {e}"));
+                self.status = Some(crate::tr!(
+                    "터미널 복귀 실패: {e}",
+                    "Terminal restore failed: {e}"
+                ));
             }
             (Ok(_), Ok(())) => {
-                self.status = Some(format!("연결 중… {}", job.target.host));
+                self.status = Some(crate::tr!("연결 중… {}", "Connecting… {}", job.target.host));
                 self.spawn_connect(job, true);
             }
             (Ok(_), Err(e)) => {
                 self.connecting[job.idx] = None;
-                self.status = Some(format!("연결 실패: {e}"));
+                self.status = Some(crate::tr!("연결 실패: {e}", "Connection failed: {e}"));
             }
         }
     }
@@ -1447,7 +1471,11 @@ impl App {
             match msg {
                 ConnectMsg::NeedAuth(job) => {
                     if self.connecting[job.idx] == Some(job.attempt) {
-                        self.status = Some(format!("인증 필요: {}", job.target.host));
+                        self.status = Some(crate::tr!(
+                            "인증 필요: {}",
+                            "Authentication required: {}",
+                            job.target.host
+                        ));
                         self.pending_master.retain(|j| j.idx != job.idx);
                         // Workers answer in any order; ask in request order.
                         let at = self
@@ -1472,10 +1500,13 @@ impl App {
                     match result {
                         Ok(ConnectDone::Established(e)) => self.attach_remote(idx, e),
                         Ok(ConnectDone::Revived) => {
-                            self.status = Some("재연결됨".into());
+                            self.status = Some(crate::i18n::t("재연결됨", "Reconnected").into());
                             self.reload_remote_panels();
                         }
-                        Err(e) => self.status = Some(format!("연결 실패: {e}")),
+                        Err(e) => {
+                            self.status =
+                                Some(crate::tr!("연결 실패: {e}", "Connection failed: {e}"))
+                        }
                     }
                 }
             }
@@ -1490,7 +1521,7 @@ impl App {
         self.trash_views[idx] = None;
         self.prev_dirs[idx] = None;
         self.invalidate_probe();
-        self.status = Some(format!("{} 연결됨", est.session.name));
+        self.status = Some(crate::tr!("{} 연결됨", "{} connected", est.session.name));
         self.panels[idx].set_location(Location::Remote(est.session), est.start);
         self.active = idx;
         self.reload_panel(idx, None);
@@ -1528,7 +1559,7 @@ impl App {
         self.connecting[idx] = None;
         self.pending_master.retain(|j| j.idx != idx);
         if !self.panels[idx].location.is_remote() {
-            self.status = Some("이미 로컬 패널".into());
+            self.status = Some(crate::i18n::t("이미 로컬 패널", "Already a local panel").into());
             return;
         }
         let cwd = self.local_cwds[idx]
@@ -1597,7 +1628,8 @@ impl App {
                 job.cwd.clone(),
             ),
         };
-        let mut result: Result<i32, String> = Err("실행되지 않음".into());
+        let mut result: Result<i32, String> =
+            Err(crate::i18n::t("실행되지 않음", "Not run").into());
         let outcome = suspend(&mut || {
             let r = launcher.run_shell(&argv, &run_cwd);
             if let Ok(code) = &r {
@@ -1609,9 +1641,11 @@ impl App {
         });
         self.reload_both();
         self.status = Some(match (outcome, result) {
-            (Err(e), _) => format!("터미널 복귀 실패: {e}"),
-            (Ok(_), Ok(code)) => format!("종료 코드 {code}: {}", job.cmd),
-            (Ok(_), Err(e)) => format!("오류: {}: {e}", job.cmd),
+            (Err(e), _) => crate::tr!("터미널 복귀 실패: {e}", "Terminal restore failed: {e}"),
+            (Ok(_), Ok(code)) => {
+                crate::tr!("종료 코드 {code}: {}", "Exit code {code}: {}", job.cmd)
+            }
+            (Ok(_), Err(e)) => crate::tr!("오류: {}: {e}", "Error: {}: {e}", job.cmd),
         });
     }
 
@@ -1620,7 +1654,7 @@ impl App {
         let page = self.page_height.max(1);
         let remote_here = self.active_panel().location.is_remote();
         if action == Action::TrashView && remote_here {
-            self.status = Some("원격: 휴지통 없음".into());
+            self.status = Some(crate::i18n::t("원격: 휴지통 없음", "Remote: no trash").into());
             return;
         }
         match action {
@@ -1628,7 +1662,7 @@ impl App {
                 if let Some(job) = self.job.as_mut() {
                     job.handle.cancel();
                     job.cancelling = true;
-                    self.status = Some("취소 중…".into());
+                    self.status = Some(crate::i18n::t("취소 중…", "Cancelling…").into());
                 }
             }
             Action::Copy => self.open_transfer(JobKind::Copy),
@@ -1698,7 +1732,7 @@ impl App {
             }
             Action::ToggleMode => {
                 self.set_mode(self.mode.toggled());
-                self.status = Some(format!("모드: {:?}", self.mode));
+                self.status = Some(crate::tr!("모드: {:?}", "Mode: {:?}", self.mode));
             }
             Action::View => self.open_viewer(),
             Action::Edit => self.open_editor(),
@@ -1751,7 +1785,7 @@ impl App {
         purpose: FetchPurpose,
     ) {
         if self.busy() {
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         let (r, sess) = (remote.clone(), Arc::clone(&session));
@@ -1765,7 +1799,7 @@ impl App {
             },
             move || BgResult::RemoteFetch(remote_ops::fetch(&sess, &r, for_edit)),
         ));
-        self.status = Some("내려받는 중…".into());
+        self.status = Some(crate::i18n::t("내려받는 중…", "Downloading…").into());
     }
 
     /// The download for an F4 edit is done: queue the editor on the copy.
@@ -1896,7 +1930,9 @@ impl App {
                             None => runner(&target.path),
                         }
                     }))
-                    .unwrap_or_else(|_| Preview::Error("미리보기 실패".into()));
+                    .unwrap_or_else(|_| {
+                        Preview::Error(crate::i18n::t("미리보기 실패", "Preview failed").into())
+                    });
                 let _ = tx.send((id, target, result));
             });
         }
@@ -1932,14 +1968,17 @@ impl App {
         self.reload_after_op(job.panel, Some(job.name));
         let edited = outcome.as_ref().is_ok_and(Result::is_ok);
         let mut status = match outcome {
-            Ok(Ok(())) => format!("편집 완료: {name}"),
+            Ok(Ok(())) => crate::tr!("편집 완료: {name}", "Edited: {name}"),
             Ok(Err(msg)) => msg,
-            Err(e) => format!("터미널 복귀 실패: {e}"),
+            Err(e) => crate::tr!("터미널 복귀 실패: {e}", "Terminal restore failed: {e}"),
         };
         if let Some(ctx) = remote {
             // Even after an editor error the user may have saved: a worker
             // hashes the copy and uploads it if the content changed.
-            let editor_status = std::mem::replace(&mut status, format!("변경 확인 중…: {name}"));
+            let editor_status = std::mem::replace(
+                &mut status,
+                crate::tr!("변경 확인 중…: {name}", "Checking changes…: {name}"),
+            );
             self.start_upload(ctx, name, edited, editor_status);
         }
         self.status = Some(status);
@@ -1974,7 +2013,13 @@ impl App {
             let (result, unchanged) = match stamp.differs(&l2) {
                 Ok(false) => (Ok(()), true),
                 Ok(true) => (up(&s2, &l2, &r2, &remote_st), false),
-                Err(e) => (Err(format!("편집한 파일을 읽을 수 없음: {e}")), false),
+                Err(e) => (
+                    Err(crate::tr!(
+                        "편집한 파일을 읽을 수 없음: {e}",
+                        "Cannot read edited file: {e}"
+                    )),
+                    false,
+                ),
             };
             let kept = (result.is_err() || ab.load(Ordering::SeqCst)).then(|| {
                 let _ = dir.keep();
@@ -2012,7 +2057,7 @@ impl App {
                 Err(TryRecvError::Empty) => pending.push(u),
                 Err(TryRecvError::Disconnected) => {
                     let d = UploadDone {
-                        result: Err("업로드 중단됨".into()),
+                        result: Err(crate::i18n::t("업로드 중단됨", "Upload aborted").into()),
                         unchanged: false,
                         kept: Some(u.local.clone()),
                     };
@@ -2032,24 +2077,31 @@ impl App {
                 ..
             } = u;
             self.status = Some(match &d.result {
-                Ok(()) if d.unchanged && edited => format!("편집 완료: {name} (변경 없음)"),
+                Ok(()) if d.unchanged && edited => crate::tr!(
+                    "편집 완료: {name} (변경 없음)",
+                    "Edited: {name} (unchanged)"
+                ),
                 Ok(()) if d.unchanged => editor_status,
-                Ok(()) => format!("편집 완료: {name} (업로드됨)"),
+                Ok(()) => crate::tr!("편집 완료: {name} (업로드됨)", "Edited: {name} (uploaded)"),
                 Err(e) => {
                     let kept = d
                         .kept
                         .as_ref()
-                        .map(|k| format!(" · 임시 복사본: {}", k.display()))
+                        .map(|k| crate::tr!(" · 임시 복사본: {}", " · temp copy: {}", k.display()))
                         .unwrap_or_default();
                     if let Some(k) = &d.kept {
-                        self.failed_copies.push(format!(
+                        self.failed_copies.push(crate::tr!(
                             "업로드 실패: {name}: {e}\n  편집한 복사본: {}\n  원격 대상: {}:{}",
+                            "Upload failed: {name}: {e}\n  Edited copy: {}\n  Remote target: {}:{}",
                             k.display(),
                             session.target.host,
                             remote.display()
                         ));
                     }
-                    format!("업로드 실패: {name}: {e}{kept}")
+                    crate::tr!(
+                        "업로드 실패: {name}: {e}{kept}",
+                        "Upload failed: {name}: {e}{kept}"
+                    )
                 }
             });
             let dir = remote.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -2088,8 +2140,9 @@ impl App {
         let mut notes = std::mem::take(&mut self.failed_copies);
         for u in &self.uploads {
             u.abandon.store(true, Ordering::SeqCst);
-            notes.push(format!(
+            notes.push(crate::tr!(
                 "업로드가 끝나지 않음: {}\n  편집한 복사본: {}\n  원격 대상: {}:{}",
+                "Upload not finished: {}\n  Edited copy: {}\n  Remote target: {}:{}",
                 u.name,
                 u.local.display(),
                 u.session.target.host,
@@ -2180,7 +2233,9 @@ impl App {
         let preview = match load.rx.try_recv() {
             Ok(p) => p,
             Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => Preview::Error("읽기 중단됨".into()),
+            Err(TryRecvError::Disconnected) => {
+                Preview::Error(crate::i18n::t("읽기 중단됨", "Read aborted").into())
+            }
         };
         self.viewer_load = None;
         match self.viewer.as_mut() {
@@ -2246,7 +2301,12 @@ impl App {
             });
         match spawned {
             Ok(_) => self.probe = Some(ProbeLoad { rx, req }),
-            Err(e) => self.status = Some(format!("오류: 파일 형식 확인 실패: {e}")),
+            Err(e) => {
+                self.status = Some(crate::tr!(
+                    "오류: 파일 형식 확인 실패: {e}",
+                    "Error: file type check failed: {e}"
+                ))
+            }
         }
     }
 
@@ -2274,7 +2334,9 @@ impl App {
         let result = match load.rx.try_recv() {
             Ok(r) => r,
             Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => Err("파일 형식 확인 실패".into()),
+            Err(TryRecvError::Disconnected) => {
+                Err(crate::i18n::t("파일 형식 확인 실패", "File type check failed").into())
+            }
         };
         let Some(load) = self.probe.take() else {
             return false;
@@ -2298,7 +2360,7 @@ impl App {
                 Err(e) if e == remote_ops::special_file() => self.status = Some(e),
                 Err(e) => {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    self.status = Some(format!("오류: {name}: {e}"));
+                    self.status = Some(crate::tr!("오류: {name}: {e}", "Error: {name}: {e}"));
                 }
             }
         }
@@ -2367,13 +2429,13 @@ impl App {
                 .name("hdir-spawn".into())
                 .spawn(move || {
                     let msg = match launcher.spawn_detached(&argv, &cwd) {
-                        Ok(()) => format!("실행: {shown}"),
-                        Err(e) => format!("오류: {err_label}: {e}"),
+                        Ok(()) => crate::tr!("실행: {shown}", "Run: {shown}"),
+                        Err(e) => crate::tr!("오류: {err_label}: {e}", "Error: {err_label}: {e}"),
                     };
                     let _ = tx.send(msg);
                 });
             if let Err(e) = spawned {
-                self.status = Some(format!("오류: {label}: {e}"));
+                self.status = Some(crate::tr!("오류: {label}: {e}", "Error: {label}: {e}"));
                 return false;
             }
             return true;
@@ -2420,7 +2482,7 @@ impl App {
         self.status = None;
         self.invalidate_probe();
         let Some(path) = self.current_file() else {
-            self.status = Some("파일을 선택하세요".into());
+            self.status = Some(crate::i18n::t("파일을 선택하세요", "Select a file").into());
             return;
         };
         let mut items = Vec::new();
@@ -2431,12 +2493,16 @@ impl App {
                 choices.push(OpenChoice::Rule(rule.clone()));
             }
         }
-        items.push("시스템 기본 프로그램".into());
+        items.push(crate::i18n::t("시스템 기본 프로그램", "System default program").into());
         choices.push(OpenChoice::System);
-        items.push("뷰어(F3)".into());
+        items.push(crate::i18n::t("뷰어(F3)", "Viewer (F3)").into());
         choices.push(OpenChoice::Viewer);
         self.menu = Some(OpenMenu {
-            menu: Menu::new("연결 프로그램 선택", items, 0),
+            menu: Menu::new(
+                crate::i18n::t("연결 프로그램 선택", "Choose program"),
+                items,
+                0,
+            ),
             kind: MenuKind::OpenWith {
                 path,
                 choices,
@@ -2476,16 +2542,16 @@ impl App {
         }
         let name = job.name.to_string_lossy();
         self.status = Some(match outcome {
-            Ok(Ok(())) => format!("실행 완료: {name}"),
-            Ok(Err(e)) => format!("오류: {}: {e}", job.label),
-            Err(e) => format!("터미널 복귀 실패: {e}"),
+            Ok(Ok(())) => crate::tr!("실행 완료: {name}", "Finished: {name}"),
+            Ok(Err(e)) => crate::tr!("오류: {}: {e}", "Error: {}: {e}", job.label),
+            Err(e) => crate::tr!("터미널 복귀 실패: {e}", "Terminal restore failed: {e}"),
         });
     }
 
     /// F1 inside the viewer: help for the viewer keys only.
     fn open_viewer_help(&mut self) {
         let lines = screen::help_lines_for(&self.settings.keymap, &[Context::Viewer]);
-        self.open_screen("도움말 (뷰어)", lines);
+        self.open_screen(crate::i18n::t("도움말 (뷰어)", "Help (viewer)"), lines);
     }
 
     fn handle_viewer_key(&mut self, key: KeyEvent) {
@@ -2522,7 +2588,7 @@ impl App {
 
     fn open_transfer(&mut self, kind: JobKind) {
         if self.busy() {
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         let names = self.selected_or_current();
@@ -2539,14 +2605,18 @@ impl App {
         let cwd = self.active_panel().cwd.clone();
         let sources: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
         let title = match kind {
-            JobKind::Copy => "복사",
-            JobKind::Move => "이동",
+            JobKind::Copy => crate::i18n::t("복사", "Copy"),
+            JobKind::Move => crate::i18n::t("이동", "Move"),
         };
         let initial = self.other_panel().cwd.to_string_lossy().into_owned();
         self.status = None;
         let at = self.panels_at();
         self.dialog = Some((
-            Dialog::input(title, "대상 경로:", &initial),
+            Dialog::input(
+                title,
+                crate::i18n::t("대상 경로:", "Target path:"),
+                &initial,
+            ),
             PendingAction::Transfer { kind, sources, at },
         ));
     }
@@ -2564,13 +2634,14 @@ impl App {
 
     fn start_job(&mut self, kind: JobKind, sources: Vec<PathBuf>, input: &str) {
         if self.busy() {
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         // Only reject empty input; surrounding spaces may be part of a real name.
         // Whether the folder exists is checked by the worker (no IO here).
         if input.is_empty() {
-            self.status = Some("오류: 대상 폴더 없음".into());
+            self.status =
+                Some(crate::i18n::t("오류: 대상 폴더 없음", "Error: target folder missing").into());
             return;
         }
         let src_loc = self.active_panel().location.clone();
@@ -2739,12 +2810,15 @@ impl App {
                     .cloned()
                     .unwrap_or_default();
                 let mut status = match failed.len() {
-                    0 => format!("휴지통: {ok}개"),
-                    _ if ok == 0 => format!("오류: {first}"),
-                    n => format!("휴지통: {ok}개, 실패 {n}개: {first}"),
+                    0 => crate::tr!("휴지통: {ok}개", "Trash: {ok} items"),
+                    _ if ok == 0 => crate::tr!("오류: {first}", "Error: {first}"),
+                    n => crate::tr!(
+                        "휴지통: {ok}개, 실패 {n}개: {first}",
+                        "Trash: {ok} items, {n} failed: {first}"
+                    ),
                 };
                 if lost > 0 {
-                    status.push_str(" · 되돌리기 정보 없음");
+                    status.push_str(crate::i18n::t(" · 되돌리기 정보 없음", " · no undo info"));
                 }
                 if !undo.is_empty() {
                     self.undo.push(UndoOp::Trash { items: undo });
@@ -2763,22 +2837,32 @@ impl App {
             ) => match res {
                 Ok(path) => {
                     self.undo.push(UndoOp::Mkdir { path });
-                    self.after_fs_op(panel, &parent, Some(&name), format!("폴더 생성: {name}"));
+                    self.after_fs_op(
+                        panel,
+                        &parent,
+                        Some(&name),
+                        crate::tr!("폴더 생성: {name}", "Folder created: {name}"),
+                    );
                 }
                 Err(e) => {
                     self.reload_both();
-                    self.status = Some(format!("오류: {e}"));
+                    self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
                 }
             },
             (BgKind::Rename { panel, from, name }, Some(BgResult::Rename(res))) => match res {
                 Ok(to) => {
                     let parent = from.parent().map(PathBuf::from).unwrap_or_default();
                     self.undo.push(UndoOp::Rename { from, to });
-                    self.after_fs_op(panel, &parent, Some(&name), format!("이름 변경: {name}"));
+                    self.after_fs_op(
+                        panel,
+                        &parent,
+                        Some(&name),
+                        crate::tr!("이름 변경: {name}", "Renamed: {name}"),
+                    );
                 }
                 Err(e) => {
                     self.reload_both();
-                    self.status = Some(format!("오류: {e}"));
+                    self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
                 }
             },
             (
@@ -2792,11 +2876,16 @@ impl App {
             ) => match res {
                 Ok(path) => {
                     self.undo.push(UndoOp::RemoteMkdir { session, path });
-                    self.after_fs_op(panel, &parent, Some(&name), format!("폴더 생성: {name}"));
+                    self.after_fs_op(
+                        panel,
+                        &parent,
+                        Some(&name),
+                        crate::tr!("폴더 생성: {name}", "Folder created: {name}"),
+                    );
                 }
                 Err(e) => {
                     self.reload_both();
-                    self.status = Some(format!("오류: {e}"));
+                    self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
                 }
             },
             (
@@ -2811,11 +2900,16 @@ impl App {
                 Ok(to) => {
                     let parent = from.parent().map(PathBuf::from).unwrap_or_default();
                     self.undo.push(UndoOp::RemoteRename { session, from, to });
-                    self.after_fs_op(panel, &parent, Some(&name), format!("이름 변경: {name}"));
+                    self.after_fs_op(
+                        panel,
+                        &parent,
+                        Some(&name),
+                        crate::tr!("이름 변경: {name}", "Renamed: {name}"),
+                    );
                 }
                 Err(e) => {
                     self.reload_both();
-                    self.status = Some(format!("오류: {e}"));
+                    self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
                 }
             },
             (BgKind::RemoteDelete { panel, cwd, paths }, Some(BgResult::RemoteDelete(res))) => {
@@ -2823,8 +2917,12 @@ impl App {
                 self.clear_selection(panel, &cwd, &paths);
                 self.reload_both();
                 self.status = Some(match res {
-                    Ok(()) => format!("영구 삭제: {}개 (원격 삭제는 되돌릴 수 없음)", paths.len()),
-                    Err(e) => format!("오류: {e}"),
+                    Ok(()) => crate::tr!(
+                        "영구 삭제: {}개 (원격 삭제는 되돌릴 수 없음)",
+                        "Permanently deleted: {} items (remote delete cannot be undone)",
+                        paths.len()
+                    ),
+                    Err(e) => crate::tr!("오류: {e}", "Error: {e}"),
                 });
             }
             (
@@ -2856,14 +2954,18 @@ impl App {
             }
             (BgKind::OpenOsTrash, Some(BgResult::OpenOsTrash(res))) => {
                 self.status = Some(match res {
-                    Ok(()) => "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'".to_string(),
-                    Err(e) => format!("오류: {e}"),
+                    Ok(()) => crate::i18n::t(
+                        "Finder 휴지통을 열었음 · 복원은 '되돌려 놓기'",
+                        "Opened Finder trash · restore with 'Put Back'",
+                    )
+                    .to_string(),
+                    Err(e) => crate::tr!("오류: {e}", "Error: {e}"),
                 });
             }
             (BgKind::TrashList { panel }, Some(BgResult::TrashList(res))) => {
                 self.status = match self.apply_trash_listing(panel, &res) {
                     Ok(()) => None,
-                    Err(e) => Some(format!("오류: {e}")),
+                    Err(e) => Some(crate::tr!("오류: {e}", "Error: {e}")),
                 };
             }
             (
@@ -2876,12 +2978,17 @@ impl App {
                 let _ = self.apply_trash_listing_all(panel, &list);
                 let skipped = report.skipped;
                 self.status = Some(match report.error {
-                    Some(e) => format!("오류: {e}"),
-                    None if skipped > 0 => format!(
+                    Some(e) => crate::tr!("오류: {e}", "Error: {e}"),
+                    None if skipped > 0 => crate::tr!(
                         "영구 삭제: {}개, 휴지통 항목이 바뀌어 건너뜀 {skipped}개",
+                        "Permanently deleted: {} items, {skipped} skipped (trash changed)",
                         report.purged
                     ),
-                    None => format!("영구 삭제: {}개", report.purged),
+                    None => crate::tr!(
+                        "영구 삭제: {}개",
+                        "Permanently deleted: {} items",
+                        report.purged
+                    ),
                 });
             }
             (BgKind::ConfigReload, Some(BgResult::Settings(settings))) => {
@@ -2889,14 +2996,19 @@ impl App {
                 self.apply_theme();
                 self.apply_lang();
                 self.status = Some(
-                    config::warning_summary(&self.settings.warnings)
-                        .unwrap_or_else(|| "설정을 다시 읽었음".to_string()),
+                    config::warning_summary(&self.settings.warnings).unwrap_or_else(|| {
+                        crate::i18n::t("설정을 다시 읽었음", "Config reloaded").to_string()
+                    }),
                 );
             }
             (BgKind::ThemeSave { mode, name }, Some(BgResult::ThemeSaved(res))) => {
                 self.status = Some(match res {
-                    Ok(()) => format!("테마 저장: {name} ({})", mode.key()),
-                    Err(e) => format!("테마 저장 실패: {e}"),
+                    Ok(()) => crate::tr!(
+                        "테마 저장: {name} ({})",
+                        "Theme saved: {name} ({})",
+                        mode.key()
+                    ),
+                    Err(e) => crate::tr!("테마 저장 실패: {e}", "Theme save failed: {e}"),
                 });
             }
             (BgKind::Undo, Some(BgResult::Undo(done))) => {
@@ -2910,7 +3022,8 @@ impl App {
             }
             _ => {
                 self.reload_both();
-                self.status = Some("오류: 작업이 중단됨".into());
+                self.status =
+                    Some(crate::i18n::t("오류: 작업이 중단됨", "Error: operation aborted").into());
             }
         }
         true
@@ -2928,7 +3041,7 @@ impl App {
         let copy = match res {
             Ok(c) => c,
             Err(e) => {
-                self.status = Some(format!("오류: {e}"));
+                self.status = Some(crate::tr!("오류: {e}", "Error: {e}"));
                 return;
             }
         };
@@ -3078,7 +3191,11 @@ impl App {
         self.status = None;
         let at = self.panels_at();
         self.dialog = Some((
-            Dialog::input("새 폴더", "폴더 이름:", ""),
+            Dialog::input(
+                crate::i18n::t("새 폴더", "New folder"),
+                crate::i18n::t("폴더 이름:", "Folder name:"),
+                "",
+            ),
             PendingAction::Mkdir { at },
         ));
     }
@@ -3093,7 +3210,11 @@ impl App {
         self.status = None;
         let at = self.panels_at();
         self.dialog = Some((
-            Dialog::input("이름 변경", "새 이름:", &name),
+            Dialog::input(
+                crate::i18n::t("이름 변경", "Rename"),
+                crate::i18n::t("새 이름:", "New name:"),
+                &name,
+            ),
             PendingAction::Rename { from, at },
         ));
     }
@@ -3112,9 +3233,13 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .collect();
             if names.len() > 5 {
-                msg.push(format!("외 {}개", names.len() - 5));
+                msg.push(crate::tr!("외 {}개", "and {} more", names.len() - 5));
             }
-            let title = format!("영구 삭제 (원격: {})", session.name);
+            let title = crate::tr!(
+                "영구 삭제 (원격: {})",
+                "Permanent delete (remote: {})",
+                session.name
+            );
             self.status = None;
             self.dialog = Some((
                 Dialog::danger(&title, msg),
@@ -3134,11 +3259,11 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .collect();
         if names.len() > 5 {
-            msg.push(format!("외 {}개", names.len() - 5));
+            msg.push(crate::tr!("외 {}개", "and {} more", names.len() - 5));
         }
         self.status = None;
         self.dialog = Some((
-            Dialog::confirm("휴지통으로 이동", msg),
+            Dialog::confirm(crate::i18n::t("휴지통으로 이동", "Move to trash"), msg),
             PendingAction::Trash { paths },
         ));
     }
@@ -3147,7 +3272,7 @@ impl App {
 
     fn open_trash_view(&mut self) {
         if self.task.is_some() {
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         if !self.trash.supports_view() {
@@ -3157,7 +3282,7 @@ impl App {
             self.task = Some(BgTask::spawn(BgKind::OpenOsTrash, move || {
                 BgResult::OpenOsTrash(store.open_os_trash())
             }));
-            self.status = Some("휴지통 여는 중…".into());
+            self.status = Some(crate::i18n::t("휴지통 여는 중…", "Opening trash…").into());
             return;
         }
         let idx = self.active;
@@ -3166,7 +3291,7 @@ impl App {
         self.task = Some(BgTask::spawn(BgKind::TrashList { panel: idx }, move || {
             BgResult::TrashList(store.list())
         }));
-        self.status = Some("휴지통 읽는 중…".into());
+        self.status = Some(crate::i18n::t("휴지통 읽는 중…", "Reading trash…").into());
     }
 
     fn close_trash_view(&mut self, idx: usize) {
@@ -3190,7 +3315,9 @@ impl App {
         };
         let Some(action) = self.settings.keymap.lookup(Context::Trash, &key) else {
             if matches!(key.code, KeyCode::F(_)) {
-                self.status = Some("휴지통에서는 사용할 수 없음".into());
+                self.status = Some(
+                    crate::i18n::t("휴지통에서는 사용할 수 없음", "Not available in trash").into(),
+                );
             }
             return;
         };
@@ -3211,7 +3338,10 @@ impl App {
             Action::ToggleSelect => moved(self, &TrashView::toggle_current),
             _ => {
                 if matches!(key.code, KeyCode::F(_)) {
-                    self.status = Some("휴지통에서는 사용할 수 없음".into());
+                    self.status = Some(
+                        crate::i18n::t("휴지통에서는 사용할 수 없음", "Not available in trash")
+                            .into(),
+                    );
                 }
             }
         }
@@ -3227,7 +3357,7 @@ impl App {
 
     fn open_trash_restore(&mut self) {
         if self.task.is_some() {
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         let idx = self.active;
@@ -3241,8 +3371,9 @@ impl App {
             .partition(|e| e.original_path().is_some());
         if known.is_empty() {
             let names: Vec<String> = unknown.iter().take(3).map(TrashEntry::name).collect();
-            self.status = Some(format!(
+            self.status = Some(crate::tr!(
                 "원래 위치를 알 수 없어 복원할 수 없음: {}",
+                "Cannot restore, original location unknown: {}",
                 names.join(", ")
             ));
             return;
@@ -3256,7 +3387,7 @@ impl App {
                 BgResult::TrashRestore(result, skipped, store.list())
             },
         ));
-        self.status = Some("복원 중…".into());
+        self.status = Some(crate::i18n::t("복원 중…", "Restoring…").into());
     }
 
     fn open_trash_purge(&mut self) {
@@ -3267,11 +3398,11 @@ impl App {
         }
         let mut msg: Vec<String> = entries.iter().take(5).map(TrashEntry::name).collect();
         if entries.len() > 5 {
-            msg.push(format!("외 {}개", entries.len() - 5));
+            msg.push(crate::tr!("외 {}개", "and {} more", entries.len() - 5));
         }
         self.status = None;
         self.dialog = Some((
-            Dialog::danger("영구 삭제", msg),
+            Dialog::danger(crate::i18n::t("영구 삭제", "Permanent delete"), msg),
             PendingAction::TrashPurge {
                 panel: idx,
                 entries,
@@ -3325,7 +3456,10 @@ impl App {
         }
         let mut status = result.summary();
         if unknown > 0 {
-            status.push_str(&format!(" · 원래 위치를 알 수 없어 건너뜀: {unknown}개"));
+            status.push_str(&crate::tr!(
+                " · 원래 위치를 알 수 없어 건너뜀: {unknown}개",
+                " · skipped, original location unknown: {unknown}"
+            ));
         }
         self.status = Some(status);
     }
@@ -3374,11 +3508,12 @@ impl App {
             | (PendingAction::Transfer { at, .. }, DialogResult::Submitted(_))
                 if at != self.panels_at() =>
             {
-                self.status = Some(PANELS_CHANGED_MSG.into());
+                self.status = Some(panels_changed_msg().into());
             }
             (PendingAction::Mkdir { .. }, DialogResult::Submitted(name)) => {
                 if self.busy() {
-                    self.status = Some("작업 진행 중".into());
+                    self.status =
+                        Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
                     return;
                 }
                 let parent = self.active_panel().cwd.clone();
@@ -3394,7 +3529,7 @@ impl App {
                         },
                         move || BgResult::RemoteMkdir(remote_ops::mkdir(&sess, &p, &n)),
                     ));
-                    self.status = Some("폴더 생성 중…".into());
+                    self.status = Some(crate::i18n::t("폴더 생성 중…", "Creating folder…").into());
                     return;
                 }
                 self.task = Some(BgTask::spawn(
@@ -3405,11 +3540,12 @@ impl App {
                     },
                     move || BgResult::Mkdir(fs_ops::make_dir(&p, &n)),
                 ));
-                self.status = Some("폴더 생성 중…".into());
+                self.status = Some(crate::i18n::t("폴더 생성 중…", "Creating folder…").into());
             }
             (PendingAction::Rename { from, .. }, DialogResult::Submitted(name)) => {
                 if self.busy() {
-                    self.status = Some("작업 진행 중".into());
+                    self.status =
+                        Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
                     return;
                 }
                 let (f, n) = (from.clone(), name.clone());
@@ -3424,7 +3560,7 @@ impl App {
                         },
                         move || BgResult::RemoteRename(remote_ops::rename(&sess, &f, &n)),
                     ));
-                    self.status = Some("이름 변경 중…".into());
+                    self.status = Some(crate::i18n::t("이름 변경 중…", "Renaming…").into());
                     return;
                 }
                 self.task = Some(BgTask::spawn(
@@ -3435,11 +3571,12 @@ impl App {
                     },
                     move || BgResult::Rename(fs_ops::rename(&f, &n)),
                 ));
-                self.status = Some("이름 변경 중…".into());
+                self.status = Some(crate::i18n::t("이름 변경 중…", "Renaming…").into());
             }
             (PendingAction::Trash { paths }, DialogResult::Confirmed) => {
                 if self.busy() {
-                    self.status = Some("작업 진행 중".into());
+                    self.status =
+                        Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
                     return;
                 }
                 let trash = Arc::clone(&self.trash);
@@ -3450,7 +3587,8 @@ impl App {
                     },
                     move || BgResult::Trash(trash::delete_tracked(&*trash, &paths)),
                 ));
-                self.status = Some("휴지통으로 이동 중…".into());
+                self.status =
+                    Some(crate::i18n::t("휴지통으로 이동 중…", "Moving to trash…").into());
             }
             (
                 PendingAction::RemoteDelete {
@@ -3462,7 +3600,8 @@ impl App {
                 DialogResult::Confirmed,
             ) => {
                 if self.busy() {
-                    self.status = Some("작업 진행 중".into());
+                    self.status =
+                        Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
                     return;
                 }
                 let paths: Vec<PathBuf> = names.iter().map(|n| cwd.join(n)).collect();
@@ -3471,18 +3610,19 @@ impl App {
                     BgKind::RemoteDelete { panel, cwd, paths },
                     move || BgResult::RemoteDelete(remote_ops::delete(&session, &dir, &names)),
                 ));
-                self.status = Some("영구 삭제 중…".into());
+                self.status = Some(crate::i18n::t("영구 삭제 중…", "Deleting permanently…").into());
             }
             (PendingAction::TrashPurge { panel, entries }, DialogResult::Confirmed) => {
                 if self.busy() {
-                    self.status = Some("작업 진행 중".into());
+                    self.status =
+                        Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
                     return;
                 }
                 let store = Arc::clone(&self.trash);
                 self.task = Some(BgTask::spawn(BgKind::TrashPurge { panel }, move || {
                     BgResult::TrashPurge(purge_verified(&*store, &entries), store.list())
                 }));
-                self.status = Some("영구 삭제 중…".into());
+                self.status = Some(crate::i18n::t("영구 삭제 중…", "Deleting permanently…").into());
             }
             (PendingAction::Transfer { kind, sources, .. }, DialogResult::Submitted(input)) => {
                 self.start_job(kind, sources, &input);
@@ -3507,18 +3647,18 @@ impl App {
     /// applied (status, retry, reload) from [`App::tick`].
     fn undo(&mut self) {
         if self.busy() {
-            self.status = Some("작업 진행 중".into());
+            self.status = Some(crate::i18n::t("작업 진행 중", "Operation in progress").into());
             return;
         }
         let Some(op) = self.undo.pop() else {
-            self.status = Some("되돌릴 작업 없음".into());
+            self.status = Some(crate::i18n::t("되돌릴 작업 없음", "Nothing to undo").into());
             return;
         };
         let runner = Arc::clone(&self.undo_runner);
         self.task = Some(BgTask::spawn(BgKind::Undo, move || {
             BgResult::Undo(runner(op))
         }));
-        self.status = Some("되돌리는 중…".into());
+        self.status = Some(crate::i18n::t("되돌리는 중…", "Undoing…").into());
     }
 
     /// Reload panel `idx` (cursor on `focus` if given) and the other panel when
@@ -3601,7 +3741,11 @@ impl App {
             fkeys: &fkeys,
             cmdline: self.cmdline.as_ref().map(|c| (c.value.as_str(), c.cursor)),
         };
-        let viewer_hint = format!("{} · /: 검색 · n: 다음", self.close_hint());
+        let viewer_hint = crate::tr!(
+            "{} · /: 검색 · n: 다음",
+            "{} · /: search · n: next",
+            self.close_hint()
+        );
         if let Some(scr) = self.screen.as_mut() {
             screen::render(frame, scr, &self.theme);
         } else if let Some(v) = self.viewer.as_mut() {
@@ -3658,27 +3802,36 @@ fn job_summary(kind: JobKind, report: &OpReport) -> String {
     let mut status = match &report.outcome {
         OpOutcome::Done => {
             let mut s = match kind {
-                JobKind::Copy => format!("복사 완료: {n}개"),
-                JobKind::Move => format!("이동 완료: {n}개"),
+                JobKind::Copy => crate::tr!("복사 완료: {n}개", "Copied {n} items"),
+                JobKind::Move => crate::tr!("이동 완료: {n}개", "Moved {n} items"),
             };
             if report.skipped > 0 {
-                s.push_str(&format!(", 건너뜀 {}개", report.skipped));
+                s.push_str(&crate::tr!(", 건너뜀 {}개", ", {} skipped", report.skipped));
             }
             if report.partial > 0 {
-                s.push_str(&format!(", 일부만 이동 {}개 (원본 유지)", report.partial));
+                s.push_str(&crate::tr!(
+                    ", 일부만 이동 {}개 (원본 유지)",
+                    ", {} partially moved (source kept)",
+                    report.partial
+                ));
             }
             s
         }
-        OpOutcome::Cancelled => format!("취소됨 (처리 {n}개)"),
-        OpOutcome::Failed(msg) => format!("오류: {msg} (처리 {n}개)"),
+        OpOutcome::Cancelled => crate::tr!("취소됨 (처리 {n}개)", "Cancelled ({n} done)"),
+        OpOutcome::Failed(msg) => crate::tr!("오류: {msg} (처리 {n}개)", "Error: {msg} ({n} done)"),
     };
     if let Some(first) = report.warnings.first() {
         let shown: String = first.chars().take(60).collect();
-        status.push_str(&format!(" · 경고 {}개: {shown}", report.warnings.len()));
+        status.push_str(&crate::tr!(
+            " · 경고 {}개: {shown}",
+            " · {} warnings: {shown}",
+            report.warnings.len()
+        ));
     }
     if kind == JobKind::Move && report.overwritten > 0 {
-        status.push_str(&format!(
+        status.push_str(&crate::tr!(
             " · 덮어쓴 파일 {}개는 되돌릴 수 없음",
+            " · {} overwritten files cannot be undone",
             report.overwritten
         ));
     }
@@ -10026,5 +10179,55 @@ mod tests {
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         assert!(app.is_connecting(), "{:?}", app.status);
+    }
+
+    // ---- English UI ----
+
+    #[test]
+    fn english_job_summary_and_conflict_dialog() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let mut r = OpReport::failed("");
+            r.outcome = OpOutcome::Done;
+            r.copied = 3;
+            r.skipped = 1;
+            assert_eq!(job_summary(JobKind::Copy, &r), "Copied 3 items, 1 skipped");
+            r.outcome = OpOutcome::Cancelled;
+            assert_eq!(job_summary(JobKind::Move, &r), "Cancelled (3 done)");
+            let d = conflict_dialog(std::path::Path::new("/x/a b.txt"));
+            let text = format!("{d:?}");
+            assert!(text.contains("Confirm overwrite"), "{text}");
+            assert!(text.contains("Already exists: a b.txt"), "{text}");
+        });
+    }
+
+    #[test]
+    fn english_screen_titles_and_messages() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let (_t, mut app) = fixture();
+            press(&mut app, KeyCode::F(1));
+            assert_eq!(app.screen.as_ref().unwrap().title, "Help");
+            app.screen = None;
+            app.open_warnings();
+            assert_eq!(app.screen.as_ref().unwrap().title, "Config warnings");
+            assert!(page_text(&app).contains("No warnings"));
+            app.screen = None;
+            press(&mut app, KeyCode::F(7));
+            let text = format!("{:?}", app.dialog.as_ref().unwrap().0);
+            assert!(text.contains("New folder"), "{text}");
+            assert!(text.contains("Folder name:"), "{text}");
+        });
+    }
+
+    #[test]
+    fn english_menu_and_nothing_to_undo_status() {
+        crate::i18n::with_lang(crate::i18n::Lang::En, || {
+            let (_t, mut app) = fixture();
+            app.open_main_menu();
+            let menu = format!("{:?}", app.menu.as_ref().unwrap().menu);
+            assert!(menu.contains("Choose theme"), "{menu}");
+            app.menu = None;
+            app.undo();
+            assert_eq!(app.status.as_deref(), Some("Nothing to undo"));
+        });
     }
 }
