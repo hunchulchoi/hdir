@@ -2,6 +2,8 @@ name = "mdir-red"
 base = "mdir"
 
 [colors]
+dir = "#FFFFFF"
+dir_bold = true
 bg = "#AA0000"
 preview_bg = "#AA0000"
 border = "#FFFF55"

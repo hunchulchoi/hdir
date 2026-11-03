@@ -2,7 +2,9 @@
 
 pub mod app;
 pub mod assoc;
+pub mod classic;
 pub mod cli;
+pub mod clock;
 pub mod cmdline;
 pub mod config;
 pub mod dialog;

@@ -1425,6 +1425,38 @@ mod verbatim_tests {
     }
 }
 
+// ---- disk space ----
+
+/// `(available to this user, total)` bytes of the filesystem holding
+/// `path`. Blocking (a network mount can stall): call off the UI thread.
+#[cfg(unix)]
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `st` is plain data; statvfs only writes into it.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid out pointer.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let unit = st.f_frsize as u64;
+    Some((
+        (st.f_bavail as u64).saturating_mul(unit),
+        (st.f_blocks as u64).saturating_mul(unit),
+    ))
+}
+
+#[cfg(windows)]
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: a NUL-terminated wide path and valid out pointers.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    (ok != 0).then_some((avail, total))
+}
+
 // ---- POSIX ACLs in transfers ----
 
 /// Whether anything in the tree at `path` (links not followed) has an ACL:
@@ -1588,6 +1620,17 @@ pub fn set_test_acl(path: &Path) -> io::Result<()> {
     )
 }
 
+/// [`set_test_acl`]: `false` when the filesystem has no ACL support
+/// (the test then skips); any other failure fails the test.
+#[cfg(all(test, target_os = "linux"))]
+pub fn try_test_acl(path: &Path) -> bool {
+    match set_test_acl(path) {
+        Ok(()) => true,
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => false,
+        Err(e) => panic!("setting a test ACL on {} failed: {e}", path.display()),
+    }
+}
+
 /// The access ACL stored on `path`, if any.
 #[cfg(all(test, target_os = "linux"))]
 pub fn test_acl_of(path: &Path) -> Option<Vec<u8>> {
@@ -1619,6 +1662,14 @@ mod acl_tests {
         assert_eq!(mode(&d), 0o700);
         assert_eq!(mode(&d.join("f")), 0o4700);
         assert_eq!(mode(&outside), 0o644, "a link's target is left alone");
+    }
+
+    #[test]
+    fn disk_space_of_a_real_folder_and_a_missing_one() {
+        let t = tempfile::tempdir().unwrap();
+        let (free, total) = disk_space(t.path()).expect("space");
+        assert!(total > 0 && free <= total, "{free} {total}");
+        assert_eq!(disk_space(&t.path().join("missing")), None);
     }
 
     #[test]
@@ -1677,7 +1728,7 @@ mod acl_tests {
         let t = tempfile::tempdir().unwrap();
         fs::create_dir_all(t.path().join("d/e")).unwrap();
         fs::write(t.path().join("d/e/f"), "x").unwrap();
-        if set_test_acl(&t.path().join("d/e/f")).is_err() {
+        if !try_test_acl(&t.path().join("d/e/f")) {
             eprintln!("no ACL support here, skipped");
             return;
         }

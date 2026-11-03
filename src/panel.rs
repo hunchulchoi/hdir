@@ -80,6 +80,8 @@ pub struct Panel {
     pub loading: Option<LoadRequest>,
     /// A task finished while a navigation load was in flight; reload once it lands.
     pub reload_after_load: bool,
+    /// `(available, total)` bytes where a local listing came from.
+    pub space: Option<(u64, u64)>,
 }
 
 impl Panel {
@@ -97,6 +99,7 @@ impl Panel {
             error: None,
             loading: None,
             reload_after_load: false,
+            space: None,
         };
         panel.reload();
         panel
@@ -108,7 +111,10 @@ impl Panel {
         self.loading = None;
         let keep = self.current().map(|e| e.os_name.clone());
         match read_listing(&self.cwd, self.show_hidden) {
-            Ok(listing) => self.apply_listing(listing),
+            Ok(listing) => {
+                self.apply_listing(listing);
+                self.space = crate::platform::disk_space(&self.cwd);
+            }
             Err(msg) => {
                 // Keep the last good listing and selection; only report the error.
                 if self.entries.is_empty() {
@@ -216,6 +222,7 @@ impl Panel {
         self.scroll = 0;
         self.selected.clear();
         self.apply_listing(listing);
+        self.space = crate::platform::disk_space(&self.cwd);
         if let Some(i) = focus.and_then(|n| self.entries.iter().position(|e| e.os_name == n)) {
             self.cursor = i;
         }
@@ -291,7 +298,10 @@ impl Panel {
             return false;
         };
         let listing = match res.result {
-            Ok(l) => l,
+            Ok(l) => {
+                self.space = res.space;
+                l
+            }
             Err(msg) => {
                 if self.entries.is_empty() {
                     self.entries = parent_only(&self.cwd);
@@ -1057,6 +1067,7 @@ mod tests {
             id: req.id,
             dir: req.dir.clone(),
             result: read_listing(&req.dir, show_hidden),
+            space: Some((1, 4)),
         }
     }
 
@@ -1090,6 +1101,7 @@ mod tests {
         assert_eq!(p.cwd, old);
         assert_eq!(p.loading.as_ref().unwrap().id, 5);
         assert!(p.finish_load(load_of(&req, false)));
+        assert_eq!(p.space, Some((1, 4)), "the listing's disk space");
         assert_eq!(p.cwd, old.join("adir"));
         assert_eq!(p.cursor, 0);
         assert!(p.selected.is_empty());

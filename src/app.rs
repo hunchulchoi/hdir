@@ -637,6 +637,10 @@ pub struct App {
     pending_master: VecDeque<ConnectJob>,
     /// Language detected at startup; used when the config has no `lang`.
     pub base_lang: crate::i18n::Lang,
+    /// The time source of the Classic clock (fixed in tests).
+    pub clock: fn() -> std::time::SystemTime,
+    /// Minute (since the epoch) the clock last showed.
+    drawn_minute: Option<i64>,
 }
 
 /// A prompt answered after its panels moved (a connect or a load landed).
@@ -752,6 +756,8 @@ impl App {
             connect_rx,
             pending_master: VecDeque::new(),
             base_lang: crate::i18n::Lang::default(),
+            clock: std::time::SystemTime::now,
+            drawn_minute: None,
         }
     }
 
@@ -2764,7 +2770,12 @@ impl App {
             self.tick_task() | self.tick_viewer_load() | self.tick_probe() | self.tick_uploads();
         let spawned = self.tick_spawn();
         let preview = self.tick_preview();
-        self.tick_job() || loaded || task || preview || spawned
+        // the Classic clock: redraw once the minute it shows has passed
+        let minute = self.mode == Mode::Classic
+            && self
+                .drawn_minute
+                .is_some_and(|m| m != crate::clock::unix_secs((self.clock)()).div_euclid(60));
+        self.tick_job() || loaded || task || preview || spawned || minute
     }
 
     /// Show the newest finished background-spawn result.
@@ -3696,6 +3707,8 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
+        let now_secs = crate::clock::unix_secs((self.clock)());
+        self.drawn_minute = Some(now_secs.div_euclid(60));
         let rows = panel_rows(self.mode, frame.area().height);
         self.page_height = rows.max(1);
         for p in &mut self.panels {
@@ -3740,6 +3753,7 @@ impl App {
             panel_themes: [&themes[0], &themes[1]],
             fkeys: &fkeys,
             cmdline: self.cmdline.as_ref().map(|c| (c.value.as_str(), c.cursor)),
+            now: crate::clock::local(now_secs),
         };
         let viewer_hint = crate::tr!(
             "{} · /: 검색 · n: 다음",
@@ -4774,7 +4788,7 @@ mod tests {
         let (_t, mut app) = fixture();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
-        assert_eq!(app.page_height, 19);
+        assert_eq!(app.page_height, 18);
         let text: String = terminal
             .backend()
             .buffer()
@@ -4782,7 +4796,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("hdir"));
+        assert!(text.contains("[ UpDir ]"));
         let dir_name = app.panels[0]
             .cwd
             .file_name()
@@ -5411,6 +5425,32 @@ mod tests {
     }
 
     #[test]
+    fn the_classic_clock_redraws_once_its_minute_passes() {
+        fn at_9() -> std::time::SystemTime {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(9 * 60)
+        }
+        fn at_9_30s() -> std::time::SystemTime {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(9 * 60 + 30)
+        }
+        fn at_10() -> std::time::SystemTime {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(10 * 60)
+        }
+        let (_t, mut app) = fixture_job();
+        app.clock = at_9;
+        assert!(!app.tick(), "nothing shown yet");
+        draw_app(&mut app, 80, 24);
+        app.clock = at_9_30s;
+        assert!(!app.tick(), "same minute");
+        app.clock = at_10;
+        assert!(app.tick(), "the clock moved on");
+        draw_app(&mut app, 80, 24);
+        assert!(!app.tick());
+        app.mode = crate::config::Mode::Dev;
+        app.clock = at_9;
+        assert!(!app.tick(), "Dev shows no clock");
+    }
+
+    #[test]
     fn tick_is_false_when_idle() {
         let (_t, mut app) = fixture_job();
         assert!(!app.tick());
@@ -6020,7 +6060,7 @@ mod tests {
         let text = screen_text(&mut app);
         assert!(text.contains("휴지통"));
         assert!(text.contains("g.txt") && text.contains("f.txt"));
-        assert!(text.contains("Restore") && text.contains("Purge"));
+        assert!(text.contains("복원") && text.contains("삭제"));
         let _ = tmp;
     }
 
@@ -6958,7 +6998,7 @@ mod tests {
     fn ctrl_t_switches_layout_and_page_height() {
         let (_t, mut app) = fixture();
         let rows = draw_app(&mut app, 100, 30);
-        assert_eq!(app.page_height, 25);
+        assert_eq!(app.page_height, 24);
         assert!(!rows.iter().any(|r| r.starts_with("> ")));
         press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         assert_eq!(app.mode, crate::config::Mode::Dev);
@@ -6968,7 +7008,7 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("미리보기")));
         press_mods(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
         let rows = draw_app(&mut app, 100, 30);
-        assert_eq!(app.page_height, 25);
+        assert_eq!(app.page_height, 24);
         assert!(!rows.iter().any(|r| r.starts_with("> ")));
     }
 
@@ -10127,9 +10167,9 @@ mod tests {
             assert_eq!(buf[(75, 8)].bg, red.bg, "remote panel");
             assert_ne!(buf[(10, 8)].bg, red.bg, "local panel");
             assert_eq!(
-                buf[(0, 0)].bg,
-                red.bg,
-                "header follows the active remote panel"
+                buf[(5, 2)].fg,
+                red.border,
+                "the frame lines follow the active remote panel"
             );
         }
 

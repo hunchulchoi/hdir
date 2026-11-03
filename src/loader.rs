@@ -22,6 +22,8 @@ pub struct LoadResult {
     pub id: u64,
     pub dir: PathBuf,
     pub result: Listing,
+    /// `(available, total)` bytes of a local folder's filesystem.
+    pub space: Option<(u64, u64)>,
 }
 
 struct Req {
@@ -165,6 +167,9 @@ fn pump(inner: &Arc<Inner>) {
             .unwrap_or_else(|_| {
                 Err(crate::i18n::t("디렉터리 읽기 실패", "Failed to read directory").to_string())
             });
+            let space = (req.source == 0 && result.is_ok())
+                .then(|| crate::platform::disk_space(&req.dir))
+                .flatten();
             if let Ok(mut st) = inner.state.lock() {
                 let current = st.slots.get(&key).is_some_and(|s| s.epoch == epoch);
                 if !current {
@@ -178,6 +183,7 @@ fn pump(inner: &Arc<Inner>) {
                     id: req.id,
                     dir: req.dir,
                     result,
+                    space,
                 });
             }
             pump(&inner);
@@ -213,6 +219,37 @@ mod tests {
         let (entries, skipped) = got[0].result.as_ref().unwrap();
         assert_eq!(*skipped, 0);
         assert!(entries.iter().any(|e| e.name == "한글 file.txt"));
+        let (free, total) = got[0].space.expect("disk space of a local folder");
+        assert!(free <= total);
+    }
+
+    struct RemoteLike;
+    impl Vfs for RemoteLike {
+        fn list(&self, _dir: &Path, _hidden: bool) -> Listing {
+            Ok((Vec::new(), 0))
+        }
+        fn display_path(&self, dir: &Path) -> String {
+            dir.display().to_string()
+        }
+        fn source_key(&self) -> usize {
+            9
+        }
+    }
+
+    #[test]
+    fn a_remote_listing_has_no_local_disk_space() {
+        let t = tempfile::tempdir().unwrap();
+        let loader = Loader::default();
+        loader.request_vfs(
+            0,
+            3,
+            t.path().to_path_buf(),
+            false,
+            Some(Arc::new(RemoteLike)),
+        );
+        let got = wait_for(&loader, 1);
+        assert!(got[0].result.is_ok());
+        assert_eq!(got[0].space, None);
     }
 
     struct FakeVfs;

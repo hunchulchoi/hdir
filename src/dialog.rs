@@ -406,7 +406,8 @@ mod tests {
 
     const GRAY: Color = Color::Rgb(0xAA, 0xAA, 0xAA);
     const RED: Color = Color::Rgb(0xAA, 0x00, 0x00);
-    const CYAN: Color = Color::Rgb(0x00, 0xAA, 0xAA);
+    /// The highlighted button: the theme's cursor color.
+    const HIGHLIGHT: Color = Color::Rgb(0xFF, 0x55, 0x55);
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -723,7 +724,7 @@ mod tests {
         assert!(text.contains("[ Skip ]"));
         let hl: String = cells(&buf, buf.area)
             .into_iter()
-            .filter(|&p| buf[p].bg == CYAN)
+            .filter(|&p| buf[p].bg == HIGHLIGHT)
             .map(|p| buf[p].symbol().to_string())
             .collect();
         assert_eq!(hl, "[ Skip ]");
@@ -782,7 +783,7 @@ mod tests {
         }
         let hl: String = cells(&buf, buf.area)
             .into_iter()
-            .filter(|&p| buf[p].bg == CYAN)
+            .filter(|&p| buf[p].bg == HIGHLIGHT)
             .map(|p| buf[p].symbol().to_string())
             .collect();
         assert_eq!(hl, "[ Skip all ]");

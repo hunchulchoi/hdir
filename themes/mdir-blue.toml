@@ -1,0 +1,61 @@
+name = "mdir-blue"
+base = "mdir"
+
+# The earlier hdir look: blue panels with a cyan cursor bar.
+
+[colors]
+bg = "#0000AA"
+fg = "#AAAAAA"
+border = "#55FFFF"
+border_active = "#FFFFFF"
+title = "#FFFFFF"
+dir = "#FFFFFF"
+file = "#AAAAAA"
+exec = "#55FF55"
+symlink = "#55FFFF"
+hidden = "#555555"
+assoc_file = "#55FFFF"
+selected = "#FFFF55"
+cursor_bg = "#00AAAA"
+cursor_fg = "#000000"
+status_bg = "#00AAAA"
+status_fg = "#000000"
+fkey_num_fg = "#FFFFFF"
+fkey_num_bg = "#000000"
+fkey_label_fg = "#000000"
+fkey_label_bg = "#00AAAA"
+dialog_bg = "#AAAAAA"
+dialog_fg = "#000000"
+danger_bg = "#AA0000"
+danger_fg = "#FFFFFF"
+preview_bg = "#0000AA"
+error = "#FF5555"
+dir_bold = true
+
+[ext_colors.exec]
+exts = ["exe", "msi", "app", "appimage", "sh", "command"]
+color = "#55FF55"
+
+[ext_colors.binary]
+exts = ["com", "dll", "so", "dylib", "bin"]
+color = "#AAAAAA"
+
+[ext_colors.script]
+exts = ["bat", "cmd", "bash", "zsh", "fish", "ps1"]
+color = "#55FF55"
+
+[ext_colors.archive]
+exts = ["zip", "tar", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "arj", "lzh"]
+color = "#FF55FF"
+
+[ext_colors.image]
+exts = ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "ico", "heic", "tif", "tiff"]
+color = "#AAAAAA"
+
+[ext_colors.doc]
+exts = ["txt", "md", "hwp", "hwpx", "doc", "docx", "pdf", "rtf", "odt", "csv"]
+color = "#55FFFF"
+
+[ext_colors.code]
+exts = ["rs", "toml", "json", "yaml", "yml", "js", "ts", "py", "go", "java", "c", "h"]
+color = "#55FFFF"
