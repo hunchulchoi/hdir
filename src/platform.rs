@@ -1570,6 +1570,78 @@ pub fn tree_has_posix_acl(path: &Path, cancel: &std::sync::atomic::AtomicBool) -
     }
 }
 
+/// Extended attributes macOS adds on its own (download origin, quarantine,
+/// sandbox access, last use): losing them in a move loses nothing the user
+/// made.
+#[cfg(target_os = "macos")]
+const MAC_ROUTINE_XATTRS: [&str; 6] = [
+    "com.apple.provenance",
+    "com.apple.quarantine",
+    "com.apple.macl",
+    "com.apple.lastuseddate#PS",
+    "com.apple.metadata:kMDItemWhereFroms",
+    "com.apple.metadata:kMDItemDownloadedDate",
+];
+
+/// macOS: whether anything in the tree at `path` (links not followed)
+/// carries data a plain tar to a server drops: a resource fork, Finder
+/// tags or info, or any other extended attribute but the routine ones
+/// macOS adds itself. Elsewhere `false`. An unreadable entry, or Esc,
+/// counts as yes.
+pub fn tree_has_mac_metadata(path: &Path, cancel: &std::sync::atomic::AtomicBool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        let mut todo = vec![path.to_path_buf()];
+        while let Some(q) = todo.pop() {
+            if cancel.load(Ordering::Relaxed) {
+                return true;
+            }
+            let m = match fs::symlink_metadata(&q) {
+                Ok(m) => m,
+                // gone: nothing there to send
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return true,
+            };
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(c) = xattr_sys::cpath(&q) else {
+                return true;
+            };
+            match xattr_sys::names(xattr_sys::On::Path(&c)) {
+                Ok(names) => {
+                    let mine = names.iter().any(|n| {
+                        !MAC_ROUTINE_XATTRS
+                            .iter()
+                            .any(|r| n.as_bytes() == r.as_bytes())
+                    });
+                    if mine {
+                        return true;
+                    }
+                }
+                Err(e) if xattr_sys::is_unsupported(&e) => {}
+                Err(_) => return true,
+            }
+            if m.is_dir() {
+                let Ok(rd) = fs::read_dir(&q) else {
+                    return true;
+                };
+                for e in rd {
+                    let Ok(e) = e else { return true };
+                    todo.push(e.path());
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, cancel);
+        false
+    }
+}
+
 /// Remove group and other permissions from everything in the tree at
 /// `path` (links not followed). Nothing to do off unix.
 pub fn strip_group_other(path: &Path) -> io::Result<()> {
@@ -1683,6 +1755,39 @@ mod acl_tests {
         let (free, total) = disk_space(t.path()).expect("space");
         assert!(total > 0 && free <= total, "{free} {total}");
         assert_eq!(disk_space(&t.path().join("missing")), None);
+    }
+
+    /// macOS: a resource fork or a Finder tag counts, the xattrs macOS adds
+    /// on its own do not, a link is not followed, and Esc counts as yes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_metadata_is_found_but_routine_xattrs_are_not() {
+        let no = AtomicBool::new(false);
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("내 폴더");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("sub/f"), "x").unwrap();
+        assert!(!tree_has_mac_metadata(&d, &no));
+        xattr_set_path(&d.join("sub/f"), "com.apple.quarantine", b"0081;1;x;").unwrap();
+        xattr_set_path(&d, "com.apple.provenance", b"\x01").unwrap();
+        assert!(!tree_has_mac_metadata(&d, &no), "routine ones only");
+        assert!(tree_has_mac_metadata(&d, &AtomicBool::new(true)), "Esc");
+
+        let other = t.path().join("other");
+        fs::write(&other, "y").unwrap();
+        xattr_set_path(&other, "com.apple.ResourceFork", b"fork").unwrap();
+        std::os::unix::fs::symlink(&other, d.join("link")).unwrap();
+        assert!(!tree_has_mac_metadata(&d, &no), "links are not followed");
+        assert!(tree_has_mac_metadata(&other, &no));
+
+        xattr_set_path(
+            &d.join("sub/f"),
+            "com.apple.metadata:_kMDItemUserTags",
+            b"t",
+        )
+        .unwrap();
+        assert!(tree_has_mac_metadata(&d, &no));
+        assert!(!tree_has_mac_metadata(&t.path().join("gone"), &no));
     }
 
     #[test]

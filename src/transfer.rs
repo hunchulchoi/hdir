@@ -2083,6 +2083,24 @@ fn item(
     if before.is_none() || after != before {
         return Step::Partial(changed_msg(name));
     }
+    // The local tar to a server leaves out resource forks and Finder data
+    // (macOS): the copy lacks them, so the source stays.
+    if matches!(spec.src, Side::Local)
+        && crate::platform::tree_has_mac_metadata(&src, ctl.cancel_flag())
+    {
+        if ctl.is_cancelled() {
+            return Step::Partial(crate::tr!(
+                "취소되어 원본을 지우지 않음: {}",
+                "Cancelled, source kept: {}",
+                lossy(name)
+            ));
+        }
+        return Step::Partial(crate::tr!(
+            "리소스 포크·확장 속성은 서버로 옮겨지지 않아 원본을 지우지 않음: {}",
+            "Source kept: resource forks and extended attributes do not travel to the server: {}",
+            lossy(name)
+        ));
+    }
     match delete_source(spec, name) {
         Ok(()) => Step::Done,
         Err(e) => Step::Partial(crate::tr!(
@@ -4394,6 +4412,38 @@ mod tests {
         assert_eq!((r.outcome, r.copied), (OpOutcome::Done, 1));
         assert_eq!(*trash.trashed.lock().unwrap(), vec![t.path().join("a")]);
         assert!(r.moved.is_empty(), "remote moves are not undoable");
+    }
+
+    /// macOS: tar to a server drops resource forks and Finder data, so a
+    /// source carrying them is kept, with a warning.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn moving_up_keeps_a_mac_source_whose_metadata_cannot_travel() {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "x").unwrap();
+        crate::platform::xattr_set_path(&t.path().join("a"), "com.apple.ResourceFork", b"f")
+            .unwrap();
+        let f = appears_after_scp();
+        let trash = Arc::new(FakeTrash::new());
+        let mut s = spec(
+            JobKind::Move,
+            Side::Local,
+            t.path(),
+            &["a"],
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/dst"),
+        );
+        s.trash = Arc::clone(&trash) as Arc<dyn TrashBackend>;
+        let r = run(&s, &mut Ctl::new());
+        assert!(trash.trashed.lock().unwrap().is_empty(), "source kept");
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("리소스 포크") && w.contains('a')),
+            "{:?}",
+            r.warnings
+        );
+        assert!(t.path().join("a").exists());
     }
 
     #[test]
