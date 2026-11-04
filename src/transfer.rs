@@ -2086,7 +2086,7 @@ fn item(
     // The local tar to a server leaves out resource forks and Finder data
     // (macOS): the copy lacks them, so the source stays.
     if matches!(spec.src, Side::Local)
-        && crate::platform::tree_has_mac_metadata(&src, ctl.cancel_flag())
+        && crate::platform::tree_has_lost_xattrs(&src, ctl.cancel_flag())
     {
         if ctl.is_cancelled() {
             return Step::Partial(crate::tr!(
@@ -4414,15 +4414,22 @@ mod tests {
         assert!(r.moved.is_empty(), "remote moves are not undoable");
     }
 
-    /// macOS: tar to a server drops resource forks and Finder data, so a
-    /// source carrying them is kept, with a warning.
-    #[cfg(target_os = "macos")]
+    /// tar to a server drops resource forks, Finder data (macOS) and `user.*`
+    /// attributes (Linux), so a source carrying them is kept, with a warning.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn moving_up_keeps_a_mac_source_whose_metadata_cannot_travel() {
+    fn moving_up_keeps_a_source_whose_xattrs_cannot_travel() {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join("a"), "x").unwrap();
-        crate::platform::xattr_set_path(&t.path().join("a"), "com.apple.ResourceFork", b"f")
-            .unwrap();
+        let attr = if cfg!(target_os = "macos") {
+            "com.apple.ResourceFork"
+        } else {
+            "user.hdir"
+        };
+        if crate::platform::xattr_set_path(&t.path().join("a"), attr, b"f").is_err() {
+            eprintln!("no xattrs here, skipped");
+            return;
+        }
         let f = appears_after_scp();
         let trash = Arc::new(FakeTrash::new());
         let mut s = spec(

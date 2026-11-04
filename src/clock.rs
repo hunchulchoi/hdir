@@ -55,11 +55,15 @@ impl LocalTime {
     }
 }
 
-/// Seconds since the epoch (negative before it).
+/// Whole seconds since the epoch, rounded down (negative before it).
 pub fn unix_secs(t: SystemTime) -> i64 {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs() as i64,
-        Err(e) => -(e.duration().as_secs() as i64),
+        // round down: 0.5 s before the epoch is second -1
+        Err(e) => {
+            let d = e.duration();
+            -(d.as_secs() as i64) - i64::from(d.subsec_nanos() > 0)
+        }
     }
 }
 
@@ -182,5 +186,12 @@ mod tests {
         assert!(l.year == 1970 || l.year == 1969, "{l:?}");
         assert!(l.weekday < 7 && (1..=12).contains(&l.month));
         assert_eq!(unix_secs(UNIX_EPOCH + std::time::Duration::from_secs(5)), 5);
+        // before the epoch, a part second rounds down, not toward zero
+        let half = std::time::Duration::from_millis(500);
+        assert_eq!(unix_secs(UNIX_EPOCH - half), -1);
+        assert_eq!(
+            unix_secs(UNIX_EPOCH - std::time::Duration::from_secs(2)),
+            -2
+        );
     }
 }

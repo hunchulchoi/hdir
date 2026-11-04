@@ -14,6 +14,8 @@ use unicode_width::UnicodeWidthStr;
 pub const URL_MAX: usize = 200;
 /// Text rendered at most; the rest is left out with a note.
 pub const MAX_OUTPUT: usize = 8 << 20;
+/// Quote and list levels drawn in a line's prefix; deeper ones add nothing.
+pub const MAX_DEPTH: usize = 16;
 
 /// Widest a table column gets; longer cells are cut with `…`.
 pub const COL_MAX_WIDTH: usize = 80;
@@ -261,10 +263,12 @@ impl Builder {
 
     /// The container prefix of a line; `first`: this block's first line
     /// (shows the list marker, which is then used up).
+    /// Only the outer [`MAX_DEPTH`] levels are drawn, and the prefix counts
+    /// toward [`MAX_OUTPUT`].
     fn prefix(&mut self, first: bool) -> MdLine {
         let mut p: MdLine = Vec::new();
         let n = self.frames.len();
-        for (i, f) in self.frames.iter_mut().enumerate() {
+        for (i, f) in self.frames.iter_mut().enumerate().take(MAX_DEPTH) {
             match f {
                 Frame::Quote => p.push(("│ ".into(), Style::of(Kind::Marker))),
                 Frame::Item { marker, indent } => {
@@ -276,12 +280,15 @@ impl Builder {
                 }
             }
         }
+        let bytes = p.iter().map(|(t, _)| t.len()).sum();
+        self.grow(bytes);
         p
     }
 
     fn prefix_width(&self) -> usize {
         self.frames
             .iter()
+            .take(MAX_DEPTH)
             .map(|f| match f {
                 Frame::Quote => 2,
                 Frame::Item { indent, .. } => *indent,
@@ -336,6 +343,9 @@ impl Builder {
         }
         let heading = self.heading;
         for (i, l) in lines.into_iter().enumerate() {
+            if self.stopped && i > 0 {
+                break;
+            }
             let mut line = self.prefix(i == 0);
             line.extend(trim_end(l));
             self.out.push(line);
@@ -905,6 +915,23 @@ mod tests {
             text("<https://a.b> and [https://c.d](https://c.d)", 80),
             ["https://a.b and https://c.d"]
         );
+    }
+
+    #[test]
+    fn deep_quotes_count_toward_the_output_cap() {
+        // 1,000 nested quotes around a 1 MiB paragraph: every wrapped line
+        // would carry a 1,000-part prefix
+        let src = format!("{}{}", "> ".repeat(1_000), "word ".repeat(200_000));
+        let start = std::time::Instant::now();
+        let lines = render(&src, 80);
+        let segs: usize = lines.iter().map(|l| l.len()).sum();
+        let total: usize = lines.iter().map(|l| plain(l).len()).sum();
+        assert!(total <= MAX_OUTPUT + 64 * 1024, "{total}");
+        assert!(segs <= 4_000_000, "{segs} segments");
+        assert!(lines.iter().all(|l| l.len() <= MAX_DEPTH + 8));
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        // a few levels still show in full
+        assert_eq!(text("> > a", 80), ["│ │ a"]);
     }
 
     #[test]

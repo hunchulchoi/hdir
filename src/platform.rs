@@ -1573,7 +1573,6 @@ pub fn tree_has_posix_acl(path: &Path, cancel: &std::sync::atomic::AtomicBool) -
 /// Extended attributes macOS adds on its own (download origin, quarantine,
 /// sandbox access, last use): losing them in a move loses nothing the user
 /// made.
-#[cfg(target_os = "macos")]
 const MAC_ROUTINE_XATTRS: [&str; 6] = [
     "com.apple.provenance",
     "com.apple.quarantine",
@@ -1583,13 +1582,25 @@ const MAC_ROUTINE_XATTRS: [&str; 6] = [
     "com.apple.metadata:kMDItemDownloadedDate",
 ];
 
-/// macOS: whether anything in the tree at `path` (links not followed)
-/// carries data a plain tar to a server drops: a resource fork, Finder
-/// tags or info, or any other extended attribute but the routine ones
-/// macOS adds itself. Elsewhere `false`. An unreadable entry, or Esc,
-/// counts as yes.
-pub fn tree_has_mac_metadata(path: &Path, cancel: &std::sync::atomic::AtomicBool) -> bool {
-    #[cfg(target_os = "macos")]
+/// Whether the extended attribute `name` is something the user made that
+/// a plain tar to a server leaves out. macOS (`mac`): anything but the
+/// routine ones (resource forks, Finder info and tags included). Linux:
+/// the `user.` namespace (ACLs travel by their own plan, `security.` labels
+/// belong to the receiving system).
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+fn lost_by_tar(mac: bool, name: &[u8]) -> bool {
+    if mac {
+        !MAC_ROUTINE_XATTRS.iter().any(|r| name == r.as_bytes())
+    } else {
+        name.starts_with(b"user.")
+    }
+}
+
+/// Whether anything in the tree at `path` (links not followed) carries an
+/// extended attribute the local tar to a server drops ([`lost_by_tar`]).
+/// `false` off Linux and macOS. An unreadable entry, or Esc, counts as yes.
+pub fn tree_has_lost_xattrs(path: &Path, cancel: &std::sync::atomic::AtomicBool) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::sync::atomic::Ordering;
         let mut todo = vec![path.to_path_buf()];
@@ -1611,12 +1622,8 @@ pub fn tree_has_mac_metadata(path: &Path, cancel: &std::sync::atomic::AtomicBool
             };
             match xattr_sys::names(xattr_sys::On::Path(&c)) {
                 Ok(names) => {
-                    let mine = names.iter().any(|n| {
-                        !MAC_ROUTINE_XATTRS
-                            .iter()
-                            .any(|r| n.as_bytes() == r.as_bytes())
-                    });
-                    if mine {
+                    let mac = cfg!(target_os = "macos");
+                    if names.iter().any(|n| lost_by_tar(mac, n.as_bytes())) {
                         return true;
                     }
                 }
@@ -1635,7 +1642,7 @@ pub fn tree_has_mac_metadata(path: &Path, cancel: &std::sync::atomic::AtomicBool
         }
         false
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (path, cancel);
         false
@@ -1761,24 +1768,24 @@ mod acl_tests {
     /// on its own do not, a link is not followed, and Esc counts as yes.
     #[cfg(target_os = "macos")]
     #[test]
-    fn mac_metadata_is_found_but_routine_xattrs_are_not() {
+    fn mac_xattrs_are_found_but_routine_ones_are_not() {
         let no = AtomicBool::new(false);
         let t = tempfile::tempdir().unwrap();
         let d = t.path().join("내 폴더");
         fs::create_dir_all(d.join("sub")).unwrap();
         fs::write(d.join("sub/f"), "x").unwrap();
-        assert!(!tree_has_mac_metadata(&d, &no));
+        assert!(!tree_has_lost_xattrs(&d, &no));
         xattr_set_path(&d.join("sub/f"), "com.apple.quarantine", b"0081;1;x;").unwrap();
         xattr_set_path(&d, "com.apple.provenance", b"\x01").unwrap();
-        assert!(!tree_has_mac_metadata(&d, &no), "routine ones only");
-        assert!(tree_has_mac_metadata(&d, &AtomicBool::new(true)), "Esc");
+        assert!(!tree_has_lost_xattrs(&d, &no), "routine ones only");
+        assert!(tree_has_lost_xattrs(&d, &AtomicBool::new(true)), "Esc");
 
         let other = t.path().join("other");
         fs::write(&other, "y").unwrap();
         xattr_set_path(&other, "com.apple.ResourceFork", b"fork").unwrap();
         std::os::unix::fs::symlink(&other, d.join("link")).unwrap();
-        assert!(!tree_has_mac_metadata(&d, &no), "links are not followed");
-        assert!(tree_has_mac_metadata(&other, &no));
+        assert!(!tree_has_lost_xattrs(&d, &no), "links are not followed");
+        assert!(tree_has_lost_xattrs(&other, &no));
 
         xattr_set_path(
             &d.join("sub/f"),
@@ -1786,8 +1793,40 @@ mod acl_tests {
             b"t",
         )
         .unwrap();
-        assert!(tree_has_mac_metadata(&d, &no));
-        assert!(!tree_has_mac_metadata(&t.path().join("gone"), &no));
+        assert!(tree_has_lost_xattrs(&d, &no));
+        assert!(!tree_has_lost_xattrs(&t.path().join("gone"), &no));
+    }
+
+    #[test]
+    fn which_xattrs_a_plain_tar_loses() {
+        assert!(lost_by_tar(true, b"com.apple.ResourceFork"));
+        assert!(lost_by_tar(true, b"com.apple.FinderInfo"));
+        assert!(lost_by_tar(true, b"user.note"));
+        assert!(!lost_by_tar(true, b"com.apple.quarantine"));
+        assert!(!lost_by_tar(true, b"com.apple.provenance"));
+        // Linux: the user's own namespace; ACLs travel by their own plan,
+        // SELinux labels belong to the receiving system
+        assert!(lost_by_tar(false, b"user.xdg.origin.url"));
+        assert!(!lost_by_tar(false, b"system.posix_acl_access"));
+        assert!(!lost_by_tar(false, b"security.selinux"));
+    }
+
+    /// Linux: a `user.*` attribute counts (skipped where the filesystem
+    /// has none, like some tmpfs).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_user_xattrs_are_found() {
+        let no = AtomicBool::new(false);
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("f"), "x").unwrap();
+        assert!(!tree_has_lost_xattrs(&d, &no));
+        if xattr_set_path(&d.join("f"), "user.hdir", b"1").is_err() {
+            eprintln!("no user xattrs here, skipped");
+            return;
+        }
+        assert!(tree_has_lost_xattrs(&d, &no));
     }
 
     #[test]
