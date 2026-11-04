@@ -1822,8 +1822,13 @@ mod acl_tests {
         fs::create_dir(&d).unwrap();
         fs::write(d.join("f"), "x").unwrap();
         assert!(!tree_has_lost_xattrs(&d, &no));
-        if xattr_set_path(&d.join("f"), "user.hdir", b"1").is_err() {
-            eprintln!("no user xattrs here, skipped");
+        // only a filesystem without xattrs skips; any other error fails
+        if let Err(e) = xattr_set_path(&d.join("f"), "user.hdir", b"1") {
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
+            eprintln!("no xattrs here, skipped");
             return;
         }
         assert!(tree_has_lost_xattrs(&d, &no));

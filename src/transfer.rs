@@ -4426,7 +4426,12 @@ mod tests {
         } else {
             "user.hdir"
         };
-        if crate::platform::xattr_set_path(&t.path().join("a"), attr, b"f").is_err() {
+        // only a filesystem without xattrs skips; any other error fails
+        if let Err(e) = crate::platform::xattr_set_path(&t.path().join("a"), attr, b"f") {
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
             eprintln!("no xattrs here, skipped");
             return;
         }
