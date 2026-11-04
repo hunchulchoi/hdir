@@ -693,20 +693,21 @@ impl Builder {
 
 /// `url` cut to [`URL_MAX`] columns with `…`.
 fn short_url(url: &str) -> String {
-    if url.width() <= URL_MAX {
-        return url.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for g in url.graphemes(true) {
-        if used + g.width() > URL_MAX - 1 {
-            break;
-        }
+    // one pass that stops just past URL_MAX cells: a huge URL used many
+    // times costs no more than a short one
+    let (mut used, mut cut) = (0, None);
+    for (i, g) in url.grapheme_indices(true) {
         used += g.width();
-        out.push_str(g);
+        if used > URL_MAX - 1 && cut.is_none() {
+            cut = Some(i);
+        }
+        if used > URL_MAX {
+            let mut out = url[..cut.unwrap_or(i)].to_string();
+            out.push('…');
+            return out;
+        }
     }
-    out.push('…');
-    out
+    url.to_string()
 }
 
 fn push_seg(line: &mut MdLine, text: &str, st: Style) {
@@ -932,6 +933,18 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
         // a few levels still show in full
         assert_eq!(text("> > a", 80), ["│ │ a"]);
+    }
+
+    #[test]
+    fn urls_are_cut_at_the_cap_without_splitting_wide_characters() {
+        let fits = "a".repeat(URL_MAX);
+        assert_eq!(short_url(&fits), fits);
+        let over = "a".repeat(URL_MAX + 1);
+        assert_eq!(short_url(&over), format!("{}…", "a".repeat(URL_MAX - 1)));
+        // a wide character that would cross the cut is left out whole
+        let wide = format!("{}가{}", "a".repeat(URL_MAX - 2), "b".repeat(5));
+        assert_eq!(short_url(&wide), format!("{}…", "a".repeat(URL_MAX - 2)));
+        assert!(short_url(&wide).width() <= URL_MAX);
     }
 
     #[test]
