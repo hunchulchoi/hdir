@@ -288,6 +288,16 @@ impl Panel {
         }
     }
 
+    /// The disk space of `dir`, when this panel still shows that local
+    /// folder; true when it was taken.
+    pub fn set_space(&mut self, dir: &Path, space: Option<(u64, u64)>) -> bool {
+        if !matches!(self.location, Location::Local) || self.cwd != dir || self.space == space {
+            return false;
+        }
+        self.space = space;
+        true
+    }
+
     /// Apply a finished load. Returns false (and changes nothing) when the
     /// result does not belong to the pending request.
     pub fn finish_load(&mut self, res: LoadResult) -> bool {
@@ -299,7 +309,11 @@ impl Panel {
         };
         let listing = match res.result {
             Ok(l) => {
-                self.space = res.space;
+                // another folder may be on another disk: no figure until its
+                // own arrives ([`Panel::set_space`]); a reload keeps it
+                if res.dir != self.cwd {
+                    self.space = None;
+                }
                 l
             }
             Err(msg) => {
@@ -1067,7 +1081,6 @@ mod tests {
             id: req.id,
             dir: req.dir.clone(),
             result: read_listing(&req.dir, show_hidden),
-            space: Some((1, 4)),
         }
     }
 
@@ -1100,8 +1113,12 @@ mod tests {
         assert_eq!(req.dir, old.join("adir"));
         assert_eq!(p.cwd, old);
         assert_eq!(p.loading.as_ref().unwrap().id, 5);
+        p.space = Some((9, 9));
         assert!(p.finish_load(load_of(&req, false)));
-        assert_eq!(p.space, Some((1, 4)), "the listing's disk space");
+        assert_eq!(p.space, None, "another folder: its own figure comes later");
+        assert!(!p.set_space(&old, Some((1, 4))), "the folder left behind");
+        assert!(p.set_space(&old.join("adir"), Some((1, 4))));
+        assert_eq!(p.space, Some((1, 4)));
         assert_eq!(p.cwd, old.join("adir"));
         assert_eq!(p.cursor, 0);
         assert!(p.selected.is_empty());

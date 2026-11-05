@@ -3193,6 +3193,13 @@ impl App {
                 }
             }
         }
+        // disk space trails its listing (so after it here, even when both
+        // came at once); a panel that moved on drops it
+        for sp in self.loader.try_spaces() {
+            if let Some(p) = self.panels.get_mut(sp.key) {
+                changed |= p.set_space(&sp.dir, sp.space);
+            }
+        }
         changed
     }
 
@@ -6284,6 +6291,39 @@ mod tests {
             crate::panel::read_listing(dir, hidden)
         }));
         gate
+    }
+
+    #[test]
+    fn disk_space_arrives_after_the_listing_and_only_for_its_folder() {
+        let (_t, mut app) = fixture();
+        let gate = Arc::new(Mutex::new(()));
+        let g = Arc::clone(&gate);
+        app.loader = crate::loader::Loader::with_readers(
+            Arc::new(crate::panel::read_listing),
+            Arc::new(move |_| {
+                drop(g.lock().unwrap());
+                Some((5, 10))
+            }),
+        );
+        let held = gate.lock().unwrap();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(
+            app.panels[0].cwd,
+            root.join("adir"),
+            "listed without the space"
+        );
+        assert_eq!(app.panels[0].space, None);
+        drop(held);
+        let start = Instant::now();
+        while app.panels[0].space.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            app.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.panels[0].space, Some((5, 10)));
     }
 
     #[test]
