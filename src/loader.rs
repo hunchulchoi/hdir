@@ -340,7 +340,15 @@ mod tests {
     #[test]
     fn a_remote_listing_has_no_local_disk_space() {
         let t = tempfile::tempdir().unwrap();
-        let loader = Loader::default();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = Arc::clone(&asked);
+        let loader = Loader::with_readers(
+            Arc::new(|d, h| LocalVfs.list(d, h)),
+            Arc::new(move |_| {
+                a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some((1, 1))
+            }),
+        );
         loader.request_vfs(
             0,
             3,
@@ -350,8 +358,22 @@ mod tests {
         );
         let got = wait_for(&loader, 1);
         assert!(got[0].result.is_ok());
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(loader.try_spaces().is_empty(), "no local space asked");
+        // a local listing afterwards: its answer comes after any for the
+        // remote one would have (one worker, in order)
+        loader.request(1, 4, t.path().to_path_buf(), false);
+        assert_eq!(wait_for(&loader, 1).len(), 1);
+        let start = Instant::now();
+        let mut spaces = Vec::new();
+        while spaces.is_empty() && start.elapsed() < Duration::from_secs(5) {
+            spaces.extend(loader.try_spaces());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(spaces.iter().map(|s| s.id).collect::<Vec<_>>(), [4]);
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the local one"
+        );
     }
 
     struct FakeVfs;

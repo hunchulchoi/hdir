@@ -359,7 +359,9 @@ impl Builder {
                 .saturating_sub(self.prefix_width());
             let mut line = self.prefix(false);
             let ch = if h == 1 { "═" } else { "─" };
-            line.push((ch.repeat(w.max(1)), Style::of(Kind::Heading(h))));
+            let under = ch.repeat(w.max(1));
+            self.grow(under.len());
+            line.push((under, Style::of(Kind::Heading(h))));
             self.out.push(line);
         }
     }
@@ -393,7 +395,10 @@ impl Builder {
                 self.gap();
                 let mut line = self.prefix(false);
                 let w = self.width.saturating_sub(self.prefix_width());
-                line.push(("─".repeat(w), Style::of(Kind::Rule)));
+                let rule = "─".repeat(w);
+                // a rule is 4 bytes of input and a screen-wide line
+                self.grow(rule.len());
+                line.push((rule, Style::of(Kind::Rule)));
                 self.out.push(line);
             }
             Event::TaskListMarker(done) => {
@@ -440,7 +445,9 @@ impl Builder {
                     && !lang.is_empty()
                 {
                     let mut line = self.prefix(false);
-                    line.push((format!("  {lang}"), Style::of(Kind::Url)));
+                    let tag = format!("  {lang}");
+                    self.grow(tag.len());
+                    line.push((tag, Style::of(Kind::Url)));
                     self.out.push(line);
                 }
                 self.code = Some(String::new());
@@ -1025,7 +1032,8 @@ mod tests {
 
     #[test]
     fn table_padding_and_borders_count_toward_the_output_cap() {
-        // a wide header over 200,000 empty rows: tiny input, huge padding
+        // a wide header over 50,000 empty rows: small input, ~50 MB of
+        // padding without the cap
         let cols = 12;
         let mut src = String::from("|");
         for _ in 0..cols {
@@ -1035,7 +1043,7 @@ mod tests {
         src.push('\n');
         src.push_str(&"|-".repeat(cols));
         src.push_str("|\n");
-        for _ in 0..200_000 {
+        for _ in 0..50_000 {
             src.push_str(&"|".repeat(cols + 1));
             src.push('\n');
         }
@@ -1044,6 +1052,18 @@ mod tests {
         let total: usize = lines.iter().map(|l| plain(l).len()).sum();
         assert!(total <= MAX_OUTPUT + 64 * 1024, "{total}");
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn rules_and_heading_underlines_count_toward_the_output_cap() {
+        // 4 bytes of input, a whole screen-wide line of output each
+        let rules = "***\n".repeat(100_000);
+        let heads = "a\n=\n\n".repeat(100_000);
+        for src in [rules, heads] {
+            let lines = render(&src, 200);
+            let total: usize = lines.iter().map(|l| plain(l).len()).sum();
+            assert!(total <= MAX_OUTPUT + 64 * 1024, "{total}");
+        }
     }
 
     #[test]

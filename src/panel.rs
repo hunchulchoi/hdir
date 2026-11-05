@@ -82,6 +82,9 @@ pub struct Panel {
     pub reload_after_load: bool,
     /// `(available, total)` bytes where a local listing came from.
     pub space: Option<(u64, u64)>,
+    /// Id of the load whose listing is shown: a disk space answer for an
+    /// earlier visit of the same folder is not taken.
+    pub shown_load: Option<u64>,
 }
 
 impl Panel {
@@ -100,6 +103,7 @@ impl Panel {
             loading: None,
             reload_after_load: false,
             space: None,
+            shown_load: None,
         };
         panel.reload();
         panel
@@ -290,8 +294,12 @@ impl Panel {
 
     /// The disk space of `dir`, when this panel still shows that local
     /// folder; true when it was taken.
-    pub fn set_space(&mut self, dir: &Path, space: Option<(u64, u64)>) -> bool {
-        if !matches!(self.location, Location::Local) || self.cwd != dir || self.space == space {
+    pub fn set_space(&mut self, id: u64, dir: &Path, space: Option<(u64, u64)>) -> bool {
+        if !matches!(self.location, Location::Local)
+            || self.shown_load != Some(id)
+            || self.cwd != dir
+            || self.space == space
+        {
             return false;
         }
         self.space = space;
@@ -314,6 +322,7 @@ impl Panel {
                 if res.dir != self.cwd {
                     self.space = None;
                 }
+                self.shown_load = Some(res.id);
                 l
             }
             Err(msg) => {
@@ -1116,8 +1125,15 @@ mod tests {
         p.space = Some((9, 9));
         assert!(p.finish_load(load_of(&req, false)));
         assert_eq!(p.space, None, "another folder: its own figure comes later");
-        assert!(!p.set_space(&old, Some((1, 4))), "the folder left behind");
-        assert!(p.set_space(&old.join("adir"), Some((1, 4))));
+        assert!(
+            !p.set_space(5, &old, Some((1, 4))),
+            "the folder left behind"
+        );
+        assert!(
+            !p.set_space(4, &old.join("adir"), Some((1, 4))),
+            "an older load"
+        );
+        assert!(p.set_space(5, &old.join("adir"), Some((1, 4))));
         assert_eq!(p.space, Some((1, 4)));
         assert_eq!(p.cwd, old.join("adir"));
         assert_eq!(p.cursor, 0);
