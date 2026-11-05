@@ -2115,7 +2115,17 @@ fn item(
         if src_is_dir && !on_host_move {
             let sent = count(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
             let got = count(&spec.dst, &spec.dest_dir, name, ctl.cancel_flag());
-            if !ctl.is_cancelled() && sent.is_some() && got != sent {
+            if ctl.is_cancelled() {
+                return Step::Done;
+            }
+            if sent.is_none() || got.is_none() {
+                return Step::Partial(crate::tr!(
+                    "복사는 했지만 받은 항목 수를 원본과 맞춰 보지 못함: {}",
+                    "Copied, but the received entry count could not be checked against the source: {}",
+                    lossy(name)
+                ));
+            }
+            if got != sent {
                 return Step::Partial(crate::tr!(
                     "받은 항목 수가 원본과 달라 일부가 합쳐졌을 수 있음(대소문자만 다른 이름 등): {}",
                     "Fewer entries arrived than were sent; some may have merged (names differing only in case?): {}",
@@ -5646,6 +5656,39 @@ mod tests {
             "{:?}",
             r.warnings
         );
+    }
+
+    #[test]
+    fn a_copied_folder_whose_count_cannot_be_read_is_partial() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("d")).unwrap();
+        for answer_count in [fail(1, "find: denied\n"), ok("not a number\n")] {
+            let f = FakeCmd::new(move |a| {
+                if a[0] == "pipe" {
+                    return ok("");
+                }
+                let c = remote_cmd(a).unwrap_or_default();
+                if c.contains("for f do printf .") {
+                    return answer_count.clone();
+                }
+                answer(c, &[], &[], "")
+            });
+            let s = spec(
+                JobKind::Copy,
+                Side::Local,
+                t.path(),
+                &["d"],
+                Side::Remote(session(Arc::clone(&f))),
+                &p("/dst"),
+            );
+            let r = run(&s, &mut Ctl::new());
+            assert_eq!((r.copied, r.partial), (0, 1));
+            assert!(
+                r.warnings.iter().any(|w| w.contains("맞춰 보지 못함")),
+                "{:?}",
+                r.warnings
+            );
+        }
     }
 
     #[test]
