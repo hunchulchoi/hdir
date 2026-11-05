@@ -534,27 +534,24 @@ const TIDY_RECEIVED: &[u8] =
 const STRIP_SETID_CMD: &[u8] =
     b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +";
 
-/// The rest of [`TIDY_RECEIVED`].
-const CAP_GROUP_CMD: &[u8] = b"find . ! -type l -perm -040 ! -perm -004 -exec chmod g-r {} + && \
-      find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
-      find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +";
-
 /// [`TIDY_RECEIVED`] when ACLs travelled. On an entry with a POSIX ACL the
 /// group bits are its mask, which named users and groups depend on: there
 /// only the owning group's own entry (`group::`) is capped at `other::`,
 /// and likewise in a folder's default ACL, which what is made in it later
-/// inherits. Needs python3 to edit ACLs; without it, the plain caps apply
-/// (safe, but named entries lose what the mask allowed them).
+/// inherits. Needs python3 to edit ACLs (ACLs are only sent to a server
+/// that has it, [`ACL_TIDY_PROBE`]); without it, it fails: no shell tool
+/// can be counted on to cap a default ACL.
 fn tidy_received_acls() -> Vec<u8> {
     cat(&[
         STRIP_SETID_CMD,
         b" && if command -v python3 >/dev/null 2>&1; then python3 -c '",
         ACL_CAP_PY,
-        b"'; else ",
-        CAP_GROUP_CMD,
-        b"; fi",
+        b"'; else exit 1; fi",
     ])
 }
+
+/// Exit 0 when this server can tidy received ACLs ([`tidy_received_acls`]).
+pub const ACL_TIDY_PROBE: &[u8] = b"command -v python3 >/dev/null 2>&1";
 
 /// The python walk of [`tidy_received_acls`] (no single quotes).
 const ACL_CAP_PY: &[u8] = br#"import os,stat,struct
@@ -1925,6 +1922,12 @@ fn tar_acls_ok(side: Option<&RemoteSession>) -> bool {
     }
 }
 
+/// Whether this side can tidy the ACLs it receives (`None`: local, done in
+/// Rust). Asked once per connection.
+fn acl_tidy_ok(side: Option<&RemoteSession>) -> bool {
+    side.is_none_or(|s| s.acl_tidy(|| matches!(s.exec(ACL_TIDY_PROBE), Ok(o) if o.code == Some(0))))
+}
+
 /// [`restrict_cmd`] on the received item in `stage`.
 fn restrict(stage: &Stage, name: &OsString) -> Result<(), String> {
     match stage {
@@ -1960,7 +1963,7 @@ fn send(
     }
     .map_or(AclPlan::None, |(from, to)| {
         if has_acls(from, src_dir, name, cancel) {
-            acl_plan(true, tar_acls_ok(from), tar_acls_ok(to))
+            acl_plan(true, tar_acls_ok(from), tar_acls_ok(to) && acl_tidy_ok(to))
         } else {
             AclPlan::None
         }
@@ -4998,6 +5001,48 @@ mod tests {
         );
         assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
         assert!(r.warnings[0].contains("ACL"), "{:?}", r.warnings);
+    }
+
+    /// A receiver whose tar carries ACLs but that has no python3 cannot cap
+    /// the received ACLs (a folder's default ACL above all): they are not
+    /// sent, and the copy is made private, as without ACL support.
+    #[test]
+    fn a_receiver_that_cannot_tidy_acls_gets_a_private_copy() {
+        let from = acl_host("1\n", 0);
+        let to = FakeCmd::new(|a| {
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.as_bytes() == ACL_TIDY_PROBE {
+                return code(1);
+            }
+            if c.as_bytes() == TAR_ACLS_PROBE {
+                return code(0);
+            }
+            answer(c, &[], &[], "0\x000\x00")
+        });
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a", "b"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done);
+        let joined = from.pipe_calls()[0].join(" ");
+        assert!(!joined.contains("--acls"), "{joined}");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("ACL")),
+            "{:?}",
+            r.warnings
+        );
+        let probe = String::from_utf8(ACL_TIDY_PROBE.to_vec()).unwrap();
+        let asked = to.remote_cmds().iter().filter(|c| **c == probe).count();
+        assert_eq!(asked, 1, "asked once per connection");
+        // and should python3 be gone by the time it unpacks, it stops
+        // rather than leave the ACLs as they came
+        let tidy = String::from_utf8(tidy_received_acls()).unwrap();
+        assert!(tidy.ends_with("else exit 1; fi"), "{tidy}");
     }
 
     #[test]
