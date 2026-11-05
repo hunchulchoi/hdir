@@ -541,9 +541,10 @@ const CAP_GROUP_CMD: &[u8] = b"find . ! -type l -perm -040 ! -perm -004 -exec ch
 
 /// [`TIDY_RECEIVED`] when ACLs travelled. On an entry with a POSIX ACL the
 /// group bits are its mask, which named users and groups depend on: there
-/// only the owning group's own entry (`group::`) is capped at `other::`.
-/// Needs python3 to edit ACLs; without it, the plain caps apply (safe, but
-/// named entries lose what the mask allowed them).
+/// only the owning group's own entry (`group::`) is capped at `other::`,
+/// and likewise in a folder's default ACL, which what is made in it later
+/// inherits. Needs python3 to edit ACLs; without it, the plain caps apply
+/// (safe, but named entries lose what the mask allowed them).
 fn tidy_received_acls() -> Vec<u8> {
     cat(&[
         STRIP_SETID_CMD,
@@ -558,25 +559,33 @@ fn tidy_received_acls() -> Vec<u8> {
 /// The python walk of [`tidy_received_acls`] (no single quotes).
 const ACL_CAP_PY: &[u8] = br#"import os,stat,struct
 N="system.posix_acl_access"
+D="system.posix_acl_default"
+def ca(p,n):
+    try:
+        a=os.getxattr(p,n,follow_symlinks=False)
+    except OSError:
+        return False
+    if len(a)<4 or (len(a)-4)%8:
+        return False
+    e=[list(struct.unpack_from("<HHI",a,4+8*i)) for i in range((len(a)-4)//8)]
+    o=[x[1] for x in e if x[0]==0x20]
+    if not o:
+        return False
+    for x in e:
+        if x[0]==4:
+            x[1]&=o[0]
+    b=a[:4]+b"".join(struct.pack("<HHI",*x) for x in e)
+    if b!=a:
+        os.setxattr(p,n,b,follow_symlinks=False)
+    return True
 def cap(p):
     st=os.lstat(p)
     if stat.S_ISLNK(st.st_mode):
         return
-    try:
-        a=os.getxattr(p,N,follow_symlinks=False)
-    except OSError:
-        a=None
-    if a and len(a)>=4 and (len(a)-4)%8==0:
-        e=[list(struct.unpack_from("<HHI",a,4+8*i)) for i in range((len(a)-4)//8)]
-        o=[x[1] for x in e if x[0]==0x20]
-        if o:
-            for x in e:
-                if x[0]==4:
-                    x[1]&=o[0]
-            b=a[:4]+b"".join(struct.pack("<HHI",*x) for x in e)
-            if b!=a:
-                os.setxattr(p,N,b,follow_symlinks=False)
-            return
+    if stat.S_ISDIR(st.st_mode):
+        ca(p,D)
+    if ca(p,N):
+        return
     m=st.st_mode&0o7777
     n=(m&~0o070)|(m&0o070&((m&7)<<3))
     if n!=m:
@@ -607,23 +616,35 @@ pub fn cap_acl_group(acl: &[u8]) -> Option<Vec<u8>> {
 /// `false` when `p` has none (then its mode bits are capped instead).
 #[cfg(unix)]
 fn cap_access_acl(p: &Path) -> std::io::Result<bool> {
+    cap_acl_named(p, "system.posix_acl_access")
+}
+
+/// Linux: cap the `group::` entry of folder `p`'s default ACL, which what
+/// is made in it later inherits; `false` when it has none.
+#[cfg(unix)]
+fn cap_default_acl(p: &Path) -> std::io::Result<bool> {
+    cap_acl_named(p, "system.posix_acl_default")
+}
+
+/// Linux: [`cap_acl_group`] on the ACL stored in xattr `n` of `p`.
+#[cfg(unix)]
+fn cap_acl_named(p: &Path, n: &str) -> std::io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
-        const N: &str = "system.posix_acl_access";
-        let Some(acl) = crate::platform::xattr_get_path(p, N)? else {
+        let Some(acl) = crate::platform::xattr_get_path(p, n)? else {
             return Ok(false);
         };
         let Some(capped) = cap_acl_group(&acl) else {
             return Ok(false);
         };
         if capped != acl {
-            crate::platform::xattr_set_path(p, N, &capped)?;
+            crate::platform::xattr_set_path(p, n, &capped)?;
         }
         Ok(true)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = p;
+        let _ = (p, n);
         Ok(false)
     }
 }
@@ -646,6 +667,9 @@ fn tidy_received(dir: &Path, acls: bool) -> std::io::Result<()> {
             continue;
         }
         let old = m.permissions().mode() & 0o7777;
+        if acls && m.is_dir() {
+            cap_default_acl(&q)?;
+        }
         let mut mode = if acls && cap_access_acl(&q)? {
             old
         } else {
@@ -4756,16 +4780,21 @@ mod tests {
     fn real_kept_acls_keep_their_mask_and_cap_the_owning_group() {
         use std::os::unix::fs::PermissionsExt;
         const N: &str = "system.posix_acl_access";
+        const DEF: &str = "system.posix_acl_default";
         let python = sh(b"command -v python3").status.success();
         let t = tempfile::tempdir().unwrap();
         let d = private_dir(t.path(), "d");
-        let (with, plain) = (d.join("with acl"), d.join("plain"));
+        let (with, plain, sub) = (d.join("with acl"), d.join("plain"), d.join("sub"));
         let reset = || {
             for f in [&with, &plain] {
                 fs::write(f, "x").unwrap();
                 fs::set_permissions(f, fs::Permissions::from_mode(0o640)).unwrap();
             }
-            crate::platform::xattr_set_path(&with, N, &acl_blob(&SHARED))
+            let _ = fs::remove_dir_all(&sub);
+            fs::create_dir(&sub).unwrap();
+            fs::set_permissions(&sub, fs::Permissions::from_mode(0o750)).unwrap();
+            crate::platform::xattr_set_path(&with, N, &acl_blob(&SHARED))?;
+            crate::platform::xattr_set_path(&sub, DEF, &acl_blob(&SHARED))
         };
         if let Err(e) = reset() {
             // only a filesystem without ACLs skips
@@ -4782,6 +4811,19 @@ mod tests {
             assert_eq!((mode(&with), mode(&plain)), (0o640, 0o600));
             let got = crate::platform::xattr_get_path(&with, N).unwrap().unwrap();
             assert_eq!(got, acl_blob(&want));
+            // a received folder hands the capped group:: on to what is made
+            // in it later
+            assert_eq!(mode(&sub), 0o700);
+            let def = crate::platform::xattr_get_path(&sub, DEF).unwrap().unwrap();
+            assert_eq!(def, acl_blob(&want));
+            let later = sub.join("later");
+            fs::write(&later, "y").unwrap();
+            let inherited = crate::platform::xattr_get_path(&later, N).unwrap().unwrap();
+            let group = (4..inherited.len())
+                .step_by(8)
+                .find(|&i| inherited[i..i + 2] == [4, 0])
+                .map(|i| inherited[i + 2]);
+            assert_eq!(group, Some(0), "{inherited:?}");
         };
         if python {
             let out = sh(&cat(&[
@@ -4831,6 +4873,7 @@ mod tests {
         // with ACLs kept, entries that have one are not capped
         let acl_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::ACLS)).unwrap();
         assert!(acl_in.contains("system.posix_acl_access"), "{acl_in}");
+        assert!(acl_in.contains("system.posix_acl_default"), "{acl_in}");
         let plain_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::NONE)).unwrap();
         assert!(!plain_in.contains("python3"), "{plain_in}");
         assert!(
