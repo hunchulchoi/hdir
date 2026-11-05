@@ -1431,7 +1431,9 @@ pub fn copy_dacl(src: &Path, dst: &Path) -> io::Result<()> {
             PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
             UNPROTECTED_DACL_SECURITY_INFORMATION,
         };
-        let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+        // past MAX_PATH only in the verbatim form (a deep tree)
+        let wide =
+            |p: &Path| -> Vec<u16> { long_path(p).as_os_str().encode_wide().chain([0]).collect() };
         let (s, d) = (wide(src), wide(dst));
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
