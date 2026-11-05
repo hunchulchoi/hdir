@@ -260,6 +260,38 @@ except OSError as x:
     if cfg!(target_os = "macos") {
         assert!(!hdir::platform::tree_has_posix_acl(&got, &no));
     }
+    // where both tars carry ACLs (and the local disk takes them), they
+    // must arrive: losing them with a warning is not good enough there
+    let probe = "tar --acls -cf /dev/null -T /dev/null >/dev/null 2>&1";
+    let local_tar = std::process::Command::new("sh")
+        .args(["-c", probe])
+        .status()
+        .is_ok_and(|s| s.success());
+    let remote_tar = cmd.run(&exec_argv(&target, probe.as_bytes())).code == Some(0);
+    let local_disk = {
+        let p = back.path().join("probe");
+        std::fs::write(&p, "").unwrap();
+        let blob: Vec<u8> = [2u32.to_le_bytes().to_vec(), {
+            let mut v = Vec::new();
+            for (tag, perm) in [(1u16, 6u16), (4, 4), (0x20, 4)] {
+                v.extend(tag.to_le_bytes());
+                v.extend(perm.to_le_bytes());
+                v.extend(u32::MAX.to_le_bytes());
+            }
+            v
+        }]
+        .concat();
+        let ok = cfg!(target_os = "linux")
+            && hdir::platform::xattr_set_path(&p, "system.posix_acl_access", &blob).is_ok();
+        std::fs::remove_file(&p).unwrap();
+        ok
+    };
+    if local_tar && remote_tar && local_disk {
+        assert!(
+            hdir::platform::tree_has_posix_acl(&got, &no),
+            "ACLs must travel here"
+        );
+    }
     if hdir::platform::tree_has_posix_acl(&got, &no) {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         // kept: entry for entry, the named user and the mask included, and

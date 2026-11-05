@@ -7223,7 +7223,10 @@ mod packaged_upload_tests {
         let t = tempfile::tempdir().unwrap();
         fs::write(t.path().join("a"), "x").unwrap();
         let s = session(Arc::clone(f));
-        send_up_packaged(&s, t.path(), &OsString::from("a"), STAGE.as_bytes(), cancel)
+        let r = send_up_packaged(&s, t.path(), &OsString::from("a"), STAGE.as_bytes(), cancel);
+        // tar reads from the source folder
+        assert_eq!(f.log.lock().unwrap()[0][4], t.path().to_string_lossy());
+        r
     }
 
     #[test]
@@ -7236,6 +7239,9 @@ mod packaged_upload_tests {
         assert_eq!(log[0][..2], ["tar", "-cf"]);
         assert_eq!(log[0][3], "-C");
         assert_eq!(log[0][5], "./a");
+        // the package tar wrote is the file scp sends
+        let n = log[1].len();
+        assert_eq!(log[1][n - 2], log[0][2], "{:?}", log[1]);
         assert_eq!(log[1].last().unwrap(), &format!("prod-web:{STAGE}/o.tar"));
         let unpack = String::from_utf8(unpack_cmd(STAGE.as_bytes(), b"o.tar")).unwrap();
         assert_eq!(remote_cmd(&log[2]), Some(unpack.as_str()));
