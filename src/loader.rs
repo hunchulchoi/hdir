@@ -17,12 +17,25 @@ pub type Listing = Result<(Vec<Entry>, usize), String>;
 /// Reads one directory; replaceable so tests can slow it down deterministically.
 pub type Reader = Arc<dyn Fn(&Path, bool) -> Listing + Send + Sync>;
 
+/// `(available, total)` bytes of the filesystem holding a folder;
+/// replaceable so tests can make it hang.
+pub type SpaceFn = Arc<dyn Fn(&Path) -> Option<(u64, u64)> + Send + Sync>;
+
 #[derive(Debug)]
 pub struct LoadResult {
     pub id: u64,
     pub dir: PathBuf,
     pub result: Listing,
-    /// `(available, total)` bytes of a local folder's filesystem.
+}
+
+/// The disk space of a local folder that was listed (load `id` of panel
+/// `key`), sent after its listing: a slow filesystem query never holds the
+/// listing up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceResult {
+    pub key: usize,
+    pub id: u64,
+    pub dir: PathBuf,
     pub space: Option<(u64, u64)>,
 }
 
@@ -58,6 +71,8 @@ struct Inner {
     reader: Reader,
     tx: Sender<LoadResult>,
     state: Mutex<State>,
+    /// Space queries for the one space worker.
+    space_tx: Sender<(usize, u64, PathBuf)>,
 }
 
 /// Reads directories off the UI thread: per key (panel) at most one read is in
@@ -65,6 +80,7 @@ struct Inner {
 pub struct Loader {
     inner: Arc<Inner>,
     rx: Mutex<Receiver<LoadResult>>,
+    space_rx: Mutex<Receiver<SpaceResult>>,
 }
 
 impl Default for Loader {
@@ -75,15 +91,58 @@ impl Default for Loader {
 
 impl Loader {
     pub fn with_reader(reader: Reader) -> Self {
+        Self::with_readers(reader, Arc::new(crate::platform::disk_space))
+    }
+
+    /// [`Loader::with_reader`] with the disk space query too.
+    pub fn with_readers(reader: Reader, space: SpaceFn) -> Self {
         let (tx, rx) = channel();
+        let (space_tx, queries) = channel::<(usize, u64, PathBuf)>();
+        let (done_tx, space_rx) = channel();
+        // One worker for every space query: one that hangs (a dead NFS
+        // mount) stalls only the space shown, never a listing or a thread
+        // per load. Only each panel's newest query is answered.
+        std::thread::spawn(move || {
+            while let Ok(first) = queries.recv() {
+                let mut latest: Vec<(usize, u64, PathBuf)> = vec![first];
+                for q in queries.try_iter() {
+                    latest.retain(|l| l.0 != q.0);
+                    latest.push(q);
+                }
+                for (key, id, dir) in latest {
+                    let space = space(&dir);
+                    if done_tx
+                        .send(SpaceResult {
+                            key,
+                            id,
+                            dir,
+                            space,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
         Self {
             inner: Arc::new(Inner {
                 reader,
                 tx,
                 state: Mutex::new(State::default()),
+                space_tx,
             }),
             rx: Mutex::new(rx),
+            space_rx: Mutex::new(space_rx),
         }
+    }
+
+    /// Disk space answers that arrived (see [`SpaceResult`]).
+    pub fn try_spaces(&self) -> Vec<SpaceResult> {
+        let Ok(rx) = self.space_rx.lock() else {
+            return Vec::new();
+        };
+        rx.try_iter().collect()
     }
 
     /// Queue loading `dir` for panel `key`; the result is tagged with `id`. A
@@ -167,9 +226,7 @@ fn pump(inner: &Arc<Inner>) {
             .unwrap_or_else(|_| {
                 Err(crate::i18n::t("디렉터리 읽기 실패", "Failed to read directory").to_string())
             });
-            let space = (req.source == 0 && result.is_ok())
-                .then(|| crate::platform::disk_space(&req.dir))
-                .flatten();
+            let local_ok = req.source == 0 && result.is_ok();
             if let Ok(mut st) = inner.state.lock() {
                 let current = st.slots.get(&key).is_some_and(|s| s.epoch == epoch);
                 if !current {
@@ -179,12 +236,15 @@ fn pump(inner: &Arc<Inner>) {
                 if let Some(slot) = st.slots.get_mut(&key) {
                     slot.in_flight = false;
                 }
+                let dir = req.dir.clone();
                 let _ = inner.tx.send(LoadResult {
                     id: req.id,
                     dir: req.dir,
                     result,
-                    space,
                 });
+                if local_ok {
+                    let _ = inner.space_tx.send((key, req.id, dir));
+                }
             }
             pump(&inner);
         });
@@ -219,7 +279,13 @@ mod tests {
         let (entries, skipped) = got[0].result.as_ref().unwrap();
         assert_eq!(*skipped, 0);
         assert!(entries.iter().any(|e| e.name == "한글 file.txt"));
-        let (free, total) = got[0].space.expect("disk space of a local folder");
+        let start = Instant::now();
+        let mut spaces = Vec::new();
+        while spaces.is_empty() && start.elapsed() < Duration::from_secs(5) {
+            spaces.extend(loader.try_spaces());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (free, total) = spaces[0].space.expect("disk space of a local folder");
         assert!(free <= total);
     }
 
@@ -236,10 +302,53 @@ mod tests {
         }
     }
 
+    /// A disk whose space query hangs (NFS, FUSE) never holds up the
+    /// listing: the space follows on its own channel.
+    #[test]
+    fn a_slow_disk_space_query_never_holds_the_listing() {
+        let t = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let g = Arc::clone(&gate);
+        let loader = Loader::with_readers(
+            Arc::new(|d, h| LocalVfs.list(d, h)),
+            Arc::new(move |_| {
+                drop(g.lock().unwrap());
+                Some((1, 4))
+            }),
+        );
+        loader.request(2, 7, t.path().to_path_buf(), false);
+        let got = wait_for(&loader, 1);
+        assert_eq!(got.len(), 1, "the listing came while the space query hangs");
+        assert!(got[0].result.is_ok());
+        assert!(loader.try_spaces().is_empty());
+        drop(held);
+        let start = Instant::now();
+        let mut spaces = Vec::new();
+        while spaces.is_empty() && start.elapsed() < Duration::from_secs(5) {
+            spaces.extend(loader.try_spaces());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(spaces.len(), 1);
+        let s = &spaces[0];
+        assert_eq!(
+            (s.key, s.id, s.dir.as_path(), s.space),
+            (2, 7, t.path(), Some((1, 4)))
+        );
+    }
+
     #[test]
     fn a_remote_listing_has_no_local_disk_space() {
         let t = tempfile::tempdir().unwrap();
-        let loader = Loader::default();
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = Arc::clone(&asked);
+        let loader = Loader::with_readers(
+            Arc::new(|d, h| LocalVfs.list(d, h)),
+            Arc::new(move |_| {
+                a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some((1, 1))
+            }),
+        );
         loader.request_vfs(
             0,
             3,
@@ -249,7 +358,22 @@ mod tests {
         );
         let got = wait_for(&loader, 1);
         assert!(got[0].result.is_ok());
-        assert_eq!(got[0].space, None);
+        // a local listing afterwards: its answer comes after any for the
+        // remote one would have (one worker, in order)
+        loader.request(1, 4, t.path().to_path_buf(), false);
+        assert_eq!(wait_for(&loader, 1).len(), 1);
+        let start = Instant::now();
+        let mut spaces = Vec::new();
+        while spaces.is_empty() && start.elapsed() < Duration::from_secs(5) {
+            spaces.extend(loader.try_spaces());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(spaces.iter().map(|s| s.id).collect::<Vec<_>>(), [4]);
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the local one"
+        );
     }
 
     struct FakeVfs;

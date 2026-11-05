@@ -3193,6 +3193,13 @@ impl App {
                 }
             }
         }
+        // disk space trails its listing (so after it here, even when both
+        // came at once); a panel that moved on drops it
+        for sp in self.loader.try_spaces() {
+            if let Some(p) = self.panels.get_mut(sp.key) {
+                changed |= p.set_space(sp.id, &sp.dir, sp.space);
+            }
+        }
         changed
     }
 
@@ -6284,6 +6291,87 @@ mod tests {
             crate::panel::read_listing(dir, hidden)
         }));
         gate
+    }
+
+    #[test]
+    fn disk_space_arrives_after_the_listing_and_only_for_its_folder() {
+        let (_t, mut app) = fixture();
+        let gate = Arc::new(Mutex::new(()));
+        let g = Arc::clone(&gate);
+        app.loader = crate::loader::Loader::with_readers(
+            Arc::new(crate::panel::read_listing),
+            Arc::new(move |_| {
+                drop(g.lock().unwrap());
+                Some((5, 10))
+            }),
+        );
+        let held = gate.lock().unwrap();
+        let root = app.panels[0].cwd.clone();
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        assert_eq!(
+            app.panels[0].cwd,
+            root.join("adir"),
+            "listed without the space"
+        );
+        assert_eq!(app.panels[0].space, None);
+        drop(held);
+        let start = Instant::now();
+        while app.panels[0].space.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            app.tick();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.panels[0].space, Some((5, 10)));
+    }
+
+    #[test]
+    fn a_space_answer_for_an_earlier_visit_of_the_same_folder_is_dropped() {
+        let (_t, mut app) = fixture();
+        // each query waits for its own token
+        let (go, tokens) = std::sync::mpsc::channel::<()>();
+        let tokens = Mutex::new(tokens);
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let c = Arc::clone(&calls);
+        app.loader = crate::loader::Loader::with_readers(
+            Arc::new(crate::panel::read_listing),
+            Arc::new(move |_| {
+                let _ = entered_tx.lock().unwrap().send(());
+                let _ = tokens.lock().unwrap().recv();
+                let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Some((n, n))
+            }),
+        );
+        press(&mut app, KeyCode::Down); // adir
+        press(&mut app, KeyCode::Enter);
+        settle(&mut app);
+        // the worker holds the first query before the panel moves on
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        press(&mut app, KeyCode::Backspace);
+        settle(&mut app);
+        press(&mut app, KeyCode::Enter); // adir again
+        settle(&mut app);
+        let wait_calls = |n: u64| {
+            let start = Instant::now();
+            while calls.load(std::sync::atomic::Ordering::SeqCst) < n {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // the answer for the first visit of adir
+        go.send(()).unwrap();
+        wait_calls(1);
+        app.tick();
+        assert_eq!(app.panels[0].space, None, "it belonged to the first visit");
+        // the answer for this visit
+        go.send(()).unwrap();
+        wait_calls(2);
+        app.tick();
+        assert_eq!(app.panels[0].space, Some((2, 2)));
     }
 
     #[test]

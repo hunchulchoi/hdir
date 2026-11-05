@@ -82,6 +82,9 @@ pub struct Panel {
     pub reload_after_load: bool,
     /// `(available, total)` bytes where a local listing came from.
     pub space: Option<(u64, u64)>,
+    /// Id of the load whose listing is shown: a disk space answer for an
+    /// earlier visit of the same folder is not taken.
+    pub shown_load: Option<u64>,
 }
 
 impl Panel {
@@ -100,6 +103,7 @@ impl Panel {
             loading: None,
             reload_after_load: false,
             space: None,
+            shown_load: None,
         };
         panel.reload();
         panel
@@ -288,6 +292,20 @@ impl Panel {
         }
     }
 
+    /// The disk space of `dir`, when this panel still shows that local
+    /// folder; true when it was taken.
+    pub fn set_space(&mut self, id: u64, dir: &Path, space: Option<(u64, u64)>) -> bool {
+        if !matches!(self.location, Location::Local)
+            || self.shown_load != Some(id)
+            || self.cwd != dir
+            || self.space == space
+        {
+            return false;
+        }
+        self.space = space;
+        true
+    }
+
     /// Apply a finished load. Returns false (and changes nothing) when the
     /// result does not belong to the pending request.
     pub fn finish_load(&mut self, res: LoadResult) -> bool {
@@ -299,7 +317,12 @@ impl Panel {
         };
         let listing = match res.result {
             Ok(l) => {
-                self.space = res.space;
+                // another folder may be on another disk: no figure until its
+                // own arrives ([`Panel::set_space`]); a reload keeps it
+                if res.dir != self.cwd {
+                    self.space = None;
+                }
+                self.shown_load = Some(res.id);
                 l
             }
             Err(msg) => {
@@ -1067,7 +1090,6 @@ mod tests {
             id: req.id,
             dir: req.dir.clone(),
             result: read_listing(&req.dir, show_hidden),
-            space: Some((1, 4)),
         }
     }
 
@@ -1100,8 +1122,19 @@ mod tests {
         assert_eq!(req.dir, old.join("adir"));
         assert_eq!(p.cwd, old);
         assert_eq!(p.loading.as_ref().unwrap().id, 5);
+        p.space = Some((9, 9));
         assert!(p.finish_load(load_of(&req, false)));
-        assert_eq!(p.space, Some((1, 4)), "the listing's disk space");
+        assert_eq!(p.space, None, "another folder: its own figure comes later");
+        assert!(
+            !p.set_space(5, &old, Some((1, 4))),
+            "the folder left behind"
+        );
+        assert!(
+            !p.set_space(4, &old.join("adir"), Some((1, 4))),
+            "an older load"
+        );
+        assert!(p.set_space(5, &old.join("adir"), Some((1, 4))));
+        assert_eq!(p.space, Some((1, 4)));
         assert_eq!(p.cwd, old.join("adir"));
         assert_eq!(p.cursor, 0);
         assert!(p.selected.is_empty());

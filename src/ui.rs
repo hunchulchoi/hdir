@@ -1502,6 +1502,7 @@ mod tests {
             loading: None,
             reload_after_load: false,
             space: None,
+            shown_load: None,
         }
     }
 
