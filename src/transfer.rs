@@ -777,7 +777,16 @@ fn send_up_packaged(
     tar.push("-C".into());
     tar.push(src_dir.as_os_str().to_os_string());
     tar.push(item);
+    // Esc during a step: the next one never starts
+    let stopped = || {
+        cancel
+            .load(Ordering::Relaxed)
+            .then(|| crate::i18n::t("취소됨", "Cancelled").to_string())
+    };
     ran(d.run_local(&tar, cancel))?;
+    if let Some(e) = stopped() {
+        return Err(e);
+    }
     let remote_pkg = cat(&[&into_dir(stage), pkg_name(&os_bytes(name))]);
     let argv = crate::remote::scp_argv(
         &crate::remote::Endpoint::Local(pkg.path()),
@@ -785,6 +794,9 @@ fn send_up_packaged(
         d.scp_mode,
     )?;
     ran(d.scp_cancellable(&argv, cancel).map_err(|e| e.message())?)?;
+    if let Some(e) = stopped() {
+        return Err(e);
+    }
     let cmd = unpack_cmd(stage, pkg_name(&os_bytes(name)));
     ran(d.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?).map(drop)
 }
@@ -7088,36 +7100,6 @@ mod tests {
     }
 
     #[test]
-    fn a_packaged_upload_tars_locally_then_scps_then_unpacks() {
-        let t = tempfile::tempdir().unwrap();
-        fs::write(t.path().join("a"), "x").unwrap();
-        let f = FakeCmd::new(|a| {
-            if a[0] == "tar" {
-                return ok("");
-            }
-            answer(remote_cmd(a).unwrap_or_default(), &[], &[], "")
-        });
-        let s = session(Arc::clone(&f));
-        let no = AtomicBool::new(false);
-        send_up_packaged(&s, t.path(), &OsString::from("a"), STAGE.as_bytes(), &no).unwrap();
-        let log = f.log.lock().unwrap().clone();
-        assert_eq!(log[0][..2], ["tar", "-cf"]);
-        assert_eq!(
-            log[0][3..],
-            [
-                "-C".to_string(),
-                t.path().to_string_lossy().into(),
-                "./a".into()
-            ]
-        );
-        assert_eq!(log[1][0], "scp");
-        assert_eq!(log[1].last().unwrap(), &format!("prod-web:{STAGE}/o.tar"));
-        let unpack = String::from_utf8(unpack_cmd(STAGE.as_bytes(), b"o.tar")).unwrap();
-        assert_eq!(remote_cmd(&log[2]), Some(unpack.as_str()));
-        assert_eq!(pkg_name(b"o.tar"), b"p.tar", "never the item's own name");
-    }
-
-    #[test]
     fn real_unpacking_a_package_keeps_links_drops_the_package_and_setuid() {
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
@@ -7183,6 +7165,118 @@ mod tests {
             "theirs kept"
         );
         assert!(sp.join("ln").exists() || fs::symlink_metadata(sp.join("ln")).is_ok());
+    }
+}
+
+/// The Windows upload path ([`send_up_packaged`]) on every platform, with a
+/// fake ssh: each step's failure, or Esc, stops the ones after it.
+#[cfg(test)]
+mod packaged_upload_tests {
+    use super::*;
+    use crate::testutil::{FakeCmd, fail, ok, remote_cmd, session};
+    use std::fs;
+
+    const STAGE: &str = "/dst/.hdir-xfer.ABC123";
+
+    /// A fake answering tar (local), scp and the unpack with these codes;
+    /// `esc_on`: the step during which Esc is pressed.
+    fn fake(
+        tar: i32,
+        scp: i32,
+        unpack: i32,
+        esc_on: Option<&'static str>,
+        cancel: Arc<AtomicBool>,
+    ) -> Arc<FakeCmd> {
+        FakeCmd::new(move |a| {
+            let step = if a[0] == "tar" {
+                "tar"
+            } else if a[0] == "scp" {
+                "scp"
+            } else {
+                "unpack"
+            };
+            if esc_on == Some(step) {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            let c = match step {
+                "tar" => tar,
+                "scp" => scp,
+                _ => unpack,
+            };
+            if c == 0 { ok("") } else { fail(c, "broken\n") }
+        })
+    }
+
+    fn steps(f: &FakeCmd) -> Vec<String> {
+        f.log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| match a[0].as_str() {
+                "tar" | "scp" => a[0].clone(),
+                _ => remote_cmd(a).map_or("?".into(), |_| "unpack".into()),
+            })
+            .collect()
+    }
+
+    fn send(f: &Arc<FakeCmd>, cancel: &AtomicBool) -> Result<(), String> {
+        let t = tempfile::tempdir().unwrap();
+        fs::write(t.path().join("a"), "x").unwrap();
+        let s = session(Arc::clone(f));
+        let r = send_up_packaged(&s, t.path(), &OsString::from("a"), STAGE.as_bytes(), cancel);
+        // tar reads from the source folder
+        assert_eq!(f.log.lock().unwrap()[0][4], t.path().to_string_lossy());
+        r
+    }
+
+    #[test]
+    fn a_packaged_upload_tars_locally_then_scps_then_unpacks() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let f = fake(0, 0, 0, None, Arc::clone(&cancel));
+        send(&f, &cancel).unwrap();
+        assert_eq!(steps(&f), ["tar", "scp", "unpack"]);
+        let log = f.log.lock().unwrap().clone();
+        assert_eq!(log[0][..2], ["tar", "-cf"]);
+        assert_eq!(log[0][3], "-C");
+        assert_eq!(log[0][5], "./a");
+        // the package tar wrote is the file scp sends
+        let n = log[1].len();
+        assert_eq!(log[1][n - 2], log[0][2], "{:?}", log[1]);
+        assert_eq!(log[1].last().unwrap(), &format!("prod-web:{STAGE}/o.tar"));
+        let unpack = String::from_utf8(unpack_cmd(STAGE.as_bytes(), b"o.tar")).unwrap();
+        assert_eq!(remote_cmd(&log[2]), Some(unpack.as_str()));
+        assert_eq!(pkg_name(b"o.tar"), b"p.tar", "never the item's own name");
+        assert!(
+            !std::path::Path::new(&log[0][2]).exists(),
+            "the local package is gone"
+        );
+    }
+
+    #[test]
+    fn a_failed_step_stops_the_ones_after_it() {
+        for (tar, scp, unpack, want) in [
+            (2, 0, 0, vec!["tar"]),
+            (0, 1, 0, vec!["tar", "scp"]),
+            (0, 0, 2, vec!["tar", "scp", "unpack"]),
+        ] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let f = fake(tar, scp, unpack, None, Arc::clone(&cancel));
+            let r = send(&f, &cancel);
+            assert!(r.is_err(), "{want:?}");
+            assert_eq!(steps(&f), want);
+            let pkg = f.log.lock().unwrap()[0][2].clone();
+            assert!(!std::path::Path::new(&pkg).exists(), "package removed");
+        }
+    }
+
+    #[test]
+    fn esc_during_a_step_stops_the_ones_after_it() {
+        for (on, want) in [("tar", vec!["tar"]), ("scp", vec!["tar", "scp"])] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let f = fake(0, 0, 0, Some(on), Arc::clone(&cancel));
+            assert!(send(&f, &cancel).is_err(), "{on}");
+            assert_eq!(steps(&f), want, "{on}");
+        }
     }
 }
 

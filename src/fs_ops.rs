@@ -2831,7 +2831,8 @@ mod tests {
         // inheriting, plus one explicit rule
         let open = s.join("open.txt");
         fs::write(&open, "y").unwrap();
-        icacls(&[open.to_str().unwrap(), "/grant", "Everyone:(R)"]);
+        // Everyone by SID: the name is translated on other Windows languages
+        icacls(&[open.to_str().unwrap(), "/grant", "*S-1-1-0:(R)"]);
         // a protected folder, with a file that inherits from it
         let dir = s.join("vault");
         fs::create_dir(&dir).unwrap();
@@ -2853,10 +2854,120 @@ mod tests {
             acl_of(&locked),
             "the same restricted rules"
         );
-        let copied = acl_of(&d.join("open.txt"));
+        // the explicit rule, compared by SID (WD: Everyone)
+        let (own, _) = aces(&sddl(&d.join("open.txt")));
+        assert_eq!(own, aces(&sddl(&open)).0, "explicit rules kept");
+        assert!(own.iter().any(|a| a.ends_with(";;;WD)")), "{own:?}");
+    }
+
+    /// The DACL of `p` in SDDL (SIDs, not names).
+    #[cfg(windows)]
+    fn sddl(p: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+            SDDL_REVISION_1, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: valid wide string and out pointers; freed below.
+        let r = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(r, 0, "GetNamedSecurityInfoW {r}");
+        let mut text: *mut u16 = std::ptr::null_mut();
+        let mut len = 0u32;
+        // SAFETY: `sd` came from the call above; `text` is freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut len,
+            )
+        };
+        assert_ne!(ok, 0, "{}", io::Error::last_os_error());
+        // SAFETY: `text` holds `len` UTF-16 units including the NUL.
+        let out = String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(text, len.saturating_sub(1) as usize)
+        });
+        unsafe {
+            LocalFree(text.cast());
+            LocalFree(sd);
+        }
+        out
+    }
+
+    /// (explicit ACEs, inherited ACEs) of an SDDL DACL, plus whether it is
+    /// protected, as `("P" in the flags)`.
+    #[cfg(windows)]
+    fn aces(sddl: &str) -> (Vec<String>, Vec<String>) {
+        let d = sddl.split_once("D:").map_or("", |(_, d)| d);
+        let d = d.split_once("S:").map_or(d, |(d, _)| d);
+        let mut own = Vec::new();
+        let mut inherited = Vec::new();
+        for ace in d.split('(').skip(1) {
+            let ace = format!("({}", ace.trim_end_matches(')'));
+            let flags = ace.split(';').nth(1).unwrap_or("");
+            if flags.contains("ID") {
+                inherited.push(format!("{ace})"));
+            } else {
+                own.push(format!("{ace})"));
+            }
+        }
+        own.sort();
+        inherited.sort();
+        (own, inherited)
+    }
+
+    /// A copied file that inherits keeps its own explicit rules, inherits
+    /// from the destination folder and drops what it inherited from the
+    /// source folder.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_inherits_from_its_new_folder_not_the_old_one() {
+        let (_t, s, d) = two_dirs();
+        let icacls = |args: &[&str]| {
+            let st = std::process::Command::new("icacls")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "{st:?}");
+        };
+        // source folder: Power Users (PU) inherit read; destination: Guests (BG)
+        icacls(&[s.to_str().unwrap(), "/grant", "*S-1-5-32-547:(OI)(CI)(R)"]);
+        icacls(&[d.to_str().unwrap(), "/grant", "*S-1-5-32-546:(OI)(CI)(R)"]);
+        let f = s.join("f.txt");
+        fs::write(&f, "x").unwrap();
+        icacls(&[f.to_str().unwrap(), "/grant", "*S-1-1-0:(R)"]);
+        let (_, from_old) = aces(&sddl(&f));
         assert!(
-            copied.iter().any(|l| l.starts_with("Everyone:(R)")),
-            "{copied:?}"
+            from_old.iter().any(|a| a.ends_with(";;;PU)")),
+            "{from_old:?}"
+        );
+        let r = copy_items(std::slice::from_ref(&f), &d, &mut ctl());
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        let copy = sddl(&d.join("f.txt"));
+        let (own, inherited) = aces(&copy);
+        assert_eq!(own, aces(&sddl(&f)).0, "explicit rules kept: {copy}");
+        assert!(inherited.iter().any(|a| a.ends_with(";;;BG)")), "{copy}");
+        assert!(!inherited.iter().any(|a| a.ends_with(";;;PU)")), "{copy}");
+        let flags = copy.split_once("D:").map_or("", |(_, d)| d);
+        assert!(
+            !flags.split('(').next().unwrap_or("").contains('P'),
+            "not protected: {copy}"
         );
     }
 

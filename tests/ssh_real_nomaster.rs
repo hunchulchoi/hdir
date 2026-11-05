@@ -195,19 +195,47 @@ fn a_file_with_an_acl_never_arrives_more_open() {
     assert!(dir.starts_with('/') && !dir.contains('\n'));
     let _cleanup = RemoteDir(Arc::clone(&cmd), target.clone(), dir.clone());
     // user::rw- user:nobody:r-- group::--- mask::r-- other::---
+    // Exit 77: no python3 or no ACLs on that filesystem (a skip); anything
+    // else that fails is a failure of the test itself.
     let mk = format!(
-        "cd -- {} && printf secret > secret.txt && chmod 640 secret.txt && python3 -c '\
-import os, struct
+        "cd -- {} && printf secret > secret.txt && chmod 640 secret.txt && \
+         {{ command -v python3 >/dev/null 2>&1 || exit 77; }} && python3 -c '\
+import errno, os, struct, sys
 u = 0xffffffff
 e = [(1, 6, u), (2, 4, 65534), (4, 0, u), (0x10, 4, u), (0x20, 0, u)]
 v = struct.pack(\"<I\", 2) + b\"\".join(struct.pack(\"<HHI\", *x) for x in e)
-os.setxattr(\"secret.txt\", \"system.posix_acl_access\", v)'",
+try:
+    os.setxattr(\"secret.txt\", \"system.posix_acl_access\", v)
+except OSError as x:
+    if x.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+        sys.exit(77)
+    raise'",
         String::from_utf8(sh_quote(dir.as_bytes())).unwrap()
     );
-    if cmd.run(&exec_argv(&target, mk.as_bytes())).code != Some(0) {
-        eprintln!("cannot set an ACL there, skipped");
+    let prep = cmd.run(&exec_argv(&target, mk.as_bytes()));
+    if prep.code == Some(77) {
+        eprintln!("no python3 or no ACLs there, skipped");
         return;
     }
+    assert_eq!(
+        prep.code,
+        Some(0),
+        "preparing the ACL failed: {}",
+        String::from_utf8_lossy(&prep.stderr)
+    );
+    // what the server holds: the same entries are expected back
+    let sent = acl_entries(&cmd, &target, &dir, "secret.txt");
+    assert_eq!(
+        sent,
+        [
+            (1, 6, u32::MAX),
+            (2, 4, 65534),
+            (4, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX)
+        ],
+        "the server keeps the ACL as set"
+    );
     let back = tempfile::tempdir().unwrap();
     let spec = TransferSpec {
         kind: JobKind::Copy,
@@ -232,8 +260,49 @@ os.setxattr(\"secret.txt\", \"system.posix_acl_access\", v)'",
     if cfg!(target_os = "macos") {
         assert!(!hdir::platform::tree_has_posix_acl(&got, &no));
     }
+    // where both tars carry ACLs (and the local disk takes them), they
+    // must arrive: losing them with a warning is not good enough there
+    let probe = "tar --acls -cf /dev/null -T /dev/null >/dev/null 2>&1";
+    let local_tar = std::process::Command::new("sh")
+        .args(["-c", probe])
+        .status()
+        .is_ok_and(|s| s.success());
+    let remote_tar = cmd.run(&exec_argv(&target, probe.as_bytes())).code == Some(0);
+    let local_disk = {
+        let p = back.path().join("probe");
+        std::fs::write(&p, "").unwrap();
+        let blob: Vec<u8> = [2u32.to_le_bytes().to_vec(), {
+            let mut v = Vec::new();
+            for (tag, perm) in [(1u16, 6u16), (4, 4), (0x20, 4)] {
+                v.extend(tag.to_le_bytes());
+                v.extend(perm.to_le_bytes());
+                v.extend(u32::MAX.to_le_bytes());
+            }
+            v
+        }]
+        .concat();
+        let ok = cfg!(target_os = "linux")
+            && hdir::platform::xattr_set_path(&p, "system.posix_acl_access", &blob).is_ok();
+        std::fs::remove_file(&p).unwrap();
+        ok
+    };
+    if local_tar && remote_tar && local_disk {
+        assert!(
+            hdir::platform::tree_has_posix_acl(&got, &no),
+            "ACLs must travel here"
+        );
+    }
     if hdir::platform::tree_has_posix_acl(&got, &no) {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // kept: entry for entry, the named user and the mask included, and
+        // the owning group no more open than other
+        #[cfg(target_os = "linux")]
+        {
+            let blob = hdir::platform::xattr_get_path(&got, "system.posix_acl_access")
+                .unwrap()
+                .expect("an ACL");
+            assert_eq!(parse_acl(&blob), sent);
+        }
     } else {
         #[cfg(unix)]
         {
@@ -243,4 +312,51 @@ os.setxattr(\"secret.txt\", \"system.posix_acl_access\", v)'",
         }
         assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
     }
+}
+
+/// (tag, perm, id) entries of a Linux ACL xattr.
+#[cfg(unix)]
+fn parse_acl(blob: &[u8]) -> Vec<(u16, u16, u32)> {
+    assert!(
+        blob.len() >= 4 && (blob.len() - 4).is_multiple_of(8),
+        "{blob:?}"
+    );
+    blob[4..]
+        .chunks(8)
+        .map(|c| {
+            (
+                u16::from_le_bytes([c[0], c[1]]),
+                u16::from_le_bytes([c[2], c[3]]),
+                u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+            )
+        })
+        .collect()
+}
+
+/// The ACL entries of `dir/name` on the server, read with python3.
+#[cfg(unix)]
+fn acl_entries(
+    cmd: &Arc<dyn Cmd>,
+    target: &SshTarget,
+    dir: &str,
+    name: &str,
+) -> Vec<(u16, u16, u32)> {
+    let script = format!(
+        "cd -- {} && python3 -c 'import os,sys; sys.stdout.write(os.getxattr(sys.argv[1], \"system.posix_acl_access\").hex())' {}",
+        String::from_utf8(sh_quote(dir.as_bytes())).unwrap(),
+        String::from_utf8(sh_quote(name.as_bytes())).unwrap()
+    );
+    let out = cmd.run(&exec_argv(target, script.as_bytes()));
+    assert_eq!(
+        out.code,
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hex = String::from_utf8(out.stdout).unwrap();
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    parse_acl(&bytes)
 }
