@@ -1220,7 +1220,7 @@ impl App {
             }
             Action::Collapse => tree.collapse(),
             Action::Enter => {
-                let dir = tree.cursor().to_path_buf();
+                let dir = tree.shown();
                 self.tree = None;
                 // the loader reads it; a folder that is gone or locked
                 // leaves the panel where it was, with the reason
