@@ -4756,7 +4756,11 @@ mod tests {
             crate::platform::xattr_set_path(&with, N, &acl_blob(&SHARED))
         };
         if let Err(e) = reset() {
-            eprintln!("no POSIX ACLs here ({e}), skipped");
+            // only a filesystem without ACLs skips
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
             return;
         }
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
