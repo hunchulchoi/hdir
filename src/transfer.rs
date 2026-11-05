@@ -510,7 +510,11 @@ pub fn tar_in_cmd(stage: &[u8], meta: TarMeta) -> Vec<u8> {
         b" || exit 1; ",
         &tar_word(meta),
         b" -xpof - || exit 1; ",
-        TIDY_RECEIVED,
+        if meta.acls {
+            TIDY_RECEIVED_ACLS
+        } else {
+            TIDY_RECEIVED
+        },
     ])
 }
 
@@ -526,15 +530,41 @@ const TIDY_RECEIVED: &[u8] =
       find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
       find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +";
 
+/// [`TIDY_RECEIVED`] when ACLs travelled: an entry that has one (`+` in
+/// `ls -l`) keeps its group bits, which are the ACL's mask there: lowering
+/// them would take away what the ACL grants named users and groups.
+const TIDY_RECEIVED_ACLS: &[u8] =
+    b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} + && \
+      find . ! -type l -perm -040 ! -perm -004 -exec sh -c 'for f do case $(ls -ldn -- \"$f\") in ??????????+*) ;; *) chmod g-r -- \"$f\" || exit 1;; esac; done' sh {} + && \
+      find . ! -type l -perm -020 ! -perm -002 -exec sh -c 'for f do case $(ls -ldn -- \"$f\") in ??????????+*) ;; *) chmod g-w -- \"$f\" || exit 1;; esac; done' sh {} + && \
+      find . ! -type l -perm -010 ! -perm -001 -exec sh -c 'for f do case $(ls -ldn -- \"$f\") in ??????????+*) ;; *) chmod g-x -- \"$f\" || exit 1;; esac; done' sh {} +";
+
+/// Whether `p` (not followed) has a POSIX access ACL (Linux).
+fn has_access_acl(p: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            crate::platform::xattr_get_path(p, "system.posix_acl_access"),
+            Ok(Some(_))
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = p;
+        false
+    }
+}
+
 /// `mode` with its group bits limited to its other bits.
 pub fn cap_group(mode: u32) -> u32 {
     let other = mode & 0o007;
     mode & !0o070 | (mode & 0o070 & (other << 3))
 }
 
-/// [`TIDY_RECEIVED`] for a local stage (links are never followed).
+/// [`TIDY_RECEIVED`] for a local stage (links are never followed);
+/// `acls`: like [`TIDY_RECEIVED_ACLS`].
 #[cfg(unix)]
-fn tidy_received(dir: &Path) -> std::io::Result<()> {
+fn tidy_received(dir: &Path, acls: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut todo = vec![dir.to_path_buf()];
     while let Some(q) = todo.pop() {
@@ -543,7 +573,11 @@ fn tidy_received(dir: &Path) -> std::io::Result<()> {
             continue;
         }
         let old = m.permissions().mode() & 0o7777;
-        let mut mode = cap_group(old);
+        let mut mode = if acls && has_access_acl(&q) {
+            old
+        } else {
+            cap_group(old)
+        };
         if m.is_file() {
             mode &= !0o6000;
         }
@@ -560,7 +594,7 @@ fn tidy_received(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn tidy_received(_dir: &Path) -> std::io::Result<()> {
+fn tidy_received(_dir: &Path, _acls: bool) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1913,7 +1947,7 @@ fn send(
     match (oa.code, ob.code) {
         (Some(0), Some(0)) => {
             if let Stage::Local(t, _) = stage {
-                tidy_received(t.path()).map_err(|e| {
+                tidy_received(t.path(), meta.acls).map_err(|e| {
                     crate::tr!(
                         "받은 파일 권한 정리 실패: {e}",
                         "Cannot fix permissions of received files: {e}"
@@ -4598,6 +4632,51 @@ mod tests {
         );
     }
 
+    /// Linux: with ACLs kept, an entry that has one keeps its group bits
+    /// (its mask, which named users depend on); one without is capped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_kept_acls_keep_their_mask() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let d = private_dir(t.path(), "d");
+        let (with, plain) = (d.join("with acl"), d.join("plain"));
+        for f in [&with, &plain] {
+            fs::write(f, "x").unwrap();
+            fs::set_permissions(f, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        // user::rw- user:65534:r-- group::r-- mask::r-- other::---
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (1u16, 6u16, u32::MAX),
+            (2, 4, 65534),
+            (4, 4, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        if let Err(e) = crate::platform::xattr_set_path(&with, "system.posix_acl_access", &acl) {
+            eprintln!("no POSIX ACLs here ({e}), skipped");
+            return;
+        }
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let out = sh(&cat(&[
+            b"cd -- ",
+            &sh_quote(&b(&d)),
+            b" && ",
+            TIDY_RECEIVED_ACLS,
+        ]));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!((mode(&with), mode(&plain)), (0o640, 0o600));
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o640)).unwrap();
+        tidy_received(&d, true).unwrap();
+        assert_eq!((mode(&with), mode(&plain)), (0o640, 0o600));
+        assert!(has_access_acl(&with));
+    }
+
     #[test]
     fn xattr_options_scan_answers_and_plans() {
         assert_eq!(tar_word(TarMeta::NONE), b"tar");
@@ -4628,6 +4707,11 @@ mod tests {
             .map(OsString::from)
         );
         assert!(tar_in_cmd(b"/st", x).starts_with(b"cd -- '/st' || exit 1; tar --xattrs"));
+        // with ACLs kept, entries that have one are not capped
+        let acl_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::ACLS)).unwrap();
+        assert!(acl_in.contains("??????????+*) ;;"), "{acl_in}");
+        let plain_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::NONE)).unwrap();
+        assert!(!plain_in.contains("ls -ldn"), "{plain_in}");
         assert_eq!(xattr_plan(false, false, false), XattrPlan::None);
         assert_eq!(xattr_plan(true, true, true), XattrPlan::Keep);
         assert_eq!(xattr_plan(true, true, false), XattrPlan::Lost);
@@ -6642,7 +6726,7 @@ mod tests {
             &no,
         );
         assert_eq!((oa.code, ob.code), (Some(0), Some(0)));
-        tidy_received(&local_in).unwrap();
+        tidy_received(&local_in, false).unwrap();
         expect(&local_in);
     }
 
