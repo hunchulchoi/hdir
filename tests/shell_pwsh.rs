@@ -15,11 +15,15 @@ if ($null -ne $env:FAKE_DIR) {
 exit [int]$env:FAKE_RC
 "#;
 
+/// Whether pwsh runs here. On Windows it must: the Windows gate is where
+/// this integration is checked, so a missing pwsh fails instead of skipping.
 fn pwsh() -> bool {
-    Command::new("pwsh")
+    let ok = Command::new("pwsh")
         .args(["-NoProfile", "-Command", "exit 0"])
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| o.status.success());
+    assert!(ok || !cfg!(windows), "pwsh must run on Windows");
+    ok
 }
 
 struct Env {
