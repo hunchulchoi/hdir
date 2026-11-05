@@ -510,10 +510,10 @@ pub fn tar_in_cmd(stage: &[u8], meta: TarMeta) -> Vec<u8> {
         b" || exit 1; ",
         &tar_word(meta),
         b" -xpof - || exit 1; ",
-        if meta.acls {
-            TIDY_RECEIVED_ACLS
+        &if meta.acls {
+            tidy_received_acls()
         } else {
-            TIDY_RECEIVED
+            TIDY_RECEIVED.to_vec()
         },
     ])
 }
@@ -530,28 +530,101 @@ const TIDY_RECEIVED: &[u8] =
       find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
       find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +";
 
-/// [`TIDY_RECEIVED`] when ACLs travelled: an entry that has one (`+` in
-/// `ls -l`) keeps its group bits, which are the ACL's mask there: lowering
-/// them would take away what the ACL grants named users and groups.
-const TIDY_RECEIVED_ACLS: &[u8] =
-    b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} + && \
-      find . ! -type l -perm -040 ! -perm -004 -exec sh -c 'for f do case $(ls -ldn -- \"$f\") in ??????????+*) ;; *) chmod g-r -- \"$f\" || exit 1;; esac; done' sh {} + && \
-      find . ! -type l -perm -020 ! -perm -002 -exec sh -c 'for f do case $(ls -ldn -- \"$f\") in ??????????+*) ;; *) chmod g-w -- \"$f\" || exit 1;; esac; done' sh {} + && \
-      find . ! -type l -perm -010 ! -perm -001 -exec sh -c 'for f do case $(ls -ldn -- \"$f\") in ??????????+*) ;; *) chmod g-x -- \"$f\" || exit 1;; esac; done' sh {} +";
+/// The first part of [`TIDY_RECEIVED`].
+const STRIP_SETID_CMD: &[u8] =
+    b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +";
 
-/// Whether `p` (not followed) has a POSIX access ACL (Linux).
-fn has_access_acl(p: &Path) -> bool {
+/// The rest of [`TIDY_RECEIVED`].
+const CAP_GROUP_CMD: &[u8] = b"find . ! -type l -perm -040 ! -perm -004 -exec chmod g-r {} + && \
+      find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
+      find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +";
+
+/// [`TIDY_RECEIVED`] when ACLs travelled. On an entry with a POSIX ACL the
+/// group bits are its mask, which named users and groups depend on: there
+/// only the owning group's own entry (`group::`) is capped at `other::`.
+/// Needs python3 to edit ACLs; without it, the plain caps apply (safe, but
+/// named entries lose what the mask allowed them).
+fn tidy_received_acls() -> Vec<u8> {
+    cat(&[
+        STRIP_SETID_CMD,
+        b" && if command -v python3 >/dev/null 2>&1; then python3 -c '",
+        ACL_CAP_PY,
+        b"'; else ",
+        CAP_GROUP_CMD,
+        b"; fi",
+    ])
+}
+
+/// The python walk of [`tidy_received_acls`] (no single quotes).
+const ACL_CAP_PY: &[u8] = br#"import os,stat,struct
+N="system.posix_acl_access"
+def cap(p):
+    st=os.lstat(p)
+    if stat.S_ISLNK(st.st_mode):
+        return
+    try:
+        a=os.getxattr(p,N,follow_symlinks=False)
+    except OSError:
+        a=None
+    if a and len(a)>=4 and (len(a)-4)%8==0:
+        e=[list(struct.unpack_from("<HHI",a,4+8*i)) for i in range((len(a)-4)//8)]
+        o=[x[1] for x in e if x[0]==0x20]
+        if o:
+            for x in e:
+                if x[0]==4:
+                    x[1]&=o[0]
+            b=a[:4]+b"".join(struct.pack("<HHI",*x) for x in e)
+            if b!=a:
+                os.setxattr(p,N,b,follow_symlinks=False)
+            return
+    m=st.st_mode&0o7777
+    n=(m&~0o070)|(m&0o070&((m&7)<<3))
+    if n!=m:
+        os.chmod(p,n)
+cap(".")
+for d,ds,fs in os.walk("."):
+    for y in ds+fs:
+        cap(os.path.join(d,y))"#;
+
+/// A POSIX ACL (Linux xattr form) with its `group::` entry capped at its
+/// `other::` entry; `None` when `acl` is not one.
+pub fn cap_acl_group(acl: &[u8]) -> Option<Vec<u8>> {
+    if acl.len() < 4 || !(acl.len() - 4).is_multiple_of(8) {
+        return None;
+    }
+    let mut out = acl.to_vec();
+    let entries = (acl.len() - 4) / 8;
+    let tag = |i: usize| u16::from_le_bytes([acl[4 + 8 * i], acl[5 + 8 * i]]);
+    let perm = |i: usize| u16::from_le_bytes([acl[6 + 8 * i], acl[7 + 8 * i]]);
+    let other = (0..entries).find(|&i| tag(i) == 0x20).map(perm)?;
+    for i in (0..entries).filter(|&i| tag(i) == 0x04) {
+        out[6 + 8 * i..8 + 8 * i].copy_from_slice(&(perm(i) & other).to_le_bytes());
+    }
+    Some(out)
+}
+
+/// Linux: cap the `group::` entry of `p`'s access ACL ([`cap_acl_group`]);
+/// `false` when `p` has none (then its mode bits are capped instead).
+#[cfg(unix)]
+fn cap_access_acl(p: &Path) -> std::io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
-        matches!(
-            crate::platform::xattr_get_path(p, "system.posix_acl_access"),
-            Ok(Some(_))
-        )
+        const N: &str = "system.posix_acl_access";
+        let Some(acl) = crate::platform::xattr_get_path(p, N)? else {
+            return Ok(false);
+        };
+        let Some(capped) = cap_acl_group(&acl) else {
+            return Ok(false);
+        };
+        if capped != acl {
+            crate::platform::xattr_set_path(p, N, &capped)?;
+        }
+        Ok(true)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = p;
-        false
+        Ok(false)
     }
 }
 
@@ -562,7 +635,7 @@ pub fn cap_group(mode: u32) -> u32 {
 }
 
 /// [`TIDY_RECEIVED`] for a local stage (links are never followed);
-/// `acls`: like [`TIDY_RECEIVED_ACLS`].
+/// `acls`: like [`tidy_received_acls`].
 #[cfg(unix)]
 fn tidy_received(dir: &Path, acls: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -573,7 +646,7 @@ fn tidy_received(dir: &Path, acls: bool) -> std::io::Result<()> {
             continue;
         }
         let old = m.permissions().mode() & 0o7777;
-        let mut mode = if acls && has_access_acl(&q) {
+        let mut mode = if acls && cap_access_acl(&q)? {
             old
         } else {
             cap_group(old)
@@ -4632,49 +4705,81 @@ mod tests {
         );
     }
 
-    /// Linux: with ACLs kept, an entry that has one keeps its group bits
-    /// (its mask, which named users depend on); one without is capped.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn real_kept_acls_keep_their_mask() {
-        use std::os::unix::fs::PermissionsExt;
-        let t = tempfile::tempdir().unwrap();
-        let d = private_dir(t.path(), "d");
-        let (with, plain) = (d.join("with acl"), d.join("plain"));
-        for f in [&with, &plain] {
-            fs::write(f, "x").unwrap();
-            fs::set_permissions(f, fs::Permissions::from_mode(0o640)).unwrap();
-        }
-        // user::rw- user:65534:r-- group::r-- mask::r-- other::---
+    /// An ACL blob (Linux xattr form) from (tag, perm, id) entries.
+    fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
         let mut acl = 2u32.to_le_bytes().to_vec();
-        for (tag, perm, id) in [
-            (1u16, 6u16, u32::MAX),
-            (2, 4, 65534),
-            (4, 4, u32::MAX),
-            (0x10, 4, u32::MAX),
-            (0x20, 0, u32::MAX),
-        ] {
+        for (tag, perm, id) in entries {
             acl.extend(tag.to_le_bytes());
             acl.extend(perm.to_le_bytes());
             acl.extend(id.to_le_bytes());
         }
-        if let Err(e) = crate::platform::xattr_set_path(&with, "system.posix_acl_access", &acl) {
+        acl
+    }
+
+    // user::rw- user:65534:r-- group::r-- mask::r-- other::---
+    const SHARED: [(u16, u16, u32); 5] = [
+        (1, 6, u32::MAX),
+        (2, 4, 65534),
+        (4, 4, u32::MAX),
+        (0x10, 4, u32::MAX),
+        (0x20, 0, u32::MAX),
+    ];
+
+    #[test]
+    fn an_acls_owning_group_entry_is_capped_at_other() {
+        let mut want = SHARED;
+        want[2].1 = 0; // group:: only; the named user and the mask stay
+        assert_eq!(cap_acl_group(&acl_blob(&SHARED)), Some(acl_blob(&want)));
+        let open = [(1, 6, u32::MAX), (4, 4, u32::MAX), (0x20, 4, u32::MAX)];
+        assert_eq!(cap_acl_group(&acl_blob(&open)), Some(acl_blob(&open)));
+        assert_eq!(cap_acl_group(b"\x02\0\0\0\x01"), None, "torn");
+        assert_eq!(cap_acl_group(&acl_blob(&[(1, 6, 0)])), None, "no other::");
+    }
+
+    /// Linux: with ACLs kept, an entry with one keeps its mode (the mask,
+    /// which named users depend on) and only its `group::` is capped; one
+    /// without has its mode capped. Through python3 and in Rust alike.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_kept_acls_keep_their_mask_and_cap_the_owning_group() {
+        use std::os::unix::fs::PermissionsExt;
+        const N: &str = "system.posix_acl_access";
+        let python = sh(b"command -v python3").status.success();
+        let t = tempfile::tempdir().unwrap();
+        let d = private_dir(t.path(), "d");
+        let (with, plain) = (d.join("with acl"), d.join("plain"));
+        let reset = || {
+            for f in [&with, &plain] {
+                fs::write(f, "x").unwrap();
+                fs::set_permissions(f, fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            crate::platform::xattr_set_path(&with, N, &acl_blob(&SHARED))
+        };
+        if let Err(e) = reset() {
             eprintln!("no POSIX ACLs here ({e}), skipped");
             return;
         }
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        let out = sh(&cat(&[
-            b"cd -- ",
-            &sh_quote(&b(&d)),
-            b" && ",
-            TIDY_RECEIVED_ACLS,
-        ]));
-        assert!(out.status.success(), "{out:?}");
-        assert_eq!((mode(&with), mode(&plain)), (0o640, 0o600));
-        fs::set_permissions(&plain, fs::Permissions::from_mode(0o640)).unwrap();
+        let mut want = SHARED;
+        want[2].1 = 0;
+        let check = || {
+            assert_eq!((mode(&with), mode(&plain)), (0o640, 0o600));
+            let got = crate::platform::xattr_get_path(&with, N).unwrap().unwrap();
+            assert_eq!(got, acl_blob(&want));
+        };
+        if python {
+            let out = sh(&cat(&[
+                b"cd -- ",
+                &sh_quote(&b(&d)),
+                b" && ",
+                &tidy_received_acls(),
+            ]));
+            assert!(out.status.success(), "{out:?}");
+            check();
+            reset().unwrap();
+        }
         tidy_received(&d, true).unwrap();
-        assert_eq!((mode(&with), mode(&plain)), (0o640, 0o600));
-        assert!(has_access_acl(&with));
+        check();
     }
 
     #[test]
@@ -4709,9 +4814,13 @@ mod tests {
         assert!(tar_in_cmd(b"/st", x).starts_with(b"cd -- '/st' || exit 1; tar --xattrs"));
         // with ACLs kept, entries that have one are not capped
         let acl_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::ACLS)).unwrap();
-        assert!(acl_in.contains("??????????+*) ;;"), "{acl_in}");
+        assert!(acl_in.contains("system.posix_acl_access"), "{acl_in}");
         let plain_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::NONE)).unwrap();
-        assert!(!plain_in.contains("ls -ldn"), "{plain_in}");
+        assert!(!plain_in.contains("python3"), "{plain_in}");
+        assert!(
+            !String::from_utf8_lossy(ACL_CAP_PY).contains('\''),
+            "no single quotes"
+        );
         assert_eq!(xattr_plan(false, false, false), XattrPlan::None);
         assert_eq!(xattr_plan(true, true, true), XattrPlan::Keep);
         assert_eq!(xattr_plan(true, true, false), XattrPlan::Lost);
