@@ -121,7 +121,7 @@ struct Builder {
     heading: Option<u8>,
     /// Targets of the open links / images, and where their text starts
     /// (segment index, byte offset in it) in the current inline buffer.
-    links: Vec<(String, usize, usize)>,
+    links: Vec<(UrlHead, usize, usize)>,
     in_image: usize,
     code: Option<String>,
     table: Option<Table>,
@@ -477,11 +477,11 @@ impl Builder {
             Tag::Strikethrough => self.strike += 1,
             Tag::Link { dest_url, .. } => {
                 let at = self.text_mark();
-                self.links.push((dest_url.to_string(), at.0, at.1));
+                self.links.push((UrlHead::of(&dest_url), at.0, at.1));
             }
             Tag::Image { dest_url, .. } => {
                 let at = self.text_mark();
-                self.links.push((dest_url.to_string(), at.0, at.1));
+                self.links.push((UrlHead::of(&dest_url), at.0, at.1));
                 self.in_image += 1;
                 self.push_text(crate::i18n::t("[그림: ", "[image: "), Kind::Marker);
             }
@@ -587,15 +587,15 @@ impl Builder {
                         t
                     });
                 }
-                if !url.is_empty() && text != url {
-                    self.push_text(&format!(" ({})", short_url(&url)), Kind::Url);
+                if url.len > 0 && !url.is(&text) {
+                    self.push_text(&format!(" ({})", url.short()), Kind::Url);
                 }
             }
             TagEnd::Image => {
                 let (url, ..) = self.links.pop().unwrap_or_default();
                 self.in_image = self.in_image.saturating_sub(1);
                 self.push_text("] ", Kind::Marker);
-                self.push_text(&short_url(&url), Kind::Url);
+                self.push_text(&url.short(), Kind::Url);
             }
             TagEnd::TableCell => {
                 let cell = std::mem::take(&mut self.cell);
@@ -650,8 +650,11 @@ impl Builder {
         let top = rule("┌", "┬", "┐");
         let mut line = self.prefix(false);
         line.push((top, bar));
-        self.out.push(line);
+        self.push_line(line);
         for (ri, row) in t.rows.iter().enumerate() {
+            if self.stopped {
+                break;
+            }
             let mut line = self.prefix(false);
             line.push(("│".into(), bar));
             for (i, w) in widths.iter().enumerate() {
@@ -678,16 +681,61 @@ impl Builder {
             if more {
                 line.push(("…".into(), bar));
             }
-            self.out.push(line);
+            self.push_line(line);
             if ri + 1 == t.head_rows {
                 let mut line = self.prefix(false);
                 line.push((rule("├", "┼", "┤"), bar));
-                self.out.push(line);
+                self.push_line(line);
             }
         }
         let mut line = self.prefix(false);
         line.push((rule("└", "┴", "┘"), bar));
+        self.push_line(line);
+    }
+
+    /// Add a finished line, counting its text toward [`MAX_OUTPUT`].
+    fn push_line(&mut self, line: MdLine) {
+        let bytes = line.iter().map(|(t, _)| t.len()).sum();
+        self.grow(bytes);
         self.out.push(line);
+    }
+}
+
+/// What a link keeps of its target: the length and the first bytes, enough
+/// to show it cut ([`URL_MAX`]) and to tell a bare link (text = target).
+/// A huge target used by many links is never copied whole.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct UrlHead {
+    head: String,
+    len: usize,
+}
+
+impl UrlHead {
+    const KEEP: usize = 4 * URL_MAX + 64;
+
+    fn of(url: &str) -> Self {
+        let mut end = url.len().min(Self::KEEP);
+        while !url.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self {
+            head: url[..end].to_string(),
+            len: url.len(),
+        }
+    }
+
+    /// Whether `text` is this target (a cut one: same length and start).
+    fn is(&self, text: &str) -> bool {
+        text.len() == self.len && text.starts_with(&self.head)
+    }
+
+    fn short(&self) -> String {
+        let s = short_url(&self.head);
+        if self.head.len() < self.len && !s.ends_with('…') {
+            format!("{s}…")
+        } else {
+            s
+        }
     }
 }
 
@@ -945,6 +993,57 @@ mod tests {
         let wide = format!("{}가{}", "a".repeat(URL_MAX - 2), "b".repeat(5));
         assert_eq!(short_url(&wide), format!("{}…", "a".repeat(URL_MAX - 2)));
         assert!(short_url(&wide).width() <= URL_MAX);
+    }
+
+    #[test]
+    fn a_huge_url_used_many_times_is_not_copied_each_time() {
+        // 10,000 references to one 1 MiB target: copying it per link would
+        // move 10 GiB
+        let url = "u".repeat(1 << 20);
+        let mut src = format!("[r]: {url}\n\n");
+        for _ in 0..10_000 {
+            src.push_str("[a][r] ");
+        }
+        let start = std::time::Instant::now();
+        let lines = render(&src, 80);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        let first: String = lines.iter().take(3).map(plain).collect();
+        assert!(
+            first.starts_with("a (uuu"),
+            "{}",
+            &first[..60.min(first.len())]
+        );
+        // a bare link is still shown once, long or not
+        let long = format!("<https://x.y/{}>", "p".repeat(3000));
+        let all: String = render(&long, 80).iter().map(plain).collect();
+        assert_eq!(all.matches("https://x.y/").count(), 1, "{}", all.len());
+    }
+
+    #[test]
+    fn table_padding_and_borders_count_toward_the_output_cap() {
+        // a wide header over 200,000 empty rows: tiny input, huge padding
+        let cols = 12;
+        let mut src = String::from("|");
+        for _ in 0..cols {
+            src.push_str(&"h".repeat(80));
+            src.push('|');
+        }
+        src.push('\n');
+        src.push_str(&"|-".repeat(cols));
+        src.push_str("|\n");
+        for _ in 0..200_000 {
+            src.push_str(&"|".repeat(cols + 1));
+            src.push('\n');
+        }
+        let start = std::time::Instant::now();
+        let lines = render(&src, 80);
+        let total: usize = lines.iter().map(|l| plain(l).len()).sum();
+        assert!(total <= MAX_OUTPUT + 64 * 1024, "{total}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

@@ -57,6 +57,11 @@ pub struct TreeView {
     /// The folder under the cursor (stays on it while rows change).
     cursor: PathBuf,
     pub scroll: usize,
+    /// [`TreeView::rows`], kept until the tree changes (cursor moves and
+    /// redraws reuse it).
+    cache: std::cell::RefCell<Option<std::sync::Arc<Vec<Row>>>>,
+    /// Test seam: how many times the rows were built.
+    builds: std::cell::Cell<usize>,
 }
 
 /// `path` and its ancestors, root first.
@@ -79,6 +84,8 @@ impl TreeView {
             children: HashMap::new(),
             cursor: start.to_path_buf(),
             scroll: 0,
+            cache: Default::default(),
+            builds: Default::default(),
         }
     }
 
@@ -94,7 +101,20 @@ impl TreeView {
         for p in &out {
             self.children.insert(p.clone(), Children::Loading);
         }
+        if !out.is_empty() {
+            self.changed();
+        }
         out
+    }
+
+    /// The rows must be built again.
+    fn changed(&self) {
+        self.cache.borrow_mut().take();
+    }
+
+    /// Test seam: how many times [`TreeView::rows`] built the rows.
+    pub fn row_builds(&self) -> usize {
+        self.builds.get()
     }
 
     /// A listing of `dir` arrived, already in [`sort_subs`] order.
@@ -124,12 +144,20 @@ impl TreeView {
             Err(e) => Children::Failed(e),
         };
         self.children.insert(dir.to_path_buf(), c);
+        self.changed();
     }
 
-    pub fn rows(&self) -> Vec<Row> {
+    /// Every row, top to bottom; built once per change of the tree.
+    pub fn rows(&self) -> std::sync::Arc<Vec<Row>> {
+        if let Some(r) = self.cache.borrow().as_ref() {
+            return std::sync::Arc::clone(r);
+        }
         let mut out = Vec::new();
         let name = self.root.to_string_lossy().into_owned();
         self.push(&mut out, &self.root, name, false, 0, Vec::new());
+        self.builds.set(self.builds.get() + 1);
+        let out = std::sync::Arc::new(out);
+        *self.cache.borrow_mut() = Some(std::sync::Arc::clone(&out));
         out
     }
 
@@ -227,8 +255,10 @@ impl TreeView {
     pub fn expand(&mut self) -> Vec<PathBuf> {
         let rows = self.rows();
         let i = self.cursor_index(&rows);
-        if let RowKind::Folder { link: false, .. } = rows[i].kind {
-            self.expanded.insert(rows[i].path.clone());
+        if let RowKind::Folder { link: false, .. } = rows[i].kind
+            && self.expanded.insert(rows[i].path.clone())
+        {
+            self.changed();
         }
         self.wanted()
     }
@@ -250,6 +280,7 @@ impl TreeView {
                 self.expanded.remove(&p);
                 // a later expand reads it afresh
                 self.children.remove(&p);
+                self.changed();
             }
             _ => {
                 if let Some(parent) = p.parent().filter(|_| p != self.root) {
@@ -673,5 +704,32 @@ mod tests {
         t.loaded(Path::new("/locked"), Err("permission denied".into()));
         t.collapse();
         assert_eq!(t.cursor(), Path::new("/locked"));
+    }
+
+    #[test]
+    fn rows_are_built_once_until_the_tree_changes() {
+        let mut t = tree();
+        let _ = t.rows();
+        let built = t.row_builds();
+        for _ in 0..5 {
+            t.move_by(1);
+            let _ = t.rows();
+            let _ = t.shown();
+        }
+        t.move_by(-5);
+        assert_eq!(t.row_builds(), built, "moving reuses the rows");
+        t.move_by(3); // from / to src
+        assert_eq!(t.cursor(), Path::new("/home/me/src"));
+        let wanted = t.expand();
+        assert_eq!(names(&t).len(), 7, "a loading row appeared");
+        t.loaded(&wanted[0], sorted(vec![sub("/home/me/src", "a")]));
+        assert!(
+            names(&t).contains(&"        a".to_string()),
+            "{:?}",
+            names(&t)
+        );
+        t.collapse();
+        assert!(!names(&t).contains(&"        a".to_string()));
+        assert!(t.row_builds() > built);
     }
 }

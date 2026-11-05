@@ -3202,7 +3202,7 @@ impl App {
         let task =
             self.tick_task() | self.tick_viewer_load() | self.tick_probe() | self.tick_uploads();
         let spawned = self.tick_spawn() | self.tick_place() | self.tick_tree();
-        let preview = self.tick_preview();
+        let preview = self.tick_preview() | self.viewer.as_mut().is_some_and(|v| v.tick_md());
         self.track_history();
         // the Classic clock: redraw once the minute it shows has passed
         let minute = self.mode == Mode::Classic

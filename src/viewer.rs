@@ -1,5 +1,6 @@
 //! F3 full-screen text viewer: state, scrolling, search and rendering.
-//! Loading happens elsewhere (a background task); this module is pure.
+//! Loading happens elsewhere (a background task); a big Markdown document is
+//! laid out on a worker thread ([`Viewer::tick_md`] picks the result up).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,10 +61,61 @@ impl LineIndex {
     }
 }
 
+/// Markdown at least this big is laid out on a worker, off the UI thread.
+pub const MD_ASYNC: usize = 64 * 1024;
+
+/// Formatted lines for one width.
+#[derive(Debug)]
+struct Layout {
+    width: usize,
+    lines: Vec<crate::markdown::MdLine>,
+    plain: Vec<String>,
+    max_width: usize,
+}
+
+fn layout(source: &str, width: usize) -> Layout {
+    let lines = crate::markdown::render(source, width);
+    let plain: Vec<String> = lines.iter().map(crate::markdown::plain).collect();
+    let max_width = plain.iter().map(|l| l.width()).max().unwrap_or(0);
+    Layout {
+        width,
+        lines,
+        plain,
+        max_width,
+    }
+}
+
+/// A layout being made on a worker, for `.0` columns.
+#[derive(Clone, Default)]
+struct Pending(
+    Option<(
+        usize,
+        std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Layout>>>,
+    )>,
+);
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pending({:?})", self.0.as_ref().map(|p| p.0))
+    }
+}
+
+/// A worker is not part of what a viewer shows.
+impl PartialEq for Pending {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Pending {}
+
 /// A Markdown document: its source and the formatted lines for one width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MdView {
-    source: String,
+    source: std::sync::Arc<str>,
+    /// The width wanted (the screen's); `width` catches up with it.
+    want: usize,
+    pending: Pending,
     /// Showing the source instead of the formatted text.
     raw: bool,
     /// Width `lines` were laid out for (0: not yet).
@@ -127,15 +179,81 @@ impl Viewer {
         self.md.as_ref().is_some_and(|m| !m.raw)
     }
 
-    /// Lay the Markdown out for `width` columns (when that changed).
+    /// Lay the Markdown out for `width` columns (when that changed): right
+    /// away for a small document, on a worker for a big one ([`MD_ASYNC`]),
+    /// one at a time.
     fn layout_md(&mut self, width: usize) {
-        let Some(m) = self.md.as_mut().filter(|m| !m.raw && m.width != width) else {
+        let Some(m) = self.md.as_mut().filter(|m| !m.raw) else {
             return;
         };
-        m.lines = crate::markdown::render(&m.source, width);
-        m.plain = m.lines.iter().map(crate::markdown::plain).collect();
-        m.max_width = m.plain.iter().map(|l| l.width()).max().unwrap_or(0);
-        m.width = width;
+        m.want = width;
+        if m.width == width {
+            return;
+        }
+        if m.source.len() < MD_ASYNC {
+            let l = layout(&m.source, width);
+            self.adopt(l);
+        } else if m.pending.0.is_none() {
+            Self::spawn_layout(m, width);
+        }
+    }
+
+    fn spawn_layout(m: &mut MdView, width: usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let src = std::sync::Arc::clone(&m.source);
+        std::thread::spawn(move || {
+            let _ = tx.send(layout(&src, width));
+        });
+        m.pending = Pending(Some((
+            width,
+            std::sync::Arc::new(std::sync::Mutex::new(rx)),
+        )));
+    }
+
+    /// Take a finished layout; another starts when the width changed
+    /// meanwhile. True when there is something new to draw.
+    pub fn tick_md(&mut self) -> bool {
+        let Some(m) = self.md.as_mut() else {
+            return false;
+        };
+        let Some((_, rx)) = m.pending.0.as_ref() else {
+            return false;
+        };
+        let got = match rx.lock() {
+            Ok(r) => r.try_recv(),
+            Err(_) => Err(std::sync::mpsc::TryRecvError::Disconnected),
+        };
+        let l = match got {
+            Ok(l) => l,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            // the worker died: nothing to wait for
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                m.pending = Pending(None);
+                return false;
+            }
+        };
+        m.pending = Pending(None);
+        if !m.raw && m.want != l.width {
+            let want = m.want;
+            Self::spawn_layout(m, want);
+        }
+        self.adopt(l);
+        true
+    }
+
+    /// Whether a layout is still being made.
+    pub fn md_pending(&self) -> bool {
+        self.md.as_ref().is_some_and(|m| m.pending.0.is_some())
+    }
+
+    fn adopt(&mut self, l: Layout) {
+        let Some(m) = self.md.as_mut() else {
+            return;
+        };
+        m.lines = l.lines;
+        m.plain = l.plain;
+        m.max_width = l.max_width;
+        m.width = l.width;
         // line numbers changed: searches and indexes start over
         self.lower = None;
         self.line_index.clear();
@@ -156,7 +274,9 @@ impl Viewer {
                 self.max_width = lines.iter().map(|l| l.width()).max().unwrap_or(0);
                 if crate::markdown::is_markdown(&self.path) {
                     self.md = Some(MdView {
-                        source: lines.join("\n"),
+                        source: lines.join("\n").into(),
+                        want: 0,
+                        pending: Pending::default(),
                         raw: false,
                         width: 0,
                         lines: Vec::new(),
@@ -452,6 +572,12 @@ pub fn render(frame: &mut Frame, v: &mut Viewer, theme: &Theme, close_hint: &str
     match &v.content {
         Content::Text { .. } if v.formatted() => {
             let m = v.md.as_ref().expect("formatted");
+            if m.lines.is_empty() && m.pending.0.is_some() {
+                lines.push(Line::styled(
+                    fit_width(t(" 서식 적용 중…", " Formatting…"), w),
+                    base,
+                ));
+            }
             for (i, l) in m.lines.iter().enumerate().skip(v.scroll).take(v.rows) {
                 let mut spans = md_window(l, v.hscroll, w, theme);
                 if v.match_line == Some(i) {
@@ -911,6 +1037,43 @@ mod md_tests {
             })
             .collect();
         (rows, buf)
+    }
+
+    /// Wait for the worker's layout (a big document).
+    fn settle(v: &mut Viewer) -> bool {
+        let start = std::time::Instant::now();
+        let mut got = false;
+        while v.md_pending() {
+            got |= v.tick_md();
+            assert!(start.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        got
+    }
+
+    #[test]
+    fn a_big_markdown_file_is_laid_out_off_the_ui_thread() {
+        let body = "단어 ".repeat(40);
+        let mut src = String::from("# 큰 문서\n\n");
+        while src.len() < MD_ASYNC + 1 {
+            src.push_str(&body);
+            src.push_str("\n\n");
+        }
+        let mut v = md(&src);
+        let (rows, _) = draw(&mut v, 40, 8);
+        assert!(rows[1].contains("서식 적용 중"), "{rows:?}");
+        assert!(v.md_pending());
+        assert!(settle(&mut v), "the layout arrived");
+        let (rows, _) = draw(&mut v, 40, 8);
+        assert_eq!(rows[1].trim_end(), "큰 문서");
+        // resized while the next one is being made: ends at the last width
+        let _ = draw(&mut v, 60, 8);
+        let _ = draw(&mut v, 30, 8);
+        settle(&mut v);
+        assert_eq!(v.md.as_ref().unwrap().width, 30, "the newest width wins");
+        let (rows, _) = draw(&mut v, 30, 8);
+        assert!(rows[4].trim_end().len() <= 30 * 3, "{rows:?}");
+        assert!(!v.tick_md(), "nothing more to do");
     }
 
     #[test]
