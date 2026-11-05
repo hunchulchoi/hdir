@@ -390,6 +390,7 @@ fn copy_file_in(
         meta_copy = crate::platform::copy_xattrs_fd(&input, &out);
         // Windows access rules (nothing elsewhere)
         if let Err(e) = crate::platform::copy_dacl(src, &tmp) {
+            meta_copy.lost.push("DACL".into());
             meta_copy.err.get_or_insert(e);
         }
         out.set_permissions(kept_permissions(meta, meta_copy.acl_lost))?;
@@ -668,6 +669,7 @@ fn copy_dir(
             };
             // last, after the children: restrictive rules could block them
             if let Err(e) = crate::platform::copy_dacl(src, dest) {
+                meta_copy.lost.push("DACL".into());
                 meta_copy.err.get_or_insert(e);
             }
             set_dir_modified(dest, meta.modified()?)?;
@@ -1731,6 +1733,50 @@ mod tests {
         );
         assert_eq!(r.outcome, OpOutcome::Done);
         assert_eq!(mode(&t.path().join("dst2/d/f")), 0o644);
+        // the same ACL entries as the source, on the file and the folder
+        let entries = |p: &Path| -> Vec<String> {
+            let out = std::process::Command::new("ls")
+                .arg("-led")
+                .arg(p)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .skip(1)
+                .map(|l| l.trim().to_string())
+                .collect()
+        };
+        for rel in ["d/f", "d"] {
+            let want = entries(&src.join(rel));
+            assert!(
+                !want.is_empty() && want[0].contains("nobody deny"),
+                "{want:?}"
+            );
+            assert_eq!(entries(&t.path().join("dst2").join(rel)), want, "{rel}");
+        }
+    }
+
+    /// Windows: access rules that cannot follow keep a source moved across
+    /// volumes, and a copy warns.
+    #[cfg(windows)]
+    #[test]
+    fn a_dacl_that_cannot_follow_keeps_a_moved_source() {
+        let t = tempdir().unwrap();
+        let dst = t.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        let f = t.path().join("f.txt");
+        fs::write(&f, "x").unwrap();
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
+        let r = crate::platform::refuse_xattr_writes(|| {
+            move_items_with(std::slice::from_ref(&f), &dst, &mut ctl(), &exdev)
+        });
+        assert!(f.exists(), "source kept");
+        assert_eq!(r.partial, 1, "{r:?}");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("DACL")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     #[test]

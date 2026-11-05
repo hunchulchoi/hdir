@@ -1417,6 +1417,10 @@ mod plain_name_tests {
 pub fn copy_dacl(src: &Path, dst: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
+        #[cfg(test)]
+        if writes_refused() {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
         use windows_sys::Win32::Security::Authorization::{
