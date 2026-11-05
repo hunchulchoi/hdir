@@ -192,6 +192,15 @@ impl TreeView {
         &self.cursor
     }
 
+    /// The folder of the highlighted row: the cursor, or while it is not
+    /// shown yet (loading, unreadable), the ancestor it shows on. What Enter
+    /// opens.
+    pub fn shown(&self) -> PathBuf {
+        let rows = self.rows();
+        rows.get(self.cursor_index(&rows))
+            .map_or_else(|| self.cursor.clone(), |r| r.path.clone())
+    }
+
     /// Move by `delta` folder rows (placeholders are skipped).
     pub fn move_by(&mut self, delta: isize) {
         let rows = self.rows();
@@ -235,6 +244,9 @@ impl TreeView {
                 expanded: true,
                 link: false,
             } if p != self.root || self.expanded.contains(&p) => {
+                // the cursor may sit below, on a row not shown yet: it
+                // lands on the folder it showed on
+                self.cursor = p.clone();
                 self.expanded.remove(&p);
                 // a later expand reads it afresh
                 self.children.remove(&p);
@@ -638,5 +650,28 @@ mod tests {
         t.cursor = PathBuf::from("/home/me/src/deep");
         let rows = t.rows();
         assert_eq!(rows[t.cursor_index(&rows)].path, Path::new("/home/me/src"));
+    }
+
+    #[test]
+    fn collapsing_the_shown_ancestor_moves_the_cursor_onto_it() {
+        // /home is still loading: the cursor (/home/me) is not a row yet
+        let mut t = TreeView::new(Path::new("/home/me"));
+        t.wanted();
+        t.loaded(
+            Path::new("/"),
+            sorted(vec![sub("/", "home"), sub("/", "usr")]),
+        );
+        let rows = t.rows();
+        assert_eq!(rows[t.cursor_index(&rows)].path, Path::new("/home"));
+        assert_eq!(t.shown(), Path::new("/home"), "what Enter opens");
+        t.collapse(); // closes /home, the row the cursor shows on
+        assert_eq!(t.cursor(), Path::new("/home"), "Enter opens what is shown");
+        // a folder whose listing failed: same
+        let mut t = TreeView::new(Path::new("/locked/inner"));
+        t.wanted();
+        t.loaded(Path::new("/"), sorted(vec![sub("/", "locked")]));
+        t.loaded(Path::new("/locked"), Err("permission denied".into()));
+        t.collapse();
+        assert_eq!(t.cursor(), Path::new("/locked"));
     }
 }
