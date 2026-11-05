@@ -1688,26 +1688,27 @@ fn has_acls(
 }
 
 /// Whether `dir/name` on a Linux sending side (`None`: local) has `user.*`
-/// xattrs. Other systems, and a server with no way to tell, say no.
+/// xattrs; `None` when that server has no way to tell. Other systems say
+/// no.
 fn has_user_xattrs(
     side: Option<&RemoteSession>,
     dir: &Path,
     name: &OsString,
     cancel: &AtomicBool,
-) -> bool {
+) -> Option<bool> {
     match side {
-        None => {
+        None => Some(
             cfg!(target_os = "linux")
-                && crate::platform::tree_has_lost_xattrs(&dir.join(name), cancel)
-        }
+                && crate::platform::tree_has_lost_xattrs(&dir.join(name), cancel),
+        ),
         Some(s) if matches!(s.os, RemoteOs::Linux) => {
             let out = s.exec_cancellable(&user_xattr_scan_cmd(&b(dir), &os_bytes(name)), cancel);
             match out {
-                Ok(o) => parse_user_xattr_scan(o.code, &o.stdout).unwrap_or(false),
-                Err(_) => true,
+                Ok(o) => parse_user_xattr_scan(o.code, &o.stdout),
+                Err(_) => Some(true),
             }
         }
-        Some(_) => false,
+        Some(_) => Some(false),
     }
 }
 
@@ -1739,8 +1740,8 @@ fn xattrs_for(route: &Route, src_dir: &Path, name: &OsString, cancel: &AtomicBoo
         Route::Between(s, d) => (Some(*s), Some(*d)),
         // one server: GNU cp keeps them (or fails, which keeps a source)
         Route::SameHost(s) => {
-            let has =
-                matches!(s.os, RemoteOs::Linux) && has_user_xattrs(Some(*s), src_dir, name, cancel);
+            let has = matches!(s.os, RemoteOs::Linux)
+                && has_user_xattrs(Some(*s), src_dir, name, cancel) == Some(true);
             return if has {
                 XattrPlan::Keep
             } else {
@@ -1748,10 +1749,14 @@ fn xattrs_for(route: &Route, src_dir: &Path, name: &OsString, cancel: &AtomicBoo
             };
         }
     };
-    if cfg!(windows) || !has_user_xattrs(from, src_dir, name, cancel) {
-        return XattrPlan::None;
+    match has_user_xattrs(from, src_dir, name, cancel) {
+        Some(false) => XattrPlan::None,
+        Some(true) => xattr_plan(true, tar_xattrs_ok(from), tar_xattrs_ok(to)),
+        // no way to tell: carried along when both tars can (harmless if
+        // there are none); otherwise, as before, not known to be lost
+        None if tar_xattrs_ok(from) && tar_xattrs_ok(to) => XattrPlan::Keep,
+        None => XattrPlan::None,
     }
-    xattr_plan(true, tar_xattrs_ok(from), tar_xattrs_ok(to))
 }
 
 /// Whether this side's tar can carry POSIX ACLs (`None`: local). Asked
@@ -4569,6 +4574,27 @@ mod tests {
         assert_eq!(
             crate::platform::xattr_get_path(&st.join("f"), "user.hdir").unwrap(),
             Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_tell_still_sends_xattrs_when_both_tars_can() {
+        let (from, to) = (xattr_host("unknown\n", 0), xattr_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        let joined = from.pipe_calls()[0].join(" ");
+        assert_eq!(
+            joined.matches("--xattrs --xattrs-include=").count(),
+            2,
+            "{joined}"
         );
     }
 
