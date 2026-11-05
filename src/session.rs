@@ -510,6 +510,8 @@ pub struct RemoteSession {
     alive: AtomicBool,
     /// Whether the server's tar carries POSIX ACLs, once asked.
     tar_acls: std::sync::OnceLock<bool>,
+    /// Whether the server's tar carries `user.*` xattrs, once asked.
+    tar_xattrs: std::sync::OnceLock<bool>,
     /// This boot of the server ([`crate::transfer::HOST_ID_CMD`]), once asked.
     host_id: std::sync::OnceLock<Option<String>>,
 }
@@ -550,6 +552,7 @@ impl RemoteSession {
             cmd,
             alive: AtomicBool::new(true),
             tar_acls: std::sync::OnceLock::new(),
+            tar_xattrs: std::sync::OnceLock::new(),
             host_id: std::sync::OnceLock::new(),
         }
     }
@@ -558,6 +561,11 @@ impl RemoteSession {
     /// connection.
     pub fn tar_acls(&self, ask: impl FnOnce() -> bool) -> bool {
         *self.tar_acls.get_or_init(ask)
+    }
+
+    /// Like [`tar_acls`](Self::tar_acls), for `user.*` xattrs.
+    pub fn tar_xattrs(&self, ask: impl FnOnce() -> bool) -> bool {
+        *self.tar_xattrs.get_or_init(ask)
     }
 
     /// Like [`tar_acls`](Self::tar_acls): asked once per connection.

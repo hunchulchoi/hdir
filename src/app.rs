@@ -10694,6 +10694,9 @@ mod tests {
                 if c.contains("ls -dn --") {
                     return Some(out(0, "0\n")); // no ACLs
                 }
+                if c.contains("then python3 -c '") {
+                    return Some(out(0, "0\n")); // no user.* xattrs
+                }
                 if c.contains("for f do printf .") {
                     return Some(out(0, "1\n")); // the entry count
                 }

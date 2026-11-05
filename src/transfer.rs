@@ -256,7 +256,7 @@ pub fn parse_scan(stdout: &[u8], n: usize) -> Option<Vec<u64>> {
 /// the `cd`, the folder now current must still be that one ([`SRC_MOVED`]
 /// otherwise), and tar reads relative to it, so swapping the folder for a
 /// link can never make it read elsewhere.
-pub fn tar_out_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], id: &[u8], acls: bool) -> Vec<u8> {
+pub fn tar_out_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], id: &[u8], meta: TarMeta) -> Vec<u8> {
     cat(&[
         b"cd -- ",
         &sh_quote(dir),
@@ -265,15 +265,121 @@ pub fn tar_out_cmd(os: &RemoteOs, dir: &[u8], name: &[u8], id: &[u8], acls: bool
         b".) || exit 1; [ \"$i\" = ",
         &sh_quote(id),
         b" ] || exit 51; ",
-        tar_word(acls),
+        &tar_word(meta),
         b" -cf - ./",
         &sh_quote(name),
     ])
 }
 
-/// `tar`, with `--acls` when POSIX ACLs travel too.
-fn tar_word(acls: bool) -> &'static [u8] {
-    if acls { b"tar --acls" } else { b"tar" }
+/// What travels in a tar stream besides data and modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TarMeta {
+    /// POSIX ACLs (`--acls`).
+    pub acls: bool,
+    /// Linux `user.*` extended attributes (`--xattrs`, those only).
+    pub xattrs: bool,
+}
+
+impl TarMeta {
+    pub const NONE: Self = Self {
+        acls: false,
+        xattrs: false,
+    };
+    pub const ACLS: Self = Self {
+        acls: true,
+        xattrs: false,
+    };
+}
+
+/// The tar options for `meta`, as words after `tar`.
+fn tar_opts(meta: TarMeta) -> &'static str {
+    match (meta.acls, meta.xattrs) {
+        (false, false) => "",
+        (true, false) => " --acls",
+        (false, true) => " --xattrs --xattrs-include='user.*'",
+        (true, true) => " --acls --xattrs --xattrs-include='user.*'",
+    }
+}
+
+/// `tar` with the options for `meta`.
+fn tar_word(meta: TarMeta) -> Vec<u8> {
+    format!("tar{}", tar_opts(meta)).into_bytes()
+}
+
+/// Exit 0 when this side's tar can store and restore `user.*` xattrs.
+pub const TAR_XATTRS_PROBE: &[u8] =
+    b"tar --xattrs --xattrs-include='user.*' -cf /dev/null -T /dev/null >/dev/null 2>&1";
+
+/// Prints how many entries in `dir/name` (links not followed) carry a
+/// `user.*` extended attribute, through python3 or getfattr, whichever the
+/// server has; `unknown` with neither. A walk that fails counts as one.
+pub fn user_xattr_scan_cmd(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    cat(&[
+        b"cd -- ",
+        &sh_quote(dir),
+        b" || exit 1; if command -v python3 >/dev/null 2>&1; then python3 -c '",
+        USER_XATTR_PY,
+        b"' ./",
+        &sh_quote(name),
+        b"; elif command -v getfattr >/dev/null 2>&1; then           n=$({ getfattr -R -P -m '^user\\.' -- ./",
+        &sh_quote(name),
+        b" 2>/dev/null || echo hdir-scan-failed; } | grep -c -e '^user\\.' -e '^hdir-scan-failed$');           echo $((n)); else echo unknown; fi",
+    ])
+}
+
+/// The python walk behind [`user_xattr_scan_cmd`] (no single quotes).
+const USER_XATTR_PY: &[u8] = b"import os,sys
+n=0
+def bad(e=None):
+    global n
+    n+=1
+def look(p):
+    try:
+        if any(a.startswith(\"user.\") for a in os.listxattr(p, follow_symlinks=False)):
+            bad()
+    except OSError as e:
+        if e.errno not in (61, 95):
+            bad()
+top=sys.argv[1]
+look(top)
+if os.path.isdir(top) and not os.path.islink(top):
+    for d,ds,fs in os.walk(top, onerror=bad):
+        for x in ds+fs:
+            look(os.path.join(d,x))
+print(n)";
+
+/// What to do about `user.*` xattrs of a Linux source in a tar transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrPlan {
+    /// None there (or no way to tell): plain tar.
+    None,
+    /// Both tars carry them.
+    Keep,
+    /// They cannot travel: a copy warns, a move keeps its source.
+    Lost,
+}
+
+pub fn xattr_plan(has: bool, sender_ok: bool, receiver_ok: bool) -> XattrPlan {
+    match (has, sender_ok && receiver_ok) {
+        (false, _) => XattrPlan::None,
+        (true, true) => XattrPlan::Keep,
+        (true, false) => XattrPlan::Lost,
+    }
+}
+
+/// The answer of [`user_xattr_scan_cmd`]: `Some(true)` when some entry has
+/// them, `None` when the server has no way to tell.
+pub fn parse_user_xattr_scan(code: Option<i32>, stdout: &[u8]) -> Option<bool> {
+    let out = String::from_utf8_lossy(stdout);
+    let out = out.trim();
+    if code == Some(0) && out == "unknown" {
+        return None;
+    }
+    match (code, out.parse::<u64>()) {
+        (Some(0), Ok(n)) => Some(n > 0),
+        // failed, or an answer that makes no sense: assume they are there
+        _ => Some(true),
+    }
 }
 
 /// Exit 0 when this side's tar can store and restore POSIX ACLs.
@@ -397,14 +503,18 @@ fn src_dir_id(side: &Side, dir: &Path) -> Result<String, String> {
 
 /// Remote side of a transfer stream: unpack stdin into `stage`, keeping
 /// modes (`-p`) but not the sender's owners (`-o`).
-pub fn tar_in_cmd(stage: &[u8], acls: bool) -> Vec<u8> {
+pub fn tar_in_cmd(stage: &[u8], meta: TarMeta) -> Vec<u8> {
     cat(&[
         b"cd -- ",
         &sh_quote(stage),
         b" || exit 1; ",
-        tar_word(acls),
+        &tar_word(meta),
         b" -xpof - || exit 1; ",
-        TIDY_RECEIVED,
+        &if meta.acls {
+            tidy_received_acls()
+        } else {
+            TIDY_RECEIVED.to_vec()
+        },
     ])
 }
 
@@ -420,15 +530,114 @@ const TIDY_RECEIVED: &[u8] =
       find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
       find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +";
 
+/// The first part of [`TIDY_RECEIVED`].
+const STRIP_SETID_CMD: &[u8] =
+    b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +";
+
+/// The rest of [`TIDY_RECEIVED`].
+const CAP_GROUP_CMD: &[u8] = b"find . ! -type l -perm -040 ! -perm -004 -exec chmod g-r {} + && \
+      find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
+      find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +";
+
+/// [`TIDY_RECEIVED`] when ACLs travelled. On an entry with a POSIX ACL the
+/// group bits are its mask, which named users and groups depend on: there
+/// only the owning group's own entry (`group::`) is capped at `other::`.
+/// Needs python3 to edit ACLs; without it, the plain caps apply (safe, but
+/// named entries lose what the mask allowed them).
+fn tidy_received_acls() -> Vec<u8> {
+    cat(&[
+        STRIP_SETID_CMD,
+        b" && if command -v python3 >/dev/null 2>&1; then python3 -c '",
+        ACL_CAP_PY,
+        b"'; else ",
+        CAP_GROUP_CMD,
+        b"; fi",
+    ])
+}
+
+/// The python walk of [`tidy_received_acls`] (no single quotes).
+const ACL_CAP_PY: &[u8] = br#"import os,stat,struct
+N="system.posix_acl_access"
+def cap(p):
+    st=os.lstat(p)
+    if stat.S_ISLNK(st.st_mode):
+        return
+    try:
+        a=os.getxattr(p,N,follow_symlinks=False)
+    except OSError:
+        a=None
+    if a and len(a)>=4 and (len(a)-4)%8==0:
+        e=[list(struct.unpack_from("<HHI",a,4+8*i)) for i in range((len(a)-4)//8)]
+        o=[x[1] for x in e if x[0]==0x20]
+        if o:
+            for x in e:
+                if x[0]==4:
+                    x[1]&=o[0]
+            b=a[:4]+b"".join(struct.pack("<HHI",*x) for x in e)
+            if b!=a:
+                os.setxattr(p,N,b,follow_symlinks=False)
+            return
+    m=st.st_mode&0o7777
+    n=(m&~0o070)|(m&0o070&((m&7)<<3))
+    if n!=m:
+        os.chmod(p,n)
+cap(".")
+for d,ds,fs in os.walk("."):
+    for y in ds+fs:
+        cap(os.path.join(d,y))"#;
+
+/// A POSIX ACL (Linux xattr form) with its `group::` entry capped at its
+/// `other::` entry; `None` when `acl` is not one.
+pub fn cap_acl_group(acl: &[u8]) -> Option<Vec<u8>> {
+    if acl.len() < 4 || !(acl.len() - 4).is_multiple_of(8) {
+        return None;
+    }
+    let mut out = acl.to_vec();
+    let entries = (acl.len() - 4) / 8;
+    let tag = |i: usize| u16::from_le_bytes([acl[4 + 8 * i], acl[5 + 8 * i]]);
+    let perm = |i: usize| u16::from_le_bytes([acl[6 + 8 * i], acl[7 + 8 * i]]);
+    let other = (0..entries).find(|&i| tag(i) == 0x20).map(perm)?;
+    for i in (0..entries).filter(|&i| tag(i) == 0x04) {
+        out[6 + 8 * i..8 + 8 * i].copy_from_slice(&(perm(i) & other).to_le_bytes());
+    }
+    Some(out)
+}
+
+/// Linux: cap the `group::` entry of `p`'s access ACL ([`cap_acl_group`]);
+/// `false` when `p` has none (then its mode bits are capped instead).
+#[cfg(unix)]
+fn cap_access_acl(p: &Path) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        const N: &str = "system.posix_acl_access";
+        let Some(acl) = crate::platform::xattr_get_path(p, N)? else {
+            return Ok(false);
+        };
+        let Some(capped) = cap_acl_group(&acl) else {
+            return Ok(false);
+        };
+        if capped != acl {
+            crate::platform::xattr_set_path(p, N, &capped)?;
+        }
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = p;
+        Ok(false)
+    }
+}
+
 /// `mode` with its group bits limited to its other bits.
 pub fn cap_group(mode: u32) -> u32 {
     let other = mode & 0o007;
     mode & !0o070 | (mode & 0o070 & (other << 3))
 }
 
-/// [`TIDY_RECEIVED`] for a local stage (links are never followed).
+/// [`TIDY_RECEIVED`] for a local stage (links are never followed);
+/// `acls`: like [`tidy_received_acls`].
 #[cfg(unix)]
-fn tidy_received(dir: &Path) -> std::io::Result<()> {
+fn tidy_received(dir: &Path, acls: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut todo = vec![dir.to_path_buf()];
     while let Some(q) = todo.pop() {
@@ -437,7 +646,11 @@ fn tidy_received(dir: &Path) -> std::io::Result<()> {
             continue;
         }
         let old = m.permissions().mode() & 0o7777;
-        let mut mode = cap_group(old);
+        let mut mode = if acls && cap_access_acl(&q)? {
+            old
+        } else {
+            cap_group(old)
+        };
         if m.is_file() {
             mode &= !0o6000;
         }
@@ -454,7 +667,7 @@ fn tidy_received(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn tidy_received(_dir: &Path) -> std::io::Result<()> {
+fn tidy_received(_dir: &Path, _acls: bool) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -481,7 +694,7 @@ pub fn same_fs_cmd(os: &RemoteOs, a: &[u8], b: &[u8]) -> Vec<u8> {
 /// Like [`tar_out_cmd`], a shell first enters `dir`, checks it is still the
 /// folder `id` names and then runs tar there; the paths travel as arguments
 /// (`$1` folder, `$2` id, `$3` name), never inside the script.
-pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str, acls: bool) -> Vec<OsString> {
+pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str, meta: TarMeta) -> Vec<OsString> {
     if cfg!(windows) {
         // no POSIX shell: Windows' own tar.exe, path based like local
         // copies there
@@ -494,17 +707,14 @@ pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str, acls: bool) -
         return v;
     }
     let (stat, tar) = if cfg!(target_os = "linux") {
-        (
-            "stat -c %d:%i -- .",
-            if acls { "tar --acls" } else { "tar" },
-        )
+        ("stat -c %d:%i -- .", format!("tar{}", tar_opts(meta)))
     } else if cfg!(target_os = "macos") {
         (
             "stat -f %d:%i -- .",
-            "COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs",
+            "COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs".to_string(),
         )
     } else {
-        ("stat -f %d:%i -- .", "tar")
+        ("stat -f %d:%i -- .", "tar".to_string())
     };
     let script = format!(
         "cd -- \"$1\" || exit 1; i=$({stat}) || exit 1; \
@@ -580,10 +790,13 @@ fn send_up_packaged(
 }
 
 /// Local `tar` unpacking stdin into `stage`.
-pub fn local_tar_in(stage: &Path, acls: bool) -> Vec<OsString> {
+pub fn local_tar_in(stage: &Path, meta: TarMeta) -> Vec<OsString> {
     let mut v: Vec<OsString> = ["tar"].map(OsString::from).to_vec();
-    if acls {
+    if meta.acls {
         v.push("--acls".into());
+    }
+    if meta.xattrs {
+        v.extend(["--xattrs", "--xattrs-include=user.*"].map(OsString::from));
     }
     v.extend(["-xpof", "-", "-C"].map(OsString::from));
     v.push(stage.as_os_str().to_os_string());
@@ -944,9 +1157,27 @@ pub fn unstage_cmd(stage: &[u8]) -> Vec<u8> {
 
 /// Copy `src` into `dir` on the same host.
 pub fn cp_cmd(os: &RemoteOs, src_dir: &[u8], name: &[u8], id: &[u8], dir: &[u8]) -> Vec<u8> {
+    cp_keep_cmd(os, src_dir, name, id, dir, false)
+}
+
+/// [`cp_cmd`]; `xattrs`: GNU cp keeps extended attributes too, and fails
+/// when it cannot (`-p` alone drops them).
+pub fn cp_keep_cmd(
+    os: &RemoteOs,
+    src_dir: &[u8],
+    name: &[u8],
+    id: &[u8],
+    dir: &[u8],
+    xattrs: bool,
+) -> Vec<u8> {
+    let cp: &[u8] = if xattrs {
+        b"cp -Rp --preserve=xattr -- ./"
+    } else {
+        b"cp -Rp -- ./"
+    };
     cat(&[
         &in_src_dir(os, src_dir, id),
-        b"cp -Rp -- ./",
+        cp,
         &sh_quote(name),
         b" ",
         &sh_quote(&into_dir(dir)),
@@ -1563,6 +1794,78 @@ fn has_acls(
     }
 }
 
+/// Whether `dir/name` on a Linux sending side (`None`: local) has `user.*`
+/// xattrs; `None` when that server has no way to tell. Other systems say
+/// no.
+fn has_user_xattrs(
+    side: Option<&RemoteSession>,
+    dir: &Path,
+    name: &OsString,
+    cancel: &AtomicBool,
+) -> Option<bool> {
+    match side {
+        None => Some(
+            cfg!(target_os = "linux")
+                && crate::platform::tree_has_lost_xattrs(&dir.join(name), cancel),
+        ),
+        Some(s) if matches!(s.os, RemoteOs::Linux) => {
+            let out = s.exec_cancellable(&user_xattr_scan_cmd(&b(dir), &os_bytes(name)), cancel);
+            match out {
+                Ok(o) => parse_user_xattr_scan(o.code, &o.stdout),
+                Err(_) => Some(true),
+            }
+        }
+        Some(_) => Some(false),
+    }
+}
+
+/// Whether this side's tar can carry `user.*` xattrs (`None`: local).
+fn tar_xattrs_ok(side: Option<&RemoteSession>) -> bool {
+    static LOCAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match side {
+        None => *LOCAL.get_or_init(|| {
+            cfg!(target_os = "linux")
+                && std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(std::str::from_utf8(TAR_XATTRS_PROBE).unwrap_or("false"))
+                    .stdin(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|st| st.success())
+        }),
+        Some(s) => s.tar_xattrs(|| {
+            matches!(s.os, RemoteOs::Linux)
+                && matches!(s.exec(TAR_XATTRS_PROBE), Ok(o) if o.code == Some(0))
+        }),
+    }
+}
+
+/// [`XattrPlan`] for sending `src_dir/name` over `route` (tar routes only).
+fn xattrs_for(route: &Route, src_dir: &Path, name: &OsString, cancel: &AtomicBool) -> XattrPlan {
+    let (from, to) = match route {
+        Route::Up(d) => (None, Some(*d)),
+        Route::Down(s) => (Some(*s), None),
+        Route::Between(s, d) => (Some(*s), Some(*d)),
+        // one server: GNU cp keeps them (or fails, which keeps a source)
+        Route::SameHost(s) => {
+            let has = matches!(s.os, RemoteOs::Linux)
+                && has_user_xattrs(Some(*s), src_dir, name, cancel) == Some(true);
+            return if has {
+                XattrPlan::Keep
+            } else {
+                XattrPlan::None
+            };
+        }
+    };
+    match has_user_xattrs(from, src_dir, name, cancel) {
+        Some(false) => XattrPlan::None,
+        Some(true) => xattr_plan(true, tar_xattrs_ok(from), tar_xattrs_ok(to)),
+        // no way to tell: carried along when both tars can (harmless if
+        // there are none); otherwise, as before, not known to be lost
+        None if tar_xattrs_ok(from) && tar_xattrs_ok(to) => XattrPlan::Keep,
+        None => XattrPlan::None,
+    }
+}
+
 /// Whether this side's tar can carry POSIX ACLs (`None`: local). Asked
 /// once per connection, and once per run for the local tar.
 fn tar_acls_ok(side: Option<&RemoteSession>) -> bool {
@@ -1609,6 +1912,7 @@ fn send(
     src_id: &str,
     name: &OsString,
     stage: &Stage,
+    xattrs: bool,
     cancel: &AtomicBool,
 ) -> Result<Option<String>, String> {
     let (n, sd) = (os_bytes(name).into_owned(), b(src_dir));
@@ -1625,16 +1929,19 @@ fn send(
             AclPlan::None
         }
     });
-    let acls = plan == AclPlan::Keep;
+    let meta = TarMeta {
+        acls: plan == AclPlan::Keep,
+        xattrs,
+    };
     let remote_in = |d: &RemoteSession| match stage {
-        Stage::Remote(_, _, p) => Ok(exec_argv(&d.target, &tar_in_cmd(p, acls))),
+        Stage::Remote(_, _, p) => Ok(exec_argv(&d.target, &tar_in_cmd(p, meta))),
         Stage::Local(..) => Err(crate::tr!(
             "임시 폴더가 원격이 아님",
             "temp folder is not remote"
         )),
     };
     let local_in = || match stage {
-        Stage::Local(t, _) => Ok(local_tar_in(t.path(), acls)),
+        Stage::Local(t, _) => Ok(local_tar_in(t.path(), meta)),
         Stage::Remote(..) => Err(crate::tr!(
             "임시 폴더가 로컬이 아님",
             "temp folder is not local"
@@ -1643,7 +1950,7 @@ fn send(
     let remote_out = |s: &RemoteSession| {
         exec_argv(
             &s.target,
-            &tar_out_cmd(&s.os, &sd, &n, src_id.as_bytes(), acls),
+            &tar_out_cmd(&s.os, &sd, &n, src_id.as_bytes(), meta),
         )
     };
     if cfg!(windows) {
@@ -1664,7 +1971,7 @@ fn send(
     let (runner, from, from_s, to, to_s) = match route {
         Route::Up(d) => (
             *d,
-            local_tar_out(src_dir, name, src_id, acls),
+            local_tar_out(src_dir, name, src_id, meta),
             None,
             remote_in(d)?,
             Some(*d),
@@ -1678,7 +1985,14 @@ fn send(
                     "temp folder is not remote"
                 ));
             };
-            let cmd = cp_cmd(&s.os, &b(src_dir), &os_bytes(name), src_id.as_bytes(), p);
+            let cmd = cp_keep_cmd(
+                &s.os,
+                &b(src_dir),
+                &os_bytes(name),
+                src_id.as_bytes(),
+                p,
+                xattrs,
+            );
             let out = s.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?;
             if out.code == Some(SRC_MOVED) {
                 return Err(crate::tr!(
@@ -1706,7 +2020,7 @@ fn send(
     match (oa.code, ob.code) {
         (Some(0), Some(0)) => {
             if let Stage::Local(t, _) = stage {
-                tidy_received(t.path()).map_err(|e| {
+                tidy_received(t.path(), meta.acls).map_err(|e| {
                     crate::tr!(
                         "받은 파일 권한 정리 실패: {e}",
                         "Cannot fix permissions of received files: {e}"
@@ -2012,6 +2326,12 @@ fn item(
         r.warnings.extend(discard(stage));
         return Step::Stop(OpOutcome::Cancelled);
     }
+    // Linux `user.*` xattrs ride along when both tars can carry them.
+    let xattrs = if on_host_move {
+        XattrPlan::None
+    } else {
+        xattrs_for(route, &spec.src_dir, name, ctl.cancel_flag())
+    };
     // On one server a move first renames the source into the stage (a copy
     // there when it crosses filesystems), then places it like any item, so
     // an existing target is never written over in place.
@@ -2048,9 +2368,12 @@ fn item(
             src_id,
             name,
             &stage,
+            xattrs == XattrPlan::Keep,
             ctl.cancel_flag(),
         )
     };
+    // ACLs that could not travel (the copy was made private instead)
+    let acls_lost = matches!(sent, Ok(Some(_)));
     let sent = sent.map(|w| r.warnings.extend(w));
     if let Err(e) = sent {
         let cancelled = ctl.is_cancelled();
@@ -2109,6 +2432,27 @@ fn item(
         }
     }
     r.overwritten += usize::from(overwrite);
+    if acls_lost && before.is_some() {
+        return Step::Partial(crate::tr!(
+            "ACL을 옮길 수 없어 원본을 지우지 않음: {}",
+            "Source kept: its ACLs could not travel: {}",
+            lossy(name)
+        ));
+    }
+    if xattrs == XattrPlan::Lost {
+        let msg = crate::tr!(
+            "확장 속성(user.*)은 옮겨지지 않음: {}",
+            "Extended attributes (user.*) did not travel: {}",
+            lossy(name)
+        );
+        if before.is_some() {
+            return Step::Partial(crate::tr!(
+                "{msg}, 원본을 지우지 않음",
+                "{msg}, source kept"
+            ));
+        }
+        r.warnings.push(msg);
+    }
     let Some(before) = before else {
         // a copied folder: names differing only in case may have become one
         // on the way (a move checks this below, before deleting)
@@ -2187,8 +2531,10 @@ fn item(
         return Step::Partial(changed_msg(name));
     }
     // The local tar to a server leaves out resource forks and Finder data
-    // (macOS): the copy lacks them, so the source stays.
-    if matches!(spec.src, Side::Local)
+    // (macOS): the copy lacks them, so the source stays. (Linux ones are
+    // the xattr plan's above.)
+    if cfg!(target_os = "macos")
+        && matches!(spec.src, Side::Local)
         && crate::platform::tree_has_lost_xattrs(&src, ctl.cancel_flag())
     {
         if ctl.is_cancelled() {
@@ -2595,13 +2941,13 @@ mod tests {
             .unwrap();
         assert!(o.contains("'/d/S/p'") && !o.contains("'/d/S/o' ||"), "{o}");
         assert_eq!(
-            tar_out_cmd(&RemoteOs::Linux, b"/s it's", b"-x", b"5:6", false),
+            tar_out_cmd(&RemoteOs::Linux, b"/s it's", b"-x", b"5:6", TarMeta::NONE),
             b"cd -- '/s it'\\''s' || exit 1; i=$(stat -c %d:%i -- .) || exit 1; \
               [ \"$i\" = '5:6' ] || exit 51; tar -cf - ./'-x'"
                 .to_vec()
         );
         assert_eq!(
-            tar_in_cmd(b"/d/.hdir-xfer.1", false),
+            tar_in_cmd(b"/d/.hdir-xfer.1", TarMeta::NONE),
             b"cd -- '/d/.hdir-xfer.1' || exit 1; tar -xpof - || exit 1; \
               find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} + && \
               find . ! -type l -perm -040 ! -perm -004 -exec chmod g-r {} + && \
@@ -2614,13 +2960,13 @@ mod tests {
             Path::new("/s 'x'"),
             std::ffi::OsStr::new("-x"),
             "5:6",
-            false,
+            TarMeta::NONE,
         );
         let tail: Vec<&str> = out[3..].iter().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(tail, ["sh", "/s 'x'", "5:6", "-x"]);
         assert!(!out[2].to_str().unwrap().contains("/s"), "{:?}", out[2]);
         assert_eq!(
-            local_tar_in(Path::new("/st"), false),
+            local_tar_in(Path::new("/st"), TarMeta::NONE),
             ["tar", "-xpof", "-", "-C", "/st"]
                 .map(OsString::from)
                 .to_vec()
@@ -2629,25 +2975,30 @@ mod tests {
 
     #[test]
     fn acl_commands_carry_acls_or_strip_group_and_other() {
-        let out = tar_out_cmd(&RemoteOs::Linux, b"/s", b"a", b"5:6", true);
+        let out = tar_out_cmd(&RemoteOs::Linux, b"/s", b"a", b"5:6", TarMeta::ACLS);
         assert!(
             out.ends_with(b"tar --acls -cf - ./'a'"),
             "{}",
             lossy_b(&out)
         );
-        let inn = tar_in_cmd(b"/d/S", true);
+        let inn = tar_in_cmd(b"/d/S", TarMeta::ACLS);
         assert!(
             inn.starts_with(b"cd -- '/d/S' || exit 1; tar --acls -xpof - || exit 1; "),
             "{}",
             lossy_b(&inn)
         );
         assert_eq!(
-            local_tar_in(Path::new("/st"), true),
+            local_tar_in(Path::new("/st"), TarMeta::ACLS),
             ["tar", "--acls", "-xpof", "-", "-C", "/st"]
                 .map(OsString::from)
                 .to_vec()
         );
-        let lo = local_tar_out(Path::new("/s"), std::ffi::OsStr::new("a"), "5:6", true);
+        let lo = local_tar_out(
+            Path::new("/s"),
+            std::ffi::OsStr::new("a"),
+            "5:6",
+            TarMeta::ACLS,
+        );
         if cfg!(target_os = "linux") {
             assert!(
                 lo[2].to_str().unwrap().contains("tar --acls -cf -"),
@@ -2850,8 +3201,22 @@ mod tests {
         for acls in [true, false] {
             let stage = private_dir(t.path(), if acls { "with" } else { "without" });
             let (oa, ob) = crate::session::run_pipe_cancellable(
-                &local_tar_out(&src, std::ffi::OsStr::new("d"), &id, acls),
-                &local_tar_in(&stage, acls),
+                &local_tar_out(
+                    &src,
+                    std::ffi::OsStr::new("d"),
+                    &id,
+                    TarMeta {
+                        acls,
+                        xattrs: false,
+                    },
+                ),
+                &local_tar_in(
+                    &stage,
+                    TarMeta {
+                        acls,
+                        xattrs: false,
+                    },
+                ),
                 std::time::Duration::from_secs(30),
                 &no,
             );
@@ -2890,14 +3255,14 @@ mod tests {
                 &b(&src),
                 b"-d it's",
                 src_dir_id(&Side::Local, &src).unwrap().as_bytes(),
-                false,
+                TarMeta::NONE,
             ))
             .to_os_string()
         }];
         let no = AtomicBool::new(false);
         let (oa, ob) = crate::session::run_pipe_cancellable(
             &from,
-            &local_tar_in(&stage, false),
+            &local_tar_in(&stage, TarMeta::NONE),
             std::time::Duration::from_secs(30),
             &no,
         );
@@ -2920,14 +3285,14 @@ mod tests {
         let back = private_dir(t.path(), "back");
         let to: Vec<OsString> = vec!["sh".into(), "-c".into(), {
             use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&back), false)).to_os_string()
+            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&back), TarMeta::NONE)).to_os_string()
         }];
         let (oa, ob) = crate::session::run_pipe_cancellable(
             &local_tar_out(
                 &src,
                 std::ffi::OsStr::new("-d it's"),
                 &src_dir_id(&Side::Local, &src).unwrap(),
-                false,
+                TarMeta::NONE,
             ),
             &to,
             std::time::Duration::from_secs(30),
@@ -3572,6 +3937,9 @@ mod tests {
         if c.contains("ls -dn --") {
             return ok("0\n"); // no ACLs
         }
+        if c.contains("then python3 -c '") {
+            return ok("0\n"); // no user.* xattrs
+        }
         if c.contains("for f do printf .") {
             return ok("1\n"); // the entry count
         }
@@ -4060,6 +4428,13 @@ mod tests {
             .into_iter()
             .filter(|c| !c.contains("du -sk"))
             .collect();
+        // the copy asked about user.* xattrs (for cp), the move did not
+        let scans = long.iter().filter(|c| c.contains("python3 -c")).count();
+        assert_eq!(scans, 1, "{long:?}");
+        let long: Vec<String> = long
+            .into_iter()
+            .filter(|c| !c.contains("python3 -c"))
+            .collect();
         let cp = String::from_utf8(cp_cmd(
             &RemoteOs::Linux,
             b"/srv",
@@ -4145,6 +4520,385 @@ mod tests {
         assert!(joined.contains("tar --acls -cf -"), "{joined}");
         assert!(joined.contains("tar --acls -xpof -"), "{joined}");
         assert!(!to.remote_cmds().iter().any(|c| c.contains("go-rwx")));
+    }
+
+    /// A Linux server whose items carry `user.*` xattrs (`scan` answers
+    /// that) and whose tar can carry them when `probe` is 0.
+    fn xattr_host(scan: &'static str, probe: i32) -> Arc<FakeCmd> {
+        FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("then python3 -c '") {
+                return ok(scan);
+            }
+            if c.as_bytes() == TAR_XATTRS_PROBE {
+                return code(probe);
+            }
+            answer(c, &[], &[], "0\x000\x00")
+        })
+    }
+
+    #[test]
+    fn user_xattrs_travel_between_servers_whose_tars_can_carry_them() {
+        let (from, to) = (xattr_host("3\n", 0), xattr_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let joined = from.pipe_calls()[0].join(" ");
+        assert_eq!(
+            joined.matches("--xattrs --xattrs-include=").count(),
+            2,
+            "{joined}"
+        );
+        assert!(
+            joined.contains("-cf -") && joined.contains("-xpof -"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn user_xattrs_that_cannot_travel_warn_a_copy_and_keep_a_moved_source() {
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let (from, to) = (xattr_host("1\n", 0), xattr_host("0\n", 2));
+            let s = spec(
+                kind,
+                Side::Remote(session(Arc::clone(&from))),
+                &p("/srv"),
+                &["a"],
+                to_other(&to),
+                &p("/dst"),
+            );
+            let r = run(&s, &mut Ctl::new());
+            assert_eq!(r.outcome, OpOutcome::Done, "{kind:?}");
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.contains("user.*") && w.contains('a')),
+                "{kind:?} {:?}",
+                r.warnings
+            );
+            assert!(!from.pipe_calls()[0].join(" ").contains("--xattrs"));
+            if kind == JobKind::Move {
+                assert_eq!(r.partial, 1);
+                assert!(
+                    !from.remote_cmds().iter().any(|c| c.contains(".hdir-del.")),
+                    "the source was not set aside for deleting: {:?}",
+                    from.remote_cmds()
+                );
+            } else {
+                assert_eq!(r.copied, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_same_server_copy_with_user_xattrs_keeps_them_with_cp() {
+        let f = xattr_host("2\n", 0);
+        let sess = session(Arc::clone(&f));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(Arc::clone(&sess)),
+            &p("/srv"),
+            &["a"],
+            Side::Remote(sess),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        assert!(
+            f.long_cmds()
+                .iter()
+                .any(|c| c.contains("cp -Rp --preserve=xattr -- ./'a'")),
+            "{:?}",
+            f.long_cmds()
+        );
+    }
+
+    #[test]
+    fn a_move_whose_acls_could_not_travel_keeps_the_source() {
+        let (from, to) = (acl_host("1\n", 0), acl_host("0\n", 2));
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            (r.outcome, r.partial),
+            (OpOutcome::Done, 1),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("ACL을 옮길 수 없어 원본을 지우지 않음")),
+            "{:?}",
+            r.warnings
+        );
+        assert!(!from.remote_cmds().iter().any(|c| c.contains(".hdir-del.")));
+    }
+
+    /// Linux: `cp --preserve=xattr` really keeps a `user.*` attribute.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_same_host_cp_keeps_user_xattrs() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        let st = private_dir(t.path(), "st");
+        fs::write(src.join("f"), "x").unwrap();
+        if let Err(e) = crate::platform::xattr_set_path(&src.join("f"), "user.hdir", b"v") {
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
+            return;
+        }
+        let os = crate::testutil::local_os();
+        let id = src_dir_id(&Side::Local, &src).unwrap();
+        let out = sh(&cp_keep_cmd(
+            &os,
+            &b(&src),
+            b"f",
+            id.as_bytes(),
+            &b(&st),
+            true,
+        ));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            crate::platform::xattr_get_path(&st.join("f"), "user.hdir").unwrap(),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_tell_still_sends_xattrs_when_both_tars_can() {
+        let (from, to) = (xattr_host("unknown\n", 0), xattr_host("0\n", 0));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        let joined = from.pipe_calls()[0].join(" ");
+        assert_eq!(
+            joined.matches("--xattrs --xattrs-include=").count(),
+            2,
+            "{joined}"
+        );
+    }
+
+    /// An ACL blob (Linux xattr form) from (tag, perm, id) entries.
+    fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in entries {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        acl
+    }
+
+    // user::rw- user:65534:r-- group::r-- mask::r-- other::---
+    const SHARED: [(u16, u16, u32); 5] = [
+        (1, 6, u32::MAX),
+        (2, 4, 65534),
+        (4, 4, u32::MAX),
+        (0x10, 4, u32::MAX),
+        (0x20, 0, u32::MAX),
+    ];
+
+    #[test]
+    fn an_acls_owning_group_entry_is_capped_at_other() {
+        let mut want = SHARED;
+        want[2].1 = 0; // group:: only; the named user and the mask stay
+        assert_eq!(cap_acl_group(&acl_blob(&SHARED)), Some(acl_blob(&want)));
+        let open = [(1, 6, u32::MAX), (4, 4, u32::MAX), (0x20, 4, u32::MAX)];
+        assert_eq!(cap_acl_group(&acl_blob(&open)), Some(acl_blob(&open)));
+        assert_eq!(cap_acl_group(b"\x02\0\0\0\x01"), None, "torn");
+        assert_eq!(cap_acl_group(&acl_blob(&[(1, 6, 0)])), None, "no other::");
+    }
+
+    /// Linux: with ACLs kept, an entry with one keeps its mode (the mask,
+    /// which named users depend on) and only its `group::` is capped; one
+    /// without has its mode capped. Through python3 and in Rust alike.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_kept_acls_keep_their_mask_and_cap_the_owning_group() {
+        use std::os::unix::fs::PermissionsExt;
+        const N: &str = "system.posix_acl_access";
+        let python = sh(b"command -v python3").status.success();
+        let t = tempfile::tempdir().unwrap();
+        let d = private_dir(t.path(), "d");
+        let (with, plain) = (d.join("with acl"), d.join("plain"));
+        let reset = || {
+            for f in [&with, &plain] {
+                fs::write(f, "x").unwrap();
+                fs::set_permissions(f, fs::Permissions::from_mode(0o640)).unwrap();
+            }
+            crate::platform::xattr_set_path(&with, N, &acl_blob(&SHARED))
+        };
+        if let Err(e) = reset() {
+            // only a filesystem without ACLs skips
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
+            return;
+        }
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mut want = SHARED;
+        want[2].1 = 0;
+        let check = || {
+            assert_eq!((mode(&with), mode(&plain)), (0o640, 0o600));
+            let got = crate::platform::xattr_get_path(&with, N).unwrap().unwrap();
+            assert_eq!(got, acl_blob(&want));
+        };
+        if python {
+            let out = sh(&cat(&[
+                b"cd -- ",
+                &sh_quote(&b(&d)),
+                b" && ",
+                &tidy_received_acls(),
+            ]));
+            assert!(out.status.success(), "{out:?}");
+            check();
+            reset().unwrap();
+        }
+        tidy_received(&d, true).unwrap();
+        check();
+    }
+
+    #[test]
+    fn xattr_options_scan_answers_and_plans() {
+        assert_eq!(tar_word(TarMeta::NONE), b"tar");
+        assert_eq!(tar_word(TarMeta::ACLS), b"tar --acls");
+        let both = TarMeta {
+            acls: true,
+            xattrs: true,
+        };
+        assert_eq!(
+            tar_word(both),
+            b"tar --acls --xattrs --xattrs-include='user.*'"
+        );
+        let x = TarMeta {
+            acls: false,
+            xattrs: true,
+        };
+        assert_eq!(
+            local_tar_in(Path::new("/st"), x),
+            [
+                "tar",
+                "--xattrs",
+                "--xattrs-include=user.*",
+                "-xpof",
+                "-",
+                "-C",
+                "/st"
+            ]
+            .map(OsString::from)
+        );
+        assert!(tar_in_cmd(b"/st", x).starts_with(b"cd -- '/st' || exit 1; tar --xattrs"));
+        // with ACLs kept, entries that have one are not capped
+        let acl_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::ACLS)).unwrap();
+        assert!(acl_in.contains("system.posix_acl_access"), "{acl_in}");
+        let plain_in = String::from_utf8(tar_in_cmd(b"/st", TarMeta::NONE)).unwrap();
+        assert!(!plain_in.contains("python3"), "{plain_in}");
+        assert!(
+            !String::from_utf8_lossy(ACL_CAP_PY).contains('\''),
+            "no single quotes"
+        );
+        assert_eq!(xattr_plan(false, false, false), XattrPlan::None);
+        assert_eq!(xattr_plan(true, true, true), XattrPlan::Keep);
+        assert_eq!(xattr_plan(true, true, false), XattrPlan::Lost);
+        assert_eq!(parse_user_xattr_scan(Some(0), b"0\n"), Some(false));
+        assert_eq!(parse_user_xattr_scan(Some(0), b"4\n"), Some(true));
+        assert_eq!(parse_user_xattr_scan(Some(0), b"unknown\n"), None);
+        assert_eq!(parse_user_xattr_scan(Some(1), b""), Some(true), "failed");
+        assert_eq!(parse_user_xattr_scan(Some(0), b"junk"), Some(true));
+        // the names are arguments, quoted
+        let c = String::from_utf8(user_xattr_scan_cmd(b"/s it's", b"-a")).unwrap();
+        assert!(c.starts_with("cd -- '/s it'\\''s' || exit 1; "), "{c}");
+        assert!(c.contains("' ./'-a'; elif"), "{c}");
+        assert!(c.contains("getfattr -R -P -m '^user\\.' -- ./'-a'"), "{c}");
+    }
+
+    /// Linux: the scan finds a `user.*` attribute, and the tar commands
+    /// really carry it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_user_xattrs_are_found_and_carried() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        fs::create_dir(src.join("d")).unwrap();
+        fs::write(src.join("d/f"), "x").unwrap();
+        let count = |name: &[u8]| {
+            let out = sh(&user_xattr_scan_cmd(&b(&src), name));
+            parse_user_xattr_scan(out.status.code(), &out.stdout)
+        };
+        let python = sh(b"command -v python3").status.success();
+        let check = |want: bool| {
+            let got = count(b"d");
+            if python {
+                assert_eq!(got, Some(want));
+            } else {
+                assert_ne!(got, Some(!want));
+            }
+        };
+        check(false);
+        if let Err(e) = crate::platform::xattr_set_path(&src.join("d/f"), "user.hdir", b"v") {
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
+            return;
+        }
+        check(true);
+        if !sh(TAR_XATTRS_PROBE).status.success() {
+            return; // this tar cannot carry them
+        }
+        let meta = TarMeta {
+            acls: false,
+            xattrs: true,
+        };
+        let stage = private_dir(t.path(), "in");
+        let to: Vec<OsString> = vec!["sh".into(), "-c".into(), {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&stage), meta)).to_os_string()
+        }];
+        let (oa, ob) = crate::session::run_pipe_cancellable(
+            &local_tar_out(
+                &src,
+                std::ffi::OsStr::new("d"),
+                &src_dir_id(&Side::Local, &src).unwrap(),
+                meta,
+            ),
+            &to,
+            std::time::Duration::from_secs(30),
+            &AtomicBool::new(false),
+        );
+        assert_eq!((oa.code, ob.code), (Some(0), Some(0)), "{oa:?} {ob:?}");
+        assert_eq!(
+            crate::platform::xattr_get_path(&stage.join("d/f"), "user.hdir").unwrap(),
+            Some(b"v".to_vec())
+        );
     }
 
     #[test]
@@ -4508,6 +5262,9 @@ mod tests {
                 return fake_scp(a);
             }
             let c = remote_cmd(a).unwrap_or_default();
+            if c.as_bytes() == TAR_XATTRS_PROBE {
+                return code(2); // a tar without --xattrs
+            }
             if c.ends_with("|| exit 46") {
                 sent.store(true, Ordering::SeqCst); // in place only now
                 return code(0);
@@ -4581,7 +5338,7 @@ mod tests {
         assert!(
             r.warnings
                 .iter()
-                .any(|w| w.contains("리소스 포크") && w.contains('a')),
+                .any(|w| w.contains("원본을 지우지 않음") && w.contains('a')),
             "{:?}",
             r.warnings
         );
@@ -6046,14 +6803,14 @@ mod tests {
         let shell_in = private_dir(t.path(), "shell-in");
         let to: Vec<OsString> = vec!["sh".into(), "-c".into(), {
             use std::os::unix::ffi::OsStrExt;
-            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&shell_in), false)).to_os_string()
+            std::ffi::OsStr::from_bytes(&tar_in_cmd(&b(&shell_in), TarMeta::NONE)).to_os_string()
         }];
         let (oa, ob) = crate::session::run_pipe_cancellable(
             &local_tar_out(
                 &src,
                 std::ffi::OsStr::new("d"),
                 &src_dir_id(&Side::Local, &src).unwrap(),
-                false,
+                TarMeta::NONE,
             ),
             &to,
             std::time::Duration::from_secs(30),
@@ -6075,14 +6832,14 @@ mod tests {
                 &src,
                 std::ffi::OsStr::new("d"),
                 &src_dir_id(&Side::Local, &src).unwrap(),
-                false,
+                TarMeta::NONE,
             ),
-            &local_tar_in(&local_in, false),
+            &local_tar_in(&local_in, TarMeta::NONE),
             std::time::Duration::from_secs(30),
             &no,
         );
         assert_eq!((oa.code, ob.code), (Some(0), Some(0)));
-        tidy_received(&local_in).unwrap();
+        tidy_received(&local_in, false).unwrap();
         expect(&local_in);
     }
 
@@ -6281,7 +7038,7 @@ mod tests {
         let no = AtomicBool::new(false);
         let sink: Vec<OsString> = vec!["sh".into(), "-c".into(), "cat".into()];
         let (oa, ob) = crate::session::run_pipe_cancellable(
-            &local_tar_out(&src, std::ffi::OsStr::new("f"), &id, false),
+            &local_tar_out(&src, std::ffi::OsStr::new("f"), &id, TarMeta::NONE),
             &sink,
             std::time::Duration::from_secs(30),
             &no,
@@ -6294,7 +7051,7 @@ mod tests {
             &b(&src),
             b"f",
             id.as_bytes(),
-            false,
+            TarMeta::NONE,
         ));
         assert_eq!(out.status.code(), Some(SRC_MOVED));
         assert!(out.stdout.is_empty());
