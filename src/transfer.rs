@@ -400,36 +400,57 @@ pub fn tar_in_cmd(stage: &[u8], acls: bool) -> Vec<u8> {
         b" || exit 1; ",
         tar_word(acls),
         b" -xpof - || exit 1; ",
-        STRIP_SETID,
+        TIDY_RECEIVED,
     ])
 }
 
-/// Clears setuid / setgid on every regular file under `.`: kept modes must
-/// not turn a received program into a privilege for whoever unpacked it.
-const STRIP_SETID: &[u8] =
-    b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +";
+/// Tidies what was unpacked under `.`:
+/// - clears setuid / setgid on every regular file: kept modes must not turn
+///   a received program into a privilege for whoever unpacked it;
+/// - caps each entry's group bits at its other bits ([`cap_group`]): the
+///   received group is the receiver's, not the sender's, so it must not get
+///   in where everyone else is kept out.
+const TIDY_RECEIVED: &[u8] =
+    b"find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} + && \
+      find . ! -type l -perm -040 ! -perm -004 -exec chmod g-r {} + && \
+      find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
+      find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +";
 
-/// [`STRIP_SETID`] for a local stage (links are never followed).
+/// `mode` with its group bits limited to its other bits.
+pub fn cap_group(mode: u32) -> u32 {
+    let other = mode & 0o007;
+    mode & !0o070 | (mode & 0o070 & (other << 3))
+}
+
+/// [`TIDY_RECEIVED`] for a local stage (links are never followed).
 #[cfg(unix)]
-fn strip_setid(dir: &Path) -> std::io::Result<()> {
+fn tidy_received(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut todo = vec![dir.to_path_buf()];
     while let Some(q) = todo.pop() {
         let m = std::fs::symlink_metadata(&q)?;
+        if m.file_type().is_symlink() {
+            continue;
+        }
+        let old = m.permissions().mode() & 0o7777;
+        let mut mode = cap_group(old);
+        if m.is_file() {
+            mode &= !0o6000;
+        }
+        if mode != old {
+            std::fs::set_permissions(&q, std::fs::Permissions::from_mode(mode))?;
+        }
         if m.is_dir() {
             for e in std::fs::read_dir(&q)? {
                 todo.push(e?.path());
             }
-        } else if m.is_file() && m.permissions().mode() & 0o6000 != 0 {
-            let mode = m.permissions().mode() & !0o6000;
-            std::fs::set_permissions(&q, std::fs::Permissions::from_mode(mode))?;
         }
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn strip_setid(_dir: &Path) -> std::io::Result<()> {
+fn tidy_received(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -496,7 +517,7 @@ pub fn local_tar_out(dir: &Path, name: &std::ffi::OsStr, id: &str, acls: bool) -
 }
 
 /// Unpack the package `pkg` (a tar uploaded into `stage`) there, then drop
-/// it and strip setuid / setgid like [`tar_in_cmd`].
+/// it and tidy modes like [`tar_in_cmd`].
 pub fn unpack_cmd(stage: &[u8], pkg: &[u8]) -> Vec<u8> {
     let p = sh_quote(pkg);
     cat(&[
@@ -507,7 +528,7 @@ pub fn unpack_cmd(stage: &[u8], pkg: &[u8]) -> Vec<u8> {
         b" || exit 1; rm -f -- ",
         &p,
         b" || exit 1; ",
-        STRIP_SETID,
+        TIDY_RECEIVED,
     ])
 }
 
@@ -1632,7 +1653,7 @@ fn send(
     match (oa.code, ob.code) {
         (Some(0), Some(0)) => {
             if let Stage::Local(t, _) = stage {
-                strip_setid(t.path()).map_err(|e| {
+                tidy_received(t.path()).map_err(|e| {
                     crate::tr!(
                         "받은 파일 권한 정리 실패: {e}",
                         "Cannot fix permissions of received files: {e}"
@@ -2500,7 +2521,10 @@ mod tests {
         assert_eq!(
             tar_in_cmd(b"/d/.hdir-xfer.1", false),
             b"cd -- '/d/.hdir-xfer.1' || exit 1; tar -xpof - || exit 1; \
-              find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} +"
+              find . -type f \\( -perm -4000 -o -perm -2000 \\) -exec chmod ug-s {} + && \
+              find . ! -type l -perm -040 ! -perm -004 -exec chmod g-r {} + && \
+              find . ! -type l -perm -020 ! -perm -002 -exec chmod g-w {} + && \
+              find . ! -type l -perm -010 ! -perm -001 -exec chmod g-x {} +"
                 .to_vec()
         );
         // the paths are arguments, never part of the script
@@ -2624,6 +2648,16 @@ mod tests {
         assert_eq!(parse_scan(b"1\x00", 2), None);
         assert_eq!(parse_scan(b"1", 1), None);
         assert_eq!(parse_scan(b"", 0), Some(vec![]));
+    }
+
+    #[test]
+    fn a_received_group_gets_no_more_than_others() {
+        assert_eq!(cap_group(0o640), 0o600);
+        assert_eq!(cap_group(0o664), 0o644);
+        assert_eq!(cap_group(0o770), 0o700);
+        assert_eq!(cap_group(0o755), 0o755);
+        assert_eq!(cap_group(0o604), 0o604, "never adds");
+        assert_eq!(cap_group(0o1775), 0o1755, "sticky kept");
     }
 
     fn sh(cmd: &[u8]) -> std::process::Output {
@@ -5759,7 +5793,7 @@ mod tests {
     }
 
     #[test]
-    fn real_received_programs_lose_setuid_and_setgid() {
+    fn real_received_items_lose_setid_and_extra_group_access() {
         use std::os::unix::fs::PermissionsExt;
         let t = tempfile::tempdir().unwrap();
         let src = private_dir(t.path(), "src");
@@ -5768,6 +5802,10 @@ mod tests {
         fs::set_permissions(src.join("d/prog"), fs::Permissions::from_mode(0o4755)).unwrap();
         fs::write(src.join("d/plain"), "x").unwrap();
         fs::set_permissions(src.join("d/plain"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::write(src.join("d/shared"), "x").unwrap();
+        fs::set_permissions(src.join("d/shared"), fs::Permissions::from_mode(0o664)).unwrap();
+        fs::create_dir(src.join("d/sub")).unwrap();
+        fs::set_permissions(src.join("d/sub"), fs::Permissions::from_mode(0o750)).unwrap();
         if fs::metadata(src.join("d/prog"))
             .unwrap()
             .permissions()
@@ -5797,8 +5835,14 @@ mod tests {
             &no,
         );
         assert_eq!((oa.code, ob.code), (Some(0), Some(0)), "{oa:?} {ob:?}");
-        assert_eq!(mode(&shell_in.join("d/prog")), 0o755);
-        assert_eq!(mode(&shell_in.join("d/plain")), 0o640, "other modes kept");
+        // the received group is not the sender's: it gets no more than others
+        let expect = |base: &Path| {
+            assert_eq!(mode(&base.join("d/prog")), 0o755);
+            assert_eq!(mode(&base.join("d/plain")), 0o600);
+            assert_eq!(mode(&base.join("d/shared")), 0o644);
+            assert_eq!(mode(&base.join("d/sub")), 0o700);
+        };
+        expect(&shell_in);
         // local receiver
         let local_in = private_dir(t.path(), "local-in");
         let (oa, ob) = crate::session::run_pipe_cancellable(
@@ -5813,8 +5857,8 @@ mod tests {
             &no,
         );
         assert_eq!((oa.code, ob.code), (Some(0), Some(0)));
-        strip_setid(&local_in).unwrap();
-        assert_eq!(mode(&local_in.join("d/prog")), 0o755);
+        tidy_received(&local_in).unwrap();
+        expect(&local_in);
     }
 
     #[test]
@@ -5953,7 +5997,8 @@ mod tests {
         };
         assert_eq!(
             [mode("u"), mode("g"), mode("ug"), mode("plain")],
-            [0o755, 0o755, 0o750, 0o640]
+            // and the receiving group gets no more than others
+            [0o755, 0o755, 0o700, 0o600]
         );
     }
 
