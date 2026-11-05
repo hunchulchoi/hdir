@@ -93,6 +93,9 @@ struct Acc {
     partial: usize,
     removed_dirs: Vec<PathBuf>,
     warnings: Vec<String>,
+    /// Copies that arrived without some extended attributes or ACLs that
+    /// matter ([`crate::platform::MetaCopy`]): a move keeps such a source.
+    lossy: usize,
     /// Directories this operation created itself (the only ones it may delete
     /// when rolling back).
     created: Vec<PathBuf>,
@@ -370,7 +373,7 @@ fn copy_file_in(
     // Private until the data is complete; source permissions are applied below.
     let mut out = create_private_file(&tmp)?;
     let mut buf = vec![0u8; CHUNK];
-    let mut xattr_err = None;
+    let mut meta_copy = crate::platform::MetaCopy::default();
     let res = (|| -> io::Result<bool> {
         loop {
             if ctl.is_cancelled() {
@@ -384,12 +387,13 @@ fn copy_file_in(
             ctl.on_progress(n as u64, src);
         }
         // Before the mode: a read-only copy could not take them afterwards.
-        xattr_err = crate::platform::copy_xattrs_fd(&input, &out).err();
+        meta_copy = crate::platform::copy_xattrs_fd(&input, &out);
         // Windows access rules (nothing elsewhere)
         if let Err(e) = crate::platform::copy_dacl(src, &tmp) {
-            xattr_err.get_or_insert(e);
+            meta_copy.lost.push("DACL".into());
+            meta_copy.err.get_or_insert(e);
         }
-        out.set_permissions(meta.permissions())?;
+        out.set_permissions(kept_permissions(meta, meta_copy.acl_lost))?;
         out.set_modified(meta.modified()?)?;
         out.sync_all()?;
         Ok(true)
@@ -397,9 +401,7 @@ fn copy_file_in(
     drop(out);
     match res {
         Ok(true) => {
-            if let Some(e) = xattr_err {
-                acc.warnings.push(xattr_warning(dest, &e));
-            }
+            note_meta(dest, &meta_copy, acc);
             let step = place(&tmp, dest, approved, ctl, acc)?;
             if step == Step::Done {
                 ctl.on_file_done(dest);
@@ -414,6 +416,41 @@ fn copy_file_in(
             let _ = fs::remove_file(&tmp);
             Err(e)
         }
+    }
+}
+
+/// The source's permissions for its copy; with an ACL that did not follow,
+/// without group and other access (the ACL may have kept them out).
+fn kept_permissions(meta: &fs::Metadata, acl_lost: bool) -> fs::Permissions {
+    #[cfg(unix)]
+    if acl_lost {
+        use std::os::unix::fs::PermissionsExt;
+        return fs::Permissions::from_mode(meta.permissions().mode() & !0o077);
+    }
+    let _ = acl_lost;
+    meta.permissions()
+}
+
+/// Warnings for what the copy at `dest` lacks; a loss that matters is
+/// counted so a move keeps its source.
+fn note_meta(dest: &Path, m: &crate::platform::MetaCopy, acc: &mut Acc) {
+    if !m.lost.is_empty() {
+        acc.lossy += 1;
+        acc.warnings.push(crate::tr!(
+            "{}: 대상이 담지 못한 확장 속성: {}",
+            "{}: extended attributes the destination cannot hold: {}",
+            dest.display(),
+            m.lost.join(", ")
+        ));
+    } else if let Some(e) = &m.err {
+        acc.warnings.push(xattr_warning(dest, e));
+    }
+    if m.acl_lost {
+        acc.warnings.push(crate::tr!(
+            "{}: ACL을 옮기지 못해 그룹·기타 권한을 뺐음",
+            "{}: the ACL could not follow, group and other permissions removed",
+            dest.display()
+        ));
     }
 }
 
@@ -605,7 +642,7 @@ fn copy_dir(
         }
     }
     let skipped_before = acc.skipped;
-    let mut xattr_err = None;
+    let mut meta_copy = crate::platform::MetaCopy::default();
     let mut run = || -> io::Result<Step> {
         let stop = || ctl.is_cancelled();
         let Some(names) = list_names(dir, src, &stop)? else {
@@ -626,26 +663,22 @@ fn copy_dir(
             }
         }
         if created {
-            let copied = match dir {
+            meta_copy = match dir {
                 Some(d) => d.copy_xattrs_to(dest),
                 None => crate::platform::copy_xattrs_path(src, dest),
             };
-            if let Err(e) = copied {
-                xattr_err = Some(e);
-            }
             // last, after the children: restrictive rules could block them
             if let Err(e) = crate::platform::copy_dacl(src, dest) {
-                xattr_err.get_or_insert(e);
+                meta_copy.lost.push("DACL".into());
+                meta_copy.err.get_or_insert(e);
             }
             set_dir_modified(dest, meta.modified()?)?;
-            fs::set_permissions(dest, meta.permissions())?;
+            fs::set_permissions(dest, kept_permissions(meta, meta_copy.acl_lost))?;
         }
         Ok(Step::Done)
     };
     let mut res = run();
-    if let Some(e) = xattr_err {
-        acc.warnings.push(xattr_warning(dest, &e));
-    }
+    note_meta(dest, &meta_copy, acc);
     if let Some(b) = backup {
         if matches!(res, Ok(Step::Done)) && acc.skipped != skipped_before {
             // Incomplete copy: it must not replace the original. Drop it, put the
@@ -989,7 +1022,7 @@ fn relocate(
     match rename_fn(src, dest) {
         Ok(()) => {}
         Err(e) if is_cross_device(&e) => {
-            let skipped_before = acc.skipped;
+            let (skipped_before, lossy_before) = (acc.skipped, acc.lossy);
             match copy_entry(src, dest, ctl, false, replaced, acc)? {
                 Step::Cancelled => return Ok(Step::Cancelled),
                 Step::Skipped | Step::Partial | Step::SourceLeft => return Ok(Step::Skipped),
@@ -997,6 +1030,15 @@ fn relocate(
                     if acc.skipped != skipped_before {
                         // Something was not copied: the source is not fully moved,
                         // keep it intact.
+                        return Ok(Step::Partial);
+                    }
+                    if acc.lossy != lossy_before {
+                        // The copy lacks attributes the source has: keep both.
+                        acc.warnings.push(crate::tr!(
+                            "{}: 확장 속성·ACL을 다 옮기지 못해 원본을 지우지 않음",
+                            "{}: source kept, not all extended attributes or ACLs could follow",
+                            src.display()
+                        ));
                         return Ok(Step::Partial);
                     }
                     // copy_entry already counted the replaced file.
@@ -1067,7 +1109,9 @@ fn move_path_with(
             let mut acc = Acc::default();
             let res = copy_entry(src, &tmp, &mut Quiet, false, false, &mut acc);
             match res {
-                Ok(Step::Done) if acc.skipped == 0 => {
+                // a copy without all its attributes or ACLs never replaces
+                // the original either
+                Ok(Step::Done) if acc.skipped == 0 && acc.lossy == 0 => {
                     if let Err(e) = finalize_fn(&tmp, dest) {
                         // `tmp` is ours; `dest` (if any) belongs to someone else.
                         let _ = remove_source(&tmp);
@@ -1083,6 +1127,9 @@ fn move_path_with(
                     let _ = remove_source(&tmp);
                     match other {
                         Err(e) => Err(e),
+                        _ if acc.lossy > 0 => Err(io::Error::other(
+                            "extended attributes or ACLs could not follow",
+                        )),
                         _ => Err(io::Error::other("could not copy every entry")),
                     }
                 }
@@ -1594,6 +1641,142 @@ mod tests {
         assert!(!src.exists());
         assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "x");
         assert_eq!(c.progress, 1);
+    }
+
+    /// An xattr the target disk cannot hold (FAT): a copy warns, a move
+    /// across disks keeps the source.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn xattrs_lost_on_the_way_keep_a_moved_source() {
+        let t = tempdir().unwrap();
+        let src = t.path().join("d");
+        let dst = t.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join("f"), "x").unwrap();
+        let attr = if cfg!(target_os = "macos") {
+            "com.apple.ResourceFork"
+        } else {
+            "user.hdir"
+        };
+        if let Err(e) = crate::platform::xattr_set_path(&src.join("f"), attr, b"1") {
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
+            return;
+        }
+        let r = crate::platform::refuse_xattr_writes(|| {
+            copy_items(std::slice::from_ref(&src), &dst, &mut ctl())
+        });
+        assert_eq!(r.outcome, OpOutcome::Done);
+        assert!(
+            r.warnings.iter().any(|w| w.contains(attr)),
+            "{:?}",
+            r.warnings
+        );
+        fs::remove_dir_all(dst.join("d")).unwrap();
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
+        let r = crate::platform::refuse_xattr_writes(|| {
+            move_items_with(std::slice::from_ref(&src), &dst, &mut ctl(), &exdev)
+        });
+        assert!(src.join("f").exists(), "source kept");
+        assert_eq!(r.partial, 1, "{r:?}");
+        assert!(
+            r.warnings.iter().any(|w| w.contains(attr)),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// macOS: an ACL that cannot follow (a deny rule for `nobody`) leaves the copy
+    /// private to its owner rather than open by its mode bits.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_copy_whose_acl_cannot_follow_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempdir().unwrap();
+        let src = t.path().join("s");
+        let dst = t.path().join("dst");
+        fs::create_dir_all(src.join("d")).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join("d/f"), "x").unwrap();
+        fs::set_permissions(src.join("d/f"), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+        for p in [src.join("d/f"), src.join("d")] {
+            let st = std::process::Command::new("chmod")
+                .args(["+a", "nobody deny read"])
+                .arg(&p)
+                .status()
+                .unwrap();
+            assert!(st.success());
+        }
+        let r =
+            crate::platform::refuse_xattr_writes(|| copy_items(&[src.join("d")], &dst, &mut ctl()));
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dst.join("d/f")), 0o600, "{:?}", r.warnings);
+        assert_eq!(mode(&dst.join("d")), 0o700);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("ACL")),
+            "{:?}",
+            r.warnings
+        );
+        // and with a target that takes it, the ACL itself travels
+        let r = copy_items(
+            &[src.join("d")],
+            &{
+                let d2 = t.path().join("dst2");
+                fs::create_dir(&d2).unwrap();
+                d2
+            },
+            &mut ctl(),
+        );
+        assert_eq!(r.outcome, OpOutcome::Done);
+        assert_eq!(mode(&t.path().join("dst2/d/f")), 0o644);
+        // the same ACL entries as the source, on the file and the folder
+        let entries = |p: &Path| -> Vec<String> {
+            let out = std::process::Command::new("ls")
+                .arg("-led")
+                .arg(p)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .skip(1)
+                .map(|l| l.trim().to_string())
+                .collect()
+        };
+        for rel in ["d/f", "d"] {
+            let want = entries(&src.join(rel));
+            assert!(
+                !want.is_empty() && want[0].contains("nobody deny"),
+                "{want:?}"
+            );
+            assert_eq!(entries(&t.path().join("dst2").join(rel)), want, "{rel}");
+        }
+    }
+
+    /// Windows: access rules that cannot follow keep a source moved across
+    /// volumes, and a copy warns.
+    #[cfg(windows)]
+    #[test]
+    fn a_dacl_that_cannot_follow_keeps_a_moved_source() {
+        let t = tempdir().unwrap();
+        let dst = t.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        let f = t.path().join("f.txt");
+        fs::write(&f, "x").unwrap();
+        let exdev = |_: &Path, _: &Path| Err(crate::platform::test_exdev());
+        let r = crate::platform::refuse_xattr_writes(|| {
+            move_items_with(std::slice::from_ref(&f), &dst, &mut ctl(), &exdev)
+        });
+        assert!(f.exists(), "source kept");
+        assert_eq!(r.partial, 1, "{r:?}");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("DACL")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     #[test]
