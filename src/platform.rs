@@ -601,6 +601,10 @@ mod xattr_sys {
     }
 
     pub fn set(on: On, name: &CStr, value: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if super::writes_refused() {
+            return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+        }
         let (v, n) = (value.as_ptr().cast::<c_void>(), value.len());
         let r = unsafe {
             match on {
@@ -720,32 +724,147 @@ mod xattr_sys {
     }
 }
 
-/// Copy every extended attribute from `from` to `to`. Attributes the target
-/// filesystem cannot hold at all are not an error; the first other failure
-/// is returned after trying the rest.
+/// What a copy of extended attributes (and, on macOS, the extended ACL)
+/// could not carry over.
+#[derive(Debug, Default)]
+pub struct MetaCopy {
+    /// Attributes that matter ([`matters_locally`]) and did not arrive; a
+    /// macOS ACL shows as `ACL`.
+    pub lost: Vec<String>,
+    /// An access list (POSIX ACL, macOS ACL) did not arrive: the copy must
+    /// not be more open than the mode bits alone allow the source's group.
+    pub acl_lost: bool,
+    /// The first other failure, for a warning.
+    pub err: Option<io::Error>,
+}
+
+/// POSIX ACLs travel as these xattrs on Linux.
+pub fn is_acl_xattr(name: &[u8]) -> bool {
+    name.starts_with(b"system.posix_acl_")
+}
+
+/// Whether losing the attribute `name` in a local copy loses something the
+/// user made: what [`lost_by_tar`] counts, plus Linux's POSIX ACLs.
+pub fn matters_locally(mac: bool, name: &[u8]) -> bool {
+    lost_by_tar(mac, name) || (!mac && is_acl_xattr(name))
+}
+
+#[cfg(test)]
+thread_local! {
+    static REFUSE_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn writes_refused() -> bool {
+    REFUSE_WRITES.with(|r| r.get())
+}
+
+/// Run `f` as if every xattr and ACL write on this thread hit a target that
+/// holds none (a FAT disk).
+#[cfg(test)]
+pub fn refuse_xattr_writes<T>(f: impl FnOnce() -> T) -> T {
+    REFUSE_WRITES.with(|r| r.set(true));
+    let out = f();
+    REFUSE_WRITES.with(|r| r.set(false));
+    out
+}
+
+/// macOS: copy the extended ACL of `from` onto `to`. `Ok(false)`: there is
+/// none.
+#[cfg(target_os = "macos")]
+fn copy_mac_acl(from: xattr_sys::On, to: xattr_sys::On) -> io::Result<bool> {
+    use xattr_sys::On;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, ty: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_link_np(path: *const libc::c_char, ty: libc::c_int) -> *mut libc::c_void;
+        fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, ty: libc::c_int) -> libc::c_int;
+        fn acl_set_link_np(
+            path: *const libc::c_char,
+            ty: libc::c_int,
+            acl: *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+    }
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    // SAFETY: valid fds / NUL-terminated paths; a returned ACL is freed once.
+    let acl = unsafe {
+        match from {
+            On::Fd(fd) => acl_get_fd_np(fd, ACL_TYPE_EXTENDED),
+            On::Path(p) => acl_get_link_np(p.as_ptr(), ACL_TYPE_EXTENDED),
+        }
+    };
+    if acl.is_null() {
+        let e = io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    #[cfg(test)]
+    if writes_refused() {
+        unsafe { acl_free(acl) };
+        return Err(io::Error::from_raw_os_error(libc::ENOTSUP));
+    }
+    let r = unsafe {
+        match to {
+            On::Fd(fd) => acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED),
+            On::Path(p) => acl_set_link_np(p.as_ptr(), ACL_TYPE_EXTENDED, acl),
+        }
+    };
+    let e = io::Error::last_os_error();
+    unsafe { acl_free(acl) };
+    if r == 0 { Ok(true) } else { Err(e) }
+}
+
+/// Copy every extended attribute (and the macOS ACL) from `from` to `to`,
+/// noting what did not arrive ([`MetaCopy`]). An attribute that vanished
+/// meanwhile is not a loss.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn copy_xattrs_on(from: xattr_sys::On, to: xattr_sys::On) -> io::Result<()> {
+fn copy_xattrs_on(from: xattr_sys::On, to: xattr_sys::On) -> MetaCopy {
+    let mac = cfg!(target_os = "macos");
+    let mut out = MetaCopy::default();
+    #[cfg(target_os = "macos")]
+    if let Err(e) = copy_mac_acl(from, to) {
+        out.lost.push("ACL".into());
+        out.acl_lost = true;
+        out.err.get_or_insert(e);
+    }
     let names = match xattr_sys::names(from) {
         Ok(n) => n,
-        Err(e) if xattr_sys::is_unsupported(&e) => return Ok(()),
-        Err(e) => return Err(e),
+        Err(e) if xattr_sys::is_unsupported(&e) => return out,
+        Err(e) => {
+            // nothing known about them: as if all were lost
+            out.lost.push("?".into());
+            out.acl_lost = true;
+            out.err.get_or_insert(e);
+            return out;
+        }
     };
-    let mut first = None;
     for name in names {
         let res = xattr_sys::get(from, &name).and_then(|v| xattr_sys::set(to, &name, &v));
         match res {
             Ok(()) => {}
-            Err(e) if xattr_sys::is_unsupported(&e) || xattr_sys::is_missing(&e) => {}
+            Err(e) if xattr_sys::is_missing(&e) => {}
             Err(e) => {
-                first.get_or_insert(e);
+                let n = name.as_bytes();
+                if matters_locally(mac, n) {
+                    out.lost.push(String::from_utf8_lossy(n).into_owned());
+                }
+                if is_acl_xattr(n) {
+                    out.acl_lost = true;
+                }
+                if !xattr_sys::is_unsupported(&e) {
+                    out.err.get_or_insert(e);
+                }
             }
         }
     }
-    first.map_or(Ok(()), Err)
+    out
 }
 
 /// [`copy_xattrs_on`] between two open files.
-pub fn copy_xattrs_fd(from: &fs::File, to: &fs::File) -> io::Result<()> {
+pub fn copy_xattrs_fd(from: &fs::File, to: &fs::File) -> MetaCopy {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::unix::io::AsRawFd;
@@ -755,22 +874,28 @@ pub fn copy_xattrs_fd(from: &fs::File, to: &fs::File) -> io::Result<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (from, to);
-        Ok(())
+        MetaCopy::default()
     }
 }
 
 /// [`copy_xattrs_on`] between two paths (final symlinks not followed).
-pub fn copy_xattrs_path(from: &Path, to: &Path) -> io::Result<()> {
+pub fn copy_xattrs_path(from: &Path, to: &Path) -> MetaCopy {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use xattr_sys::{On, cpath};
-        let (f, t) = (cpath(from)?, cpath(to)?);
-        copy_xattrs_on(On::Path(&f), On::Path(&t))
+        match (cpath(from), cpath(to)) {
+            (Ok(f), Ok(t)) => copy_xattrs_on(On::Path(&f), On::Path(&t)),
+            (Err(e), _) | (_, Err(e)) => MetaCopy {
+                lost: vec!["?".into()],
+                acl_lost: true,
+                err: Some(e),
+            },
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (from, to);
-        Ok(())
+        MetaCopy::default()
     }
 }
 
@@ -831,7 +956,7 @@ impl DirFd {
     pub fn entries_until(&self, _stop: &dyn Fn() -> bool) -> io::Result<Option<Vec<OsString>>> {
         match *self {}
     }
-    pub fn copy_xattrs_to(&self, _to: &Path) -> io::Result<()> {
+    pub fn copy_xattrs_to(&self, _to: &Path) -> MetaCopy {
         match *self {}
     }
 }
@@ -923,18 +1048,24 @@ impl DirFd {
     }
 
     /// Copy this folder's extended attributes onto `to` (not followed).
-    pub fn copy_xattrs_to(&self, to: &Path) -> io::Result<()> {
+    pub fn copy_xattrs_to(&self, to: &Path) -> MetaCopy {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::fd::AsRawFd;
             use xattr_sys::{On, cpath};
-            let t = cpath(to)?;
-            copy_xattrs_on(On::Fd(self.0.as_raw_fd()), On::Path(&t))
+            match cpath(to) {
+                Ok(t) => copy_xattrs_on(On::Fd(self.0.as_raw_fd()), On::Path(&t)),
+                Err(e) => MetaCopy {
+                    lost: vec!["?".into()],
+                    acl_lost: true,
+                    err: Some(e),
+                },
+            }
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = to;
-            Ok(())
+            MetaCopy::default()
         }
     }
 }
@@ -1795,6 +1926,84 @@ mod acl_tests {
         .unwrap();
         assert!(tree_has_lost_xattrs(&d, &no));
         assert!(!tree_has_lost_xattrs(&t.path().join("gone"), &no));
+    }
+
+    #[test]
+    fn which_xattrs_a_local_copy_must_not_lose() {
+        assert!(matters_locally(true, b"com.apple.ResourceFork"));
+        assert!(!matters_locally(true, b"com.apple.quarantine"));
+        assert!(matters_locally(false, b"user.note"));
+        assert!(matters_locally(false, b"system.posix_acl_access"));
+        assert!(matters_locally(false, b"system.posix_acl_default"));
+        assert!(!matters_locally(false, b"security.selinux"));
+        assert!(is_acl_xattr(b"system.posix_acl_access"));
+        assert!(!is_acl_xattr(b"user.note"));
+    }
+
+    /// A target that holds no xattrs: the ones that matter are reported
+    /// lost, routine ones are not.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn xattrs_a_target_cannot_hold_are_reported_lost() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "").unwrap();
+        let mine = if cfg!(target_os = "macos") {
+            "com.apple.ResourceFork"
+        } else {
+            "user.hdir"
+        };
+        if let Err(e) = xattr_set_path(&a, mine, b"1") {
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
+            return;
+        }
+        let ok = copy_xattrs_path(&a, &b);
+        assert!(
+            ok.lost.is_empty() && ok.err.is_none() && !ok.acl_lost,
+            "{ok:?}"
+        );
+        assert_eq!(
+            xattr_get_path(&b, mine).unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        let c = t.path().join("c");
+        fs::write(&c, "").unwrap();
+        let lost = refuse_xattr_writes(|| copy_xattrs_path(&a, &c));
+        assert_eq!(lost.lost, vec![mine.to_string()], "{lost:?}");
+        assert!(lost.err.is_none() && !lost.acl_lost, "{lost:?}");
+    }
+
+    /// macOS: an extended ACL (not an xattr there) is copied, and one the
+    /// target cannot take is reported.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_acls_are_copied_or_reported_lost() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b, c) = (t.path().join("a"), t.path().join("b"), t.path().join("c"));
+        for p in [&a, &b, &c] {
+            fs::write(p, "x").unwrap();
+        }
+        let st = std::process::Command::new("chmod")
+            .args(["+a", "everyone deny read"])
+            .arg(&a)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let no = AtomicBool::new(false);
+        assert!(!tree_has_posix_acl(&b, &no));
+        let ok = copy_xattrs_path(&a, &b);
+        assert!(ok.lost.is_empty() && !ok.acl_lost, "{ok:?}");
+        assert!(tree_has_posix_acl(&b, &no), "the ACL came along");
+        let lost = refuse_xattr_writes(|| copy_xattrs_path(&a, &c));
+        assert!(
+            lost.acl_lost && lost.lost == vec!["ACL".to_string()],
+            "{lost:?}"
+        );
+        assert!(!tree_has_posix_acl(&c, &no));
     }
 
     #[test]
