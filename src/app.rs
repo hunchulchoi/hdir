@@ -6332,11 +6332,14 @@ mod tests {
         // each query waits for its own token
         let (go, tokens) = std::sync::mpsc::channel::<()>();
         let tokens = Mutex::new(tokens);
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let entered_tx = Mutex::new(entered_tx);
         let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let c = Arc::clone(&calls);
         app.loader = crate::loader::Loader::with_readers(
             Arc::new(crate::panel::read_listing),
             Arc::new(move |_| {
+                let _ = entered_tx.lock().unwrap().send(());
                 let _ = tokens.lock().unwrap().recv();
                 let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 Some((n, n))
@@ -6345,6 +6348,8 @@ mod tests {
         press(&mut app, KeyCode::Down); // adir
         press(&mut app, KeyCode::Enter);
         settle(&mut app);
+        // the worker holds the first query before the panel moves on
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
         press(&mut app, KeyCode::Backspace);
         settle(&mut app);
         press(&mut app, KeyCode::Enter); // adir again
