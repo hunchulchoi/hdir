@@ -22,7 +22,11 @@
 //!   parent-by-parent check remote saves use);
 //! - a conflict where either side is a directory (skipped): merging cannot
 //!   be atomic;
-//! - a folder sent into itself (compared by device and inode).
+//! - a folder sent into itself (compared by device and inode, unless the
+//!   two sides report different boot ids: then they are two machines).
+//!
+//! A copied folder whose received entry count differs from the source's
+//! (names differing only in case, merged) ends as partial, with a warning.
 //!
 //! A move deletes the source only when the copy is in place and the
 //! source's whole tree (identity, size, nanosecond mtime / ctime of every
@@ -1161,6 +1165,55 @@ fn dest_chain(side: &Side, dir: &Path) -> Result<Vec<String>, String> {
     }
 }
 
+/// Prints an id of this boot of the machine: Linux's boot id, macOS's boot
+/// session, or the BSD boot time. Two sides that print different ids are
+/// different machines (a cloned VM can share inode numbers, never a boot).
+pub const HOST_ID_CMD: &[u8] = b"cat /proc/sys/kernel/random/boot_id 2>/dev/null || \
+      sysctl -n kern.bootsessionuuid 2>/dev/null || sysctl -n kern.boottime 2>/dev/null";
+
+/// [`HOST_ID_CMD`] run here, once per run of hdir.
+fn local_host_id() -> Option<String> {
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        if cfg!(windows) {
+            return None;
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(std::str::from_utf8(HOST_ID_CMD).unwrap_or("false"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        host_id_of(out.status.success(), &out.stdout)
+    })
+    .clone()
+}
+
+fn host_id_of(ok: bool, stdout: &[u8]) -> Option<String> {
+    let id = String::from_utf8_lossy(stdout).trim().to_string();
+    (ok && !id.is_empty()).then_some(id)
+}
+
+/// The boot id of a side; `None` when it cannot be told.
+fn host_id(side: &Side) -> Option<String> {
+    match side {
+        Side::Local => local_host_id(),
+        Side::Remote(s) => s.host_id(|| {
+            let o = s.exec(HOST_ID_CMD).ok()?;
+            host_id_of(o.code == Some(0), &o.stdout)
+        }),
+    }
+}
+
+/// Whether two sides may be one machine: only different known boot ids
+/// tell them apart.
+pub fn maybe_same_host(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
 /// `dev:inode` of `path` if it is a real directory.
 fn dir_id(side: &Side, path: &Path) -> Result<Option<String>, String> {
     match side {
@@ -1919,16 +1972,22 @@ fn item(
     let is_move = spec.kind == JobKind::Move;
     // A folder sent into itself (one machine seen through two names, ssh
     // to localhost): the copy would keep copying its own stage.
-    match dir_id(&spec.src, &src) {
-        Ok(Some(id)) if chain.contains(&id) => {
+    let src_is_dir = match dir_id(&spec.src, &src) {
+        Ok(Some(id))
+            if chain.contains(&id)
+                && maybe_same_host(
+                    host_id(&spec.src).as_deref(),
+                    host_id(&spec.dst).as_deref(),
+                ) =>
+        {
             return fail(crate::tr!(
                 "폴더를 그 안으로 보낼 수 없음",
                 "Cannot send a folder into itself"
             ));
         }
-        Ok(_) => {}
+        Ok(id) => id.is_some(),
         Err(e) => return fail(e),
-    }
+    };
     let stage = match make_stage(&spec.dst, &spec.dest_dir, real) {
         Ok(st) => st,
         Err(e) => return fail(e),
@@ -2051,6 +2110,19 @@ fn item(
     }
     r.overwritten += usize::from(overwrite);
     let Some(before) = before else {
+        // a copied folder: names differing only in case may have become one
+        // on the way (a move checks this below, before deleting)
+        if src_is_dir && !on_host_move {
+            let sent = count(&spec.src, &spec.src_dir, name, ctl.cancel_flag());
+            let got = count(&spec.dst, &spec.dest_dir, name, ctl.cancel_flag());
+            if !ctl.is_cancelled() && sent.is_some() && got != sent {
+                return Step::Partial(crate::tr!(
+                    "받은 항목 수가 원본과 달라 일부가 합쳐졌을 수 있음(대소문자만 다른 이름 등): {}",
+                    "Fewer entries arrived than were sent; some may have merged (names differing only in case?): {}",
+                    lossy(name)
+                ));
+            }
+        }
         return Step::Done;
     };
     match kind(&spec.dst, &dest) {
@@ -3539,6 +3611,20 @@ mod tests {
         })
     }
 
+    /// [`host`] whose received folders hold `n` entries (the copy check).
+    fn host_holding(n: u64) -> Arc<FakeCmd> {
+        FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return fake_scp(a);
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("for f do printf .") {
+                return ok(&format!("{n}\n"));
+            }
+            answer(c, &[], &[], "")
+        })
+    }
+
     fn scp_pairs(f: &FakeCmd) -> Vec<(String, String)> {
         f.pipe_calls().iter().map(|a| pipe_ends(a)).collect()
     }
@@ -3627,7 +3713,7 @@ mod tests {
         fs::write(t.path().join("a"), "12345").unwrap();
         fs::create_dir(t.path().join("d")).unwrap();
         fs::write(t.path().join("d/x"), "123").unwrap();
-        let f = host(&[], &[], "");
+        let f = host_holding(2); // d and its one entry
         let s = spec(
             JobKind::Copy,
             Side::Local,
@@ -3814,7 +3900,7 @@ mod tests {
         fs::create_dir(t.path().join("d")).unwrap();
         std::os::unix::fs::symlink("/etc", t.path().join("d/secret")).unwrap();
         fs::write(t.path().join("ok"), "x").unwrap();
-        let f = host(&[], &[], "");
+        let f = host_holding(2); // d and its one entry
         let s = spec(
             JobKind::Copy,
             Side::Local,
@@ -5473,6 +5559,102 @@ mod tests {
             OpOutcome::Failed("d: 폴더를 그 안으로 보낼 수 없음".into())
         );
         assert!(f.pipe_calls().is_empty());
+    }
+
+    #[test]
+    fn hosts_with_different_boot_ids_are_never_the_same_machine() {
+        assert!(maybe_same_host(Some("a"), Some("a")));
+        assert!(!maybe_same_host(Some("a"), Some("b")));
+        // unknown on either side: the dev:inode check still runs
+        assert!(maybe_same_host(None, Some("b")));
+        assert!(maybe_same_host(Some("a"), None));
+    }
+
+    #[test]
+    fn a_folder_on_another_machine_with_matching_ids_is_sent() {
+        // a cloned VM: the destination's parent has the source's dev:inode,
+        // but the machine booted separately
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        fs::create_dir_all(&d).unwrap();
+        let id = {
+            use std::os::unix::fs::MetadataExt;
+            let m = fs::metadata(&d).unwrap();
+            format!("{}:{}", m.dev(), m.ino())
+        };
+        assert!(local_host_id().is_some(), "this machine tells its boot id");
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return ok("");
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("; c=$(pwd -P && echo x)") {
+                return ok(&format!("7:7\n{id}\n2:2\n"));
+            }
+            if c == String::from_utf8_lossy(HOST_ID_CMD) {
+                return ok("another-boot\n");
+            }
+            if c.contains("for f do printf .") {
+                return ok("1\n");
+            }
+            answer(c, &[], &[], "")
+        });
+        let s = spec(
+            JobKind::Copy,
+            Side::Local,
+            t.path(),
+            &["d"],
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/clone/d/inner"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        assert_eq!(f.pipe_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_copied_folder_that_lost_entries_is_partial() {
+        // `a` and `A` became one on a destination that ignores case
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir(t.path().join("d")).unwrap();
+        fs::write(t.path().join("d/a"), "1").unwrap();
+        fs::write(t.path().join("d/b"), "2").unwrap();
+        let f = FakeCmd::new(move |a| {
+            if a[0] == "pipe" {
+                return ok("");
+            }
+            let c = remote_cmd(a).unwrap_or_default();
+            if c.contains("for f do printf .") {
+                return ok("2\n"); // d and one file, 3 were sent
+            }
+            answer(c, &[], &[], "")
+        });
+        let s = spec(
+            JobKind::Copy,
+            Side::Local,
+            t.path(),
+            &["d"],
+            Side::Remote(session(Arc::clone(&f))),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!((r.outcome, r.copied, r.partial), (OpOutcome::Done, 0, 1));
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("대소문자") && w.contains('d')),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn real_host_id_command_matches_the_local_one() {
+        let out = sh(HOST_ID_CMD);
+        assert!(out.status.success(), "{out:?}");
+        let id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert!(!id.is_empty());
+        assert_eq!(local_host_id().as_deref(), Some(id.as_str()));
     }
 
     #[test]
