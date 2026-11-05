@@ -1050,9 +1050,27 @@ pub fn unstage_cmd(stage: &[u8]) -> Vec<u8> {
 
 /// Copy `src` into `dir` on the same host.
 pub fn cp_cmd(os: &RemoteOs, src_dir: &[u8], name: &[u8], id: &[u8], dir: &[u8]) -> Vec<u8> {
+    cp_keep_cmd(os, src_dir, name, id, dir, false)
+}
+
+/// [`cp_cmd`]; `xattrs`: GNU cp keeps extended attributes too, and fails
+/// when it cannot (`-p` alone drops them).
+pub fn cp_keep_cmd(
+    os: &RemoteOs,
+    src_dir: &[u8],
+    name: &[u8],
+    id: &[u8],
+    dir: &[u8],
+    xattrs: bool,
+) -> Vec<u8> {
+    let cp: &[u8] = if xattrs {
+        b"cp -Rp --preserve=xattr -- ./"
+    } else {
+        b"cp -Rp -- ./"
+    };
     cat(&[
         &in_src_dir(os, src_dir, id),
-        b"cp -Rp -- ./",
+        cp,
         &sh_quote(name),
         b" ",
         &sh_quote(&into_dir(dir)),
@@ -1719,7 +1737,16 @@ fn xattrs_for(route: &Route, src_dir: &Path, name: &OsString, cancel: &AtomicBoo
         Route::Up(d) => (None, Some(*d)),
         Route::Down(s) => (Some(*s), None),
         Route::Between(s, d) => (Some(*s), Some(*d)),
-        Route::SameHost(_) => return XattrPlan::None,
+        // one server: GNU cp keeps them (or fails, which keeps a source)
+        Route::SameHost(s) => {
+            let has =
+                matches!(s.os, RemoteOs::Linux) && has_user_xattrs(Some(*s), src_dir, name, cancel);
+            return if has {
+                XattrPlan::Keep
+            } else {
+                XattrPlan::None
+            };
+        }
     };
     if cfg!(windows) || !has_user_xattrs(from, src_dir, name, cancel) {
         return XattrPlan::None;
@@ -1846,7 +1873,14 @@ fn send(
                     "temp folder is not remote"
                 ));
             };
-            let cmd = cp_cmd(&s.os, &b(src_dir), &os_bytes(name), src_id.as_bytes(), p);
+            let cmd = cp_keep_cmd(
+                &s.os,
+                &b(src_dir),
+                &os_bytes(name),
+                src_id.as_bytes(),
+                p,
+                xattrs,
+            );
             let out = s.exec_cancellable(&cmd, cancel).map_err(|e| e.message())?;
             if out.code == Some(SRC_MOVED) {
                 return Err(crate::tr!(
@@ -2226,6 +2260,8 @@ fn item(
             ctl.cancel_flag(),
         )
     };
+    // ACLs that could not travel (the copy was made private instead)
+    let acls_lost = matches!(sent, Ok(Some(_)));
     let sent = sent.map(|w| r.warnings.extend(w));
     if let Err(e) = sent {
         let cancelled = ctl.is_cancelled();
@@ -2284,6 +2320,13 @@ fn item(
         }
     }
     r.overwritten += usize::from(overwrite);
+    if acls_lost && before.is_some() {
+        return Step::Partial(crate::tr!(
+            "ACL을 옮길 수 없어 원본을 지우지 않음: {}",
+            "Source kept: its ACLs could not travel: {}",
+            lossy(name)
+        ));
+    }
     if xattrs == XattrPlan::Lost {
         let msg = crate::tr!(
             "확장 속성(user.*)은 옮겨지지 않음: {}",
@@ -4273,6 +4316,13 @@ mod tests {
             .into_iter()
             .filter(|c| !c.contains("du -sk"))
             .collect();
+        // the copy asked about user.* xattrs (for cp), the move did not
+        let scans = long.iter().filter(|c| c.contains("python3 -c")).count();
+        assert_eq!(scans, 1, "{long:?}");
+        let long: Vec<String> = long
+            .into_iter()
+            .filter(|c| !c.contains("python3 -c"))
+            .collect();
         let cp = String::from_utf8(cp_cmd(
             &RemoteOs::Linux,
             b"/srv",
@@ -4440,6 +4490,89 @@ mod tests {
     }
 
     #[test]
+    fn a_same_server_copy_with_user_xattrs_keeps_them_with_cp() {
+        let f = xattr_host("2\n", 0);
+        let sess = session(Arc::clone(&f));
+        let s = spec(
+            JobKind::Copy,
+            Side::Remote(Arc::clone(&sess)),
+            &p("/srv"),
+            &["a"],
+            Side::Remote(sess),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(r.outcome, OpOutcome::Done, "{:?}", r.warnings);
+        assert!(
+            f.long_cmds()
+                .iter()
+                .any(|c| c.contains("cp -Rp --preserve=xattr -- ./'a'")),
+            "{:?}",
+            f.long_cmds()
+        );
+    }
+
+    #[test]
+    fn a_move_whose_acls_could_not_travel_keeps_the_source() {
+        let (from, to) = (acl_host("1\n", 0), acl_host("0\n", 2));
+        let s = spec(
+            JobKind::Move,
+            Side::Remote(session(Arc::clone(&from))),
+            &p("/srv"),
+            &["a"],
+            to_other(&to),
+            &p("/dst"),
+        );
+        let r = run(&s, &mut Ctl::new());
+        assert_eq!(
+            (r.outcome, r.partial),
+            (OpOutcome::Done, 1),
+            "{:?}",
+            r.warnings
+        );
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("ACL을 옮길 수 없어 원본을 지우지 않음")),
+            "{:?}",
+            r.warnings
+        );
+        assert!(!from.remote_cmds().iter().any(|c| c.contains(".hdir-del.")));
+    }
+
+    /// Linux: `cp --preserve=xattr` really keeps a `user.*` attribute.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_same_host_cp_keeps_user_xattrs() {
+        let t = tempfile::tempdir().unwrap();
+        let src = private_dir(t.path(), "src");
+        let st = private_dir(t.path(), "st");
+        fs::write(src.join("f"), "x").unwrap();
+        if let Err(e) = crate::platform::xattr_set_path(&src.join("f"), "user.hdir", b"v") {
+            assert!(
+                matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
+                "{e}"
+            );
+            return;
+        }
+        let os = crate::testutil::local_os();
+        let id = src_dir_id(&Side::Local, &src).unwrap();
+        let out = sh(&cp_keep_cmd(
+            &os,
+            &b(&src),
+            b"f",
+            id.as_bytes(),
+            &b(&st),
+            true,
+        ));
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            crate::platform::xattr_get_path(&st.join("f"), "user.hdir").unwrap(),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
     fn xattr_options_scan_answers_and_plans() {
         assert_eq!(tar_word(TarMeta::NONE), b"tar");
         assert_eq!(tar_word(TarMeta::ACLS), b"tar --acls");
@@ -4497,7 +4630,16 @@ mod tests {
             let out = sh(&user_xattr_scan_cmd(&b(&src), name));
             parse_user_xattr_scan(out.status.code(), &out.stdout)
         };
-        assert_ne!(count(b"d"), Some(true), "nothing yet");
+        let python = sh(b"command -v python3").status.success();
+        let check = |want: bool| {
+            let got = count(b"d");
+            if python {
+                assert_eq!(got, Some(want));
+            } else {
+                assert_ne!(got, Some(!want));
+            }
+        };
+        check(false);
         if let Err(e) = crate::platform::xattr_set_path(&src.join("d/f"), "user.hdir", b"v") {
             assert!(
                 matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP),
@@ -4505,7 +4647,7 @@ mod tests {
             );
             return;
         }
-        assert_ne!(count(b"d"), Some(false));
+        check(true);
         if !sh(TAR_XATTRS_PROBE).status.success() {
             return; // this tar cannot carry them
         }
